@@ -1,0 +1,18 @@
+{
+  "launchAtStartup": true,
+  "refreshIntervalMinutes": 1,
+  "theme": "glass",
+  "quotaNotifications": true,
+  "providerPreferences": {
+    "order": [
+      "openai-codex"
+    ],
+    "hidden": []
+  },
+  "quotaPerspective": "used",
+  "surfaceTransparency": 45,
+  "futurePluginSettings": {
+    "telemetryOptIn": false,
+    "experimentalCharts": true
+  }
+}

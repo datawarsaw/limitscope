@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: Windows build & tests
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TZ: Europe/Warsaw
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup stable Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Rust tests (live tests are #[ignore]d)
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Frontend build (tsc + vite)
+        run: npm run build
+
+      - name: Tauri build (NSIS installer)
+        run: npm run tauri build
+
+      - name: Upload NSIS installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rate-limits-windows-installer
+          path: src-tauri/target/release/bundle/nsis/*-setup.exe
+          if-no-files-found: error

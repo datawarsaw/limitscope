@@ -1,0 +1,19 @@
+{
+  "launchAtStartup": true,
+  "refreshIntervalMinutes": 15,
+  "theme": "oled",
+  "quotaNotifications": true,
+  "providerPreferences": {
+    "order": [
+      "openai-codex",
+      "zai",
+      "opencode-go",
+      "antigravity",
+      "grok"
+    ],
+    "hidden": [
+      "grok"
+    ]
+  },
+  "quotaPerspective": "remaining"
+}

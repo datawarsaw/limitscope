@@ -1,0 +1,7 @@
+providerId,providerName,account,windowLabel,usedPercent,observedAt,resetAt,resolution
+antigravity,Google Antigravity,,daily,12.5,2026-09-30T08:00:00.000Z,2026-10-01T00:00:00.000Z,detailed
+grok,Grok (xAI),xai:acct_1,sliding,85,2026-09-28T10:00:00.000Z,,compacted
+openai-codex,OpenAI / Codex,chatgpt:5678,5-hour,0,2026-09-30T11:30:00.000Z,2026-09-30T16:30:00.000Z,detailed
+opencode-go,OpenCode Go,key:3456,"label, with ""comma""",100,2026-09-29T00:00:00.000Z,,compacted
+unknown-vendor,,,custom,42,2026-09-27T12:00:00.000Z,,compacted
+zai,Z.ai,key:9012,monthly,63.25,2026-09-30T10:00:00.000Z,2026-10-31T23:59:59.000Z,detailed

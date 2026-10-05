@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:," />
+    <title>LimitScope</title>
+    <style>
+      html {
+        background: #161619;
+      }
+    </style>
+    <script>
+      (function () {
+        try {
+          var internals = window.__TAURI_INTERNALS__;
+          var label =
+            internals &&
+            internals.metadata &&
+            internals.metadata.currentWindow &&
+            internals.metadata.currentWindow.label;
+          if (label === "floating-quota") {
+            document.documentElement.setAttribute("data-window", "floating");
+            document.documentElement.style.background = "transparent";
+          }
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

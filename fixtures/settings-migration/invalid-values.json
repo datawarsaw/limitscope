@@ -1,0 +1,18 @@
+{
+  "launchAtStartup": "not-a-boolean",
+  "refreshIntervalMinutes": 42,
+  "theme": "cyberpunk-neon",
+  "quotaNotifications": 123,
+  "providerPreferences": {
+    "order": [
+      "openai-codex",
+      999,
+      null,
+      "openai-codex",
+      ""
+    ],
+    "hidden": "not-an-array"
+  },
+  "quotaPerspective": "inverted",
+  "surfaceTransparency": 999
+}

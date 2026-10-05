@@ -1,0 +1,6 @@
+{
+  "launchAtStartup": true,
+  "refreshIntervalMinutes": 15,
+  "theme": "glass",
+  "quotaNotifications": true
+}

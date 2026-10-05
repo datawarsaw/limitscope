@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "kind": "limitscope-usage-export",
+  "exportedAt": "2026-09-30T12:00:00.000Z",
+  "rangeCovered": {
+    "from": "2026-09-27T12:00:00.000Z",
+    "to": "2026-09-30T11:30:00.000Z"
+  },
+  "semantics": {
+    "gapSemantics": "notObservedNeverZeroFilled",
+    "resolutionSemantics": "detailedWithin24hOtherwiseCompacted",
+    "resetBoundaryRule": "usedPercentDropOver5PointsOrResetAtForwardMoveOver1Minute",
+    "thresholdsMeasureUsed": true
+  },
+  "rows": [
+    {
+      "providerId": "antigravity",
+      "providerName": "Google Antigravity",
+      "account": null,
+      "windowLabel": "daily",
+      "usedPercent": 12.5,
+      "observedAt": "2026-09-30T08:00:00.000Z",
+      "resetAt": "2026-10-01T00:00:00.000Z",
+      "resolution": "detailed"
+    },
+    {
+      "providerId": "grok",
+      "providerName": "Grok (xAI)",
+      "account": "xai:acct_1",
+      "windowLabel": "sliding",
+      "usedPercent": 85.0,
+      "observedAt": "2026-09-28T10:00:00.000Z",
+      "resetAt": null,
+      "resolution": "compacted"
+    },
+    {
+      "providerId": "openai-codex",
+      "providerName": "OpenAI / Codex",
+      "account": "chatgpt:5678",
+      "windowLabel": "5-hour",
+      "usedPercent": 0.0,
+      "observedAt": "2026-09-30T11:30:00.000Z",
+      "resetAt": "2026-09-30T16:30:00.000Z",
+      "resolution": "detailed"
+    },
+    {
+      "providerId": "opencode-go",
+      "providerName": "OpenCode Go",
+      "account": "key:3456",
+      "windowLabel": "label, with \"comma\"",
+      "usedPercent": 100.0,
+      "observedAt": "2026-09-29T00:00:00.000Z",
+      "resetAt": null,
+      "resolution": "compacted"
+    },
+    {
+      "providerId": "unknown-vendor",
+      "providerName": "",
+      "account": null,
+      "windowLabel": "custom",
+      "usedPercent": 42.0,
+      "observedAt": "2026-09-27T12:00:00.000Z",
+      "resetAt": null,
+      "resolution": "compacted"
+    },
+    {
+      "providerId": "zai",
+      "providerName": "Z.ai",
+      "account": "key:9012",
+      "windowLabel": "monthly",
+      "usedPercent": 63.25,
+      "observedAt": "2026-09-30T10:00:00.000Z",
+      "resetAt": "2026-10-31T23:59:59.000Z",
+      "resolution": "detailed"
+    }
+  ]
+}

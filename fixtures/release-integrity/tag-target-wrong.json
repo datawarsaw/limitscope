@@ -1,0 +1,6 @@
+{
+  "tagExists": true,
+  "tagType": "tag",
+  "tagCommit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expectedSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}

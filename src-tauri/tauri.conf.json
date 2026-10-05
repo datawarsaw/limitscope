@@ -1,0 +1,90 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "LimitScope",
+  "version": "0.8.6",
+  "identifier": "com.ratelimits.desktop",
+  "mainBinaryName": "LimitScope",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "LimitScope",
+        "width": 700,
+        "height": 760,
+        "minWidth": 360,
+        "minHeight": 420,
+        "center": true,
+        "resizable": true,
+        "visible": false,
+        "theme": "Dark",
+        "backgroundColor": "#161619"
+      },
+      {
+        "label": "floating-quota",
+        "title": "LimitScope",
+        "width": 520,
+        "height": 64,
+        "minWidth": 300,
+        "maxWidth": 640,
+        "minHeight": 64,
+        "maxHeight": 640,
+        "x": 80,
+        "y": 40,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "center": false,
+        "theme": "Dark",
+        "backgroundColor": "#00000000"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "nsis": {
+        "installerHooks": "./installer-hooks.nsh",
+        "languages": [
+          "English"
+        ],
+        "customLanguageFiles": {
+          "English": "installer/English-custom.nsh"
+        }
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAyNUZGMzZERTNGRjQ0RUIKUldUclJQL2piZk5mQWdhQ0FtNVNUSHRoNURJNER6UDVQQmZMeHk4NS9MYjlRYkFyMG0vcHFFOVoK",
+      "endpoints": [
+        "https://github.com/datawarsaw/limitscope-releases/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

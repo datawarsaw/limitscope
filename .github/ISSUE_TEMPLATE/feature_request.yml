@@ -1,0 +1,22 @@
+name: Feature request
+description: Suggest a focused improvement to LimitScope
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What task or limitation does this address?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: considerations
+    attributes:
+      label: Privacy, security, or compatibility considerations
+      description: Mention provider access, local data, or platform requirements if relevant.

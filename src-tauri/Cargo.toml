@@ -1,0 +1,50 @@
+[package]
+name = "rate-limits"
+version = "0.8.6"
+description = "Local-first Windows tray dashboard for AI provider quota usage"
+license = "MIT"
+repository = "https://github.com/datawarsaw/limitscope"
+edition = "2021"
+
+[features]
+# This feature is used for production builds so the frontendDist assets are
+# embedded and the devUrl is ignored. Building the release binary with plain
+# `cargo build --release` (without this feature) compiles it in dev mode: the
+# webview then loads http://localhost:1420 and fails with ERR_CONNECTION_REFUSED.
+# DO NOT REMOVE!!
+custom-protocol = ["tauri/custom-protocol"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png", "image-ico"] }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-autostart = "2"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+base64 = "0.22"
+aes-gcm = "0.10"
+sha2 = "0.10"
+regex = "1"
+tauri-plugin-updater = "2.13.0"
+tauri-plugin-process = "2.4.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+# Runtime panic containment needs unwinding: with "abort" one provider or
+# cycle panic would kill the whole process instead of surfacing as the
+# ordinary structured failure.
+panic = "unwind"
+strip = true
+

@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible problem in LimitScope
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include credentials, tokens, account identifiers, or private provider data. Report security vulnerabilities privately using SECURITY.md."
+  - type: input
+    id: version
+    attributes:
+      label: LimitScope version
+      placeholder: "0.8.6"
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: "Windows 11"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include the provider or screen involved, without secrets or personal data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Add safe screenshots or sanitized diagnostics if they help.

@@ -1,0 +1,6 @@
+{
+  "launchAtStartup": false,
+  "refreshIntervalMinutes": 15,
+  "theme": "oled",
+  "quotaNotifications": true
+}

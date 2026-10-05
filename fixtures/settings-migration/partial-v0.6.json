@@ -1,0 +1,13 @@
+{
+  "launchAtStartup": false,
+  "refreshIntervalMinutes": 5,
+  "theme": "graphite",
+  "quotaNotifications": false,
+  "providerPreferences": {
+    "order": [
+      "zai",
+      "openai-codex"
+    ],
+    "hidden": []
+  }
+}

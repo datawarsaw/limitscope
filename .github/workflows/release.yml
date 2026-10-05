@@ -1,0 +1,501 @@
+name: Release
+
+# Builds, signs and publishes a Windows release of LimitScope.
+#
+# Distribution model (docs/updater-production.md): the installed app reads a
+# public, credential-free update feed hosted as release assets on the
+# public companion repository datawarsaw/limitscope-releases. The source
+# repository holds the source and signing secrets; only the signed installer,
+# signature, and latest.json are published to the companion.
+#
+# Release publication uses atomic ordering:
+#   1. Create release and upload installer + .sig (exact artifacts, sizes verified)
+#   2. Verify availability of uploaded release assets (exact name set + byte sizes)
+#   3. Upload latest.json LAST so the feed never points to missing assets.
+#   4. Verify the final asset set and feed content after publication.
+#
+# Hardened pre-RC (v0.8):
+#   - Tag/ref/HEAD identity: the run must check out GITHUB_SHA, the operator
+#     must pass the exact expected_head_sha, and the source tag v<version>
+#     must resolve to that same commit.
+#   - Version-surface agreement: package.json, src-tauri/tauri.conf.json,
+#     src-tauri/Cargo.toml and src-tauri/Cargo.lock must all carry the
+#     requested version; productName/mainBinaryName must stay LimitScope.
+#   - Exact artifact selection: the installer is addressed by its exact
+#     LimitScope_<version>_x64-setup.exe name; the bundle directory must
+#     contain exactly one installer, and no glob/substring selection exists.
+#   - Traceability: SHA-256 + byte sizes are recorded for the installer and
+#     signature in release-artifacts-manifest.txt (run summary + workflow
+#     artifact). The manifest is NOT published to the public feed repo — the
+#     companion release carries exactly installer, signature, latest.json.
+#
+# Release channels (docs/updater-production.md "Public RC channel"):
+# The channel is DERIVED from the version shape — there is no operator
+# toggle. A stable x.y.z version publishes exactly as before. An
+# x.y.z-rc.N version (e.g. 0.8.7-rc.1) publishes the same companion
+# release, but created with --prerelease from the initial creation call:
+#   - The isolation primitive is that GitHub releases/latest excludes
+#     prereleases, so stable clients polling
+#     releases/latest/download/latest.json can never see an RC. The
+#     prerelease flag is therefore set atomically at creation and asserted
+#     BEFORE any asset is uploaded; make_latest=false is pinned as a second
+#     lock (GitHub REST API: drafts and prereleases cannot be set as latest).
+#   - The RC's latest.json is an asset of the RC release only; there is no
+#     global RC feed pointer. RC installers are manual-download artifacts.
+#   - Malformed versions (neither x.y.z nor x.y.z-rc.N) fail the run.
+# scripts/verify-release-integrity.mjs --rc is the post-publication RC
+# verifier; the local harness scripts/update-harness.mjs remains the
+# fully local, signed update loop (127.0.0.1 feed, no production contact).
+#
+# MANUAL SETUP REQUIRED BEFORE THE FIRST RUN (see docs/updater-production.md):
+#   1. Create the public companion repo datawarsaw/limitscope-releases.
+#   2. Add secret TAURI_SIGNING_PRIVATE_KEY (contents of limitscope.key).
+#   3. Add secret TAURI_SIGNING_PRIVATE_KEY_PASSWORD.
+#   4. Add secret RELEASES_PAT — fine-grained PAT with contents:read/write
+#      on datawarsaw/limitscope-releases only. It is NOT embedded in the
+#      app; only this workflow uses it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release: stable x.y.z (e.g. 0.8.7) or RC x.y.z-rc.N (e.g. 0.8.7-rc.1); must match every version surface'
+        required: true
+        type: string
+      expected_head_sha:
+        description: 'Exact full commit SHA the release must be built from (tag v<version> must point at it)'
+        required: true
+        type: string
+      notes:
+        description: 'Short release notes shown by the in-app updater'
+        required: false
+        type: string
+        default: 'Stability improvements.'
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Build, sign, publish update feed
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      PUBLIC_FEED_REPO: datawarsaw/limitscope-releases
+      VERSION: ${{ inputs.version }}
+      TZ: Europe/Warsaw
+
+    steps:
+      - name: Verify release secrets are configured
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          RELEASES_PAT: ${{ secrets.RELEASES_PAT }}
+        run: |
+          $missing = @()
+          foreach ($name in @('TAURI_SIGNING_PRIVATE_KEY','TAURI_SIGNING_PRIVATE_KEY_PASSWORD','RELEASES_PAT')) {
+            if (-not (Get-ChildItem "env:$name" -ErrorAction SilentlyContinue) -or [string]::IsNullOrEmpty((Get-Item "env:$name").Value)) {
+              $missing += $name
+            }
+          }
+          if ($missing.Count -gt 0) {
+            Write-Host "Missing repository secrets: $($missing -join ', ')"
+            Write-Host "Set them under Settings > Secrets and variables > Actions, then re-run."
+            Write-Host "See docs/updater-production.md 'Required CI secrets'."
+            exit 1
+          }
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # The release channel is derived from the version shape, never chosen:
+      #   x.y.z        -> stable (unchanged publication path)
+      #   x.y.z-rc.N   -> RC     (companion release created with --prerelease)
+      # Anything else fails the run — versions are never reinterpreted.
+      - name: Derive release channel from version
+        shell: bash
+        run: |
+          if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.[0-9]+$ ]]; then
+            echo "RELEASE_CHANNEL=rc" >> "$GITHUB_ENV"
+            echo "RC channel: version $VERSION publishes as a GitHub prerelease (releases/latest isolation)."
+          elif [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "RELEASE_CHANNEL=stable" >> "$GITHUB_ENV"
+            echo "Stable channel: version $VERSION publishes as the live latest release."
+          else
+            echo "FAIL: version '$VERSION' is neither a stable x.y.z nor an RC x.y.z-rc.N version."
+            echo "Refusing to reinterpret it; fix the version surfaces and re-dispatch."
+            exit 1
+          fi
+
+      - name: Verify tag/ref/HEAD identity
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        shell: bash
+        run: |
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "checkout HEAD:    $ACTUAL_SHA"
+          echo "workflow SHA:     $GITHUB_SHA"
+          echo "requested SHA:    $EXPECTED_HEAD_SHA"
+          if [ -z "$EXPECTED_HEAD_SHA" ]; then
+            echo "FAIL: expected_head_sha input is required."
+            exit 1
+          fi
+          if [ "$ACTUAL_SHA" != "$GITHUB_SHA" ]; then
+            echo "FAIL: checked-out HEAD ($ACTUAL_SHA) != workflow run commit (GITHUB_SHA=$GITHUB_SHA)"
+            exit 1
+          fi
+          if [ "$ACTUAL_SHA" != "$EXPECTED_HEAD_SHA" ]; then
+            echo "FAIL: checked-out HEAD ($ACTUAL_SHA) != requested expected_head_sha ($EXPECTED_HEAD_SHA)"
+            exit 1
+          fi
+          git fetch --force origin "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          TAG_SHA=$(git rev-parse "v$VERSION^{commit}")
+          echo "tag v$VERSION ->  $TAG_SHA"
+          if [ "$TAG_SHA" != "$ACTUAL_SHA" ]; then
+            echo "FAIL: tag v$VERSION points at $TAG_SHA, not the release HEAD $ACTUAL_SHA"
+            exit 1
+          fi
+
+      - name: Verify all version surfaces agree
+        shell: bash
+        run: |
+          CONF_VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          CARGO_VERSION=$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p && $1=="version" {gsub(/"/,"",$3); print $3; exit}' src-tauri/Cargo.toml)
+          LOCK_VERSION=$(node -e '
+            const lock = require("fs").readFileSync("src-tauri/Cargo.lock", "utf8");
+            const m = lock.match(/\[\[package\]\]\s*name = "rate-limits"\s*version = "([^"]+)"/);
+            if (!m) { console.error("rate-limits package not found in src-tauri/Cargo.lock"); process.exit(1); }
+            console.log(m[1]);
+          ')
+          PRODUCT_NAME=$(node -p "require('./src-tauri/tauri.conf.json').productName")
+          MAIN_BINARY=$(node -p "require('./src-tauri/tauri.conf.json').mainBinaryName")
+          fail=false
+          for surface in \
+            "src-tauri/tauri.conf.json $CONF_VERSION" \
+            "package.json $PKG_VERSION" \
+            "src-tauri/Cargo.toml $CARGO_VERSION" \
+            "src-tauri/Cargo.lock $LOCK_VERSION"
+          do
+            name=$(echo "$surface" | awk '{print $1}')
+            value=$(echo "$surface" | awk '{print $2}')
+            echo "$name -> $value"
+            if [ "$value" != "$VERSION" ]; then
+              echo "FAIL: $name version ($value) != requested version ($VERSION)"
+              fail=true
+            fi
+          done
+          echo "productName -> $PRODUCT_NAME; mainBinaryName -> $MAIN_BINARY"
+          if [ "$PRODUCT_NAME" != "LimitScope" ] || [ "$MAIN_BINARY" != "LimitScope" ]; then
+            echo "FAIL: installer-name contract requires productName/mainBinaryName == LimitScope"
+            fail=true
+          fi
+          if [ "$fail" = true ]; then
+            echo "Bump every version surface to $VERSION and re-tag before dispatching this workflow."
+            exit 1
+          fi
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup stable Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Rust tests (live tests are #[ignore]d)
+        working-directory: src-tauri
+        run: cargo test --locked
+
+      - name: Frontend build (tsc + vite)
+        run: npm run build
+
+      # The signing env makes the bundler emit <installer>.sig next to the
+      # setup.exe. The private key exists only in this step's environment.
+      # Any stale installer/signature from a previous run of the same version
+      # is removed first so a re-run can never publish a stale artifact.
+      - name: Tauri build (signed NSIS installer)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          BUNDLE_DIR="src-tauri/target/release/bundle/nsis"
+          EXPECTED_INSTALLER="LimitScope_${VERSION}_x64-setup.exe"
+          rm -f "$BUNDLE_DIR/$EXPECTED_INSTALLER" "$BUNDLE_DIR/$EXPECTED_INSTALLER.sig"
+          npm run tauri build
+          INSTALLER="$BUNDLE_DIR/$EXPECTED_INSTALLER"
+          if [ ! -f "$INSTALLER" ]; then
+            echo "Expected installer was not produced: $INSTALLER"
+            ls -la "$BUNDLE_DIR" || true
+            exit 1
+          fi
+          if [ ! -f "${INSTALLER}.sig" ]; then
+            echo "Signing installer with tauri signer..."
+            npx tauri signer sign --app-version "$VERSION" "$INSTALLER"
+          fi
+
+      # Exact artifact selection: address the installer by its exact name and
+      # require the bundle directory to hold exactly one installer, so no
+      # glob/substring matching can pick a wrong or stale artifact.
+      - name: Resolve exact release artifacts
+        shell: bash
+        run: |
+          BUNDLE_DIR="src-tauri/target/release/bundle/nsis"
+          INSTALLER_NAME="LimitScope_${VERSION}_x64-setup.exe"
+          INSTALLER_PATH="$BUNDLE_DIR/$INSTALLER_NAME"
+          SIG_PATH="${INSTALLER_PATH}.sig"
+          if [ ! -f "$INSTALLER_PATH" ]; then
+            echo "FAIL: expected installer not found: $INSTALLER_PATH"
+            ls -la "$BUNDLE_DIR" || true
+            exit 1
+          fi
+          if [ ! -f "$SIG_PATH" ]; then
+            echo "FAIL: expected signature not found: $SIG_PATH"
+            exit 1
+          fi
+          INSTALLER_COUNT=$(find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*_x64-setup.exe' | wc -l)
+          if [ "$INSTALLER_COUNT" -ne 1 ]; then
+            echo "FAIL: expected exactly one installer in $BUNDLE_DIR, found $INSTALLER_COUNT:"
+            find "$BUNDLE_DIR" -maxdepth 1 -type f -name '*_x64-setup.exe'
+            exit 1
+          fi
+          {
+            echo "INSTALLER_NAME=$INSTALLER_NAME"
+            echo "INSTALLER_PATH=$INSTALLER_PATH"
+            echo "SIG_PATH=$SIG_PATH"
+          } >> "$GITHUB_ENV"
+          echo "Resolved exact release artifacts: $INSTALLER_PATH (+ .sig)"
+
+      - name: Record artifact SHA-256 and sizes
+        shell: bash
+        run: |
+          INSTALLER_SHA256=$(sha256sum "$INSTALLER_PATH" | awk '{print $1}')
+          INSTALLER_SIZE=$(wc -c < "$INSTALLER_PATH" | tr -d '[:space:]')
+          SIG_SHA256=$(sha256sum "$SIG_PATH" | awk '{print $1}')
+          SIG_SIZE=$(wc -c < "$SIG_PATH" | tr -d '[:space:]')
+          if [ -z "$INSTALLER_SHA256" ] || [ "$INSTALLER_SIZE" -le 0 ] || [ -z "$SIG_SHA256" ] || [ "$SIG_SIZE" -le 0 ]; then
+            echo "FAIL: hashing failed or an artifact is empty"
+            exit 1
+          fi
+          cat > release-artifacts-manifest.txt <<EOF
+          LimitScope $VERSION release artifact manifest
+          installer: $INSTALLER_NAME
+          installer_sha256: $INSTALLER_SHA256
+          installer_bytes: $INSTALLER_SIZE
+          signature: $INSTALLER_NAME.sig
+          signature_sha256: $SIG_SHA256
+          signature_bytes: $SIG_SIZE
+          source_sha: $GITHUB_SHA
+          generated_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          EOF
+          {
+            echo "INSTALLER_SHA256=$INSTALLER_SHA256"
+            echo "INSTALLER_SIZE=$INSTALLER_SIZE"
+            echo "SIG_SHA256=$SIG_SHA256"
+            echo "SIG_SIZE=$SIG_SIZE"
+          } >> "$GITHUB_ENV"
+          echo "Artifact manifest:"
+          cat release-artifacts-manifest.txt >> "$GITHUB_STEP_SUMMARY"
+          cat release-artifacts-manifest.txt
+
+      - name: Scan build outputs for secrets
+        run: npm run scan:secrets
+
+      # latest.json is only written locally here; it is uploaded LAST in a
+      # dedicated step after the installer and signature are verified, so the
+      # public feed can never point at a missing or wrong asset.
+      - name: Generate update feed metadata
+        shell: bash
+        run: |
+          node -e '
+          const fs = require("fs");
+          const version = process.env.VERSION;
+          const installerPath = process.env.INSTALLER_PATH;
+          const installerName = process.env.INSTALLER_NAME;
+          const expectedPath = "src-tauri/target/release/bundle/nsis/" + installerName;
+          if (installerPath !== expectedPath) {
+            console.error("installer path mismatch: " + installerPath + " != " + expectedPath);
+            process.exit(1);
+          }
+          if (!fs.existsSync(installerPath) || !fs.existsSync(installerPath + ".sig")) {
+            console.error("missing exact release artifacts: " + installerPath);
+            process.exit(1);
+          }
+          const signature = fs.readFileSync(installerPath + ".sig", "utf8").trim();
+          if (!signature) { console.error("empty updater signature"); process.exit(1); }
+          const asset = encodeURIComponent(installerName).replace(/%2F/g, "/");
+          const feed = {
+            version,
+            pub_date: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+            notes: process.env.RELEASE_NOTES || "Stability improvements.",
+            platforms: {
+              "windows-x86_64": {
+                signature,
+                url: "https://github.com/" + process.env.PUBLIC_FEED_REPO + "/releases/download/v" + version + "/" + asset,
+              },
+            },
+          };
+          fs.writeFileSync("latest.json", JSON.stringify(feed, null, 2) + "\n");
+          console.log("latest.json generated ->", feed.platforms["windows-x86_64"].url);
+          console.log("installer sha256:", process.env.INSTALLER_SHA256);
+          '
+        env:
+          RELEASE_NOTES: ${{ inputs.notes }}
+
+      - name: Step 1 & 2 - Publish installer & signature, then verify exact assets
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+          RELEASE_NOTES: ${{ inputs.notes }}
+        shell: bash
+        run: |
+          # RC mode: the prerelease flag is part of the INITIAL creation call
+          # so there is never a window in which the RC exists as a full
+          # release (a full release would take over the live stable feed).
+          # The state is asserted BEFORE any asset upload, and
+          # make_latest=false is pinned as a second lock (GitHub REST API:
+          # drafts and prereleases cannot be set as latest).
+          if [ "$RELEASE_CHANNEL" = "rc" ]; then
+            echo "RC channel: creating release v$VERSION on $PUBLIC_FEED_REPO as a PRERELEASE (no assets yet)..."
+            gh release create "v$VERSION" \
+              --repo "$PUBLIC_FEED_REPO" \
+              --target main \
+              --prerelease \
+              --title "LimitScope $VERSION" \
+              --notes "$RELEASE_NOTES"
+
+            assert_rc_prerelease_state() {
+              STATE=$(gh release view "v$VERSION" --repo "$PUBLIC_FEED_REPO" --json isPrerelease,isDraft)
+              export STATE
+              node -e '
+              const state = JSON.parse(process.env.STATE);
+              if (state.isPrerelease !== true || state.isDraft !== false) {
+                console.error("FAIL: RC release state isPrerelease=" + state.isPrerelease + " isDraft=" + state.isDraft +
+                  " — expected a published prerelease before any asset upload (stable-feed isolation invariant)");
+                process.exit(1);
+              }
+              console.log("RC release state verified: isPrerelease=true, isDraft=false");
+              '
+            }
+
+            echo "Asserting prerelease state before uploading any assets..."
+            assert_rc_prerelease_state
+
+            echo "Pinning make_latest=false as a second isolation lock..."
+            RELEASE_ID=$(gh release view "v$VERSION" --repo "$PUBLIC_FEED_REPO" --json id --jq .id)
+            if [ -z "$RELEASE_ID" ]; then
+              echo "FAIL: could not resolve the release id for make_latest pinning."
+              exit 1
+            fi
+            if ! gh api -X PATCH "repos/$PUBLIC_FEED_REPO/releases/$RELEASE_ID" -f make_latest=false > /dev/null; then
+              echo "FAIL: make_latest=false could not be pinned on the RC release."
+              exit 1
+            fi
+            assert_rc_prerelease_state
+
+            echo "Uploading the exact installer and signature to the prerelease..."
+            gh release upload "v$VERSION" \
+              --repo "$PUBLIC_FEED_REPO" \
+              "$INSTALLER_PATH" \
+              "$SIG_PATH"
+          else
+            echo "Stable channel: creating release v$VERSION on $PUBLIC_FEED_REPO with the exact installer and signature..."
+            gh release create "v$VERSION" \
+              --repo "$PUBLIC_FEED_REPO" \
+              --target main \
+              --title "LimitScope $VERSION" \
+              --notes "$RELEASE_NOTES" \
+              "$INSTALLER_PATH" \
+              "$SIG_PATH"
+          fi
+
+          echo "Verifying the release carries exactly the two expected assets, byte-size intact..."
+          ASSETS=$(gh release view "v$VERSION" --repo "$PUBLIC_FEED_REPO" --json assets)
+          export ASSETS
+          node -e '
+          const view = JSON.parse(process.env.ASSETS);
+          const expected = new Map([
+            [process.env.INSTALLER_NAME, Number(process.env.INSTALLER_SIZE)],
+            [process.env.INSTALLER_NAME + ".sig", Number(process.env.SIG_SIZE)],
+          ]);
+          const assets = view.assets ?? [];
+          let fail = false;
+          for (const asset of assets) {
+            const want = expected.get(asset.name);
+            if (want === undefined) { console.error("FAIL: unexpected release asset: " + asset.name); fail = true; continue; }
+            if (asset.size !== want) { console.error("FAIL: asset " + asset.name + " size " + asset.size + " != local " + want); fail = true; }
+          }
+          for (const name of expected.keys()) {
+            if (!assets.some((a) => a.name === name)) { console.error("FAIL: missing release asset: " + name); fail = true; }
+          }
+          if (assets.length !== expected.size) { console.error("FAIL: release has " + assets.length + " assets, expected " + expected.size); fail = true; }
+          if (fail) process.exit(1);
+          console.log("release assets verified: exact names and byte sizes match the local artifacts");
+          '
+
+      - name: Step 3 - Publish update feed (latest.json) LAST
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        shell: bash
+        run: |
+          echo "Uploading latest.json to v$VERSION (feed goes live atomically, always last)..."
+          gh release upload "v$VERSION" \
+            --repo "$PUBLIC_FEED_REPO" \
+            --clobber \
+            latest.json
+
+      - name: Verify final asset set and published feed
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_PAT }}
+        shell: bash
+        run: |
+          echo "Verifying final asset set on v$VERSION (installer + signature + latest.json, feed uploaded last)..."
+          FINAL_ASSETS=$(gh release view "v$VERSION" --repo "$PUBLIC_FEED_REPO" --json assets)
+          export FINAL_ASSETS
+          node -e '
+          const view = JSON.parse(process.env.FINAL_ASSETS);
+          const names = (view.assets ?? []).map((a) => a.name).sort();
+          const expected = [process.env.INSTALLER_NAME, process.env.INSTALLER_NAME + ".sig", "latest.json"].sort();
+          if (JSON.stringify(names) !== JSON.stringify(expected)) {
+            console.error("FAIL: final asset set " + JSON.stringify(names) + " != expected " + JSON.stringify(expected));
+            process.exit(1);
+          }
+          '
+          echo "Downloading the published latest.json back and comparing bytes with the generated feed..."
+          rm -rf feed-check && mkdir feed-check
+          gh release download "v$VERSION" --repo "$PUBLIC_FEED_REPO" --pattern "latest.json" --dir feed-check --clobber
+          diff -u latest.json feed-check/latest.json
+          node -e '
+          const fs = require("fs");
+          const feed = JSON.parse(fs.readFileSync("feed-check/latest.json", "utf8"));
+          if (feed.version !== process.env.VERSION) { console.error("FAIL: published feed version " + feed.version); process.exit(1); }
+          const url = feed.platforms["windows-x86_64"].url;
+          const expectedUrl = "https://github.com/" + process.env.PUBLIC_FEED_REPO + "/releases/download/v" + process.env.VERSION + "/" + encodeURIComponent(process.env.INSTALLER_NAME);
+          if (url !== expectedUrl) { console.error("FAIL: feed url " + url + " != " + expectedUrl); process.exit(1); }
+          if (!feed.platforms["windows-x86_64"].signature) { console.error("FAIL: published feed has no updater signature"); process.exit(1); }
+          console.log("published feed verified: version " + feed.version + " -> " + url);
+          '
+
+      - name: Upload artifacts to this workflow run (traceability)
+        uses: actions/upload-artifact@v4
+        with:
+          name: limitscope-signed-release
+          path: |
+            ${{ env.INSTALLER_PATH }}
+            ${{ env.SIG_PATH }}
+            latest.json
+            release-artifacts-manifest.txt
+          if-no-files-found: error

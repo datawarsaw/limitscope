@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    LimitScope primary mark — "Dock Tick" quota-bar glyph.
+
+    A compact horizontal quota bar on a dark graphite tile: the teal fill is
+    usage, the soft tick is the attention threshold (80%). Deliberately not a
+    monogram, reticle, or radar target — it reads as usage/threshold state and
+    survives 16px tray rendering. Geometry mirrors scripts/generate-icon.mjs;
+    change both together.
+  -->
+  <!-- tile: border ring + graphite face (same family as the v0.4 app icon) -->
+  <rect x="32" y="32" width="960" height="960" rx="208" fill="#3a3b44"/>
+  <rect x="56" y="56" width="912" height="912" rx="192" fill="#1e1f24"/>
+  <!-- quota track (unfilled remainder) -->
+  <rect x="192" y="448" width="640" height="128" rx="64" fill="#40414a"/>
+  <!-- usage fill: 60% of the track, brand teal -->
+  <rect x="192" y="448" width="384" height="128" rx="64" fill="#2dd4bf"/>
+  <!-- attention-threshold tick at 80% of the track -->
+  <rect x="672" y="400" width="64" height="224" rx="32" fill="#e9e9ee"/>
+</svg>

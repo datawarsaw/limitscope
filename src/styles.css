@@ -1,0 +1,2530 @@
+/*
+ * Themes are selected via <html data-theme="..."> and only differ in surface
+ * variables; every component reads tokens, never literals. The bare :root
+ * block is the default (graphite) so the first painted frame is themed even
+ * before settings load.
+ */
+:root,
+:root[data-theme="graphite"] {
+  color-scheme: dark;
+
+  --bg: #161619;
+  /* Depth layer behind the content; only glass sets a gradient. */
+  --bg-image: none;
+  --card: #1f1f24;
+  --card-border: rgba(255, 255, 255, 0.07);
+  --divider: rgba(255, 255, 255, 0.05);
+  --bar-track: rgba(255, 255, 255, 0.09);
+  --text: #e9e9ee;
+  --text-dim: #a4a4af;
+  /* Faintest tier must still clear WCAG AA (4.5:1) at its 10.5px usage on
+     every theme's surfaces; the previous value measured 3.4:1 on graphite
+     cards. */
+  --text-faint: #8a8a95;
+  --teal: #2dd4bf;
+  --amber: #fbbf24;
+  --red: #f87171;
+  --green: #34d399;
+  /* Selection accent tints derived from --teal; shared by every theme. */
+  --accent-soft: rgba(45, 212, 191, 0.09);
+  --accent-border: rgba(45, 212, 191, 0.5);
+  /* Solid fill for form controls and whether surfaces blur what's behind. */
+  --field-bg: #161619;
+  --card-backdrop: none;
+}
+
+/* Frontend depth treatment: translucent surfaces over a fixed desktop-like
+   gradient with restrained blur. Text tokens are unchanged so readability
+   never depends on the blur landing exactly. */
+:root[data-theme="glass"] {
+  --bg: #17171d;
+  --bg-image:
+    radial-gradient(120% 90% at 85% -10%, rgba(45, 212, 191, 0.09), transparent 55%),
+    radial-gradient(120% 100% at -10% 110%, rgba(99, 102, 241, 0.11), transparent 55%),
+    linear-gradient(165deg, #1e1e26 0%, #15151b 48%, #191922 100%);
+  --card: rgba(33, 33, 42, 0.55);
+  --card-border: rgba(255, 255, 255, 0.11);
+  --divider: rgba(255, 255, 255, 0.08);
+  --bar-track: rgba(255, 255, 255, 0.1);
+  --field-bg: rgba(23, 23, 29, 0.72);
+  --card-backdrop: blur(18px) saturate(140%);
+}
+
+/* Near-black, near-borderless: the accent tones stay untouched so contrast
+   holds, while glows and borders step out of the way. */
+:root[data-theme="oled"] {
+  --bg: #000;
+  --bg-image: none;
+  --card: #060607;
+  --card-border: rgba(255, 255, 255, 0.06);
+  --divider: rgba(255, 255, 255, 0.04);
+  --bar-track: rgba(255, 255, 255, 0.08);
+  --field-bg: #0a0a0c;
+  --card-backdrop: none;
+}
+
+/* Glass must stay readable when the compositor can't blur (old WebView2,
+   forced-off transparency): fall back to an opaque card. */
+@supports not (backdrop-filter: blur(1px)) {
+  :root[data-theme="glass"] {
+    --card: #21212a;
+    --card-backdrop: none;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  :root[data-theme="glass"] {
+    --card: #21212a;
+    --card-backdrop: none;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background-color: var(--bg);
+  background-image: var(--bg-image);
+  color: var(--text);
+  font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  font-size: 13px;
+  line-height: 1.4;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  /* The dashboard owns up to 900px of window width; beyond that the utility
+     frame centers instead of stretching zones across the whole desktop. */
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.header {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px 9px;
+  border-bottom: 1px solid var(--divider);
+}
+
+.title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+
+.refresh-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--card-border);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.refresh-btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--text);
+}
+
+.refresh-btn:active:not(:disabled) {
+  transform: translateY(0.5px);
+}
+
+.refresh-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.refresh-btn:focus-visible,
+.utility-settings-btn:focus-visible,
+.setting-row select:focus-visible,
+.setting-row input[type="checkbox"]:focus-visible,
+.rail-item:focus-visible,
+.attention-item:focus-visible,
+.pace-note:focus-visible,
+.view-nav-btn:focus-visible,
+.usage-scope-all:focus-visible,
+.usage-range button:focus-visible,
+.usage-window-filter select:focus-visible,
+.usage-retry:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.pace-note:focus-visible,
+.rail-item:focus-visible,
+.attention-item:focus-visible {
+  outline-offset: 1px;
+}
+
+.refresh-btn svg {
+  width: 14px;
+  height: 14px;
+}
+
+.refresh-btn.spinning svg {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ---------------------------------------------------------------
+ * Dashboard grid — three zones, one structural switch.
+ *
+ * The layout comes from `data-layout` on .app (see useDashboardLayout):
+ * the JS attribute and these blocks share one breakpoint source, so the
+ * markup orientation and the stylesheet can never disagree. Narrow is the
+ * default and also the no-matchMedia fallback: a single scrolling column,
+ * never horizontal scrolling, nothing critical hidden at 360px.
+ * --------------------------------------------------------------- */
+.dashboard {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  justify-content: stretch;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    "rail"
+    "main"
+    "attention";
+  padding: 10px 12px;
+}
+
+/* Medium: navigation + main side by side; attention joins below the main
+   column so the two reading zones keep their width. */
+.app[data-layout="medium"] .dashboard {
+  grid-template-columns: 172px minmax(0, 1fr);
+  grid-template-areas:
+    "rail main"
+    "rail attention";
+}
+
+/* Wide: the approved three-zone composition. */
+.app[data-layout="wide"] .dashboard {
+  grid-template-columns: 176px minmax(0, 1fr) 178px;
+  grid-template-areas: "rail main attention";
+}
+
+.app[data-layout="medium"] .dashboard,
+.app[data-layout="wide"] .dashboard {
+  align-items: start;
+}
+
+.dashboard::-webkit-scrollbar {
+  width: 8px;
+}
+
+.dashboard::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 4px;
+}
+
+.dashboard::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.provider-rail {
+  grid-area: rail;
+  min-width: 0;
+}
+
+.provider-rail-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+}
+
+.rail-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.rail-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.rail-item.selected {
+  background: var(--accent-soft);
+  box-shadow: inset 2px 0 0 var(--teal);
+}
+
+.rail-mark {
+  display: grid;
+  place-items: center;
+  width: 21px;
+  height: 21px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.07);
+  color: var(--text-dim);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.rail-mark.selected {
+  background: var(--accent-soft);
+  color: var(--teal);
+}
+
+.rail-entry {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.rail-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.rail-name {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rail-item.selected .rail-name {
+  color: var(--text);
+}
+
+.rail-percent {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.rail-meter {
+  height: 3px;
+  border-radius: 1.5px;
+  background: var(--bar-track);
+  overflow: hidden;
+}
+
+.rail-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: 1.5px;
+}
+
+.rail-meter-fill.tone-calm {
+  background: var(--teal);
+}
+
+.rail-meter-fill.tone-warn {
+  background: var(--amber);
+}
+
+.rail-meter-fill.tone-critical {
+  background: var(--red);
+}
+
+/* Narrow: the rail becomes a wrapping row of chips — mark, name, status,
+   percent; the tiny meter drops out for space, status stays as the dot plus
+ * the accessible name. */
+.app[data-layout="narrow"] .provider-rail-list {
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+
+.app[data-layout="narrow"] .rail-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  padding: 4px 9px 4px 4px;
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+}
+
+.app[data-layout="narrow"] .rail-item:hover {
+  background: var(--card);
+  border-color: rgba(255, 255, 255, 0.16);
+}
+
+.app[data-layout="narrow"] .rail-item.selected {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  box-shadow: none;
+}
+
+.app[data-layout="narrow"] .rail-entry {
+  flex-direction: row;
+  align-items: center;
+  gap: 5px;
+}
+
+.app[data-layout="narrow"] .rail-name-row {
+  justify-content: flex-start;
+}
+
+.app[data-layout="narrow"] .rail-name {
+  white-space: nowrap;
+}
+
+.app[data-layout="narrow"] .rail-meter {
+  display: none;
+}
+
+/* ---------------------------------------------------------------
+ * Main column: primary overview (Zone A) + quota windows (Zone B).
+ * --------------------------------------------------------------- */
+.provider-main {
+  grid-area: main;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+.primary-panel,
+.window-panel,
+.attention-panel {
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 12px 14px 13px;
+}
+
+.panel-heading {
+  margin: 0 0 8px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.primary-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.primary-name {
+  margin: 0;
+  font-size: 13.5px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.primary-window {
+  margin: 12px 0 0;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.primary-metric-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 1px;
+}
+
+/* The one dominant metric: large, tabular, neutral — severity lives on the
+   meter and in the attention rail, never as a wall of red. */
+.primary-percent {
+  font-size: 40px;
+  line-height: 1.15;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.5px;
+}
+
+.primary-limit-reached {
+  color: var(--red);
+  font-size: 10.5px;
+  font-weight: 600;
+}
+
+.primary-bar {
+  height: 8px;
+  margin-top: 6px;
+  border-radius: 4px;
+}
+
+.primary-reset {
+  margin: 7px 0 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.primary-empty {
+  margin: 12px 0 2px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.primary-source {
+  margin-top: 10px;
+}
+
+.status-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+
+.status-ok {
+  background: var(--green);
+  box-shadow: 0 0 6px rgba(52, 211, 153, 0.45);
+}
+
+/* Provider data comes from a cached snapshot past its freshness threshold. */
+.status-stale {
+  background: var(--amber);
+  box-shadow: 0 0 6px rgba(251, 191, 36, 0.45);
+}
+
+.status-error {
+  background: var(--red);
+  box-shadow: 0 0 6px rgba(248, 113, 113, 0.45);
+}
+
+.status-unknown {
+  background: var(--text-faint);
+}
+
+.status-mock {
+  background: var(--text-faint);
+}
+
+.status-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.source-note {
+  margin: 0 0 6px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.provider-error {
+  margin: 10px 0 0;
+  color: var(--red);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+/* Account attribution (MIC-297): names the account whose quota the panel
+   shows and states what it covers. The label comes from the provider's
+   stable identity; the coverage copy explains the limitation. */
+.account-note {
+  margin: 2px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* Zone A's single pace line: quiet, factual, gated by the prediction
+   engine's own visibility rules. Reuses the projection tooltip. */
+.pace-note {
+  position: relative;
+  margin: 10px 0 0;
+  padding: 6px 8px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: var(--field-bg);
+  font-size: 10.5px;
+  color: var(--text-dim);
+}
+
+/* ---------------------------------------------------------------
+ * Zone B — compact quota-window rows.
+ * --------------------------------------------------------------- */
+.limit + .limit {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--divider);
+}
+
+.limit-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.limit-label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.limit-percent {
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.tone-calm {
+  color: var(--teal);
+}
+
+.tone-warn {
+  color: var(--amber);
+}
+
+.tone-critical {
+  color: var(--red);
+}
+
+.bar {
+  flex: 1;
+  height: 4px;
+  margin-top: 4px;
+  border-radius: 2px;
+  background: var(--bar-track);
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  border-radius: 2px;
+  transition: width 400ms ease;
+}
+
+.bar-fill.tone-calm {
+  background: var(--teal);
+}
+
+.bar-fill.tone-warn {
+  background: var(--amber);
+}
+
+.bar-fill.tone-critical {
+  background: var(--red);
+}
+
+.window-empty {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+/* Absolute reset time + local countdown, on its own line under the bar so
+   both stay readable at the 400px window width. */
+.limit-reset {
+  display: block;
+  margin-top: 3px;
+  text-align: right;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.limit-reached {
+  display: block;
+  margin-top: 4px;
+  color: var(--red);
+  font-size: 10.5px;
+  font-weight: 600;
+  text-align: right;
+}
+
+.prediction {
+  position: relative;
+  margin-top: 5px;
+  padding: 6px 7px;
+  border: 1px solid var(--divider);
+  border-radius: 6px;
+  background: var(--field-bg);
+  font-size: 10.5px;
+}
+
+.prediction:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.prediction-title {
+  display: block;
+  margin-bottom: 4px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+
+.prediction-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 8px;
+  color: var(--text-faint);
+}
+
+.prediction-grid strong {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* v0.8 threshold rows: one line per canonical level the engine resolved
+   (80 then 95). Time statements, not severity escalations — they render
+   identically in every severity band and both quota perspectives. */
+.prediction-thresholds {
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.prediction-threshold {
+  position: relative;
+  display: block;
+  color: var(--text-faint);
+  border-radius: 4px;
+}
+
+.prediction-threshold:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.prediction-threshold:hover .prediction-tooltip,
+.prediction-threshold:focus-visible .prediction-tooltip {
+  visibility: visible;
+  opacity: 1;
+}
+
+.prediction-tooltip {
+  position: absolute;
+  z-index: 5;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  visibility: hidden;
+  opacity: 0;
+  padding: 5px 7px;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--card);
+  color: var(--text-dim);
+  box-shadow: 0 5px 16px rgba(0, 0, 0, 0.28);
+  /* A02 (parallel-safe slice): the tooltip is hoverable — pointer travel
+     into it keeps the container's :hover, so it does not vanish mid-read.
+     The pinned-persistence and Escape-dismissal halves of K04 need
+     component state in PredictionBlocks and are deferred to the Lane A
+     merge; this rule stays compatible with that controlled reveal. */
+  pointer-events: auto;
+}
+
+.prediction:hover .prediction-tooltip,
+.prediction:focus-visible .prediction-tooltip,
+.pace-note:hover .prediction-tooltip,
+.pace-note:focus-visible .prediction-tooltip {
+  visibility: visible;
+  opacity: 1;
+}
+
+/* A02/K04 (integration completion): the controlled-reveal halves that need
+   component state. Click/tap pins the tooltip open so it persists while
+   reading; Escape dismisses it and suppresses reopening until a deliberate
+   refocus or click — PredictionBlocks carries both states as data
+   attributes, these rules are the CSS half. Dismissal must win over every
+   reveal path (hover, focus-visible, pin), hence the !important. */
+.prediction[data-tooltip-pinned="true"] > .prediction-tooltip,
+.pace-note[data-tooltip-pinned="true"] > .prediction-tooltip,
+.prediction-threshold[data-tooltip-pinned="true"] > .prediction-tooltip {
+  visibility: visible;
+  opacity: 1;
+}
+
+.prediction[data-tooltip-suppressed="true"] .prediction-tooltip,
+.pace-note[data-tooltip-suppressed="true"] .prediction-tooltip,
+.prediction-threshold[data-tooltip-suppressed="true"] .prediction-tooltip {
+  visibility: hidden !important;
+  opacity: 0 !important;
+}
+
+.empty {
+  padding: 28px 0;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------------------
+ * Zone C — needs attention.
+ * --------------------------------------------------------------- */
+.attention-panel {
+  grid-area: attention;
+  min-width: 0;
+}
+
+.attention-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+}
+
+.attention-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 5px;
+  border: 0;
+  border-radius: 7px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.attention-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.attention-list > li + li .attention-item {
+  border-top: 1px solid var(--divider);
+}
+
+.attention-item .status-dot {
+  margin-top: 3px;
+}
+
+.attention-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.attention-name {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.attention-line {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.attention-empty {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  padding: 2px 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.attention-check {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--green);
+}
+
+/* Error-boundary fallback: minimal recoverable state on the themed canvas. */
+.crash-fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 540px;
+  margin: 48px auto 0;
+  padding: 0 14px;
+}
+
+.crash-fallback .title {
+  font-size: 15px;
+}
+
+.crash-message {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.crash-detail {
+  margin: 0;
+  color: var(--red);
+  font-size: 10.5px;
+  overflow-wrap: anywhere;
+}
+
+.crash-fallback .clear-history-btn {
+  align-self: flex-start;
+}
+
+.utility-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 7px 14px;
+  border-top: 1px solid var(--divider);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.utility-updated {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.utility-updated.stale {
+  color: var(--amber);
+}
+
+.utility-sep {
+  flex: none;
+  opacity: 0.6;
+}
+
+.utility-interval {
+  flex: none;
+  white-space: nowrap;
+}
+
+.utility-settings-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-left: auto;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  padding: 2px 4px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 10.5px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.utility-settings-btn:hover {
+  color: var(--text);
+}
+
+.utility-chevron {
+  width: 9px;
+  height: 6px;
+  transition: transform 120ms ease;
+}
+
+.utility-chevron.open {
+  transform: rotate(180deg);
+}
+
+/* Secondary drawer: no card, just a divided strip above the utility bar so
+   quota content stays visually primary. W02: the drawer may exceed the space
+   a short viewport leaves, so it shrinks under pressure and scrolls its own
+   content instead of pushing the utility bar (and its Settings control)
+   below the clipped viewport — the footer keeps its fixed height, the
+   dashboard keeps scrolling, and no control becomes unreachable. */
+.settings-drawer {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  margin: 0 12px 4px;
+  padding: 0 2px;
+  border-top: 1px solid var(--divider);
+  animation: drawer-in 120ms ease-out;
+}
+
+@keyframes drawer-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  cursor: pointer;
+}
+
+.setting-row + .setting-row {
+  border-top: 1px solid var(--divider);
+}
+
+.setting-row.utility-action {
+  cursor: default;
+}
+
+.setting-label {
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.setting-row input[type="checkbox"] {
+  flex: none;
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--teal);
+  cursor: pointer;
+}
+
+.setting-row input[type="checkbox"]:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.setting-row select {
+  flex: none;
+  background: var(--field-bg);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11.5px;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+/* v0.6 provider presentation preferences: compact rows that stay inside
+   the drawer at 360px. Name flexes and ellipsizes; the visibility switch
+   and reorder buttons are fixed-width so the list never overflows. */
+.providers-prefs {
+  padding: 7px 0;
+}
+
+.providers-prefs + .setting-row {
+  border-top: 1px solid var(--divider);
+}
+
+.providers-prefs-note {
+  margin: 2px 0 4px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.providers-prefs-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.provider-prefs-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.provider-prefs-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+  color: var(--text);
+}
+
+.provider-prefs-visibility {
+  display: flex;
+  flex: none;
+}
+
+.provider-prefs-visibility input[type="checkbox"] {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--teal);
+  cursor: pointer;
+}
+
+.provider-prefs-moves {
+  display: flex;
+  flex: none;
+  gap: 4px;
+}
+
+.provider-prefs-moves button {
+  width: 24px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.provider-prefs-moves button:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.provider-prefs-moves button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.provider-prefs-moves button:focus-visible,
+.provider-prefs-visibility input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.setting-fieldset {
+  min-width: 0;
+  margin: 0;
+  padding: 7px 0;
+  border: 0;
+  cursor: default;
+}
+
+.quota-perspective-control {
+  display: flex;
+  flex: none;
+  gap: 3px;
+  padding: 2px;
+  border: 1px solid var(--card-border);
+  border-radius: 7px;
+  background: var(--field-bg);
+}
+
+.quota-perspective-option {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 62px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.quota-perspective-option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+}
+
+.quota-perspective-option:has(input:checked) {
+  background: var(--card-border);
+  color: var(--text);
+}
+
+.quota-perspective-option:has(input:focus-visible) {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.setting-error {
+  margin: 0;
+  padding: 0 0 7px;
+  font-size: 10.5px;
+  color: var(--red);
+}
+
+.setting-success {
+  margin: 0;
+  padding: 0 0 7px;
+  font-size: 10.5px;
+  color: var(--teal);
+}
+
+.setting-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.setting-note {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.clear-history-btn {
+  flex: none;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text-dim);
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.clear-history-btn:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.clear-history-btn:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.clear-history-btn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+.usage-export-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+/* Usage export destination chooser (replaces the native Save As dialog,
+   which cannot settle on destinations it refuses). It rides the drawer's
+   existing row rhythm like the local-data confirmations. */
+.usage-export-panel {
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-export-panel p {
+  margin: 0;
+}
+
+.usage-export-folder {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-export-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.usage-export-name-input {
+  min-width: 0;
+  flex: 1;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text);
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 11px;
+}
+
+.usage-export-name-input:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.usage-export-name-input:disabled {
+  opacity: 0.55;
+}
+
+/* Save is not the destructive choice; only Replace (overwriting an existing
+   file) keeps the warmer destructive color from local-data-confirm-btn. */
+.usage-export-save-btn {
+  color: var(--text-dim);
+}
+
+/* Local data (v0.7): one compact row per LimitScope-owned data class, each
+   with an in-place confirmation instead of a modal. The section rides the
+   drawer's existing row rhythm so it reads as one more settings group. */
+.local-data-title {
+  display: block;
+  padding: 7px 0 1px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.local-data-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid var(--divider);
+}
+
+.local-data-confirm {
+  display: flex;
+  flex: 1 1 100%;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.local-data-confirm p {
+  margin: 0;
+}
+
+.local-data-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.local-data-cancel-btn,
+.local-data-confirm-btn {
+  flex: none;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text-dim);
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.local-data-cancel-btn:hover,
+.local-data-confirm-btn:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+/* The confirming action is the destructive choice. It is identified by its
+   verb (the button text) first; the warmer text color only reinforces it. */
+.local-data-confirm-btn {
+  color: var(--red);
+}
+
+.local-data-cancel-btn:disabled,
+.local-data-confirm-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.local-data-cancel-btn:focus-visible,
+.local-data-confirm-btn:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.local-data-row .setting-success,
+.local-data-row .setting-error {
+  flex: 1 1 100%;
+  padding: 0;
+}
+
+/* Updates block: version row plus check/install actions. The rows are not
+   clickable (unlike the label-wrapped rows above), so they opt out of the
+   pointer cursor the shared .setting-row rule sets. */
+.updates-block {
+  display: block;
+}
+
+.updates-block .setting-row {
+  cursor: default;
+}
+
+.updates-title {
+  display: block;
+  padding: 7px 0 1px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.update-version {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.update-actions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+
+.check-updates-btn,
+.update-install-btn,
+.update-dismiss-btn {
+  flex: none;
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text-dim);
+  padding: 4px 7px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.check-updates-btn:hover,
+.update-install-btn:hover,
+.update-dismiss-btn:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+/* The primary action of the block: teal text marks it without a filled
+   surface, which no other settings control uses. */
+.update-install-btn {
+  color: var(--teal);
+}
+
+.check-updates-btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.check-updates-btn:focus-visible,
+.update-install-btn:focus-visible,
+.update-dismiss-btn:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+/* OLED: drop the status-dot glows — pure black amplifies halos, and the
+   reduced-noise brief asks for color without bloom. */
+:root[data-theme="oled"] .status-ok,
+:root[data-theme="oled"] .status-stale,
+:root[data-theme="oled"] .status-error {
+  box-shadow: none;
+}
+
+/* ---------------------------------------------------------------
+ * v0.7 execution runs — compact toolbar action + small panel.
+ * Same tokens as every other surface; severity stays textual, the
+ * tinted confidence chip is decorative redundancy only.
+ * --------------------------------------------------------------- */
+.header-actions {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.run-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.run-btn:hover {
+  background: rgba(255, 255, 255, 0.09);
+  color: var(--text);
+}
+
+.run-btn:active {
+  transform: translateY(0.5px);
+}
+
+/* The active marker is textual (elapsed time) plus a decorative dot. */
+.run-btn.active {
+  border-color: var(--accent-border);
+  color: var(--teal);
+}
+
+.run-btn-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--teal);
+  animation: run-pulse 2s ease-in-out infinite;
+}
+
+@keyframes run-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.execution-panel {
+  flex: none;
+  margin: 10px 12px 0;
+  padding: 11px 14px 13px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  animation: drawer-in 120ms ease-out;
+}
+
+.run-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.run-panel-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.run-panel-title:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.run-close-btn {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  color: var(--text-faint);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.run-close-btn:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+/* Active-run card */
+.run-active-status {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.run-active-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--teal);
+  animation: run-pulse 2s ease-in-out infinite;
+}
+
+.run-active-meta {
+  margin: 3px 0 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+
+.run-note {
+  margin: 6px 0 0;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.run-error {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(248, 113, 113, 0.35);
+  border-radius: 6px;
+  font-size: 10.5px;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+
+.run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.run-btn-primary,
+.run-btn-secondary {
+  border: 1px solid var(--card-border);
+  border-radius: 7px;
+  background: var(--field-bg);
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+
+.run-btn-primary {
+  color: var(--teal);
+  border-color: var(--accent-border);
+}
+
+.run-btn-secondary {
+  color: var(--text-dim);
+}
+
+.run-btn-primary:hover,
+.run-btn-secondary:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.run-inline-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.run-conflict-copy {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+/* Start form */
+.run-field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 0;
+}
+
+.run-field-label {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.run-select,
+.run-input {
+  flex: none;
+  width: 160px;
+  background: var(--field-bg);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+/* ---------------------------------------------------------------
+ * v0.7 Usage view — one coherent analytics surface.
+ *
+ * Same tokens as the dashboard; no new colors. Severity reads the canonical
+ * used percentage through the shared tone classes; exact/lower-bound and
+ * estimated semantics always exist as text next to the value.
+ * --------------------------------------------------------------- */
+.header-lead {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.view-nav {
+  display: inline-flex;
+  flex: none;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.view-nav-btn {
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  padding: 3px 10px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.view-nav-btn:hover {
+  color: var(--text);
+}
+
+.view-nav-btn[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+/* Usage keeps the rail (provider scope) and drops the attention zone, so
+   the analytics surface gets the full main column. */
+.app[data-view="usage"][data-layout="medium"] .dashboard {
+  grid-template-columns: 172px minmax(0, 1fr);
+  grid-template-areas: "rail main";
+}
+
+.app[data-view="usage"][data-layout="wide"] .dashboard {
+  grid-template-columns: 176px minmax(0, 1fr);
+  grid-template-areas: "rail main";
+}
+
+.usage-main {
+  gap: 10px;
+}
+
+.usage-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.usage-toolbar-label {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-scope-all {
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  padding: 3px 10px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.usage-scope-all:hover {
+  color: var(--text);
+}
+
+.usage-scope-all[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+  color: var(--text);
+}
+
+.usage-range {
+  display: inline-flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+}
+
+.usage-range button {
+  border: 0;
+  border-radius: 6px;
+  background: none;
+  padding: 3px 10px;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.usage-range button:hover {
+  color: var(--text);
+}
+
+.usage-range button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--accent-border);
+}
+
+.usage-window-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.usage-window-filter select {
+  background: var(--field-bg);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 3px 6px;
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+.run-input {
+  width: auto;
+  min-width: 120px;
+  max-width: 220px;
+}
+
+.run-optional {
+  margin: 2px 0;
+}
+
+.run-optional summary {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.run-optional summary:hover {
+  color: var(--text-dim);
+}
+
+.run-baseline {
+  margin: 7px 0 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* Execution summary */
+.run-summary {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--divider);
+}
+
+.run-summary-title {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.run-summary-title:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.run-summary-meta {
+  margin: 4px 0 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.run-summary-windows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-summary-window {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.run-summary-window + .run-summary-window {
+  border-top: 1px solid var(--divider);
+}
+
+.run-window-label {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.run-window-delta {
+  font-size: 11.5px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.run-window-delta strong {
+  font-weight: 600;
+  color: var(--teal);
+}
+
+.run-window-blocked {
+  font-size: 10.5px;
+  color: var(--amber);
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.run-summary-blocked {
+  margin: 8px 0 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  border-radius: 6px;
+  font-size: 10.5px;
+  color: var(--amber);
+  overflow-wrap: anywhere;
+}
+
+.run-confidence-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin: 9px 0 0;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+
+.run-confidence {
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--card-border);
+
+  max-width: 170px;
+  cursor: pointer;
+}
+
+.usage-refreshing {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* Summary strip: five metrics, one strip, wraps instead of exploding. */
+.usage-summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 0;
+  margin: 0;
+  padding: 10px 14px 12px;
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+}
+
+.usage-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  padding: 2px 12px 2px 0;
+}
+
+.usage-metric + .usage-metric {
+  padding-left: 12px;
+  border-left: 1px solid var(--divider);
+}
+
+.usage-metric-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.run-confidence-bounded {
+  color: var(--teal);
+  background: var(--accent-soft);
+  border-color: var(--accent-border);
+}
+
+.run-confidence-inferred {
+  color: var(--amber);
+  background: rgba(251, 191, 36, 0.09);
+  border-color: rgba(251, 191, 36, 0.4);
+}
+
+.run-confidence-unavailable {
+  color: var(--text-dim);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.run-confidence-why summary {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.run-confidence-why summary:hover {
+  color: var(--text-dim);
+}
+
+.run-confidence-explanation {
+  margin: 5px 0 0;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  max-width: 60ch;
+}
+
+/* The mandatory non-task-cost disclaimer, always visible with deltas. */
+.run-disclaimer {
+  margin: 8px 0 0;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Recent runs */
+.run-recent {
+  margin-top: 12px;
+  padding-top: 9px;
+  border-top: 1px solid var(--divider);
+}
+
+.run-recent summary {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  cursor: pointer;
+}
+
+.run-recent summary:hover {
+  color: var(--text-dim);
+}
+
+.run-recent-list {
+  margin: 6px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.run-recent-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.run-recent-meta {
+  min-width: 0;
+
+  color: var(--text-faint);
+}
+
+.usage-metric-value-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.usage-metric-value {
+  font-size: 19px;
+  font-weight: 600;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  border: 1px solid var(--card-border);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
+.usage-badge-warn {
+  border-color: var(--amber);
+  color: var(--amber);
+}
+
+.usage-badge-critical {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.usage-metric-sub {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+.usage-metric-sub.dim {
+  color: var(--text-dim);
+}
+
+/* Panels and the small-multiples trend grid. */
+.usage-panel {
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 12px 14px 13px;
+}
+
+.usage-trend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 218px), 1fr));
+  gap: 10px 14px;
+}
+
+.usage-trend-card {
+  margin: 0;
+  min-width: 0;
+}
+
+.usage-trend-title {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-recent-delta {
+  flex: none;
+  color: var(--text-faint);
+}
+
+/* Focus visibility for every new interactive element. */
+.run-btn:focus-visible,
+.run-close-btn:focus-visible,
+.run-btn-primary:focus-visible,
+.run-btn-secondary:focus-visible,
+.run-inline-btn:focus-visible,
+.run-select:focus-visible,
+.run-input:focus-visible,
+.run-optional summary:focus-visible,
+.run-recent summary:focus-visible,
+.run-confidence-why summary:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.usage-chart {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+.usage-chart-gridline {
+  stroke: var(--divider);
+  stroke-width: 1;
+}
+
+.usage-chart-gridline.baseline {
+  stroke: var(--card-border);
+}
+
+.usage-chart-guide {
+  stroke: var(--text-faint);
+  stroke-width: 1;
+  stroke-dasharray: 3 4;
+  opacity: 0.55;
+}
+
+.usage-chart-line {
+  stroke: var(--teal);
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+  fill: none;
+}
+
+.usage-chart-dot {
+  fill: var(--teal);
+}
+
+.usage-chart-reset {
+  fill: none;
+  stroke: var(--amber);
+  stroke-width: 1.4;
+}
+
+/* Reset markers are shape + tooltip + counted in the summary — the amber
+   stroke supports, never carries, the signal alone. */
+
+.usage-chart-gap {
+  fill: var(--bar-track);
+}
+
+.usage-chart-tick {
+  fill: var(--text-faint);
+  font-size: 8.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-chart-tick.end {
+  text-anchor: end;
+}
+
+.app[data-layout="narrow"] .usage-chart-tick {
+  display: none;
+}
+
+.usage-trend-summary {
+  margin: 4px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-trend-empty {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.usage-trend-more {
+  margin: 8px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-chart-legend {
+  margin: 10px 0 0;
+  padding-top: 8px;
+  border-top: 1px solid var(--divider);
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Heatmap: fixed absolute bands (0/25/50/75/100), hatched not-observed. */
+.usage-heatmap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.usage-day {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  min-width: 44px;
+  padding: 5px 6px 4px;
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  border-bottom-width: 3px;
+}
+
+.usage-day-weekday {
+  font-size: 9px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.usage-day-number {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-day-value {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-band-1 {
+  background: rgba(45, 212, 191, 0.13);
+  border-bottom-color: var(--teal);
+}
+
+.usage-band-2 {
+  background: rgba(52, 211, 153, 0.16);
+  border-bottom-color: var(--green);
+}
+
+.usage-band-3 {
+  background: rgba(251, 191, 36, 0.14);
+  border-bottom-color: var(--amber);
+}
+
+.usage-band-4 {
+  background: rgba(248, 113, 113, 0.15);
+  border-bottom-color: var(--red);
+}
+
+/* A day with no observations: hatch + dash — never reads as a 0% day. */
+.usage-day-none {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 3px,
+    var(--bar-track) 3px,
+    var(--bar-track) 5px
+  );
+  border-bottom-color: var(--card-border);
+}
+
+.usage-day-none .usage-day-number,
+.usage-day-none .usage-day-value {
+  color: var(--text-faint);
+}
+
+.usage-day-none .usage-day-value {
+  font-weight: 400;
+}
+
+.usage-heatmap-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  margin-top: 9px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+.usage-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.usage-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid var(--card-border);
+}
+
+.usage-heatmap-note {
+  margin: 7px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* Coverage / gap annotation and the empty, error, and loading states. */
+.usage-coverage {
+  margin: 0;
+  padding: 0 2px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-empty {
+  text-align: center;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+
+.usage-empty p {
+  margin: 10px 0 0;
+}
+
+.usage-empty .usage-empty-note {
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-error {
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+
+.usage-error p {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+
+.usage-error .usage-error-note {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-refresh-error {
+  margin: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  font-size: 10.5px;
+  color: var(--amber);
+  overflow-wrap: anywhere;
+}
+
+.usage-retry {
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  background: var(--field-bg);
+  color: var(--text-dim);
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.usage-retry:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+
+.usage-loading {
+  padding: 18px 0;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 11.5px;
+}
+
+/* The animated properties in the app: the refresh spinner, the usage bar's
+   width transition, and the settings drawer's entrance (plus its chevron
+   rotation). All are decorative — drop them, don't slow them. This block sits
+   after the declarations it neutralizes on purpose: a media query adds no
+   specificity, so the later `transition: width 400ms ease` on .bar-fill would
+   otherwise still win and leave the bar animating. */
+@media (prefers-reduced-motion: reduce) {
+  .refresh-btn.spinning svg {
+    animation: none;
+  }
+
+  .bar-fill {
+    transition: none;
+  }
+
+  .settings-drawer {
+    animation: none;
+  }
+
+  .utility-chevron {
+    transition: none;
+  }
+}
+
+.reset-credits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 8px;
+  color: var(--text-dim);
+  font-size: 10.5px;
+}
