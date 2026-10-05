@@ -2,13 +2,13 @@
 
 LimitScope is a Windows 11 tray app that brings AI provider quota windows into one compact, local dashboard.
 
+![LimitScope Windows app showing provider quota monitoring](docs/assets/limitscope-hero.png)
+
 > **Early access · Windows 11 · stable release v0.8.6**
 >
 > LimitScope was previously developed under working name **Rate Limits**; the technical package and crate name remains `rate-limits`.
 >
 > This checkout includes source changes made after the public `v0.8.6` release. The ZCode reset-card row below describes the current source and is not included in the `v0.8.6` installer.
->
-> The current screenshots in `docs/` show older interfaces and provider states. A current screenshot will be added after visual acceptance; do not treat those images as a preview of this release.
 
 ## Why LimitScope
 
