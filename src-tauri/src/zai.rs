@@ -182,10 +182,12 @@ struct LimitEntry {
 
 // ---------- normalization ----------
 
-/// Dashboard label for one upstream window. `unit`/`number` encode the window
-/// duration (unit 3 = hour, 4 = day, 5 = week, 6 = month; 3/5 corroborated by
-/// GLM's documented 5-hour window, 6/1 by a billing-anniversary reset); the
-/// 5-hour coding-plan window uses the same label as Codex and OpenCode Go.
+/// Dashboard label for one upstream window. GLM's coding plan documents
+/// exactly two credit windows — a 5-hour pool and a weekly pool that resets
+/// every 7 days from order time (docs.z.ai/devpack); there is no monthly
+/// window. The live payload spells the weekly pool as unit 6/number 1 (its
+/// next reset lands ~7 days out, matching the documented weekly cycle), and
+/// the 5-hour window uses the same label as Codex and OpenCode Go.
 fn label_for_limit(limit: &LimitEntry) -> String {
     match limit.r#type.as_deref() {
         Some("TIME_LIMIT") => return "5-hour".to_string(),
@@ -199,8 +201,7 @@ fn label_for_limit(limit: &LimitEntry) -> String {
         (Some("CREDIT_LIMIT"), Some(3), Some(5)) => "5-hour".to_string(),
         (Some("CREDIT_LIMIT"), Some(3), _) => "Hourly".to_string(),
         (Some("CREDIT_LIMIT"), Some(4), _) => "Daily".to_string(),
-        (Some("CREDIT_LIMIT"), Some(5), _) => "Weekly".to_string(),
-        (Some("CREDIT_LIMIT"), Some(6), _) => "Monthly".to_string(),
+        (Some("CREDIT_LIMIT"), Some(5) | Some(6), _) => "Weekly".to_string(),
         _ => sanitize_fallback_label(limit.r#type.as_deref()),
     }
 }
@@ -1200,7 +1201,7 @@ mod tests {
                 .iter()
                 .map(|limit| limit.label.as_str())
                 .collect::<Vec<_>>(),
-            ["5-hour", "Monthly"]
+            ["5-hour", "Weekly"]
         );
         assert_eq!(limits[0].used_percent, 0.0);
         assert_eq!(limits[1].used_percent, 64.0);
