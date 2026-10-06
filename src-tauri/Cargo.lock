@@ -3190,11 +3190,13 @@ dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "chrono",
+ "iana-time-zone",
  "regex",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2",
+ "sys-locale",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -3204,6 +3206,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
  "tokio",
+ "uuid",
  "windows-sys 0.61.2",
 ]
 
@@ -4048,6 +4051,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

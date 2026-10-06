@@ -49,6 +49,65 @@ export type ZCodeResetStatus = {
 };
 
 /**
+ * One absolute balance bucket under one active ZCode plan/package
+ * (Z.ai provider only). Mirrors the Rust ZCodePlanBalance DTO
+ * (src-tauri/src/zcode_plans.rs).
+ *
+ * The pool values are ABSOLUTE upstream counts (e.g. tokens) — deliberately
+ * not the monitor endpoint's percentage-only window shape, and never summed
+ * across units or plans.
+ */
+export type ZCodePlanBalance = {
+  /** Stable upstream identifiers (diagnostics; never rendered). */
+  userPlanId?: string;
+  entitlementId?: string;
+  bucketId?: string;
+  /** Display model for the bucket (capability-derived, else show_name). */
+  model?: string;
+  /** Upstream meter classification, when reported. */
+  meter?: string;
+  /** Upstream unit type (e.g. "token", "credit") — rows never merge units. */
+  unit?: string;
+  /** Absolute pool size (total_units), as reported. */
+  limit?: number;
+  /** Absolute consumption (used_units), as reported. */
+  used?: number;
+  /** Absolute remainder (remaining_units), as reported. */
+  remaining?: number;
+  /** Upstream period (e.g. "one_time", "daily"), when reported. */
+  period?: string;
+  /** RFC-3339 UTC end of the bucket's current period, when reported. */
+  periodEnd?: string;
+  /** RFC-3339 UTC bucket expiry, when reported. */
+  expiresAt?: string;
+};
+
+/** One active ZCode plan/package with its plan-grouped balances. */
+export type ZCodePlan = {
+  /** Stable upstream identifier (diagnostics; never rendered). */
+  planId: string;
+  userPlanId?: string;
+  /** Upstream display name, display-sanitized by the backend. */
+  name?: string;
+  /** The raw upstream status that qualified the plan (only active plans
+   * are carried — classification is upstream's, never a name heuristic). */
+  status: string;
+  /** RFC-3339 UTC plan expiry (ends_at), when reported. */
+  endsAt?: string;
+  balances: ZCodePlanBalance[];
+};
+
+/**
+ * Supplemental ZCode plan/balance observation (Z.ai entry only). Refreshed
+ * passively by the ordinary runtime cycle; the backend strips it once stale
+ * and never hydrates it from disk, so anything on the wire is current by
+ * construction. Other providers never set this.
+ */
+export type ZCodePlansObservation = {
+  plans: ZCodePlan[];
+};
+
+/**
  * Freshness of the underlying source data for providers that surface a
  * cached snapshot (e.g. a local quota cache file) instead of a live fetch.
  * Live providers never set it. "stale" also covers an indeterminate
@@ -121,6 +180,10 @@ export type ProviderUsage = {
    * yet — the shape is pinned for a future product decision.
    */
   zcodeResetCards?: ZCodeResetStatus;
+  /** ZCode plan/balance observation (Z.ai entry only) — active plans and
+   * packages beyond the coding plan, with absolute plan-grouped balances.
+   * See {@link ZCodePlansObservation}. */
+  zcodePlans?: ZCodePlansObservation;
   /** True for deterministic demo providers; they never enter history/prediction. */
   simulated?: boolean;
   /** Legacy status vocabulary, derived in Rust from {@link ProviderUsage.health}

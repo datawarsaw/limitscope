@@ -20,6 +20,7 @@ mod secret_scrub;
 mod usage_analytics;
 mod usage_export;
 mod zai;
+mod zcode_plans;
 mod zcode_reset;
 
 use tauri::{

@@ -92,6 +92,7 @@ use crate::notifications::NotificationLane;
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::zai::{self, ZaiUsage};
+use crate::zcode_plans::{self, ZCodePlansObservation};
 use crate::zcode_reset::{self, ZCodeResetStatus};
 
 /// Frontend event carrying a full runtime snapshot after every cycle.
@@ -248,6 +249,17 @@ pub struct ProviderUsageDto {
     /// Z.ai never set this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zcode_reset_cards: Option<ZCodeResetStatus>,
+    /// Optional ZCode plan/balance observation. Active ZCode plans/packages
+    /// (e.g. Start Plan / promotional Trust Build packages) with their own
+    /// plan-grouped ABSOLUTE balances — a deliberately different shape from
+    /// the monitor endpoint's percentage-only windows, never merged into
+    /// them, and never summed across plans or units. Present only on the
+    /// Z.ai entry when the passive balance observation answered; observed by
+    /// the ordinary runtime cycle, never hydrated from disk, stripped once
+    /// stale. A failed observation never fails the Z.ai quota refresh.
+    /// Providers other than Z.ai never set this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zcode_plans: Option<ZCodePlansObservation>,
     /// Internal, never serialized (`serde(skip)`): the Antigravity adapter's
     /// structured live-failure cause when a refresh degraded to cached
     /// windows. The success path records it in the diagnostics lane's
@@ -614,6 +626,7 @@ fn base_usage(
         data_freshness: None,
         reset_credits: None,
         zcode_reset_cards: None,
+        zcode_plans: None,
         fallback_failure: None,
     }
 }
@@ -712,14 +725,33 @@ fn trim_stale_zcode_reset_cards(dto: &mut ProviderUsageDto, now: DateTime<Utc>) 
     }
 }
 
-/// `reset_cards` arrives as an independent `Option`: a failed reset-card
-/// observation (`None`) must never fail the Z.ai quota refresh, and a failed
-/// quota refresh propagates the quota failure while any fresh card data is
-/// simply dropped for the cycle (the retained last-good entry keeps serving
-/// its still-fresh copy).
+/// Plan-observation freshness guard (Z.ai only): a retained snapshot may
+/// carry its plan/balance observation forward only while the observation is
+/// within its TTL (`zcode_plans::OBSERVATION_TTL_SECS`, mirroring the
+/// reset-card budget). A stale observation is dropped so a consumed bucket
+/// can never read as available; the quota windows themselves are unaffected.
+fn trim_stale_zcode_plans(dto: &mut ProviderUsageDto, now: DateTime<Utc>) {
+    if dto.id != ProviderKind::Zai.id() {
+        return;
+    }
+    let fresh = dto
+        .zcode_plans
+        .as_ref()
+        .is_some_and(|plans| zcode_plans::plans_fresh(&plans.observed_at, now));
+    if !fresh {
+        dto.zcode_plans = None;
+    }
+}
+
+/// `reset_cards` and `plans` arrive as independent `Option`s: a failed
+/// supplemental observation (`None`) must never fail the Z.ai quota refresh,
+/// and a failed quota refresh propagates the quota failure while any fresh
+/// supplemental data is simply dropped for the cycle (the retained last-good
+/// entry keeps serving its still-fresh copy).
 fn normalize_zai(
     result: Result<ZaiUsage, ProviderError>,
     reset_cards: Option<ZCodeResetStatus>,
+    plans: Option<ZCodePlansObservation>,
     now_ms: i64,
 ) -> Result<ProviderUsageDto, ProviderFailure> {
     match result {
@@ -740,6 +772,7 @@ fn normalize_zai(
             let mut dto = base_usage(ProviderKind::Zai, health, limits);
             dto.account = build_zai_attribution(usage.account.as_ref());
             dto.zcode_reset_cards = reset_cards;
+            dto.zcode_plans = plans;
             Ok(dto)
         }
         Err(error) => Err(failure_from_provider_error(error)),
@@ -943,15 +976,17 @@ pub fn production_specs() -> Vec<ProviderSpec> {
             fetch: Arc::new(|| {
                 Box::pin(async {
                     let now_ms = Utc::now().timestamp_millis();
-                    // The reset-card observation rides the existing Z.ai job
-                    // of the same cycle (`tokio::join!` runs both on this one
-                    // task — no second scheduler, no extra cycle) and its
-                    // failure is consumed independently of the quota result.
-                    let (usage, reset_cards) = tokio::join!(
+                    // The supplemental observations ride the existing Z.ai
+                    // job of the same cycle (`tokio::join!` runs all three on
+                    // this one task — no second scheduler, no extra cycle);
+                    // each failure is consumed independently of the quota
+                    // result.
+                    let (usage, reset_cards, plans) = tokio::join!(
                         zai::get_zai_usage(),
-                        zcode_reset::fetch_reset_status()
+                        zcode_reset::fetch_reset_status(),
+                        zcode_plans::fetch_plan_balances()
                     );
-                    normalize_zai(usage, reset_cards.ok(), now_ms)
+                    normalize_zai(usage, reset_cards.ok(), plans.ok(), now_ms)
                 })
             }),
         },
@@ -1824,6 +1859,7 @@ impl RuntimeCore {
                 // the windows keep their existing retention semantics.
                 trim_stale_reset_credits(&mut retained, failure_at);
                 trim_stale_zcode_reset_cards(&mut retained, failure_at);
+                trim_stale_zcode_plans(&mut retained, failure_at);
                 return retained;
             }
         }
@@ -2446,6 +2482,7 @@ mod tests {
             data_freshness: None,
             reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
             fallback_failure: None,
         }
     }
@@ -2587,6 +2624,7 @@ mod tests {
         let dto = normalize_zai(
             zai_quota_ok(),
             Some(observed_reset_cards(fixed_now())),
+            None,
             fixed_now().timestamp_millis(),
         )
         .expect("quota success must normalize");
@@ -2604,7 +2642,7 @@ mod tests {
     /// and never fails or degrades the quota refresh.
     #[test]
     fn zai_reset_card_failure_never_fails_the_quota_refresh() {
-        let dto = normalize_zai(zai_quota_ok(), None, fixed_now().timestamp_millis())
+        let dto = normalize_zai(zai_quota_ok(), None, None, fixed_now().timestamp_millis())
             .expect("quota success must normalize regardless of the card observation");
         assert_eq!(dto.health, ProviderHealth::Live);
         assert_eq!(dto.limits.len(), 1);
@@ -2620,6 +2658,7 @@ mod tests {
         let failure = normalize_zai(
             Err(ProviderError::transient("network", "offline")),
             Some(observed_reset_cards(fixed_now())),
+            None,
             fixed_now().timestamp_millis(),
         )
         .unwrap_err();
@@ -2633,6 +2672,7 @@ mod tests {
         let mut fresh = normalize_zai(
             zai_quota_ok(),
             Some(observed_reset_cards(now - chrono::Duration::minutes(10))),
+            None,
             now.timestamp_millis(),
         )
         .expect("quota success must normalize");
@@ -2647,6 +2687,7 @@ mod tests {
             Some(observed_reset_cards(
                 now - chrono::Duration::seconds(zcode_reset::OBSERVATION_TTL_SECS + 60),
             )),
+            None,
             now.timestamp_millis(),
         )
         .expect("quota success must normalize");
@@ -2671,6 +2712,7 @@ mod tests {
         let dto = normalize_zai(
             zai_quota_ok(),
             Some(observed_reset_cards(fixed_now())),
+            None,
             fixed_now().timestamp_millis(),
         )
         .expect("quota success must normalize");
@@ -2686,10 +2728,155 @@ mod tests {
         assert!(!wire.contains("observedAt"), "wire: {wire}");
 
         // Without an observation the field is omitted entirely.
-        let bare = normalize_zai(zai_quota_ok(), None, fixed_now().timestamp_millis())
+        let bare = normalize_zai(zai_quota_ok(), None, None, fixed_now().timestamp_millis())
             .expect("quota success must normalize");
         let wire = serde_json::to_string(&bare).unwrap();
         assert!(!wire.contains("zcodeResetCards"), "wire: {wire}");
+    }
+
+    fn observed_plan_observation(now: chrono::DateTime<chrono::Utc>) -> ZCodePlansObservation {
+        ZCodePlansObservation {
+            plans: vec![zcode_plans::ZCodePlan {
+                plan_id: "plan-trust-build".to_string(),
+                user_plan_id: Some("up-1".to_string()),
+                name: Some("ZCode Trust Build".to_string()),
+                status: "active".to_string(),
+                ends_at: Some("2026-10-26T07:33:20Z".to_string()),
+                balances: vec![zcode_plans::ZCodePlanBalance {
+                    user_plan_id: Some("up-1".to_string()),
+                    entitlement_id: Some("ent-token".to_string()),
+                    bucket_id: Some("bucket-1".to_string()),
+                    model: Some("GLM-5.3-Flash".to_string()),
+                    meter: None,
+                    unit: Some("token".to_string()),
+                    limit: Some(100_000_000.0),
+                    used: Some(5_200_000.0),
+                    remaining: Some(94_800_000.0),
+                    period: Some("one_time".to_string()),
+                    period_end: None,
+                    expires_at: Some("2026-10-26T07:33:20Z".to_string()),
+                }],
+            }],
+            observed_at: now,
+        }
+    }
+
+    #[test]
+    fn normalize_zai_carries_plan_observation_on_the_quota_entry() {
+        let dto = normalize_zai(
+            zai_quota_ok(),
+            None,
+            Some(observed_plan_observation(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        let plans = dto.zcode_plans.expect("plans must ride the entry");
+        assert_eq!(plans.plans.len(), 1);
+        let plan = &plans.plans[0];
+        assert_eq!(plan.plan_id, "plan-trust-build");
+        assert_eq!(plan.name.as_deref(), Some("ZCode Trust Build"));
+        assert_eq!(plan.balances.len(), 1);
+        // Absolute balances ride unchanged — never squeezed into a percent.
+        assert_eq!(plan.balances[0].limit, Some(100_000_000.0));
+        assert_eq!(plan.balances[0].remaining, Some(94_800_000.0));
+        assert_eq!(plan.balances[0].unit.as_deref(), Some("token"));
+    }
+
+    /// Independence (supplemental side): a failed plan observation arrives
+    /// as `None` and never fails or degrades the quota refresh — with or
+    /// without the other supplemental observation succeeding.
+    #[test]
+    fn zai_plan_observation_failure_never_fails_the_quota_refresh() {
+        let dto = normalize_zai(zai_quota_ok(), None, None, fixed_now().timestamp_millis())
+            .expect("quota success must normalize regardless of the plan observation");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.limits.len(), 1);
+        assert_eq!(dto.zcode_plans, None);
+        assert_eq!(dto.zcode_reset_cards, None);
+    }
+
+    /// Independence (quota side): a failed quota refresh propagates the
+    /// quota verdict even when fresh plan data exists — plans never stand
+    /// in for quota, and they are dropped for the cycle.
+    #[test]
+    fn zai_quota_failure_is_not_masked_by_fresh_plans() {
+        let failure = normalize_zai(
+            Err(ProviderError::transient("network", "offline")),
+            None,
+            Some(observed_plan_observation(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "network");
+        assert_eq!(failure.transient, Some(true));
+    }
+
+    #[test]
+    fn retained_zai_snapshot_keeps_fresh_plans_and_drops_stale() {
+        let now = fixed_now();
+        let mut fresh = normalize_zai(
+            zai_quota_ok(),
+            None,
+            Some(observed_plan_observation(now - chrono::Duration::minutes(10))),
+            now.timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        trim_stale_zcode_plans(&mut fresh, now);
+        assert!(
+            fresh.zcode_plans.is_some(),
+            "fresh plan observations must survive retention"
+        );
+
+        let mut stale = normalize_zai(
+            zai_quota_ok(),
+            None,
+            Some(observed_plan_observation(
+                now - chrono::Duration::seconds(zcode_plans::OBSERVATION_TTL_SECS + 60),
+            )),
+            now.timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        trim_stale_zcode_plans(&mut stale, now);
+        assert_eq!(
+            stale.zcode_plans, None,
+            "stale plan observations must stop reading as available"
+        );
+
+        // The guard is Z.ai-only: other providers never carry the field.
+        let mut other = ok_usage("openai-codex", "OpenAI / Codex", 10.0);
+        trim_stale_zcode_plans(&mut other, now);
+        assert_eq!(other.zcode_plans, None);
+    }
+
+    /// The wire contract keeps plan-grouped absolute balances intact: the
+    /// plan grouping, the stable identifiers, and the absolute values are
+    /// all present, the internal stamp is not, and a cycle without an
+    /// observation omits the field entirely.
+    #[test]
+    fn zcode_plan_wire_preserves_plan_grouping_and_absolute_values() {
+        let dto = normalize_zai(
+            zai_quota_ok(),
+            None,
+            Some(observed_plan_observation(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        let wire = serde_json::to_string(&dto).unwrap();
+        assert!(wire.contains("\"zcodePlans\":"), "wire: {wire}");
+        assert!(wire.contains("\"planId\":\"plan-trust-build\""), "wire: {wire}");
+        assert!(wire.contains("\"userPlanId\":\"up-1\""), "wire: {wire}");
+        assert!(wire.contains("\"entitlementId\":\"ent-token\""), "wire: {wire}");
+        assert!(wire.contains("\"bucketId\":\"bucket-1\""), "wire: {wire}");
+        assert!(wire.contains("\"remaining\":94800000.0"), "wire: {wire}");
+        assert!(wire.contains("\"unit\":\"token\""), "wire: {wire}");
+        assert!(wire.contains("\"period\":\"one_time\""), "wire: {wire}");
+        assert!(!wire.contains("observedAt"), "wire: {wire}");
+
+        let bare = normalize_zai(zai_quota_ok(), None, None, fixed_now().timestamp_millis())
+            .expect("quota success must normalize");
+        let wire = serde_json::to_string(&bare).unwrap();
+        assert!(!wire.contains("zcodePlans"), "wire: {wire}");
     }
 
     fn counting_spec(
@@ -5195,6 +5382,7 @@ mod tests {
             data_freshness: None,
             reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
             fallback_failure: None,
         }
     }

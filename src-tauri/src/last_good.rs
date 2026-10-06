@@ -276,6 +276,7 @@ impl ProviderLastGoodStore {
                 // re-observes before the capability reads as available.
                 reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
                 fallback_failure: None,
             };
 
@@ -511,6 +512,7 @@ mod tests {
             data_freshness: None,
             reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
             fallback_failure: None,
         }
     }
@@ -672,6 +674,64 @@ mod tests {
         assert_eq!(
             provider.zcode_reset_cards, None,
             "cards must be re-observed live, never hydrated"
+        );
+    }
+
+    fn hydrated_state_never_carries_zcode_plan_observations() {
+        // ZCode plan observations are fresh-live-observation-only: even a
+        // DTO that held plans persists and hydrates without them, so a cold
+        // start always re-observes before a balance reads as available.
+        use crate::zcode_plans::{ZCodePlan, ZCodePlanBalance, ZCodePlansObservation};
+        let dir = tempdir::temp_dir("no-plan-hydration");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now)));
+
+        let mut live = sample_usage(ProviderKind::Zai, 50.0, Some("2026-09-29T16:00:00Z"));
+        live.zcode_plans = Some(ZCodePlansObservation {
+            plans: vec![ZCodePlan {
+                plan_id: "plan-trust-build".to_string(),
+                user_plan_id: None,
+                name: Some("ZCode Trust Build".to_string()),
+                status: "active".to_string(),
+                ends_at: None,
+                balances: vec![ZCodePlanBalance {
+                    user_plan_id: None,
+                    entitlement_id: None,
+                    bucket_id: None,
+                    model: Some("GLM-5.3-Flash".to_string()),
+                    meter: None,
+                    unit: Some("token".to_string()),
+                    limit: Some(100.0),
+                    used: None,
+                    remaining: Some(94.8),
+                    period: None,
+                    period_end: None,
+                    expires_at: None,
+                }],
+            }],
+            observed_at: fixed_now(),
+        });
+        store.record_success(ProviderKind::Zai, &live);
+
+        let specs = vec![mock_spec(
+            ProviderKind::Zai,
+            Ok(sample_usage(ProviderKind::Zai, 50.0, None)),
+        )];
+
+        let core = RuntimeCore::with_injections(
+            specs,
+            5,
+            Box::new(|| 0),
+            Box::new(fixed_now),
+        )
+        .with_last_good_store(Some(store));
+
+        let snapshot = core.snapshot();
+        let provider = &snapshot.providers[0];
+        assert_eq!(provider.health, ProviderHealth::Stale);
+        assert_eq!(
+            provider.zcode_plans, None,
+            "plan observations must be re-observed live, never hydrated"
         );
     }
 

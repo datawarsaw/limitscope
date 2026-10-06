@@ -207,20 +207,16 @@ fn label_for_limit(limit: &LimitEntry) -> String {
 }
 
 /// Conservative display cap for a provider-derived fallback label.
-const MAX_FALLBACK_LABEL_CHARS: usize = 40;
+pub(crate) const MAX_FALLBACK_LABEL_CHARS: usize = 40;
 
-/// Display-safety for the fallback branch of `label_for_limit`: unknown
-/// upstream `type` values are provider-derived free text, so ANSI escape
-/// sequences are stripped whole, control characters are removed, whitespace
-/// runs collapse to single spaces, and the result is capped. Ordinary text
-/// is unchanged (underscores still read as spaces); input with no visible
-/// text left degrades to `"UNKNOWN"`, the same label a missing type uses.
-/// Known labels return before this gate and are never altered.
-fn sanitize_fallback_label(raw_type: Option<&str>) -> String {
-    let Some(raw) = raw_type else {
-        return "UNKNOWN".to_string();
-    };
-    let visible: String = strip_ansi_escapes(&raw.replace('_', " "))
+/// Display-safety for provider-derived free text bound for a label: ANSI
+/// escape sequences are stripped whole, control characters are removed,
+/// whitespace runs collapse to single spaces, and the result is capped.
+/// Ordinary text is unchanged. Returns `None` when nothing visible remains,
+/// so the caller can degrade (to `"UNKNOWN"`, to omitting the label, ...) —
+/// shared with the sibling ZCode observers that surface provider labels.
+pub(crate) fn sanitize_display_label(raw: &str) -> Option<String> {
+    let visible: String = strip_ansi_escapes(raw)
         .chars()
         .filter(|character| !character.is_control())
         .collect();
@@ -229,10 +225,20 @@ fn sanitize_fallback_label(raw_type: Option<&str>) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     let capped: String = collapsed.chars().take(MAX_FALLBACK_LABEL_CHARS).collect();
-    if capped.is_empty() {
+    (!capped.is_empty()).then_some(capped)
+}
+
+/// Display-safety for the fallback branch of `label_for_limit`: unknown
+/// upstream `type` values are provider-derived free text, so they pass the
+/// shared display gate; input with no visible text left degrades to
+/// `"UNKNOWN"`, the same label a missing type uses. Known labels return
+/// before this gate and are never altered.
+fn sanitize_fallback_label(raw_type: Option<&str>) -> String {
+    let Some(raw) = raw_type else {
         return "UNKNOWN".to_string();
-    }
-    capped
+    };
+    sanitize_display_label(&raw.replace('_', " "))
+        .unwrap_or_else(|| "UNKNOWN".to_string())
 }
 
 /// Removes ANSI/ECMA-48 escape sequences — CSI (parameterized), OSC

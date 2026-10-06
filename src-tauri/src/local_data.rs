@@ -154,6 +154,7 @@ mod tests {
             plan_type: None,
             reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
             error: None,
             error_category: None,
             error_http_status: None,

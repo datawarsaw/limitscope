@@ -2528,3 +2528,42 @@ body {
   color: var(--text-dim);
   font-size: 10.5px;
 }
+/* Active ZCode plans/packages under the Z.ai card: one visually separated
+   group per plan, absolute balance rows beneath it. Rows reuse the window
+   row vocabulary (.limit-row/.limit-label/.limit-reset) so the two layers
+   read as one system; only the group chrome is new here. */
+.zcode-plans {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--card-border);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.zcode-plan-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+
+.zcode-plan-name {
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+
+.zcode-plan-expiry {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Balance values are absolute counts, not percents: keep the window row's
+   geometry but the tabular-numeric, dim treatment of a secondary readout. */
+.zcode-balance-value {
+  font-variant-numeric: tabular-nums;
+}
