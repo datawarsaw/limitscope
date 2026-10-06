@@ -336,6 +336,7 @@ fn collect_from_live(
             watermark_ms: new_watermark,
             fingerprint,
             rejected,
+            usage_not_reported: 0,
             events,
             files: Vec::new(),
         },
@@ -1538,14 +1539,17 @@ mod tests {
 
         // Enabled: one cycle baselines the source through the cycle hook.
         // The Codex home resolver is pointed at an empty temp directory so
-        // the cycle's (Phase 2) Codex pass stays off the real machine.
+        // the cycle's (Phase 2) Codex pass stays off the real machine, and
+        // the OpenCode resolver at a nonexistent path so the (Phase 3)
+        // OpenCode pass does too.
         let fix = fixture("cycle-enabled");
         insert_completed(&fix.connection, "old");
         let (store, _dir) = store_at("cycle-enabled-store", Some(fix.path()));
         let codex_dir = tempdir::temp_dir("cycle-enabled-codex");
         let codex_home = codex_dir.path().to_path_buf();
         let store = store
-            .with_codex_home_resolver(Box::new(move || Some(codex_home.clone())));
+            .with_codex_home_resolver(Box::new(move || Some(codex_home.clone())))
+            .with_opencode_db_resolver(Box::new(|| None));
         enable(&store);
         let core = std::sync::Arc::new(
             RuntimeCore::with_injections(
@@ -1575,11 +1579,13 @@ mod tests {
         assert_eq!(reopened.events().len(), 0, "no backlog was imported");
 
         // Disabled: the cycle performs zero resolver calls — for the ZCode
-        // reader and (Phase 2) the Codex reader alike.
+        // reader, the Codex reader, and the OpenCode reader alike.
         let probes = std::sync::Arc::new(AtomicUsize::new(0));
         let counter = probes.clone();
         let codex_probes = std::sync::Arc::new(AtomicUsize::new(0));
         let codex_counter = codex_probes.clone();
+        let opencode_probes = std::sync::Arc::new(AtomicUsize::new(0));
+        let opencode_counter = opencode_probes.clone();
         let dir = tempdir::temp_dir("cycle-disabled");
         let disabled = crate::usage_intelligence::UsageIntelligenceStore::open_with(
             dir.path()
@@ -1592,6 +1598,10 @@ mod tests {
         )
         .with_codex_home_resolver(Box::new(move || {
             codex_counter.fetch_add(1, Ordering::SeqCst);
+            None
+        }))
+        .with_opencode_db_resolver(Box::new(move || {
+            opencode_counter.fetch_add(1, Ordering::SeqCst);
             None
         }));
         let core = std::sync::Arc::new(
@@ -1613,6 +1623,11 @@ mod tests {
             codex_probes.load(Ordering::SeqCst),
             0,
             "a disabled store never resolves the Codex home either"
+        );
+        assert_eq!(
+            opencode_probes.load(Ordering::SeqCst),
+            0,
+            "a disabled store never resolves the OpenCode database either"
         );
     }
 }

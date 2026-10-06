@@ -78,8 +78,8 @@ export function TokenUsageSection({
         </p>
         <p className="token-usage-off-copy">
           When enabled, LimitScope reads local AI tool usage metadata —
-          models and token counts — from supported tools like ZCode and
-          Codex, on this device only. It never reads prompt or response
+          models and token counts — from supported tools like ZCode, Codex,
+          and OpenCode, on this device only. It never reads prompt or response
           content, and nothing is uploaded.
         </p>
         {onOpenSettings ? (
@@ -226,6 +226,7 @@ export function TokenUsageSection({
 function sourceLabel(source: string): string {
   if (source === "zcode") return "ZCode";
   if (source === "codex") return "Codex";
+  if (source === "opencode") return "OpenCode";
   return source;
 }
 

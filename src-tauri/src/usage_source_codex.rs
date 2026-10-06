@@ -740,6 +740,7 @@ fn incremental_scan(
             fingerprint: None,
             events: std::mem::take(&mut budgets.events),
             rejected: budgets.rejected,
+            usage_not_reported: 0,
             files,
         },
     );

@@ -57,6 +57,9 @@ export type UsageSourceDiagnostics = {
     accepted: number;
     duplicates: number;
     rejected: number;
+    /** OpenCode only: completed rows whose every dimension was zero —
+     * usage the provider never reported; never stored as measured zero. */
+    usageNotReported?: number;
   };
 };
 

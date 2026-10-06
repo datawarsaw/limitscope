@@ -18,13 +18,16 @@
 //!
 //! - The sources are the ZCode local database (`~/.zcode/cli/db/db.sqlite`,
 //!   table `model_usage`, read strictly read-only through a temporary
-//!   snapshot copy — see `usage_source_zcode.rs`) and, since Phase 2, the
-//!   Codex rollout logs (`~/.codex/sessions/**` and
-//!   `~/.codex/archived_sessions/**`, read strictly read-only with
-//!   per-file byte cursors — see `usage_source_codex.rs`). Source files
-//!   are never opened for writing, never checkpointed, never mutated.
-//!   Each source keeps its own cursor under its own source id; one source
-//!   failing never blocks or hides the other.
+//!   snapshot copy — see `usage_source_zcode.rs`), the Codex rollout logs
+//!   (`~/.codex/sessions/**` and `~/.codex/archived_sessions/**`, read
+//!   strictly read-only with per-file byte cursors — see
+//!   `usage_source_codex.rs`), and the OpenCode local database
+//!   (`~/.local/share/opencode/opencode.db`, table `message`, read
+//!   strictly read-only through a temporary snapshot copy — see
+//!   `usage_source_opencode.rs`). Source files are never opened for
+//!   writing, never checkpointed, never mutated. Each source keeps its
+//!   own cursor under its own source id; one source failing never blocks
+//!   or hides the others.
 //! - Collection is strictly opt-in. While the persisted `enabled` flag is
 //!   false the collector does not even resolve the source path — no stat,
 //!   no existence probe, no open, no copy, no schema inspection
@@ -112,6 +115,9 @@ pub const USAGE_SOURCE_ZCODE: &str = "zcode";
 
 /// The stable source id of the Codex rollout-log reader.
 pub const USAGE_SOURCE_CODEX: &str = "codex";
+
+/// The stable source id of the OpenCode database reader.
+pub const USAGE_SOURCE_OPENCODE: &str = "opencode";
 
 /// Clock-skew tolerance for source event timestamps: a row completed
 /// further than this in the future is rejected as implausible.
@@ -294,6 +300,17 @@ pub struct ScanStats {
     pub duplicates: usize,
     /// Source rows rejected by validation (malformed / invariant drift).
     pub rejected: usize,
+    /// Source rows dispositioned as "usage not reported": completed,
+    /// error-free rows whose every token dimension is zero — the verified
+    /// sparse-reporting pattern of some providers, never stored as
+    /// trustworthy measured zero. Zero and omitted for sources that never
+    /// produce it (ZCode, Codex).
+    #[serde(default, skip_serializing_if = "usage_not_reported_is_zero")]
+    pub usage_not_reported: usize,
+}
+
+fn usage_not_reported_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// Carried attribution state for file-based sources (the Codex reader
@@ -360,6 +377,10 @@ pub struct SourceScan {
     pub fingerprint: Option<SourceFingerprint>,
     pub events: Vec<UsageEvent>,
     pub rejected: usize,
+    /// Rows dispositioned as usage-not-reported (see
+    /// [`ScanStats::usage_not_reported`]); zero for sources without the
+    /// pattern.
+    pub usage_not_reported: usize,
     /// The full tracked-file state after this scan (file-based sources
     /// only; empty for the ZCode reader). Replaces the cursor's file
     /// list wholesale so deletions are reflected.
@@ -406,6 +427,11 @@ pub type ZcodeDbResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 /// Same injection and disabled-gate rules as [`ZcodeDbResolver`].
 pub type CodexHomeResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
+/// Resolves the OpenCode database location (`~/.local/share/opencode/
+/// opencode.db` in production, verified against the installed OpenCode).
+/// Same injection and disabled-gate rules as [`ZcodeDbResolver`].
+pub type OpencodeDbResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
 /// The Usage Intelligence store: bounded state behind a small mutex,
 /// persisted to one JSON file, plus the opt-in flag. Locking model: mutate
 /// under the lock, release, then write the file — filesystem I/O never
@@ -416,6 +442,7 @@ pub struct UsageIntelligenceStore {
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
     codex_home: CodexHomeResolver,
+    opencode_db: OpencodeDbResolver,
     /// Transient in-flight latch for the "collecting" diagnostic.
     pub(crate) collecting: std::sync::atomic::AtomicBool,
 }
@@ -442,6 +469,7 @@ impl UsageIntelligenceStore {
             now_ms,
             zcode_db,
             codex_home: production_codex_home_resolver(),
+            opencode_db: production_opencode_db_resolver(),
             collecting: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_from_disk();
@@ -451,6 +479,13 @@ impl UsageIntelligenceStore {
     /// Overrides the Codex home resolver (tests, fixtures). Chainable.
     pub fn with_codex_home_resolver(mut self, resolver: CodexHomeResolver) -> Self {
         self.codex_home = resolver;
+        self
+    }
+
+    /// Overrides the OpenCode database resolver (tests, fixtures).
+    /// Chainable.
+    pub fn with_opencode_db_resolver(mut self, resolver: OpencodeDbResolver) -> Self {
+        self.opencode_db = resolver;
         self
     }
 
@@ -470,6 +505,13 @@ impl UsageIntelligenceStore {
     /// enabled gate has passed.
     pub(crate) fn codex_home_resolver(&self) -> &CodexHomeResolver {
         &self.codex_home
+    }
+
+    /// The injected OpenCode database resolver (production:
+    /// `~/.local/share/opencode`; tests: fixtures). Only the collector
+    /// may call it — and only after the enabled gate has passed.
+    pub(crate) fn opencode_db_resolver(&self) -> &OpencodeDbResolver {
+        &self.opencode_db
     }
 
     /// The persisted opt-in flag. While false, collection must not probe
@@ -628,6 +670,7 @@ impl UsageIntelligenceStore {
                             accepted: 0,
                             duplicates: 0,
                             rejected: 0,
+                            usage_not_reported: 0,
                         }),
                         files,
                     },
@@ -738,6 +781,7 @@ impl UsageIntelligenceStore {
                 accepted,
                 duplicates,
                 rejected,
+                usage_not_reported: scan.usage_not_reported,
             };
             state.events = retained;
             if let Some(cursor) = state.cursors.get_mut(source) {
@@ -1045,6 +1089,22 @@ fn production_codex_home_resolver() -> CodexHomeResolver {
     })
 }
 
+/// The production OpenCode database:
+/// `~/.local/share/opencode/opencode.db` (verified against the installed
+/// OpenCode CLI). Resolving it is the collector's business — never called
+/// while disabled.
+fn production_opencode_db_resolver() -> OpencodeDbResolver {
+    Box::new(|| {
+        let home = std::env::home_dir()?;
+        Some(
+            home.join(".local")
+                .join("share")
+                .join("opencode")
+                .join("opencode.db"),
+        )
+    })
+}
+
 /// The derived, wire-facing state of a source: `disabled` and
 /// `collecting` are runtime verdicts; the rest persist.
 fn rendered_source_state(persisted: SourceState, enabled: bool, collecting: bool) -> String {
@@ -1175,14 +1235,15 @@ pub fn collect_zcode(
 }
 
 /// Runs one collection pass over every source under the single shared
-/// opt-in: ZCode first, then Codex. The sources are isolated — each
-/// updates only its own cursor and diagnostics, so one source failing
-/// never blocks or corrupts the other, and neither failure can reach
-/// quota-provider health. Blocking filesystem work — call from
+/// opt-in: ZCode first, then Codex, then OpenCode. The sources are
+/// isolated — each updates only its own cursor and diagnostics, so one
+/// source failing never blocks or corrupts the others, and no failure can
+/// reach quota-provider health. Blocking filesystem work — call from
 /// `spawn_blocking` off the async runtime.
 pub fn run_collection_pass(store: &UsageIntelligenceStore) {
     let _ = collect_zcode(store);
     let _ = crate::usage_source_codex::collect(store);
+    let _ = crate::usage_source_opencode::collect(store);
 }
 
 /// Spawns one detached collection pass (used by the runtime cycle and the
@@ -1384,6 +1445,7 @@ mod tests {
             watermark_ms: watermark,
             fingerprint: None,
             rejected: 0,
+            usage_not_reported: 0,
             events,
             files: Vec::new(),
         }
@@ -1809,6 +1871,7 @@ mod tests {
                 watermark_ms: NOW_MS - 30_000,
                 fingerprint: None,
                 rejected: 0,
+                usage_not_reported: 0,
                 events: Vec::new(),
                 files: updated,
             },

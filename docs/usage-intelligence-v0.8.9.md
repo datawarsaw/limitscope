@@ -1,8 +1,9 @@
 # Usage Intelligence — v0.8.9 Phase 1 (ZCode)
 
-Status: implemented (Phase 1). Codex rollouts and OpenCode `message.data`
-are adopted sources from discovery but are deliberately **not implemented
-here**; they are follow-up work on the same event model.
+Status: implemented (Phase 1 ZCode, Phase 2 Codex, Phase 3 OpenCode).
+This document describes the plane and the ZCode source in depth; the
+OpenCode source is specified in the section below. The Codex rollout
+reader (`usage_source_codex.rs`) follows the same contracts.
 
 ## What this plane is (and is not)
 
@@ -82,6 +83,57 @@ takes the total from the source — the five raw fields are never summed.
 Zero is preserved as measured zero (the dimensions are NOT NULL in the
 source schema); absent values cannot occur for the dimensions and a NULL
 total rejects the row.
+
+## OpenCode source (`usage_source_opencode.rs`)
+
+- Location: `~/.local/share/opencode/opencode.db`, table `message` (schema
+  verified against the live corpus 2026-10-06: `id` PK, `session_id`,
+  `time_created`, `time_updated`, `data` JSON). Additive columns are
+  tolerated; a missing required column fails closed as
+  `schemaUnsupported`.
+- Accounting layer: the per-assistant-row `message.data.tokens` JSON
+  only. The derived layers OpenCode maintains from it — step-finish
+  parts (`part` table), the session aggregate, the event replication
+  log — are never read (fixture-proven with inflated sibling rows).
+- Read strategy: the same snapshot-copy pattern as ZCode (database plus
+  `-wal`, never `-shm`, never any write open). A (size, mtime)
+  fingerprint skips the copy for an unchanged source.
+- Completion predicate (verified live): `time.completed` present AND
+  `error` absent AND `finish` present — applied in SQL, so user rows,
+  in-flight rows, and error rows (error payloads included) are never
+  fetched or parsed. `finish` alone is no signal (the dominant live
+  value is literally `"unknown"`).
+- Cursor: `time_updated` — the row's last-write stamp — with a
+  10-minute lookback, ordered by `(time_updated, id)`, floored at the
+  immutable baseline watermark. Completions, late usage writes, and
+  fork copies all bump it, so the window catches every newly-committed
+  accounting state regardless of request age. The watermark advances
+  through accepted rows and through all-zero rows dispositioned as
+  usage-not-reported; malformed rows never advance it.
+- Token semantics (verified 428/428 live): the five dimensions
+  (`input`, `output`, `reasoning`, `cache.read`, `cache.write`) are a
+  **disjoint partition** — the total equals their sum, so they map to
+  the event dimensions directly (no overlap subtraction, unlike ZCode)
+  and the total is derived from them. A source total that disagrees
+  rejects the row.
+- Sparse reporting: completed, error-free rows whose every dimension is
+  zero are the verified "usage not reported" pattern (dominated by
+  Google / Antigravity Claude thinking models: ~2.4k of ~2.9k live
+  assistant rows). They are never stored as measured zero; they are
+  counted per scan as `usageNotReported` in the source diagnostics and
+  disposition the cursor.
+- Fork deduplication (verified live: 10 cross-session duplicate pairs,
+  ~2% of volume): forking a session duplicates executed request rows
+  under new message ids while preserving `time_created` and the whole
+  accounting payload, so the owned identity is the SHA-256 content
+  address of `(time_created, providerID, modelID, input, output,
+  reasoning, cache_read, cache_write, cost)`. Both copies map to one
+  id; the store's id dedup collapses them across rescans and restarts.
+  Residual risk (documented): two truly distinct requests sharing the
+  full fingerprint — same millisecond, model, dimensions, cost —
+  collapse into one event.
+- Scan ceiling: 20,000 rows per window, abandoned whole on overflow
+  (`scanCeiling`), cursor unmoved.
 
 ## Local-data controls (docs/local-data-controls-v0.7.md §14)
 
