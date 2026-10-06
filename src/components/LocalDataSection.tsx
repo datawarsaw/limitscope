@@ -25,6 +25,7 @@ import {
 export type LocalDataSectionProps = {
   onClearUsageHistory: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   onClearProviderCache: () => Promise<LocalDataClearResult> | LocalDataClearResult;
+  onClearUsageIntelligence: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   onClearExecutionRuns: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   onResetPreferences: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   activeExecutionRun: boolean;
@@ -35,6 +36,7 @@ type Outcome = { kind: "success" | "failure"; text: string };
 export function LocalDataSection({
   onClearUsageHistory,
   onClearProviderCache,
+  onClearUsageIntelligence,
   onClearExecutionRuns,
   onResetPreferences,
   activeExecutionRun,
@@ -70,11 +72,13 @@ export function LocalDataSection({
   const actionFor = (id: LocalDataCategoryId) =>
     id === "usageHistory"
       ? onClearUsageHistory
-      : id === "providerCache"
-        ? onClearProviderCache
-        : id === "executionRuns"
-          ? onClearExecutionRuns
-          : onResetPreferences;
+      : id === "usageIntelligence"
+        ? onClearUsageIntelligence
+        : id === "providerCache"
+          ? onClearProviderCache
+          : id === "executionRuns"
+            ? onClearExecutionRuns
+            : onResetPreferences;
 
   const dropOutcome = (id: LocalDataCategoryId) => {
     setOutcomes((prev) => {

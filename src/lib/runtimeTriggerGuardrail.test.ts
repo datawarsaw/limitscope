@@ -32,6 +32,12 @@ const ALLOWED_COMMANDS = new Set([
   "get_usage_analytics",
   "clear_history",
   "import_legacy_history",
+  // v0.8.9 Usage Intelligence: the opt-in push, the read-only
+  // aggregation, and the argument-less owned clear ride the same fixed
+  // command boundary as the rest of the local-data surface.
+  "set_usage_intelligence_enabled",
+  "get_usage_intelligence",
+  "clear_usage_intelligence",
   // v0.7 local data: the provider cache clear takes no arguments at all, so
   // no path can cross this boundary.
   "clear_provider_cache",

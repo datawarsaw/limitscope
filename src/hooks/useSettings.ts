@@ -135,6 +135,15 @@ export function useSettings() {
     });
   }, []);
 
+  const setUsageIntelligence = useCallback((usageIntelligence: boolean) => {
+    setSettings((prev) => {
+      if (prev.usageIntelligence === usageIntelligence) return prev;
+      const next = { ...prev, usageIntelligence };
+      saveSettings(next);
+      return next;
+    });
+  }, []);
+
   const setQuotaPerspective = useCallback((quotaPerspective: QuotaPerspective) => {
     setSettings((prev) => {
       if (prev.quotaPerspective === quotaPerspective) return prev;
@@ -263,12 +272,27 @@ export function useSettings() {
     });
   }, [settings.quotaNotifications]);
 
+  // The runtime's Usage Intelligence store is the single collection owner
+  // (v0.8.9), so the opt-in toggle is forwarded to Rust on attach and on
+  // every change, like the notification lane. The store persists the flag
+  // itself, which covers the scheduler's startup cycle before any window
+  // attaches; enabling there triggers the first baseline immediately.
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+    void invoke("set_usage_intelligence_enabled", {
+      enabled: settings.usageIntelligence,
+    }).catch((error) => {
+      console.error("Failed to sync the Usage Intelligence setting", error);
+    });
+  }, [settings.usageIntelligence]);
+
   return {
     settings,
     setLaunchAtStartup,
     setRefreshInterval,
     setTheme,
     setQuotaNotifications,
+    setUsageIntelligence,
     setQuotaPerspective,
     setProviderPreferences,
     setProviderHidden,

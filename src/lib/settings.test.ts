@@ -67,6 +67,7 @@ describe("settings persistence", () => {
       refreshIntervalMinutes: 15,
       theme: "graphite",
       quotaNotifications: false,
+      usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
     });
@@ -125,6 +126,7 @@ describe("v0.6 settings migration contract", () => {
       refreshIntervalMinutes: 5,
       theme: "graphite",
       quotaNotifications: false,
+      usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
     });
@@ -137,6 +139,7 @@ describe("v0.6 settings migration contract", () => {
       refreshIntervalMinutes: 15,
       theme: "glass",
       quotaNotifications: true,
+      usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
     });
@@ -207,6 +210,7 @@ describe("v0.6 settings migration contract", () => {
       refreshIntervalMinutes: 5,
       theme: "graphite",
       quotaNotifications: false,
+      usageIntelligence: false,
       providerPreferences: { order: ["openai-codex"], hidden: [] },
       quotaPerspective: "used",
     });
@@ -232,6 +236,7 @@ describe("v0.6 settings migration contract", () => {
       refreshIntervalMinutes: 5,
       theme: "oled",
       quotaNotifications: false,
+      usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
     });
@@ -290,6 +295,7 @@ describe("v0.6 settings migration contract", () => {
       refreshIntervalMinutes: 15,
       theme: "oled",
       quotaNotifications: true,
+      usageIntelligence: false,
       providerPreferences: {
         order: ["openai-codex", "zai", "opencode-go", "antigravity", "grok"],
         hidden: ["grok"],
@@ -318,6 +324,7 @@ describe("settings safe write contract", () => {
       refreshIntervalMinutes: 5,
       theme: "graphite",
       quotaNotifications: false,
+      usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
     });
@@ -352,7 +359,7 @@ describe("settings safe write contract", () => {
 });
 
 describe("settings reset (v0.7 local data)", () => {
-  it("pins the six canonical fields and preserves an unknown field across save, perspective change, and reset", () => {
+  it("pins the canonical fields and preserves an unknown field across save, perspective change, and reset", () => {
     const map = stubStorage().set(
       "rate-limits.settings.v1",
       JSON.stringify({
@@ -374,6 +381,7 @@ describe("settings reset (v0.7 local data)", () => {
       "quotaPerspective",
       "refreshIntervalMinutes",
       "theme",
+      "usageIntelligence",
     ]);
     expect(stored.futureLaneField).toEqual({ nested: [1, 2, 3] });
     expect(stored.quotaPerspective).toBe("used");

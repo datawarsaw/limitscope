@@ -10,6 +10,7 @@ const OK: LocalDataClearResult = { ok: true, removed: true };
 function renderSection(
   overrides: {
     usageHistory?: () => Promise<LocalDataClearResult>;
+    usageIntelligence?: () => Promise<LocalDataClearResult>;
     providerCache?: () => Promise<LocalDataClearResult>;
     executionRuns?: () => Promise<LocalDataClearResult>;
     preferences?: () => Promise<LocalDataClearResult>;
@@ -19,6 +20,7 @@ function renderSection(
   const actions = {
     onClearUsageHistory: vi.fn(overrides.usageHistory ?? (async () => OK)),
     onClearProviderCache: vi.fn(overrides.providerCache ?? (async () => OK)),
+    onClearUsageIntelligence: vi.fn(overrides.usageIntelligence ?? (async () => OK)),
     onClearExecutionRuns: vi.fn(overrides.executionRuns ?? (async () => OK)),
     onResetPreferences: vi.fn(overrides.preferences ?? (async () => OK)),
     activeExecutionRun: overrides.activeExecutionRun ?? false,

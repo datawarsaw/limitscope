@@ -20,6 +20,8 @@ mod runtime;
 mod secret_scrub;
 mod usage_analytics;
 mod usage_export;
+mod usage_intelligence;
+mod usage_source_zcode;
 mod zai;
 mod zcode_plans;
 mod zcode_reset;
@@ -135,6 +137,9 @@ fn main() {
             history::get_history,
             history::get_history_range,
             usage_analytics::get_usage_analytics,
+            usage_intelligence::get_usage_intelligence,
+            usage_intelligence::set_usage_intelligence_enabled,
+            usage_intelligence::clear_usage_intelligence,
             history::clear_history,
             history::import_legacy_history,
             local_data::clear_provider_cache,

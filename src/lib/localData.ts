@@ -40,6 +40,7 @@ import { resetSettings, type Settings } from "./settings";
 
 export type LocalDataCategoryId =
   | "usageHistory"
+  | "usageIntelligence"
   | "providerCache"
   | "executionRuns"
   | "preferences";
@@ -60,6 +61,8 @@ export type LocalDataClearResult =
 export const LOCAL_DATA_COMMANDS = {
   /** Clears `<app-data>/provider-last-good-v1.json` (no arguments). */
   providerCache: "clear_provider_cache",
+  /** Clears `<app-data>/usage-intelligence-v1.json` (no arguments). */
+  usageIntelligence: "clear_usage_intelligence",
 } as const;
 
 export type LocalDataControl = {
@@ -106,6 +109,18 @@ export function localDataControls(
     confirmAction: "Clear usage history",
     success: "Usage history cleared.",
     failure: "Could not clear usage history.",
+  },
+  {
+    id: "usageIntelligence",
+    label: "Usage Intelligence",
+    note: "Locally collected token usage, kept for 35 days on this device.",
+    action: "Clear",
+    confirmTitle: "Clear Usage Intelligence data?",
+    confirmBody:
+      "This removes locally collected token usage records and their collection cursors. Collection (when enabled) restarts from the current moment — usage from before this clear does not reappear, and the source tools' own data is never touched.",
+    confirmAction: "Clear Usage Intelligence data",
+    success: "Usage Intelligence data cleared.",
+    failure: "Could not clear Usage Intelligence data.",
   },
   {
     id: "providerCache",
@@ -197,6 +212,26 @@ export async function clearUsageHistoryStore(): Promise<LocalDataClearResult> {
     return { ok: true, removed: true };
   } catch (error) {
     console.error("Failed to clear the quota history", error);
+    return { ok: false };
+  }
+}
+
+/**
+ * Clears the Rust-owned Usage Intelligence store (v0.8.9 token-usage
+ * plane) through its fixed command: owned events and source cursors only.
+ * The opt-in flag survives (clearing is not disabling), and the local AI
+ * tool databases the plane reads are never touched. Outside Tauri there
+ * is no store to clear and the call is a successful no-op.
+ */
+export async function clearUsageIntelligenceStore(): Promise<LocalDataClearResult> {
+  if (!isRunningInTauri()) return { ok: true, removed: false };
+  try {
+    const outcome = await invoke<{ removed?: boolean } | null>(
+      LOCAL_DATA_COMMANDS.usageIntelligence,
+    );
+    return { ok: true, removed: outcome?.removed === true };
+  } catch (error) {
+    console.error("Failed to clear the Usage Intelligence store", error);
     return { ok: false };
   }
 }

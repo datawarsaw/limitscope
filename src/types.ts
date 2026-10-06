@@ -297,4 +297,10 @@ export type RuntimeSnapshot = {
    * unchanged cycles.
    */
   historyRevision: number;
+  /**
+   * Monotonic revision of the Rust-owned Usage Intelligence plane (v0.8.9),
+   * bumped whenever the token-usage store actually changed. Consumers
+   * re-pull `get_usage_intelligence` only when this moves.
+   */
+  usageIntelligenceRevision: number;
 };
