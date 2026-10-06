@@ -1975,6 +1975,7 @@ mod tests {
             data_freshness: None,
             reset_credits: None,
             zcode_reset_cards: None,
+            zcode_plans: None,
             fallback_failure: None,
         }
     }

@@ -122,7 +122,7 @@ pub struct ResetStatusFacts {
 // ---------- credentials (passive, backend-only) ----------
 
 /// The zcode.z.ai session JWT (`zcodejwttoken` store entry).
-struct ZcodeSessionJwt(String);
+pub(crate) struct ZcodeSessionJwt(pub(crate) String);
 
 /// The Z.ai OAuth access token (`oauth:zai:access_token` store entry), sent
 /// raw in `X-Bigmodel-Authorization`.
@@ -181,6 +181,36 @@ fn load_reset_credentials() -> Result<ResetCredentials, ProviderError> {
     parse_reset_credentials(&read_store_string(&path)?, &credential_secret()?)
 }
 
+/// Loads and decrypts only the zcode.z.ai session JWT, for sibling passive
+/// observers that authenticate with the session alone (the plan-balance
+/// plane). Same strictly read-only store read, same in-process decryption;
+/// the OAuth access token stays untouched — this endpoint does not use it.
+pub(crate) fn load_session_jwt() -> Result<ZcodeSessionJwt, ProviderError> {
+    let path = zcode_dir()?.join("credentials.json");
+    let secret = credential_secret()?;
+    let value: Value = serde_json::from_str(&read_store_string(&path)?).map_err(|_| {
+        ProviderError::new(
+            "auth_unreadable",
+            "ZCode credential store (credentials.json) is not valid JSON.",
+        )
+    })?;
+    let Value::Object(entries) = value else {
+        return Err(credential_missing());
+    };
+    let stored = entries
+        .get("zcodejwttoken")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|stored| !stored.is_empty())
+        .ok_or_else(|| {
+            ProviderError::new(
+                "credential_missing",
+                "The ZCode credential store has no usable `zcodejwttoken` entry. Sign in to ZCode first.",
+            )
+        })?;
+    Ok(ZcodeSessionJwt(decrypt_credential(stored, &secret)?))
+}
+
 /// Extracts and decrypts the two reset-status credentials. Both entries are
 /// mandatory for this endpoint (the app refuses to call it without either).
 fn parse_reset_credentials(raw: &str, secret: &str) -> Result<ResetCredentials, ProviderError> {
@@ -219,16 +249,14 @@ fn parse_reset_credentials(raw: &str, secret: &str) -> Result<ResetCredentials, 
 /// would additionally carry `Bigmodel-Organization`/`Bigmodel-Project`; no
 /// team context can be derived passively from the store, so personal scope is
 /// the only honest assertion.
-fn auth_headers(credentials: &ResetCredentials) -> Result<Vec<(String, String)>, ProviderError> {
-    let jwt = credentials.zcode_session_jwt.0.trim();
-    if jwt.is_empty() {
-        return Err(credential_missing());
-    }
+/// The session value as the app sends it: a `Bearer ` prefix is prepended
+/// only when absent. Shared with sibling observers of the same session.
+pub(crate) fn bearer_session_value(jwt: &str) -> String {
     // The prefix test reads bytes, never a `str` slice: the store value
     // arrives decrypted-but-unvalidated (plaintext entries pass through), so
     // a multibyte character straddling byte 7 is possible, and a `str` slice
     // there panics with a message that embeds the credential itself.
-    let bearer = if jwt
+    if jwt
         .as_bytes()
         .get(..7)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"bearer "))
@@ -236,7 +264,15 @@ fn auth_headers(credentials: &ResetCredentials) -> Result<Vec<(String, String)>,
         jwt.to_string()
     } else {
         format!("Bearer {jwt}")
-    };
+    }
+}
+
+fn auth_headers(credentials: &ResetCredentials) -> Result<Vec<(String, String)>, ProviderError> {
+    let jwt = credentials.zcode_session_jwt.0.trim();
+    if jwt.is_empty() {
+        return Err(credential_missing());
+    }
+    let bearer = bearer_session_value(jwt);
     let access = credentials.zai_access_token.0.trim();
     if access.is_empty() {
         return Err(credential_missing());
