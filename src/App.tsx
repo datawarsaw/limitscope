@@ -22,7 +22,11 @@ import {
   UsageExportSection,
   type UsageExportRequest,
 } from "./components/UsageExportSection";
-import { clearExecutionRuns, clearProviderCache } from "./lib/localData";
+import {
+  clearExecutionRuns,
+  clearProviderCache,
+  clearUsageIntelligenceStore,
+} from "./lib/localData";
 import { useProviderUsage } from "./hooks/useProviderUsage";
 import { useSettings } from "./hooks/useSettings";
 import { useUpdater } from "./hooks/useUpdater";
@@ -176,6 +180,7 @@ export default function App() {
     setRefreshInterval,
     setTheme,
     setQuotaNotifications,
+    setUsageIntelligence,
     setProviderHidden,
     moveProvider,
     setQuotaPerspective,
@@ -192,6 +197,7 @@ export default function App() {
     stale,
     staleMinutes,
     historyRevision,
+    usageIntelligenceRevision,
   } =
     useProviderUsage(settings.refreshIntervalMinutes);
   // Dev-only visual fixtures (`?fixture=…` in `npm run dev`); null in any
@@ -233,6 +239,9 @@ export default function App() {
     setSettingsOpen(false);
     settingsButtonRef.current?.focus();
   }, []);
+  const openSettingsDrawer = useCallback(() => {
+    setSettingsOpen(true);
+  }, []);
   const [diagnosticsSaving, setDiagnosticsSaving] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState<string | null>(
     null,
@@ -266,6 +275,14 @@ export default function App() {
     if (result.ok) syncRuns();
     return result;
   }, [syncRuns]);
+  // Local data "Clear Usage Intelligence": wipes the owned token-usage
+  // events and cursors only. While the source stays enabled, collection
+  // re-baselines at the current high-water mark — pre-clear usage does
+  // not reappear. The ZCode database is never touched.
+  const clearUsageIntelligenceData = useCallback(
+    () => clearUsageIntelligenceStore(),
+    [],
+  );
   const [runPanelOpen, setRunPanelOpen] = useState(false);
   const runButtonRef = useRef<HTMLButtonElement>(null);
   const closeRunPanel = useCallback(() => {
@@ -520,6 +537,9 @@ export default function App() {
               historyRevision={historyRevision}
               perspective={settings.quotaPerspective}
               loader={devFixture?.loader}
+              usageIntelligenceEnabled={settings.usageIntelligence === true}
+              usageIntelligenceRevision={usageIntelligenceRevision}
+              onOpenSettings={openSettingsDrawer}
             />
           </main>
         ) : (
@@ -588,6 +608,23 @@ export default function App() {
               role="switch"
               checked={settings.quotaNotifications}
               onChange={(event) => setQuotaNotifications(event.target.checked)}
+            />
+          </label>
+          <label className="setting-row">
+            <span className="setting-copy">
+              <span className="setting-label">Usage Intelligence</span>
+              <span className="setting-note">
+                Reads local AI tool usage metadata (models and token counts)
+                from tools like ZCode, on this device only. Never reads
+                prompt or response content.
+              </span>
+            </span>
+            <input
+              type="checkbox"
+              role="switch"
+              aria-label="Usage Intelligence"
+              checked={settings.usageIntelligence === true}
+              onChange={(event) => setUsageIntelligence(event.target.checked)}
             />
           </label>
           <fieldset className="setting-row setting-fieldset">
@@ -710,6 +747,7 @@ export default function App() {
           <LocalDataSection
             onClearUsageHistory={clearLocalHistory}
             onClearProviderCache={clearProviderCache}
+            onClearUsageIntelligence={clearUsageIntelligenceData}
             onClearExecutionRuns={clearExecutionRunStore}
             onResetPreferences={resetPreferences}
             activeExecutionRun={activeRun !== null}

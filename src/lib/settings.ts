@@ -28,6 +28,12 @@ export type Settings = {
   theme: Theme;
   quotaNotifications: boolean;
   /**
+   * Usage Intelligence opt-in (v0.8.9): collecting reported token usage
+   * from local AI tool databases (ZCode first). Opt-in is enforced in the
+   * Rust store — while false, no local source is probed at all.
+   */
+  usageIntelligence: boolean;
+  /**
    * Provider presentation preferences (v0.6): which providers are shown
    * prominently and in what order. Presentation only - the runtime keeps
    * refreshing every registered provider, history keeps accumulating,
@@ -49,6 +55,9 @@ export const DEFAULT_SETTINGS: Settings = {
   // Interruptive behavior is opt-in, matching launchAtStartup: the runtime
   // lane starts disabled until the user turns notifications on.
   quotaNotifications: false,
+  // Reading foreign local databases is strictly opt-in: the collector
+  // must not even probe for the source until the user enables it.
+  usageIntelligence: false,
   providerPreferences: { order: [], hidden: [] },
   quotaPerspective: "used",
 };
@@ -64,6 +73,7 @@ const KNOWN_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "refreshIntervalMinutes",
   "theme",
   "quotaNotifications",
+  "usageIntelligence",
   "providerPreferences",
   "quotaPerspective",
 ]);
@@ -102,6 +112,9 @@ export function parseSettings(raw: unknown): Settings {
   }
   if (typeof record.quotaNotifications === "boolean") {
     settings.quotaNotifications = record.quotaNotifications;
+  }
+  if (typeof record.usageIntelligence === "boolean") {
+    settings.usageIntelligence = record.usageIntelligence;
   }
   settings.providerPreferences = sanitizeProviderPreferences(
     record.providerPreferences,
@@ -153,6 +166,7 @@ export function mergeSettingsWithRaw(
   merged.refreshIntervalMinutes = settings.refreshIntervalMinutes;
   merged.theme = settings.theme;
   merged.quotaNotifications = settings.quotaNotifications;
+  merged.usageIntelligence = settings.usageIntelligence;
   merged.providerPreferences = sanitizeProviderPreferences(
     settings.providerPreferences,
   );

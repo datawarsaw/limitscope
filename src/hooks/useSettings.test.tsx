@@ -67,7 +67,32 @@ describe("useSettings quota notification forwarding", () => {
       JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)
         .quotaNotifications,
     ).toBe(true);
-    expect(mocks.invoke).toHaveBeenCalledTimes(2);
+    const notificationCalls = mocks.invoke.mock.calls.filter(
+      ([command]) => command === "set_quota_notifications_enabled",
+    );
+    expect(notificationCalls).toHaveLength(2);
+  });
+
+  it("forwards the Usage Intelligence opt-in on attach and change", async () => {
+    simulateTauri();
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        "set_usage_intelligence_enabled",
+        { enabled: false },
+      );
+    });
+    act(() => result.current.setUsageIntelligence(true));
+    await waitFor(() => {
+      expect(mocks.invoke).toHaveBeenCalledWith(
+        "set_usage_intelligence_enabled",
+        { enabled: true },
+      );
+    });
+    expect(
+      JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)
+        .usageIntelligence,
+    ).toBe(true);
   });
 
   it("never invokes in the plain-browser dev path", () => {

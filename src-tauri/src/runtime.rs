@@ -83,6 +83,7 @@ use tokio::sync::watch;
 use crate::antigravity::{self, AntigravityError, AntigravityUsage, DataSourceFreshness};
 use crate::history::{QuotaHistoryStore, QuotaObservation};
 use crate::last_good::ProviderLastGoodStore;
+use crate::usage_intelligence::UsageIntelligenceStore;
 use crate::codex::{self, CodexResetCredits, CodexUsage};
 use crate::cursor_grok_bot::{self, GrokBotUsage};
 use crate::diagnostics::{
@@ -303,6 +304,10 @@ pub struct RuntimeSnapshot {
     /// this differs from the revision they last pulled, so the history file
     /// is never broadcast on unchanged cycles.
     pub history_revision: u64,
+    /// Monotonic revision of the Rust-owned Usage Intelligence plane
+    /// (v0.8.9), bumped whenever the token-usage store actually changed.
+    /// Consumers re-pull `get_usage_intelligence` only when this moves.
+    pub usage_intelligence_revision: u64,
 }
 
 // ---------- unified provider failure ----------
@@ -1210,6 +1215,10 @@ pub struct RuntimeCore {
     /// The Rust-owned quota history store, when one is attached (production
     /// always attaches; tests without history leave it off).
     history: Option<Arc<QuotaHistoryStore>>,
+    /// The Rust-owned Usage Intelligence store (v0.8.9 token-usage data
+    /// plane), when one is attached. A parallel plane to history: quota
+    /// percentages vs reported token counts, each with its own store.
+    usage_intelligence: Option<Arc<UsageIntelligenceStore>>,
     /// The threshold notification lane, when one is attached (production
     /// always attaches; tests inject a collecting sink or leave it off).
     notifications: Option<Arc<NotificationLane>>,
@@ -1231,6 +1240,17 @@ impl RuntimeCore {
     /// so tests can keep using `with_injections` unchanged.
     pub fn with_history_store(mut self, store: Option<Arc<QuotaHistoryStore>>) -> Self {
         self.history = store;
+        self
+    }
+
+    /// Attaches the Usage Intelligence store (v0.8.9 token-usage plane).
+    /// Collection is opt-in through the store's persisted flag; an attached
+    /// but disabled store collects nothing and probes nothing.
+    pub fn with_usage_intelligence_store(
+        mut self,
+        store: Option<Arc<UsageIntelligenceStore>>,
+    ) -> Self {
+        self.usage_intelligence = store;
         self
     }
 
@@ -1287,6 +1307,7 @@ impl RuntimeCore {
             retry_delay_ms,
             now,
             history: None,
+            usage_intelligence: None,
             notifications: None,
             last_good_store: None,
         }
@@ -1465,6 +1486,30 @@ impl RuntimeCore {
             let _ = history.record(accepted);
             if confirmation_requested {
                 self.request_confirmation_follow_up();
+            }
+        }
+        // Usage Intelligence (v0.8.9): one opt-in collection pass per
+        // completed cycle, off the async path (the pass is blocking
+        // filesystem work — snapshot copy — awaited here so the snapshot
+        // event that follows already reflects the plane's revision; the
+        // fingerprint skip keeps an idle source at ~zero cost). A disabled
+        // store returns before any probe, and a failure only updates the
+        // plane's own diagnostics — it can never degrade quota-provider
+        // health or the cycle verdict.
+        if let Some(usage_intelligence) = &self.usage_intelligence {
+            if usage_intelligence.enabled() {
+                let store = usage_intelligence.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store
+                        .collecting
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    let outcome = crate::usage_source_zcode::collect(&store);
+                    store
+                        .collecting
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    outcome
+                })
+                .await;
             }
         }
         // Threshold notifications (v0.5 step 4): one evaluation per
@@ -1946,6 +1991,11 @@ impl RuntimeCore {
             .as_ref()
             .map(|store| store.revision())
             .unwrap_or(0);
+        let usage_intelligence_revision = self
+            .usage_intelligence
+            .as_ref()
+            .map(|store| store.revision())
+            .unwrap_or(0);
         let inner = self.inner.lock().unwrap();
         RuntimeSnapshot {
             seq: inner.seq,
@@ -1957,6 +2007,7 @@ impl RuntimeCore {
             cycle_in_flight: inner.cycle_in_flight,
             refresh_interval_minutes: inner.interval_minutes,
             history_revision,
+            usage_intelligence_revision,
         }
     }
 
@@ -2122,6 +2173,10 @@ pub struct RuntimeHandle {
     /// The shared history store; the history commands act on the same store
     /// the runtime records into.
     history: Option<Arc<QuotaHistoryStore>>,
+    /// The shared Usage Intelligence store (v0.8.9 token-usage plane); the
+    /// intelligence commands act on the same store the runtime collects
+    /// into.
+    usage_intelligence: Option<Arc<UsageIntelligenceStore>>,
     /// The threshold notification lane the runtime evaluates; the settings
     /// command acts on the same lane.
     notifications: Option<Arc<NotificationLane>>,
@@ -2191,6 +2246,26 @@ impl RuntimeHandle {
     /// history IPC commands.
     pub fn history_store(&self) -> Option<&Arc<QuotaHistoryStore>> {
         self.history.as_ref()
+    }
+
+    /// The Usage Intelligence store shared with the runtime's collector,
+    /// for the v0.8.9 intelligence IPC commands.
+    pub fn usage_intelligence_store(&self) -> Option<&Arc<UsageIntelligenceStore>> {
+        self.usage_intelligence.as_ref()
+    }
+
+    /// Forwards the Usage Intelligence opt-in to the store (persisted
+    /// there, so the scheduler's startup cycle respects it before any
+    /// webview attaches) and runs exactly one immediate collection pass
+    /// when enabling, so the first baseline does not wait for a cycle.
+    pub fn set_usage_intelligence_enabled(&self, enabled: bool) {
+        if let Some(store) = &self.usage_intelligence {
+            store.set_enabled(enabled);
+            if enabled {
+                let store = store.clone();
+                crate::usage_intelligence::spawn_collection(store);
+            }
+        }
     }
 
     /// The persisted last-good cache shared with the runtime's hydration
@@ -2350,16 +2425,28 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
         .app_data_dir()
         .ok()
         .map(|dir| Arc::new(crate::last_good::ProviderLastGoodStore::open(dir.join(crate::last_good::LAST_GOOD_FILE_NAME))));
+    // Usage Intelligence (v0.8.9): the parallel token-usage data plane,
+    // one bounded JSON file. Collection is opt-in through the store's
+    // persisted flag, so an unresolvable data dir (or a fresh install)
+    // degrades to a runtime without the plane — never a probe, never a
+    // blocked startup.
+    let usage_intelligence = app.path().app_data_dir().ok().map(|dir| {
+        Arc::new(UsageIntelligenceStore::open(
+            dir.join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME),
+        ))
+    });
     let handle = RuntimeHandle {
         core: Arc::new(
             RuntimeCore::new(production_specs(), DEFAULT_INTERVAL_MINUTES)
                 .with_last_good_store(last_good.clone())
                 .with_history_store(history.clone())
+                .with_usage_intelligence_store(usage_intelligence.clone())
                 .with_notification_lane(notifications.clone()),
         ),
         app,
         interval_tx,
         history,
+        usage_intelligence,
         notifications,
         last_good,
     };

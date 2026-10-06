@@ -239,6 +239,7 @@ describe("local data control catalog", () => {
     // every other owned category. No other rows may appear.
     expect(localDataControls(false).map((control) => control.id)).toEqual([
       "usageHistory",
+      "usageIntelligence",
       "providerCache",
       "executionRuns",
       "preferences",
@@ -251,7 +252,9 @@ describe("local data control catalog", () => {
         control.action.toLowerCase(),
       );
       expect(control.confirmTitle.endsWith("?")).toBe(true);
-      expect(control.confirmBody).toMatch(/not affected/);
+      expect(control.confirmBody).toMatch(
+        /not affected|never touched/,
+      );
     }
   });
 

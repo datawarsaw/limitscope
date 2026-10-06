@@ -9,6 +9,7 @@
 //! | Class | Owner | Store | Clear path |
 //! |---|---|---|---|
 //! | Usage history | LimitScope (Rust) | `<app-data>/quota-history-v1.json` | `history::clear_history` -> `QuotaHistoryStore::clear` |
+//! | Usage Intelligence | LimitScope (Rust) | `<app-data>/usage-intelligence-v1.json` | `usage_intelligence::clear_usage_intelligence` -> `UsageIntelligenceStore::clear_owned` |
 //! | Provider cache | LimitScope (Rust) | `<app-data>/provider-last-good-v1.json` | `clear_provider_cache` (this module) |
 //! | Core + floating preferences | LimitScope (WebView) | `rate-limits.settings.v1`, `rate-limits.floating-quota.v1` | `src/lib/localData.ts` via the settings hook |
 //! | Execution runs | LimitScope (WebView) | `limitscope.execution-runs.v1` | `src/lib/localData.ts` via the execution-runs store (active run only behind deliberate confirmation) |

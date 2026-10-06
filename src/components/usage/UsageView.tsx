@@ -5,6 +5,10 @@ import {
   type UsageAnalyticsQuery,
   type UsageAnalyticsRange,
 } from "../../lib/usageAnalytics";
+import {
+  loadUsageIntelligence,
+  type UsageIntelligenceLoader,
+} from "../../lib/usageIntelligence";
 import { useUsageAnalytics } from "../../hooks/useUsageAnalytics";
 import { useDashboardLayout } from "../../hooks/useDashboardLayout";
 import { hasAnyObservation, visibleTrendSeries } from "../../lib/usagePresentation";
@@ -13,6 +17,7 @@ import type { QuotaPerspective } from "../../lib/quotaPresentation";
 import { UsageSummaryStrip } from "./UsageSummaryStrip";
 import { UsageTrendChart } from "./UsageTrendChart";
 import { UsageHeatmap } from "./UsageHeatmap";
+import { TokenUsageSection } from "./TokenUsageSection";
 import type { ProviderUsage } from "../../types";
 
 /**
@@ -33,6 +38,10 @@ export function UsageView({
   historyRevision,
   perspective = "used",
   loader = loadUsageAnalytics,
+  usageIntelligenceEnabled = false,
+  usageIntelligenceRevision = null,
+  usageIntelligenceLoader = loadUsageIntelligence,
+  onOpenSettings,
 }: {
   usages: readonly ProviderUsage[];
   /** Provider the view is scoped to; null means all providers. */
@@ -47,6 +56,14 @@ export function UsageView({
   perspective?: QuotaPerspective;
   /** Injected analytics source (tests, dev fixtures); production default. */
   loader?: UsageAnalyticsLoader;
+  /** The Usage Intelligence opt-in (v0.8.9 token-usage plane). */
+  usageIntelligenceEnabled?: boolean;
+  /** Token-usage store revision from the runtime snapshot. */
+  usageIntelligenceRevision?: number | null;
+  /** Injected intelligence source (tests, dev fixtures). */
+  usageIntelligenceLoader?: UsageIntelligenceLoader;
+  /** Opens the settings drawer (the section's "off" explainer action). */
+  onOpenSettings?: () => void;
 }) {
   const [range, setRange] = useState<UsageAnalyticsRange>("24h");
   const [windowLabel, setWindowLabel] = useState<string | null>(null);
@@ -230,6 +247,14 @@ export function UsageView({
           </p>
         </>
       ) : null}
+
+      <TokenUsageSection
+        enabled={usageIntelligenceEnabled}
+        revision={usageIntelligenceRevision}
+        scopeProviderId={scopeProviderId}
+        loader={usageIntelligenceLoader}
+        onOpenSettings={onOpenSettings}
+      />
     </div>
   );
 }

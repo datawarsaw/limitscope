@@ -55,6 +55,7 @@ vi.mock("./hooks/useProviderUsage", () => ({
     stale: false,
     staleMinutes: 0,
     historyRevision: 1,
+    usageIntelligenceRevision: 0,
   }),
 }));
 

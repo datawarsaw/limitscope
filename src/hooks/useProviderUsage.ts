@@ -131,6 +131,9 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
   // Monotonic revision of the Rust-owned quota history; consumers re-pull
   // `get_history` only when it moves. `null` until the first snapshot.
   const historyRevision = snapshot?.historyRevision ?? null;
+  // Monotonic revision of the Rust-owned Usage Intelligence store (v0.8.9);
+  // consumers re-pull only when it moves.
+  const usageIntelligenceRevision = snapshot?.usageIntelligenceRevision ?? null;
 
   // Data counts as stale after 2 × configured refresh interval without a
   // successful refresh; "min ago" is measured from the last successful
@@ -149,5 +152,6 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
     stale,
     staleMinutes,
     historyRevision,
+    usageIntelligenceRevision,
   };
 }

@@ -57,6 +57,7 @@ function currentSnapshot(): RuntimeSnapshot {
     cycleInFlight: false,
     refreshIntervalMinutes: 5,
     historyRevision: 0,
+    usageIntelligenceRevision: 0,
   };
 }
 

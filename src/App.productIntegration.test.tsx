@@ -34,6 +34,7 @@ import type { ProviderUsage } from "./types";
 const mocks = vi.hoisted(() => ({
   usages: [] as ProviderUsage[],
   historyRevision: 1,
+    usageIntelligenceRevision: 0,
   historyCleared: false,
   refresh: vi.fn(),
 }));
