@@ -16,11 +16,15 @@
 //!
 //! # Ownership and honesty contract
 //!
-//! - The only source in Phase 1 is the ZCode local database
-//!   (`~/.zcode/cli/db/db.sqlite`, table `model_usage`), read strictly
-//!   read-only through a temporary snapshot copy (see
-//!   `usage_source_zcode.rs`). The source files are never opened for
-//!   writing, never checkpointed, never mutated.
+//! - The sources are the ZCode local database (`~/.zcode/cli/db/db.sqlite`,
+//!   table `model_usage`, read strictly read-only through a temporary
+//!   snapshot copy — see `usage_source_zcode.rs`) and, since Phase 2, the
+//!   Codex rollout logs (`~/.codex/sessions/**` and
+//!   `~/.codex/archived_sessions/**`, read strictly read-only with
+//!   per-file byte cursors — see `usage_source_codex.rs`). Source files
+//!   are never opened for writing, never checkpointed, never mutated.
+//!   Each source keeps its own cursor under its own source id; one source
+//!   failing never blocks or hides the other.
 //! - Collection is strictly opt-in. While the persisted `enabled` flag is
 //!   false the collector does not even resolve the source path — no stat,
 //!   no existence probe, no open, no copy, no schema inspection
@@ -106,13 +110,16 @@ pub const USAGE_INTELLIGENCE_CATEGORY: &str = "usageIntelligence";
 /// The stable source id of the ZCode local database reader.
 pub const USAGE_SOURCE_ZCODE: &str = "zcode";
 
+/// The stable source id of the Codex rollout-log reader.
+pub const USAGE_SOURCE_CODEX: &str = "codex";
+
 /// Clock-skew tolerance for source event timestamps: a row completed
 /// further than this in the future is rejected as implausible.
-const EVENT_FUTURE_TOLERANCE_MS: i64 = 5 * 60_000;
+pub(crate) const EVENT_FUTURE_TOLERANCE_MS: i64 = 5 * 60_000;
 
 /// Sanity floor for source event timestamps (2020-01-01): anything older
 /// is treated as an invalid timestamp, not as real history.
-const EVENT_EPOCH_FLOOR_MS: i64 = 1_577_836_800_000;
+pub(crate) const EVENT_EPOCH_FLOOR_MS: i64 = 1_577_836_800_000;
 
 // ---------- event model ----------
 
@@ -270,6 +277,11 @@ pub struct SourceCursor {
     /// Counters of the last scan (accepted / duplicate / rejected rows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_scan: Option<ScanStats>,
+    /// Per-file progress for file-based sources (Codex rollouts today);
+    /// empty for snapshot-based sources like ZCode. Replaced wholesale by
+    /// each applied scan of the owning source.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<SourceFileCursor>,
 }
 
 /// Row-level counters of one scan, for diagnostics.
@@ -284,6 +296,62 @@ pub struct ScanStats {
     pub rejected: usize,
 }
 
+/// Carried attribution state for file-based sources (the Codex reader
+/// today): the most recent turn identities observed in a rollout file, so
+/// a usage record appended after a scan boundary can still join the
+/// `turn_context` of its turn. Bounded — the reader keeps the last N
+/// entries per file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceTurnContext {
+    pub turn_id: String,
+    pub model: String,
+}
+
+/// Per-file progress of a file-based source (the Codex rollout reader
+/// today; field semantics are the Codex reader's). Persisted inside the
+/// owning source's [`SourceCursor`] so a file cursor survives restarts.
+///
+/// Files are foreign-owned append-only logs: the cursor records how far
+/// into each file this plane has read, plus the witnesses needed to
+/// detect truncation and same-path replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceFileCursor {
+    /// Source-relative path with forward slashes (e.g.
+    /// `sessions/2026/10/06/rollout-….jsonl`) — the tracking key.
+    pub path: String,
+    /// Byte offset just past the last fully processed (accepted,
+    /// duplicated, rejected, or deliberately ignored) complete line.
+    /// Never advanced past an incomplete trailing line.
+    pub offset: u64,
+    /// The file's size at the last observation, to detect truncation
+    /// (size < offset fails the scan closed) and skip untouched files.
+    pub size: u64,
+    /// The file's mtime at the last observation, to skip untouched files
+    /// cheaply and to notice same-length rewrites.
+    pub mtime_ms: i64,
+    /// Identity witness read from the file's first line (Codex: the
+    /// `session_meta` id). A file whose witness no longer matches fails
+    /// the scan closed instead of being re-read as "new" content.
+    pub identity: String,
+    /// Source-defined record-format policy witness (Codex: the rollout is
+    /// modern, `session_meta.cli_version >= 0.153.0`, so top-level
+    /// `token_usage_record` lines win and legacy mirrors are ignored).
+    pub modern: bool,
+    /// The file was observed but could not be identified (no parseable
+    /// first-line identity): it is tracked at EOF, never read, and its
+    /// usage is never ingested — the fail-closed direction for foreign or
+    /// malformed files appearing in the source tree.
+    #[serde(default)]
+    pub refused: bool,
+    /// Carried turn contexts (most recent last), seeding attribution for
+    /// records that arrive after the scan that saw their
+    /// `turn_context`. Empty for refused files and fresh baselines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub turns: Vec<SourceTurnContext>,
+}
+
 /// One source reader's successful scan result, applied atomically by the
 /// store.
 #[derive(Debug, Clone)]
@@ -292,6 +360,10 @@ pub struct SourceScan {
     pub fingerprint: Option<SourceFingerprint>,
     pub events: Vec<UsageEvent>,
     pub rejected: usize,
+    /// The full tracked-file state after this scan (file-based sources
+    /// only; empty for the ZCode reader). Replaces the cursor's file
+    /// list wholesale so deletions are reflected.
+    pub files: Vec<SourceFileCursor>,
 }
 
 // ---------- persisted envelope ----------
@@ -329,6 +401,11 @@ struct StoreState {
 /// this machine (treated as source-absent, never an error surface).
 pub type ZcodeDbResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 
+/// Resolves the Codex home directory (`~/.codex` in production; the
+/// rollout trees `sessions/` and `archived_sessions/` live beneath it).
+/// Same injection and disabled-gate rules as [`ZcodeDbResolver`].
+pub type CodexHomeResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
+
 /// The Usage Intelligence store: bounded state behind a small mutex,
 /// persisted to one JSON file, plus the opt-in flag. Locking model: mutate
 /// under the lock, release, then write the file — filesystem I/O never
@@ -338,18 +415,22 @@ pub struct UsageIntelligenceStore {
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
+    codex_home: CodexHomeResolver,
     /// Transient in-flight latch for the "collecting" diagnostic.
     pub(crate) collecting: std::sync::atomic::AtomicBool,
 }
 
 impl UsageIntelligenceStore {
     /// Opens the store at the given app-data path with the production
-    /// ZCode resolver.
+    /// ZCode and Codex resolvers.
     pub fn open(path: PathBuf) -> Self {
         Self::open_with(path, Box::new(epoch_now_ms), production_zcode_db_resolver())
     }
 
-    /// Test constructor with an injectable clock and ZCode resolver.
+    /// Test constructor with an injectable clock and ZCode resolver. The
+    /// Codex home resolver defaults to production; tests that enable the
+    /// store attach their own via [`Self::with_codex_home_resolver`] so
+    /// unit tests never probe the real Codex tree.
     pub fn open_with(
         path: PathBuf,
         now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
@@ -360,10 +441,17 @@ impl UsageIntelligenceStore {
             path,
             now_ms,
             zcode_db,
+            codex_home: production_codex_home_resolver(),
             collecting: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_from_disk();
         store
+    }
+
+    /// Overrides the Codex home resolver (tests, fixtures). Chainable.
+    pub fn with_codex_home_resolver(mut self, resolver: CodexHomeResolver) -> Self {
+        self.codex_home = resolver;
+        self
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -375,6 +463,13 @@ impl UsageIntelligenceStore {
     /// the enabled gate has passed.
     pub(crate) fn zcode_db_resolver(&self) -> &ZcodeDbResolver {
         &self.zcode_db
+    }
+
+    /// The injected Codex home resolver (production: `~/.codex`; tests:
+    /// fixtures). Only the collector may call it — and only after the
+    /// enabled gate has passed.
+    pub(crate) fn codex_home_resolver(&self) -> &CodexHomeResolver {
+        &self.codex_home
     }
 
     /// The persisted opt-in flag. While false, collection must not probe
@@ -492,6 +587,20 @@ impl UsageIntelligenceStore {
         watermark_ms: i64,
         fingerprint: Option<SourceFingerprint>,
     ) {
+        self.establish_baseline_with_files(source, watermark_ms, fingerprint, Vec::new());
+    }
+
+    /// [`Self::establish_baseline`] for file-based sources: the baseline
+    /// also persists the initial per-file cursors (for the Codex reader:
+    /// every existing rollout tracked at its current EOF, zero events
+    /// imported).
+    pub fn establish_baseline_with_files(
+        &self,
+        source: &str,
+        watermark_ms: i64,
+        fingerprint: Option<SourceFingerprint>,
+        files: Vec<SourceFileCursor>,
+    ) {
         let now_ms = self.now_ms();
         let changed = {
             let mut state = self.state.lock().unwrap();
@@ -520,6 +629,7 @@ impl UsageIntelligenceStore {
                             duplicates: 0,
                             rejected: 0,
                         }),
+                        files,
                     },
                 );
                 if state.collection_started_at.is_none() {
@@ -556,6 +666,7 @@ impl UsageIntelligenceStore {
                     detail: None,
                     fingerprint: None,
                     last_scan: None,
+                    files: Vec::new(),
                 }
             });
             if entry.state == state && entry.detail == detail {
@@ -580,7 +691,7 @@ impl UsageIntelligenceStore {
     /// and persists. Returns the applied stats (accepted counts only
     /// newly stored events; duplicates were already present — in the store
     /// or earlier in the same batch).
-    pub fn apply_scan(&self, source: &str, scan: SourceScan) -> ScanStats {
+    pub fn apply_scan(&self, source: &str, mut scan: SourceScan) -> ScanStats {
         let now_ms = self.now_ms();
         let cutoff = now_ms - USAGE_EVENT_RETENTION_MS;
         let mut batch: Vec<UsageEvent> = Vec::new();
@@ -632,6 +743,9 @@ impl UsageIntelligenceStore {
             if let Some(cursor) = state.cursors.get_mut(source) {
                 if cursor.baselined {
                     cursor.watermark_ms = cursor.watermark_ms.max(scan.watermark_ms);
+                    // File-based sources report their full tracked-file
+                    // state; replacing wholesale also reflects deletions.
+                    cursor.files = std::mem::take(&mut scan.files);
                 }
                 cursor.last_observed_at = now_ms;
                 cursor.state = SourceState::Ok;
@@ -921,6 +1035,16 @@ fn production_zcode_db_resolver() -> ZcodeDbResolver {
     })
 }
 
+/// The production Codex home: `~/.codex` (the rollout trees beneath it
+/// are the collector's business). Resolving it is the collector's
+/// business — never called while disabled.
+fn production_codex_home_resolver() -> CodexHomeResolver {
+    Box::new(|| {
+        let home = std::env::home_dir()?;
+        Some(home.join(".codex"))
+    })
+}
+
 /// The derived, wire-facing state of a source: `disabled` and
 /// `collecting` are runtime verdicts; the rest persist.
 fn rendered_source_state(persisted: SourceState, enabled: bool, collecting: bool) -> String {
@@ -1050,6 +1174,17 @@ pub fn collect_zcode(
     crate::usage_source_zcode::collect(store)
 }
 
+/// Runs one collection pass over every source under the single shared
+/// opt-in: ZCode first, then Codex. The sources are isolated — each
+/// updates only its own cursor and diagnostics, so one source failing
+/// never blocks or corrupts the other, and neither failure can reach
+/// quota-provider health. Blocking filesystem work — call from
+/// `spawn_blocking` off the async runtime.
+pub fn run_collection_pass(store: &UsageIntelligenceStore) {
+    let _ = collect_zcode(store);
+    let _ = crate::usage_source_codex::collect(store);
+}
+
 /// Spawns one detached collection pass (used by the runtime cycle and the
 /// enable command). Failures update the store's diagnostics; nothing is
 /// propagated to quota-provider health.
@@ -1061,11 +1196,10 @@ pub fn spawn_collection(store: std::sync::Arc<UsageIntelligenceStore>) {
         store
             .collecting
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let outcome = crate::usage_source_zcode::collect(&store);
+        run_collection_pass(&store);
         store
             .collecting
             .store(false, std::sync::atomic::Ordering::Relaxed);
-        outcome
     });
 }
 
@@ -1251,6 +1385,7 @@ mod tests {
             fingerprint: None,
             rejected: 0,
             events,
+            files: Vec::new(),
         }
     }
 
@@ -1617,5 +1752,71 @@ mod tests {
             crate::usage_source_zcode::ZcodeScanOutcome::Disabled
         ));
         assert_eq!(probes.load(Ordering::SeqCst), 0, "no probe while disabled");
+    }
+
+    // 12. file-based source cursors (Codex) roundtrip through the
+    //     persisted store and survive restarts intact.
+    #[test]
+    fn file_cursors_roundtrip_through_disk() {
+        let (store, dir) = temp_store("file-cursors");
+        let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        store.set_enabled(true);
+        let files = vec![
+            SourceFileCursor {
+                path: "sessions/2026/10/06/rollout-a.jsonl".to_string(),
+                offset: 100,
+                size: 100,
+                mtime_ms: 123,
+                identity: "session-a".to_string(),
+                modern: true,
+                refused: false,
+                turns: Vec::new(),
+            },
+            SourceFileCursor {
+                path: "sessions/2026/10/06/rollout-junk.jsonl".to_string(),
+                offset: 50,
+                size: 50,
+                mtime_ms: 123,
+                identity: String::new(),
+                modern: false,
+                refused: true,
+                turns: Vec::new(),
+            },
+        ];
+        store.establish_baseline_with_files(
+            USAGE_SOURCE_CODEX,
+            NOW_MS - 60_000,
+            None,
+            files.clone(),
+        );
+        drop(store);
+
+        let reopened = UsageIntelligenceStore::open_with(path, fixed_clock(), Box::new(|| None));
+        let cursor = reopened.cursor(USAGE_SOURCE_CODEX).expect("cursor survives");
+        assert!(cursor.baselined);
+        assert_eq!(cursor.files, files, "per-file cursors survive restart");
+        assert_eq!(reopened.collection_started_at(), Some(NOW_MS));
+
+        // A scan from the file-based source replaces the file list
+        // wholesale (reflecting deletions) without disturbing ZCode.
+        let mut updated = files.clone();
+        updated[0].offset = 200;
+        updated[0].size = 200;
+        updated.remove(1); // the junk file was deleted by its owner
+        let stats = reopened.apply_scan(
+            USAGE_SOURCE_CODEX,
+            SourceScan {
+                watermark_ms: NOW_MS - 30_000,
+                fingerprint: None,
+                rejected: 0,
+                events: Vec::new(),
+                files: updated,
+            },
+        );
+        assert_eq!(stats.accepted, 0);
+        let cursor = reopened.cursor(USAGE_SOURCE_CODEX).unwrap();
+        assert_eq!(cursor.files.len(), 1);
+        assert_eq!(cursor.files[0].offset, 200);
+        assert_eq!(reopened.cursor(USAGE_SOURCE_ZCODE), None);
     }
 }

@@ -1490,12 +1490,13 @@ impl RuntimeCore {
         }
         // Usage Intelligence (v0.8.9): one opt-in collection pass per
         // completed cycle, off the async path (the pass is blocking
-        // filesystem work — snapshot copy — awaited here so the snapshot
-        // event that follows already reflects the plane's revision; the
-        // fingerprint skip keeps an idle source at ~zero cost). A disabled
-        // store returns before any probe, and a failure only updates the
-        // plane's own diagnostics — it can never degrade quota-provider
-        // health or the cycle verdict.
+        // filesystem work — snapshot copy, rollout reads — awaited here so
+        // the snapshot event that follows already reflects the plane's
+        // revision). The pass covers every source (ZCode, Codex) under the
+        // single shared opt-in; sources are isolated from each other. A
+        // disabled store returns before any probe, and a failure only
+        // updates the plane's own diagnostics — it can never degrade
+        // quota-provider health or the cycle verdict.
         if let Some(usage_intelligence) = &self.usage_intelligence {
             if usage_intelligence.enabled() {
                 let store = usage_intelligence.clone();
@@ -1503,11 +1504,10 @@ impl RuntimeCore {
                     store
                         .collecting
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                    let outcome = crate::usage_source_zcode::collect(&store);
+                    crate::usage_intelligence::run_collection_pass(&store);
                     store
                         .collecting
                         .store(false, std::sync::atomic::Ordering::Relaxed);
-                    outcome
                 })
                 .await;
             }

@@ -139,6 +139,8 @@ export function cachedTokens(breakdown: {
 /** Display label for the normalized provider axis. */
 export const USAGE_PROVIDER_LABELS: Record<string, string> = {
   zai: "Z.ai (ZCode)",
+  "openai-codex": "OpenAI / Codex",
+  unknown: "Unknown provider",
 };
 
 export function usageProviderLabel(provider: string): string {

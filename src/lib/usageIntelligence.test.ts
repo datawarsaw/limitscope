@@ -37,6 +37,9 @@ describe("usageIntelligence helpers", () => {
 
   it("labels the normalized provider axis", () => {
     expect(usageProviderLabel("zai")).toBe("Z.ai (ZCode)");
+    expect(usageProviderLabel("openai-codex")).toBe("OpenAI / Codex");
+    expect(usageProviderLabel("unknown")).toBe("Unknown provider");
+    expect(usageProviderLabel("xai")).toBe("xai");
     expect(usageProviderLabel("unknown-provider")).toBe("unknown-provider");
   });
 
