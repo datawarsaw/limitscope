@@ -921,6 +921,7 @@ mod tests {
             reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
             fallback_failure: None,
         }
     }
@@ -947,6 +948,7 @@ mod tests {
             reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
             fallback_failure: None,
         }
     }

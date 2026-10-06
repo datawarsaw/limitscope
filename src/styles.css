@@ -2567,3 +2567,16 @@ body {
 .zcode-balance-value {
   font-variant-numeric: tabular-nums;
 }
+
+/* Grok Bot (X Premium+) weekly usage under the Grok (xAI) card: one
+   visually separated, subordinate block below the xAI windows. It reuses
+   the window row vocabulary (.limit-row/.limit-label/.limit-percent/
+   .limit-reset) so the layers read as one system — and stays usable at
+   narrow widths the same way the window rows do — with only the group
+   chrome new here. Its percentage is a separate pool and never merges
+   with the xAI windows above. */
+.grok-bot {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--card-border);
+}
