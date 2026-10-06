@@ -84,6 +84,7 @@ use crate::antigravity::{self, AntigravityError, AntigravityUsage, DataSourceFre
 use crate::history::{QuotaHistoryStore, QuotaObservation};
 use crate::last_good::ProviderLastGoodStore;
 use crate::codex::{self, CodexResetCredits, CodexUsage};
+use crate::cursor_grok_bot::{self, GrokBotUsage};
 use crate::diagnostics::{
     ErrorDiagnosticSource, ProviderDiagnosticSource, RuntimeDiagnosticSource,
 };
@@ -260,6 +261,17 @@ pub struct ProviderUsageDto {
     /// Providers other than Z.ai never set this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zcode_plans: Option<ZCodePlansObservation>,
+    /// Optional Grok Bot (X Premium+) weekly usage observation — a passive,
+    /// Cursor-served supplemental pool that is deliberately separate from the
+    /// xAI billing windows on the same entry: never summed with them, never
+    /// merged into them, and carrying no history or notification identity of
+    /// its own. Present only on the Grok entry when the passive observation
+    /// answered; observed by the ordinary runtime cycle, never hydrated from
+    /// disk, stripped once stale. A failed observation never fails the
+    /// Grok/xAI quota refresh, and the quota windows are never affected by
+    /// it. Providers other than Grok never set this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grok_bot: Option<GrokBotUsage>,
     /// Internal, never serialized (`serde(skip)`): the Antigravity adapter's
     /// structured live-failure cause when a refresh degraded to cached
     /// windows. The success path records it in the diagnostics lane's
@@ -627,6 +639,7 @@ fn base_usage(
         reset_credits: None,
         zcode_reset_cards: None,
         zcode_plans: None,
+        grok_bot: None,
         fallback_failure: None,
     }
 }
@@ -740,6 +753,25 @@ fn trim_stale_zcode_plans(dto: &mut ProviderUsageDto, now: DateTime<Utc>) {
         .is_some_and(|plans| zcode_plans::plans_fresh(&plans.observed_at, now));
     if !fresh {
         dto.zcode_plans = None;
+    }
+}
+
+/// Grok Bot observation freshness guard (Grok only): a retained snapshot may
+/// carry its Grok Bot observation forward only while the observation is
+/// within its TTL (`cursor_grok_bot::OBSERVATION_TTL_SECS`, mirroring the
+/// ZCode plan budget). A stale observation is dropped so a stale Grok Bot
+/// percentage can never linger; the xAI quota windows themselves are
+/// unaffected.
+fn trim_stale_grok_bot(dto: &mut ProviderUsageDto, now: DateTime<Utc>) {
+    if dto.id != ProviderKind::Grok.id() {
+        return;
+    }
+    let fresh = dto
+        .grok_bot
+        .as_ref()
+        .is_some_and(|usage| cursor_grok_bot::usage_fresh(&usage.observed_at, now));
+    if !fresh {
+        dto.grok_bot = None;
     }
 }
 
@@ -932,8 +964,15 @@ fn build_grok_attribution(account: Option<&grok::GrokAccount>) -> Option<Account
     })
 }
 
+/// `grok_bot` arrives independently of the quota result: a failed
+/// supplemental observation (`None`) must never fail or degrade the
+/// Grok/xAI quota refresh, and a failed quota refresh propagates the quota
+/// failure while the supplemental observation is simply dropped for the
+/// cycle (the retained last-good entry keeps serving its still-fresh copy).
+/// The two health domains stay independent by construction.
 fn normalize_grok(
     result: Result<GrokUsage, GrokError>,
+    grok_bot: Option<GrokBotUsage>,
     now_ms: i64,
 ) -> Result<ProviderUsageDto, ProviderFailure> {
     match result {
@@ -948,6 +987,7 @@ fn normalize_grok(
             );
             let mut dto = base_usage(ProviderKind::Grok, ProviderHealth::Live, limits);
             dto.account = build_grok_attribution(usage.account.as_ref());
+            dto.grok_bot = grok_bot;
             Ok(dto)
         }
         Err(error) => Err(failure_from_grok_error(error)),
@@ -1013,7 +1053,16 @@ pub fn production_specs() -> Vec<ProviderSpec> {
             fetch: Arc::new(|| {
                 Box::pin(async {
                     let now_ms = Utc::now().timestamp_millis();
-                    normalize_grok(grok::get_grok_usage().await, now_ms)
+                    // The Grok Bot observation rides the existing Grok job of
+                    // the same cycle (`tokio::join!` runs both on this one
+                    // task — no second scheduler, no extra cycle); its
+                    // failure is consumed independently of the xAI quota
+                    // result and never degrades the provider.
+                    let (usage, grok_bot) = tokio::join!(
+                        grok::get_grok_usage(),
+                        cursor_grok_bot::observe_grok_bot_usage()
+                    );
+                    normalize_grok(usage, grok_bot.ok(), now_ms)
                 })
             }),
         },
@@ -1769,6 +1818,12 @@ impl RuntimeCore {
                     if let Some(last_good) = inner.last_good.get(kind.id()) {
                         let mut retained = last_good.clone();
                         set_health(&mut retained, ProviderHealth::Unknown);
+                        // A Grok Bot observation from this same cycle is
+                        // fresh and belongs on the retained quota snapshot;
+                        // a retained one must not outlive its freshness
+                        // budget either.
+                        retained.grok_bot = dto.grok_bot.take().or(retained.grok_bot);
+                        trim_stale_grok_bot(&mut retained, self.now());
                         return retained;
                     }
                 } else {
@@ -1860,6 +1915,7 @@ impl RuntimeCore {
                 trim_stale_reset_credits(&mut retained, failure_at);
                 trim_stale_zcode_reset_cards(&mut retained, failure_at);
                 trim_stale_zcode_plans(&mut retained, failure_at);
+                trim_stale_grok_bot(&mut retained, failure_at);
                 return retained;
             }
         }
@@ -2483,6 +2539,7 @@ mod tests {
             reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
             fallback_failure: None,
         }
     }
@@ -2877,6 +2934,178 @@ mod tests {
             .expect("quota success must normalize");
         let wire = serde_json::to_string(&bare).unwrap();
         assert!(!wire.contains("zcodePlans"), "wire: {wire}");
+    }
+
+    fn observed_grok_bot(now: chrono::DateTime<chrono::Utc>) -> GrokBotUsage {
+        GrokBotUsage {
+            plan_name: Some("X Premium+".to_string()),
+            plan_id: Some("x-premium-plus".to_string()),
+            cursor_plan_name: Some("Free".to_string()),
+            used_percent: 17.66,
+            period_start: Some("2026-10-04T09:12:03.000Z".to_string()),
+            reset_at: Some("2026-10-11T09:12:03.000Z".to_string()),
+            has_available_usage: Some(true),
+            on_demand_enabled: Some(false),
+            observed_at: now,
+        }
+    }
+
+    /// A fresh xAI weekly-credit quota result per call (`GrokUsage` is not
+    /// `Clone`; the transport error is built literally because the backend's
+    /// constructors are private).
+    fn grok_quota() -> Result<GrokUsage, GrokError> {
+        Ok(GrokUsage {
+            limits: vec![grok::GrokLimitWindow {
+                label: "Weekly credits".to_string(),
+                used_percent: 54.0,
+                reset_at: Some("2026-10-10T13:12:49Z".to_string()),
+            }],
+            account: None,
+        })
+    }
+
+    fn grok_transport_error() -> GrokError {
+        GrokError {
+            code: "network_error".to_string(),
+            message: "offline".to_string(),
+            http_status: None,
+            transient: Some(true),
+            retry_after_ms: None,
+            identity_hint: None,
+            transport_timeout: false,
+        }
+    }
+
+    /// The Grok Bot observation rides the Grok entry without touching the
+    /// xAI windows: same labels, same percentages, one extra supplemental
+    /// field. The two pools stay separate by construction.
+    #[test]
+    fn normalize_grok_carries_grok_bot_observation_without_touching_the_xai_windows() {
+        let quota = Ok(GrokUsage {
+            limits: vec![grok::GrokLimitWindow {
+                label: "Weekly credits".to_string(),
+                used_percent: 54.0,
+                reset_at: Some("2026-10-10T13:12:49Z".to_string()),
+            }],
+            account: None,
+        });
+        let dto = normalize_grok(
+            quota,
+            Some(observed_grok_bot(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        // The xAI windows are exactly as fetched — nothing merged, summed,
+        // or replaced by the supplemental pool.
+        assert_eq!(dto.limits.len(), 1);
+        assert_eq!(dto.limits[0].label, "Weekly credits");
+        assert_eq!(dto.limits[0].used_percent, 54.0);
+        let grok_bot = dto.grok_bot.expect("the observation must ride the entry");
+        assert_eq!(grok_bot.plan_name.as_deref(), Some("X Premium+"));
+        assert!((grok_bot.used_percent - 17.66).abs() < 1e-9);
+        assert_eq!(grok_bot.reset_at.as_deref(), Some("2026-10-11T09:12:03.000Z"));
+    }
+
+    /// Independence (supplemental side): a failed Grok Bot observation
+    /// arrives as `None` and never fails or degrades the Grok/xAI quota
+    /// refresh.
+    #[test]
+    fn grok_bot_observation_failure_never_fails_or_degrades_the_quota_refresh() {
+        let quota = Ok(GrokUsage {
+            limits: vec![grok::GrokLimitWindow {
+                label: "Weekly credits".to_string(),
+                used_percent: 54.0,
+                reset_at: None,
+            }],
+            account: None,
+        });
+        let dto = normalize_grok(quota, None, fixed_now().timestamp_millis())
+            .expect("quota success must normalize regardless of the Grok Bot observation");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.limits.len(), 1);
+        assert_eq!(dto.grok_bot, None);
+    }
+
+    /// Independence (quota side): a failed quota refresh propagates the
+    /// quota verdict even when a fresh Grok Bot observation exists — the
+    /// supplemental pool never stands in for, hides, or overwrites the xAI
+    /// failure semantics.
+    #[test]
+    fn grok_quota_failure_is_not_masked_by_fresh_grok_bot() {
+        let failure = normalize_grok(
+            Err(grok_transport_error()),
+            Some(observed_grok_bot(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .unwrap_err();
+        assert_eq!(failure.code, "network_error");
+        assert_eq!(failure.transient, Some(true));
+    }
+
+    /// The wire contract: the observation carries the server-reported label,
+    /// percentage, and reset; the internal stamp never serializes; a cycle
+    /// without an observation omits the field entirely.
+    #[test]
+    fn grok_bot_wire_keeps_the_server_reported_shape_without_the_internal_stamp() {
+        let quota = Ok(GrokUsage { limits: vec![], account: None });
+        let dto = normalize_grok(
+            quota,
+            Some(observed_grok_bot(fixed_now())),
+            fixed_now().timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        let wire = serde_json::to_string(&dto).unwrap();
+        assert!(wire.contains("\"grokBot\":"), "wire: {wire}");
+        assert!(wire.contains("\"planName\":\"X Premium+\""), "wire: {wire}");
+        assert!(wire.contains("\"planId\":\"x-premium-plus\""), "wire: {wire}");
+        assert!(wire.contains("\"usedPercent\":17.66"), "wire: {wire}");
+        assert!(wire.contains("\"resetAt\":\"2026-10-11T09:12:03.000Z\""), "wire: {wire}");
+        assert!(!wire.contains("observedAt"), "wire: {wire}");
+
+        let bare = normalize_grok(
+            Ok(GrokUsage { limits: vec![], account: None }),
+            None,
+            fixed_now().timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        let wire = serde_json::to_string(&bare).unwrap();
+        assert!(!wire.contains("grokBot"), "wire: {wire}");
+    }
+
+    #[test]
+    fn retained_grok_snapshot_keeps_fresh_grok_bot_and_drops_stale() {
+        let now = fixed_now();
+        let mut fresh = normalize_grok(
+            grok_quota(),
+            Some(observed_grok_bot(now - chrono::Duration::minutes(10))),
+            now.timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        trim_stale_grok_bot(&mut fresh, now);
+        assert!(
+            fresh.grok_bot.is_some(),
+            "fresh Grok Bot observations must survive retention"
+        );
+
+        let mut stale = normalize_grok(
+            grok_quota(),
+            Some(observed_grok_bot(
+                now - chrono::Duration::seconds(cursor_grok_bot::OBSERVATION_TTL_SECS + 60),
+            )),
+            now.timestamp_millis(),
+        )
+        .expect("quota success must normalize");
+        trim_stale_grok_bot(&mut stale, now);
+        assert_eq!(
+            stale.grok_bot, None,
+            "stale Grok Bot percentages must stop reading as current"
+        );
+
+        // The guard is Grok-only: other providers never carry the field.
+        let mut other = ok_usage("zai", "Z.ai", 10.0);
+        trim_stale_grok_bot(&mut other, now);
+        assert_eq!(other.grok_bot, None);
     }
 
     fn counting_spec(
@@ -5383,6 +5612,7 @@ mod tests {
             reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
             fallback_failure: None,
         }
     }

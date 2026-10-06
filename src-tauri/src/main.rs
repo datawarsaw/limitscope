@@ -3,6 +3,7 @@
 
 mod antigravity;
 mod codex;
+mod cursor_grok_bot;
 #[cfg(test)]
 mod diagnostic_report;
 mod diagnostics;

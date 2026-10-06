@@ -108,6 +108,38 @@ export type ZCodePlansObservation = {
 };
 
 /**
+ * Grok Bot (X Premium+) weekly usage observation (Grok entry only).
+ * Mirrors the Rust GrokBotUsage DTO (src-tauri/src/cursor_grok_bot.rs).
+ *
+ * A passive, Cursor-served supplemental pool that is deliberately separate
+ * from the xAI billing windows on the same entry: never summed with them,
+ * never merged into them, and carrying no history or notification identity
+ * of its own. The percentage, reset, and plan label are exactly what the
+ * endpoint reported — no absolute weekly limit or remaining amount is
+ * invented. Refreshed passively by the ordinary runtime cycle; the backend
+ * strips it once stale and never hydrates it from disk.
+ */
+export type GrokBotUsage = {
+  /** The Grok plan label as the endpoint reports it (e.g. "X Premium+"). */
+  planName?: string;
+  /** The stable plan id (e.g. "x-premium-plus"). Diagnostics-grade. */
+  planId?: string;
+  /** The underlying Cursor plan name (e.g. "Free"). */
+  cursorPlanName?: string;
+  /** The weekly usage percentage, as reported. */
+  usedPercent: number;
+  /** RFC-3339 start of the current weekly period, when reported. */
+  periodStart?: string;
+  /** RFC-3339 UTC reset of the current weekly period, when reported. */
+  resetAt?: string;
+  /** The endpoint's own availability verdict, when reported. */
+  hasAvailableUsage?: boolean;
+  /** The endpoint's explicit on-demand `enabled` flag. Absent stays
+   * absent — never assumed true. */
+  onDemandEnabled?: boolean;
+};
+
+/**
  * Freshness of the underlying source data for providers that surface a
  * cached snapshot (e.g. a local quota cache file) instead of a live fetch.
  * Live providers never set it. "stale" also covers an indeterminate
@@ -184,6 +216,10 @@ export type ProviderUsage = {
    * packages beyond the coding plan, with absolute plan-grouped balances.
    * See {@link ZCodePlansObservation}. */
   zcodePlans?: ZCodePlansObservation;
+  /** Grok Bot (X Premium+) weekly usage observation (Grok entry only) — a
+   * passive supplemental pool, independent of the xAI billing windows on
+   * the same entry. See {@link GrokBotUsage}. */
+  grokBot?: GrokBotUsage;
   /** True for deterministic demo providers; they never enter history/prediction. */
   simulated?: boolean;
   /** Legacy status vocabulary, derived in Rust from {@link ProviderUsage.health}

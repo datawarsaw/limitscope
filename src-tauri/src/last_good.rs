@@ -277,6 +277,7 @@ impl ProviderLastGoodStore {
                 reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
                 fallback_failure: None,
             };
 
@@ -513,6 +514,7 @@ mod tests {
             reset_credits: None,
             zcode_reset_cards: None,
             zcode_plans: None,
+            grok_bot: None,
             fallback_failure: None,
         }
     }
@@ -677,6 +679,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn hydrated_state_never_carries_zcode_plan_observations() {
         // ZCode plan observations are fresh-live-observation-only: even a
         // DTO that held plans persists and hydrates without them, so a cold
@@ -732,6 +735,53 @@ mod tests {
         assert_eq!(
             provider.zcode_plans, None,
             "plan observations must be re-observed live, never hydrated"
+        );
+    }
+
+    #[test]
+    fn hydrated_state_never_carries_grok_bot_observations() {
+        // Grok Bot observations are fresh-live-observation-only: even a DTO
+        // that held one persists and hydrates without it, so a cold start
+        // always re-observes before a supplemental percentage reads as
+        // current.
+        use crate::cursor_grok_bot::GrokBotUsage;
+        let dir = tempdir::temp_dir("no-grok-bot-hydration");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now)));
+
+        let mut live = sample_usage(ProviderKind::Grok, 50.0, Some("2026-09-29T16:00:00Z"));
+        live.grok_bot = Some(GrokBotUsage {
+            plan_name: Some("X Premium+".to_string()),
+            plan_id: Some("x-premium-plus".to_string()),
+            cursor_plan_name: Some("Free".to_string()),
+            used_percent: 17.66,
+            period_start: Some("2026-10-04T09:12:03.000Z".to_string()),
+            reset_at: Some("2026-10-11T09:12:03.000Z".to_string()),
+            has_available_usage: Some(true),
+            on_demand_enabled: Some(false),
+            observed_at: fixed_now(),
+        });
+        store.record_success(ProviderKind::Grok, &live);
+
+        let specs = vec![mock_spec(
+            ProviderKind::Grok,
+            Ok(sample_usage(ProviderKind::Grok, 50.0, None)),
+        )];
+
+        let core = RuntimeCore::with_injections(
+            specs,
+            5,
+            Box::new(|| 0),
+            Box::new(fixed_now),
+        )
+        .with_last_good_store(Some(store));
+
+        let snapshot = core.snapshot();
+        let provider = &snapshot.providers[0];
+        assert_eq!(provider.health, ProviderHealth::Stale);
+        assert_eq!(
+            provider.grok_bot, None,
+            "Grok Bot observations must be re-observed live, never hydrated"
         );
     }
 

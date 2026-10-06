@@ -1,5 +1,6 @@
 import { PredictionDetail } from "./PredictionBlocks";
 import { ZCodePlanGroups } from "./ZCodePlanGroups";
+import { GrokBotPanel } from "./GrokBotPanel";
 import { toneFor, usableQuotaWindows } from "../../lib/dashboard";
 import { formatResetLine } from "../../lib/format";
 import { visiblePrediction } from "../../lib/v03Integration";
@@ -53,6 +54,7 @@ export function QuotaWindowList({
         </div>
       )}
       <ZCodePlanGroups usage={usage} now={now} />
+      <GrokBotPanel usage={usage} now={now} />
     </section>
   );
 }
