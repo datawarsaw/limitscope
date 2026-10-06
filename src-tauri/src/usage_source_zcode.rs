@@ -337,6 +337,7 @@ fn collect_from_live(
             fingerprint,
             rejected,
             events,
+            files: Vec::new(),
         },
     );
     ZcodeScanOutcome::Collected {
@@ -1526,7 +1527,8 @@ mod tests {
     }
 
     // 14. the runtime cycle collects an attached, enabled store once per
-    //     cycle — and a disabled store's cycle performs no probe at all.
+    //     cycle — and a disabled store's cycle performs no probe at all
+    //     (for either source).
     #[tokio::test]
     async fn runtime_cycle_collects_enabled_and_never_probes_disabled() {
         use crate::runtime::RuntimeCore;
@@ -1535,9 +1537,15 @@ mod tests {
         let fixed_now = DateTime::<Utc>::from_timestamp_millis(NOW_MS).unwrap();
 
         // Enabled: one cycle baselines the source through the cycle hook.
+        // The Codex home resolver is pointed at an empty temp directory so
+        // the cycle's (Phase 2) Codex pass stays off the real machine.
         let fix = fixture("cycle-enabled");
         insert_completed(&fix.connection, "old");
         let (store, _dir) = store_at("cycle-enabled-store", Some(fix.path()));
+        let codex_dir = tempdir::temp_dir("cycle-enabled-codex");
+        let codex_home = codex_dir.path().to_path_buf();
+        let store = store
+            .with_codex_home_resolver(Box::new(move || Some(codex_home.clone())));
         enable(&store);
         let core = std::sync::Arc::new(
             RuntimeCore::with_injections(
@@ -1566,9 +1574,12 @@ mod tests {
         assert_eq!(cursor.watermark_ms, NOW_MS - 60_000 + 1);
         assert_eq!(reopened.events().len(), 0, "no backlog was imported");
 
-        // Disabled: the cycle performs zero resolver calls.
+        // Disabled: the cycle performs zero resolver calls — for the ZCode
+        // reader and (Phase 2) the Codex reader alike.
         let probes = std::sync::Arc::new(AtomicUsize::new(0));
         let counter = probes.clone();
+        let codex_probes = std::sync::Arc::new(AtomicUsize::new(0));
+        let codex_counter = codex_probes.clone();
         let dir = tempdir::temp_dir("cycle-disabled");
         let disabled = crate::usage_intelligence::UsageIntelligenceStore::open_with(
             dir.path()
@@ -1578,7 +1589,11 @@ mod tests {
                 counter.fetch_add(1, Ordering::SeqCst);
                 None
             }),
-        );
+        )
+        .with_codex_home_resolver(Box::new(move || {
+            codex_counter.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
         let core = std::sync::Arc::new(
             RuntimeCore::with_injections(
                 Vec::new(),
@@ -1593,6 +1608,11 @@ mod tests {
             probes.load(Ordering::SeqCst),
             0,
             "a disabled store is never probed by a cycle"
+        );
+        assert_eq!(
+            codex_probes.load(Ordering::SeqCst),
+            0,
+            "a disabled store never resolves the Codex home either"
         );
     }
 }

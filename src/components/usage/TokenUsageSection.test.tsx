@@ -192,6 +192,72 @@ describe("token usage section", () => {
     }
   });
 
+  it("renders Codex usage as one more provider group in the same table", async () => {
+    const data = intelligence({
+      eventsInRange: 3,
+      groups: [
+        ...withData().groups,
+        {
+          provider: "openai-codex",
+          events: 1,
+          inputTokens: 7089,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 1377,
+          reasoningTokens: 0,
+          totalTokens: 8466,
+          models: [
+            {
+              model: "gpt-5.4",
+              events: 1,
+              inputTokens: 7089,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              outputTokens: 1377,
+              reasoningTokens: 0,
+              totalTokens: 8466,
+            },
+          ],
+        },
+        {
+          provider: "xai",
+          events: 1,
+          inputTokens: 100,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 50,
+          reasoningTokens: 0,
+          totalTokens: 150,
+          models: [
+            {
+              model: "grok-4.6",
+              events: 1,
+              inputTokens: 100,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+              outputTokens: 50,
+              reasoningTokens: 0,
+              totalTokens: 150,
+            },
+          ],
+        },
+      ],
+    });
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => data)}
+      />,
+    );
+    const table = await screen.findByRole("table");
+    // No new view, no Codex-specific card: the same table gains groups.
+    expect(within(table).getByText("Z.ai (ZCode)")).toBeTruthy();
+    expect(within(table).getByText("OpenAI / Codex")).toBeTruthy();
+    expect(within(table).getByText("grok-4.6")).toBeTruthy();
+    expect(within(table).getByText("gpt-5.4")).toBeTruthy();
+  });
+
   it("discloses when collection started and when the range out-reaches it", async () => {
     render(
       <TokenUsageSection
@@ -298,5 +364,36 @@ describe("token usage section", () => {
       />,
     );
     expect(await screen.findByText(/ZCode: collecting · last observed/i)).toBeTruthy();
+  });
+
+  it("reports each source's diagnostics independently", async () => {
+    const data = intelligence({
+      ...withData(),
+      sources: [
+        {
+          source: "zcode",
+          state: "ok",
+          watermarkAt: "2026-10-06T11:55:00.000Z",
+          baselinedAt: "2026-10-04T09:30:00.000Z",
+          lastObservedAt: "2026-10-06T11:55:00.000Z",
+        },
+        {
+          source: "codex",
+          state: "sourceAbsent",
+          watermarkAt: "1970-01-01T00:00:00.000Z",
+          baselinedAt: "1970-01-01T00:00:00.000Z",
+          detail: "the Codex home has no rollout trees",
+        },
+      ],
+    });
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => data)}
+      />,
+    );
+    const sources = await screen.findByText(/ZCode: collecting · last observed/);
+    expect(sources.textContent).toContain("Codex: source not found");
   });
 });

@@ -21,6 +21,7 @@ mod secret_scrub;
 mod usage_analytics;
 mod usage_export;
 mod usage_intelligence;
+mod usage_source_codex;
 mod usage_source_zcode;
 mod zai;
 mod zcode_plans;
