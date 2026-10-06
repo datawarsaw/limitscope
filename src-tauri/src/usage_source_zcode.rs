@@ -207,16 +207,30 @@ fn collect_from_live(
         .map(|cursor| cursor.baselined)
         .unwrap_or(false);
     if !baselined {
-        let max_completed: Option<i64> = connection
-            .query_row(
-                &format!(
-                    "SELECT MAX(completed_at) FROM {USAGE_TABLE} \
-                     WHERE status = 'completed' AND completed_at IS NOT NULL"
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
+        // An empty source (Ok(None)) is a valid zero-history baseline; a
+        // failed query is not. A MAX error must never read as empty and
+        // anchor the baseline at zero — that would admit the whole backlog
+        // as history on the next pass. Fail closed: record ReadFailure,
+        // leave the cursor unbaselined, and let a later pass retry.
+        let max_completed: Option<i64> = match connection.query_row(
+            &format!(
+                "SELECT MAX(completed_at) FROM {USAGE_TABLE} \
+                 WHERE status = 'completed' AND completed_at IS NOT NULL"
+            ),
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(max) => max,
+            Err(error) => {
+                let detail = format!("baseline high-water query failed: {error}");
+                store.mark_source_state(
+                    USAGE_SOURCE_ZCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
+            }
+        };
         let watermark_ms = max_completed.map(|max| max + 1).unwrap_or(0);
         store.establish_baseline(USAGE_SOURCE_ZCODE, watermark_ms, fingerprint);
         return ZcodeScanOutcome::Baseline { watermark_ms };
@@ -706,6 +720,23 @@ mod tests {
         );
     }
 
+    /// A completed row whose `completed_at` is not a millisecond integer.
+    /// SQLite's dynamic column typing accepts it and schema verification
+    /// (names only) still passes, but `MAX(completed_at)` then returns
+    /// TEXT — a deterministic stand-in for any baseline high-water query
+    /// failure.
+    fn insert_corrupt_completed_at(connection: &rusqlite::Connection, id: &str) {
+        connection
+            .execute(
+                "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, \
+                 model_id, status, started_at, completed_at) \
+                 VALUES (?1, ?1, 's', 'account:zai-individual-coding-plan', 'GLM-5.3', \
+                 'completed', 0, 'not-a-timestamp')",
+                rusqlite::params![id],
+            )
+            .unwrap();
+    }
+
     fn store_at(
         tag: &str,
         db: Option<PathBuf>,
@@ -811,6 +842,114 @@ mod tests {
             Some("2026-10-06T12:00:00.000Z")
         );
         assert!(!dto.sources.is_empty());
+    }
+
+    // 3a. a genuinely empty source is a valid zero-history baseline:
+    //      Ok(None) from the high-water query is not an error.
+    #[test]
+    fn empty_database_baselines_at_zero() {
+        let fix = fixture("empty");
+        let (store, _dir) = store_at("empty-store", Some(fix.path()));
+        enable(&store);
+        let outcome = collect(&store);
+        assert_eq!(outcome, ZcodeScanOutcome::Baseline { watermark_ms: 0 });
+        let cursor = store
+            .cursor(USAGE_SOURCE_ZCODE)
+            .expect("the baseline cursor exists");
+        assert!(cursor.baselined);
+        assert_eq!(cursor.watermark_ms, 0);
+        assert_eq!(cursor.baseline_watermark_ms, 0);
+    }
+
+    // 3b. a failed baseline high-water query fails closed: ReadFailure,
+    //      no baseline, no cursor movement, no import — the backlog is
+    //      never admitted as history.
+    #[test]
+    fn baseline_query_failure_fails_closed_without_baselining() {
+        let fix = fixture("baseline-failure");
+        insert_corrupt_completed_at(&fix.connection, "corrupt");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("baseline-failure-store", Some(fix.path()));
+        enable(&store);
+        let outcome = collect(&store);
+        assert!(matches!(outcome, ZcodeScanOutcome::ReadFailure(_)));
+        let cursor = store
+            .cursor(USAGE_SOURCE_ZCODE)
+            .expect("the failure diagnostic exists");
+        assert!(
+            !cursor.baselined,
+            "a failed high-water query must never baseline"
+        );
+        assert_eq!(cursor.state, SourceState::ReadFailure);
+        assert!(
+            store.collection_started_at().is_none(),
+            "no baseline, no disclosure anchor"
+        );
+        assert!(
+            store.events().is_empty(),
+            "no historical row may be imported"
+        );
+    }
+
+    // 3c. after a later successful pass the source baselines at the
+    //      then-current high-water mark and still imports zero historical
+    //      rows; normal incremental accounting resumes.
+    #[test]
+    fn baseline_query_failure_recovers_on_a_later_pass() {
+        let fix = fixture("baseline-recovery");
+        insert_corrupt_completed_at(&fix.connection, "corrupt");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("baseline-recovery-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::ReadFailure(_)
+        ));
+
+        // The corruption is repaired; the remaining row predates the
+        // recovery pass and stays backlog.
+        fix.connection
+            .execute("DELETE FROM model_usage WHERE id = 'corrupt'", [])
+            .unwrap();
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected a baseline on recovery, got {outcome:?}");
+        };
+        assert_eq!(
+            watermark_ms,
+            NOW_MS - 60_000 + 1,
+            "the recovery baseline sits one millisecond above the high-water mark"
+        );
+        assert!(store.events().is_empty(), "still zero historical rows");
+        assert_eq!(store.collection_started_at(), Some(NOW_MS));
+
+        // Normal accounting resumes: a post-baseline row is imported.
+        insert(
+            &fix.connection,
+            "new-1",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 30_000),
+            1_000,
+            500,
+            0,
+            0,
+            0,
+            1_500,
+        );
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Collected {
+            accepted,
+            watermark_ms,
+            ..
+        } = outcome
+        else {
+            panic!("expected a collection after recovery, got {outcome:?}");
+        };
+        assert_eq!(accepted, 1);
+        assert_eq!(watermark_ms, NOW_MS - 30_000);
+        assert_eq!(store.events().len(), 1);
     }
 
     // 4. incremental rows after the baseline are normalized and stored

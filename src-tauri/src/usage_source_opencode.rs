@@ -247,16 +247,30 @@ fn collect_from_live(
         .map(|cursor| cursor.baselined)
         .unwrap_or(false);
     if !baselined {
-        let max_updated: Option<i64> = connection
-            .query_row(
-                &format!(
-                    "SELECT MAX(time_updated) FROM {USAGE_TABLE} \
-                     WHERE json_extract(data, '$.role') = 'assistant'"
-                ),
-                [],
-                |row| row.get(0),
-            )
-            .unwrap_or(None);
+        // An empty source (Ok(None)) is a valid zero-history baseline; a
+        // failed query is not. A MAX error must never read as empty and
+        // anchor the baseline at zero — that would admit the whole backlog
+        // as history on the next pass. Fail closed: record ReadFailure,
+        // leave the cursor unbaselined, and let a later pass retry.
+        let max_updated: Option<i64> = match connection.query_row(
+            &format!(
+                "SELECT MAX(time_updated) FROM {USAGE_TABLE} \
+                 WHERE json_extract(data, '$.role') = 'assistant'"
+            ),
+            [],
+            |row| row.get(0),
+        ) {
+            Ok(max) => max,
+            Err(error) => {
+                let detail = format!("baseline high-water query failed: {error}");
+                store.mark_source_state(
+                    USAGE_SOURCE_OPENCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return OpencodeScanOutcome::ReadFailure(read_failure_detail());
+            }
+        };
         let watermark_ms = max_updated.map(|max| max + 1).unwrap_or(0);
         store.establish_baseline(USAGE_SOURCE_OPENCODE, watermark_ms, fingerprint);
         return OpencodeScanOutcome::Baseline { watermark_ms };
@@ -979,6 +993,24 @@ mod tests {
             .to_string();
             self.insert(id, session, time_updated, time_updated, &data);
         }
+
+        /// An assistant row whose `time_updated` column value is not a
+        /// millisecond integer. SQLite's dynamic column typing accepts it
+        /// and schema verification (names only) still passes, but
+        /// `MAX(time_updated)` then returns TEXT — a deterministic
+        /// stand-in for any baseline high-water query failure.
+        fn insert_corrupt_time_updated(&self, id: &str) {
+            self.connection
+                .execute(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data) \
+                     VALUES (?1, 'ses-corrupt', 0, 'not-a-timestamp', ?2)",
+                    rusqlite::params![
+                        id,
+                        AssistantFixture::completed(NOW_MS - 61 * MIN).json()
+                    ],
+                )
+                .unwrap();
+        }
     }
 
     fn fixture(tag: &str) -> Fixture {
@@ -1121,6 +1153,89 @@ mod tests {
         enable(&store);
         let outcome = collect(&store);
         assert_eq!(outcome, OpencodeScanOutcome::Baseline { watermark_ms: 0 });
+    }
+
+    // 4a. a failed baseline high-water query fails closed: ReadFailure,
+    //      no baseline, no cursor movement, no import — the backlog is
+    //      never admitted as history.
+    #[test]
+    fn baseline_query_failure_fails_closed_without_baselining() {
+        let fix = fixture("baseline-failure");
+        fix.insert_corrupt_time_updated("msg-corrupt");
+        seed_old(&fix);
+        let (store, _dir) = store_at("baseline-failure-store", Some(fix.path()));
+        enable(&store);
+        let outcome = collect(&store);
+        assert!(matches!(outcome, OpencodeScanOutcome::ReadFailure(_)));
+        let cursor = store
+            .cursor(USAGE_SOURCE_OPENCODE)
+            .expect("the failure diagnostic exists");
+        assert!(
+            !cursor.baselined,
+            "a failed high-water query must never baseline"
+        );
+        assert_eq!(cursor.state, SourceState::ReadFailure);
+        assert!(
+            store.collection_started_at().is_none(),
+            "no baseline, no disclosure anchor"
+        );
+        assert!(
+            store.events().is_empty(),
+            "no historical row may be imported"
+        );
+    }
+
+    // 4b. after a later successful pass the source baselines at the
+    //      then-current high-water mark and still imports zero historical
+    //      rows; normal incremental accounting resumes.
+    #[test]
+    fn baseline_query_failure_recovers_on_a_later_pass() {
+        let fix = fixture("baseline-recovery");
+        fix.insert_corrupt_time_updated("msg-corrupt");
+        seed_old(&fix);
+        let (store, _dir) = store_at("baseline-recovery-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::ReadFailure(_)
+        ));
+
+        // The corruption is repaired; the remaining row predates the
+        // recovery pass and stays backlog.
+        fix.connection
+            .execute("DELETE FROM message WHERE id = 'msg-corrupt'", [])
+            .unwrap();
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected a baseline on recovery, got {outcome:?}");
+        };
+        assert_eq!(
+            watermark_ms,
+            NOW_MS - 60 * MIN + 1,
+            "the recovery baseline sits one millisecond above the high-water mark"
+        );
+        assert!(store.events().is_empty(), "still zero historical rows");
+        assert_eq!(store.collection_started_at(), Some(NOW_MS));
+
+        // Normal accounting resumes: a post-baseline row is imported.
+        fix.insert_assistant(
+            "msg-new",
+            "ses-new",
+            NOW_MS - 30 * MIN,
+            &AssistantFixture::completed(NOW_MS - 34 * MIN),
+        );
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Collected {
+            accepted,
+            watermark_ms,
+            ..
+        } = outcome
+        else {
+            panic!("expected a collection after recovery, got {outcome:?}");
+        };
+        assert_eq!(accepted, 1);
+        assert_eq!(watermark_ms, NOW_MS - 30 * MIN);
+        assert_eq!(store.events().len(), 1);
     }
 
     // 5. incremental rows after the baseline are normalized with the

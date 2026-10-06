@@ -105,6 +105,25 @@ beforeEach(() => {
   vi.spyOn(console, "error").mockImplementation(() => {});
 });
 
+/**
+ * Pins the locale that `Intl.DateTimeFormat(undefined, …)` resolves to for
+ * the duration of one test (and pins the zone to UTC, so the fixture
+ * timestamps render the same day in any host timezone). The product
+ * defers to the ambient locale, so the exact-string disclosure assertions
+ * must hold under both a day-first locale (en-GB) and a month-first one
+ * (en-US, the CI environment).
+ */
+function pinDateTimeFormat(locale: string): void {
+  const PinnedDateTimeFormat = Intl.DateTimeFormat;
+  vi.spyOn(Intl, "DateTimeFormat").mockImplementation(
+    ((_ignoredLocale: unknown, options?: Intl.DateTimeFormatOptions) =>
+      new PinnedDateTimeFormat(locale, {
+        ...options,
+        timeZone: "UTC",
+      })) as unknown as typeof Intl.DateTimeFormat,
+  );
+}
+
 describe("token usage section", () => {
   it("renders the off explainer and never queries while disabled", () => {
     const loader = vi.fn();
@@ -124,7 +143,10 @@ describe("token usage section", () => {
     expect(
       await screen.findByText("No locally collected token usage yet."),
     ).toBeTruthy();
-    expect(screen.getByText(/Collection started \d{1,2} \w+ \d{4}/i)).toBeTruthy();
+    // Locale-independent: the product defers to the ambient locale, and
+    // CI (en-US) renders month-first, so only the year is asserted here;
+    // the exact day-first and month-first strings are pinned below.
+    expect(screen.getByText(/Collection started .*2026/i)).toBeTruthy();
     expect(screen.getByText(/new requests appear here as they complete/i)).toBeTruthy();
   });
 
@@ -267,7 +289,7 @@ describe("token usage section", () => {
       />,
     );
     expect(
-      await screen.findByText(/Reported token usage collected locally since \d{1,2} \w+ \d{4}/i),
+      await screen.findByText(/Reported token usage collected locally since .*2026/i),
     ).toBeTruthy();
 
     cleanup();
@@ -297,6 +319,62 @@ describe("token usage section", () => {
     );
     expect(
       await screen.findByText(/less history than the Today range/i),
+    ).toBeTruthy();
+  });
+
+  it("renders the collection-start date day-first under a pinned en-GB locale", async () => {
+    pinDateTimeFormat("en-GB");
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => withData())}
+      />,
+    );
+    expect(
+      await screen.findByText("Reported token usage collected locally since 4 Oct 2026"),
+    ).toBeTruthy();
+    cleanup();
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => intelligence())}
+      />,
+    );
+    expect(
+      await screen.findByText(
+        "Collection started 4 Oct 2026; new requests appear here as they complete.",
+      ),
+    ).toBeTruthy();
+  });
+
+  it("renders the collection-start date month-first under a pinned en-US locale", async () => {
+    // The CI environment (en-US) renders month-first; the same disclosures
+    // must pass there without a day-first assumption.
+    pinDateTimeFormat("en-US");
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => withData())}
+      />,
+    );
+    expect(
+      await screen.findByText("Reported token usage collected locally since Oct 4, 2026"),
+    ).toBeTruthy();
+    cleanup();
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => intelligence())}
+      />,
+    );
+    expect(
+      await screen.findByText(
+        "Collection started Oct 4, 2026; new requests appear here as they complete.",
+      ),
     ).toBeTruthy();
   });
 
