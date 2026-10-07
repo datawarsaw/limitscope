@@ -98,9 +98,12 @@ One invocation reports all five production providers in canonical registry
 order (`openai-codex`, `zai`, `opencode-go`, `antigravity`, `grok`) through
 the real production fetch paths, redacted by construction and secret-scanned
 (schema and boundaries: `docs/provider-diagnostic-v0.6.md`). The filled table
-is part of the release's own evidence: record it with the RC record and carry
-it into the delivery record (the existing `Provider diagnostic` row in
-`state/project-state.md`). Template:
+is part of the release's own evidence: the dated PASS / FAIL / UNVERIFIED rows
+must remain part of the release evidence / closeout record used for that
+delivery. That record is repository-independent — keep the evidence wherever
+the delivery keeps its release record (for example the delivery report or the
+published GitHub Release notes); no specific ledger file in this repository is
+mandatory. Template:
 
 | Provider | Checked at | Result | Evidence | Note |
 | --- | --- | --- | --- | --- |
@@ -199,8 +202,25 @@ Diagnostic secret scan: PASS (no credential-shaped material in the output).
 
 ## Phase 5 — Closeout
 
-- Update `state/project-state.md` with the v0.8 delivery record; mark the RC
-  worktree/branch as archive candidates (v0.6 pattern).
+- A delivery is considered closed only when its release evidence is verified,
+  including as applicable:
+  - the canonical release commit on `main`;
+  - the annotated tag bound to that commit;
+  - a successful `release.yml` run at that commit;
+  - the published companion GitHub Release in `datawarsaw/limitscope-releases`;
+  - the artifact manifest/source-SHA binding (the run manifest matching the
+    published installer's SHA-256/size);
+  - the updater metadata (`latest.json`) serving that release;
+  - signature/trust-root verification of the published installer;
+  - updater transition verification where this runbook requires it;
+  - the dated provider-verification evidence where this runbook requires it.
+  `scripts/verify-release-integrity.mjs` (`docs/release-integrity-verifier.md`)
+  automates most of these provenance checks.
+- There is no mandatory post-release `state/project-state.md` commit, and no
+  post-release commit is required merely to duplicate GitHub release
+  provenance: verified release provenance is the closeout truth.
+- Mark the RC worktree/branch as archive candidates (v0.6 pattern);
+  archive/worktree cleanup is a separate housekeeping action.
 - Rollback / key-compromise procedures: `docs/updater-production.md`
   (corrective `v0.8.1` release path; `latest.json` repoint).
 
