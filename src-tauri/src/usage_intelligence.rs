@@ -1249,11 +1249,17 @@ pub fn run_collection_pass(store: &UsageIntelligenceStore) {
 /// Spawns one detached collection pass (used by the runtime cycle and the
 /// enable command). Failures update the store's diagnostics; nothing is
 /// propagated to quota-provider health.
+///
+/// The spawn must go through `tauri::async_runtime`, not `tokio::task`:
+/// the enable command is synchronous and runs on the WebView2 IPC callback
+/// thread with no entered Tokio runtime, where `tokio::task::spawn_blocking`
+/// panics ("there is no reactor running") and the unwind aborts the whole
+/// process across the FFI boundary.
 pub fn spawn_collection(store: std::sync::Arc<UsageIntelligenceStore>) {
     if !store.enabled() {
         return;
     }
-    let _ = tokio::task::spawn_blocking(move || {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
         store
             .collecting
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1881,5 +1887,66 @@ mod tests {
         assert_eq!(cursor.files.len(), 1);
         assert_eq!(cursor.files[0].offset, 200);
         assert_eq!(reopened.cursor(USAGE_SOURCE_ZCODE), None);
+    }
+
+    // 13. regression (v0.8.9 crash): the enable path spawns the first
+    //     collection pass from the synchronous Tauri command — a plain IPC
+    //     callback thread with no entered Tokio runtime. The 0.8.9
+    //     implementation used `tokio::task::spawn_blocking`, which panics
+    //     in exactly that context ("there is no reactor running"), and the
+    //     unwind across the FFI boundary aborted the whole process. The
+    //     runtime bridge (`tauri::async_runtime::spawn_blocking`, which
+    //     lazily initializes and uses the app-global runtime) must survive
+    //     the same context, and the detached pass must run to completion.
+    #[test]
+    fn spawn_collection_survives_plain_thread_without_tokio_runtime() {
+        let (store, _dir) = temp_store("spawn_plain_thread");
+        // Absent resolvers for every source: the pass never probes a real
+        // tree, and on completion it marks all three sources sourceAbsent
+        // — a deterministic completion signal for the detached pass.
+        let store = std::sync::Arc::new(
+            store
+                .with_codex_home_resolver(Box::new(|| None))
+                .with_opencode_db_resolver(Box::new(|| None)),
+        );
+        store.set_enabled(true);
+
+        // The enable command executes on a plain thread outside any Tokio
+        // runtime; reproduce exactly that context. The join asserts the
+        // call itself does not panic — on the 0.8.9 code it surfaces the
+        // "no reactor running" panic as a test failure instead of letting
+        // it abort the test process.
+        let handle = std::thread::spawn({
+            let store = store.clone();
+            move || spawn_collection(store)
+        });
+        handle
+            .join()
+            .expect("spawn_collection must not panic on a thread with no Tokio runtime");
+
+        // The pass is detached: wait (bounded) for it to finish rather
+        // than assuming it, via the only state a fully-absent pass leaves
+        // behind — every source reporting sourceAbsent.
+        let sources = [
+            USAGE_SOURCE_ZCODE,
+            USAGE_SOURCE_CODEX,
+            USAGE_SOURCE_OPENCODE,
+        ];
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let all_absent = sources.iter().all(|source| {
+                store
+                    .cursor(source)
+                    .is_some_and(|cursor| cursor.state == SourceState::SourceAbsent)
+            });
+            if all_absent {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the detached collection pass never completed (no sourceAbsent diagnostics)"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 }
