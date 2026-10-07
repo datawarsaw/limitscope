@@ -1,6 +1,6 @@
 [package]
 name = "rate-limits"
-version = "0.8.9"
+version = "0.8.10"
 description = "Local-first Windows tray dashboard for AI provider quota usage"
 license = "MIT"
 repository = "https://github.com/datawarsaw/limitscope"
