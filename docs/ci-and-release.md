@@ -95,6 +95,16 @@ vitest suites are offline unit tests and run everywhere.
 - **`scripts/*.ps1` are manual workstation helpers** (screenshot/tray
   automation against a running app). CI never invokes them.
 
+## Repository boundaries
+
+- `datawarsaw/limitscope` is the canonical source repository: active product
+  development and release source happen here.
+- `datawarsaw/limitscope-releases` is the public updater/distribution
+  companion: it hosts published installers, signatures, and `latest.json`
+  only; no product source lives there.
+- `datawarsaw/rate-limits` is legacy/historical and must not be used for new
+  product mutations.
+
 ## Release policy
 
 CI produces unsigned installer artifacts only. Releases remain a manual
@@ -103,6 +113,8 @@ process — the last executed release runbook is
 `docs/release-runbook-v0.8.0.md` with the updater architecture in
 `docs/updater-production.md`; each delivery under that runbook records the
 dated per-provider live verification gate (PASS / FAIL / UNVERIFIED) defined
-in its gate section. Do not add release publishing, tag pushing, or
-signing to this workflow without explicitly revisiting that policy and the
-required secrets.
+in its gate section. Release closeout is verified GitHub release provenance
+(release commit, tag, workflow run, published companion release — see the
+v0.8 runbook's Phase 5); this repository keeps no separate post-release state
+ledger. Do not add release publishing, tag pushing, or signing to this
+workflow without explicitly revisiting that policy and the required secrets.
