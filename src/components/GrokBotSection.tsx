@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { formatAge, formatTime } from "../lib/format";
 import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
 import { floatingQuotaPresentation, quotaColorLevel } from "../lib/quotaPresentation";
@@ -7,6 +7,7 @@ import {
   grokBotRemainingPercent,
   grokBotStatusMessage,
   refreshGrokBotUsage,
+  type GrokBotReading,
 } from "../lib/grokBotManual";
 
 /**
@@ -18,18 +19,37 @@ export function GrokBotSection({ now }: { now: Date }) {
   const [result, setResult] = useState<Awaited<ReturnType<typeof refreshGrokBotUsage>> | null>(
     null,
   );
+  const [lastSuccess, setLastSuccess] = useState<GrokBotReading | null>(null);
   const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const resultRef = useRef(result);
+  resultRef.current = result;
 
   const refresh = useCallback(() => {
-    if (busy) return;
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
-    refreshGrokBotUsage()
-      .then(setResult)
-      .finally(() => setBusy(false));
-  }, [busy]);
+    const previous = resultRef.current;
+    refreshGrokBotUsage(previous)
+      .then((next) => {
+        setResult(next);
+        if (next.status === "ok" && typeof next.usedPercent === "number") {
+          setLastSuccess({
+            observedAt: next.observedAt,
+            usedPercent: next.usedPercent,
+            resetText: next.resetText,
+            appVersion: next.appVersion,
+          });
+        }
+      })
+      .finally(() => {
+        busyRef.current = false;
+        setBusy(false);
+      });
+  }, []);
 
   const effective = grokBotEffectiveReading(result);
-  const reading = effective.reading;
+  const reading = effective.reading ?? lastSuccess;
   // The displayed value is the remaining quota derived from the verified
   // used percentage; when that derivation has nothing valid to work from,
   // the section shows no value rather than a fabricated 0%.
@@ -39,7 +59,7 @@ export function GrokBotSection({ now }: { now: Date }) {
       ? floatingQuotaPresentation(reading.usedPercent, FLOATING_QUOTA_PERSPECTIVE)
       : null;
   const message = grokBotStatusMessage(result);
-  const stale = effective.source === "last-known";
+  const stale = reading !== null && effective.source !== "fresh";
 
   return (
     <section className="fq-grokbot" aria-label="Grok Bot usage">
@@ -49,7 +69,8 @@ export function GrokBotSection({ now }: { now: Date }) {
           type="button"
           className="fq-grokbot-refresh"
           onClick={refresh}
-          disabled={busy}
+          aria-disabled={busy ? true : undefined}
+          aria-busy={busy ? true : undefined}
           aria-label="Refresh Grok Bot usage"
         >
           {busy ? "Refreshing…" : "Refresh"}

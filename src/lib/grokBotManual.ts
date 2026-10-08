@@ -28,14 +28,45 @@ export interface GrokBotRefreshResult extends GrokBotReading {
  * The one explicit acquisition entry point. Transport failures (and non-
  * Tauri contexts such as the dev browser) surface as an `unknown` attempt —
  * the reading contract has no error branch that could masquerade as data.
+ * Pass the previous attempt so a rejected invoke keeps that reading and its
+ * original observation stamp instead of inventing a new one.
  */
-export async function refreshGrokBotUsage(): Promise<GrokBotRefreshResult> {
+export async function refreshGrokBotUsage(
+  previous?: GrokBotRefreshResult | null,
+): Promise<GrokBotRefreshResult> {
   try {
     return await invoke<GrokBotRefreshResult>("refresh_grok_bot_usage");
   } catch (error) {
     console.warn("grok bot refresh unavailable", error);
-    return { status: "unknown", observedAt: new Date().toISOString() };
+    const lastKnown = grokBotPreservedReading(previous);
+    return {
+      status: "unknown",
+      observedAt: new Date().toISOString(),
+      ...(lastKnown ? { lastKnown } : {}),
+    };
   }
+}
+
+/** Reading fields only, so a transport failure cannot nest a whole attempt. */
+function copyReading(reading: GrokBotReading): GrokBotReading {
+  return {
+    observedAt: reading.observedAt,
+    ...(reading.usedPercent !== undefined ? { usedPercent: reading.usedPercent } : {}),
+    ...(reading.resetText !== undefined ? { resetText: reading.resetText } : {}),
+    ...(reading.appVersion !== undefined ? { appVersion: reading.appVersion } : {}),
+  };
+}
+
+/**
+ * The reading a failed transport call must keep. A fresh success contributes
+ * its own stamp; a later failure contributes the retained last-known stamp,
+ * never the failure's own timestamp.
+ */
+export function grokBotPreservedReading(
+  previous: GrokBotRefreshResult | null | undefined,
+): GrokBotReading | undefined {
+  const reading = grokBotEffectiveReading(previous ?? null).reading;
+  return reading ? copyReading(reading) : undefined;
 }
 
 /**

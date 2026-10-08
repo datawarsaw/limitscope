@@ -2,9 +2,10 @@
 //!
 //! Grok Bot (the xAI desktop app) exposes its Usage & Billing screen through
 //! the standard Windows accessibility tree: a semantic settings-panel anchor
-//! (`sand-settings-panel-usage`), a Weekly usage progress bar carrying an
-//! exact `RangeValuePattern` percentage, and day-granularity reset text such
-//! as "Resets in 3 days" (verified live, PoC B1, on app versions 0.66.0 and
+//! (`sand-settings-panel-usage`), one unambiguously identified Weekly usage
+//! progress bar carrying an exact `RangeValuePattern` percentage, and that
+//! section's own day-granularity reset text such as "Resets in 3 days"
+//! (verified live, PoC B1, on app versions 0.66.0 and
 //! 0.68.1; reads succeed foreground and background at roughly 26–41 ms).
 //!
 //! Contract — manual and read-only, by design:
@@ -30,7 +31,9 @@
 //!   touches no Grok Bot files and makes no network requests;
 //! - the scan runs on a dedicated background thread with a hard watchdog
 //!   (`SCAN_TIMEOUT_MS`), never on the UI thread, and the async runtime is
-//!   never blocked by it;
+//!   never blocked by it. The watchdog returns without waiting, but the
+//!   single-flight slot stays taken until that worker actually finishes, so
+//!   a later refresh cannot start a second accessibility walk;
 //! - the last successful reading is retained in memory (process-local,
 //!   never persisted) and returned alongside a failed attempt, so the UI can
 //!   show it clearly marked as last known. A failed attempt never overwrites
@@ -41,7 +44,11 @@
 //! not, the command answers `not_running` / `screen_not_visible` instead of
 //! reaching for the app.
 
-use std::sync::{Mutex, OnceLock};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
@@ -75,8 +82,8 @@ const MAX_WINDOWS: usize = 4;
 
 // ---------- wire contract (camelCase on the wire, status snake_case) ----------
 
-/// Outcome of one observation attempt. `ok` means the panel was found and at
-/// least one of the weekly values was read.
+/// Outcome of one observation attempt. `ok` means Weekly usage was identified
+/// unambiguously and its used percentage was read. Reset text is optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GrokBotStatus {
@@ -263,21 +270,231 @@ fn last_known() -> &'static Mutex<Option<GrokBotSnapshot>> {
     LAST_KNOWN.get_or_init(|| Mutex::new(None))
 }
 
-/// Retention core (pure, testable): a successful reading replaces the cache;
-/// a failed attempt leaves it untouched. The cache is cleared only when a
-/// successful scan reads nothing at all, which cannot happen today (`ok`
-/// requires at least one value) — kept explicit so the invariant survives
-/// future edits.
+/// Retention core (pure, testable): a successful weekly percentage replaces
+/// the cache. A failed attempt, and a partial fragment that has no used
+/// percentage, leaves the cache untouched.
 fn retain_reading(
     cache: &mut Option<GrokBotSnapshot>,
     outcome: &ScanOutcome,
 ) -> Option<GrokBotSnapshot> {
     if outcome.status == GrokBotStatus::Ok {
         if let Some(snapshot) = outcome.snapshot.clone() {
-            *cache = Some(snapshot);
+            if snapshot.used_percent.is_some() {
+                *cache = Some(snapshot);
+            }
         }
     }
     cache.clone()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelNodeKind {
+    Progress,
+    Text,
+}
+
+/// One accessibility node inside the Usage & Billing panel, in tree order.
+#[derive(Debug, Clone, PartialEq)]
+struct PanelNode {
+    kind: PanelNodeKind,
+    name: String,
+    /// Sanitized used percentage for a progress bar. Text nodes leave this empty.
+    percent: Option<f64>,
+}
+
+/// Weekly used percentage plus the reset line that belongs to that section.
+/// No percentage means the section was missing, ambiguous, or reset-only.
+/// No reset text, with a percentage, means the reset line was genuinely absent.
+#[derive(Debug, Clone, PartialEq)]
+struct WeeklyReading {
+    used_percent: Option<f64>,
+    reset_text: Option<String>,
+}
+
+fn normalized_label(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn is_weekly_usage_label(name: &str) -> bool {
+    normalized_label(name).contains("weekly usage")
+}
+
+fn is_heading_text(name: &str) -> bool {
+    !name.trim().is_empty() && sanitize_reset_text(name).is_none()
+}
+
+/// Another usage section. Percentage captions and prose stay in the current
+/// section; only a different "... usage" heading closes it.
+fn is_other_section_heading(name: &str) -> bool {
+    if !is_heading_text(name) || is_weekly_usage_label(name) {
+        return false;
+    }
+    normalized_label(name).contains("usage")
+}
+
+/// Binds the used percentage and the reset line to Weekly usage.
+///
+/// An unnamed or non-weekly progress bar is never a fallback. Zero or several
+/// Weekly usage bars is ambiguous and yields no percentage. Reset text is
+/// taken only from the span after that bar and before the next usage section.
+/// The line is copied verbatim and is never turned into a timestamp.
+fn select_weekly_reading(nodes: &[PanelNode]) -> WeeklyReading {
+    let none = WeeklyReading {
+        used_percent: None,
+        reset_text: None,
+    };
+    let bar_positions: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter_map(|(index, node)| (node.kind == PanelNodeKind::Progress).then_some(index))
+        .collect();
+    if bar_positions.is_empty() {
+        return none;
+    }
+
+    let mut candidates = Vec::new();
+    for (ordinal, &pos) in bar_positions.iter().enumerate() {
+        if is_weekly_usage_label(&nodes[pos].name) {
+            candidates.push(ordinal);
+            continue;
+        }
+        let window_start = if ordinal == 0 {
+            0
+        } else {
+            bar_positions[ordinal - 1] + 1
+        };
+        let heading_offset = nodes[window_start..pos]
+            .iter()
+            .rposition(|node| node.kind == PanelNodeKind::Text && is_heading_text(&node.name));
+        let Some(offset) = heading_offset else {
+            continue;
+        };
+        let heading_pos = window_start + offset;
+        if !is_weekly_usage_label(&nodes[heading_pos].name) {
+            continue;
+        }
+        let next_heading = nodes[pos + 1..]
+            .iter()
+            .position(|node| {
+                node.kind == PanelNodeKind::Text && is_other_section_heading(&node.name)
+            })
+            .map(|offset| pos + 1 + offset)
+            .unwrap_or(nodes.len());
+        let bars_under_heading = bar_positions
+            .iter()
+            .filter(|&&bar| bar > heading_pos && bar < next_heading)
+            .count();
+        if bars_under_heading == 1 {
+            candidates.push(ordinal);
+        }
+    }
+
+    if candidates.len() != 1 {
+        return none;
+    }
+    let pos = bar_positions[candidates[0]];
+    let Some(used_percent) = nodes[pos].percent else {
+        return none;
+    };
+
+    let next_boundary = nodes[pos + 1..]
+        .iter()
+        .position(|node| {
+            node.kind == PanelNodeKind::Progress
+                || (node.kind == PanelNodeKind::Text && is_other_section_heading(&node.name))
+        })
+        .map(|offset| pos + 1 + offset)
+        .unwrap_or(nodes.len());
+    let mut resets = Vec::new();
+    for node in &nodes[pos + 1..next_boundary] {
+        if let Some(reset) = sanitize_reset_text(&node.name) {
+            resets.push(reset);
+        }
+    }
+    WeeklyReading {
+        used_percent: Some(used_percent),
+        reset_text: if resets.len() == 1 {
+            resets.pop()
+        } else {
+            None
+        },
+    }
+}
+
+/// How far one running Grok Bot window got before Weekly usage was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowTree {
+    /// ElementFromHandle failed, so this window produced no accessibility tree.
+    Unavailable,
+    /// A tree was obtained and the usage panel was not in it.
+    UsageAbsent,
+}
+
+/// Classifies a scan that did not read Weekly usage.
+///
+/// No windows means the process is absent. A tree without the usage panel
+/// means Grok Bot is running and that screen is not showing. Failure to
+/// obtain any tree is unknown, not a missing screen.
+fn classify_window_trees(trees: &[WindowTree]) -> ScanOutcome {
+    if trees.is_empty() {
+        return ScanOutcome::not_running();
+    }
+    if trees
+        .iter()
+        .any(|tree| matches!(tree, WindowTree::UsageAbsent))
+    {
+        return ScanOutcome::screen_not_visible();
+    }
+    ScanOutcome::unknown()
+}
+
+fn scan_slot() -> &'static Arc<AtomicBool> {
+    static SLOT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(AtomicBool::new(false)))
+}
+
+struct SlotRelease(Arc<AtomicBool>);
+
+impl Drop for SlotRelease {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Runs body on one dedicated thread. A second call while that thread is
+/// still inside body does not start another one, including after this
+/// caller's timeout. The slot is released only when the worker returns.
+fn run_single_flight<F>(slot: &Arc<AtomicBool>, timeout: Duration, body: F) -> ScanOutcome
+where
+    F: FnOnce() -> ScanOutcome + Send + 'static,
+{
+    if slot
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return ScanOutcome::unknown();
+    }
+    let (tx, rx) = mpsc::channel();
+    let slot_for_worker = Arc::clone(slot);
+    let spawned = thread::Builder::new()
+        .name("grok-bot-uia-read".to_string())
+        .spawn(move || {
+            let _release = SlotRelease(slot_for_worker);
+            let outcome =
+                catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| ScanOutcome::unknown());
+            let _ = tx.send(outcome);
+        });
+    if spawned.is_err() {
+        slot.store(false, Ordering::Release);
+        return ScanOutcome::unknown();
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(outcome) => outcome,
+        Err(_) => ScanOutcome::unknown(),
+    }
 }
 
 // ---------- the one command: explicit, user-triggered only ----------
@@ -331,14 +548,12 @@ fn perform_scan() -> ScanOutcome {
 #[cfg(windows)]
 mod native {
     use std::mem::ManuallyDrop;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
-    use std::sync::mpsc;
-    use std::thread;
     use std::time::Duration;
 
     use super::{
-        parse_percent_from_name, sanitize_app_version, sanitize_reset_text, sanitize_used_percent,
-        wire_stamp, GrokBotSnapshot, ScanOutcome, GROK_BOT_EXE_NAMES, MAX_PROGRESS_BARS,
+        classify_window_trees, parse_percent_from_name, run_single_flight, sanitize_app_version,
+        sanitize_used_percent, scan_slot, select_weekly_reading, wire_stamp, GrokBotSnapshot,
+        PanelNode, PanelNodeKind, ScanOutcome, WindowTree, GROK_BOT_EXE_NAMES, MAX_PROGRESS_BARS,
         MAX_TEXT_ELEMENTS, MAX_WINDOWS, SCAN_TIMEOUT_MS, USAGE_PANEL_AUTOMATION_ID,
     };
     use chrono::Utc;
@@ -359,39 +574,33 @@ mod native {
     use windows::Win32::System::Variant::{VariantClear, VariantInit, VT_BSTR, VT_I4};
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationCondition, IUIAutomationElement,
-        IUIAutomationElementArray, IUIAutomationRangeValuePattern, TreeScope_Descendants,
-        UIA_AutomationIdPropertyId, UIA_ControlTypePropertyId, UIA_ProgressBarControlTypeId,
-        UIA_RangeValuePatternId, UIA_TextControlTypeId, UIA_PROPERTY_ID,
+        IUIAutomationRangeValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+        UIA_ControlTypePropertyId, UIA_ProgressBarControlTypeId, UIA_RangeValuePatternId,
+        UIA_TextControlTypeId, UIA_PROPERTY_ID,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, IsWindowVisible,
     };
 
     /// The scan runs on its own short-lived thread so COM apartment state,
-    /// UIA handles, and any stall stay contained; the caller waits under the
-    /// hard watchdog and answers `unknown` if the thread misses it.
+    /// UIA handles, and any stall stay contained. The caller waits under the
+    /// hard watchdog. A timeout answers unknown without releasing the slot,
+    /// so the worker remains the only scan in flight until it returns.
     pub(super) fn scan() -> ScanOutcome {
-        let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name("grok-bot-uia-read".to_string())
-            .spawn(move || {
-                let outcome = catch_unwind(AssertUnwindSafe(run_scan))
-                    .unwrap_or_else(|_| ScanOutcome::unknown());
-                let _ = tx.send(outcome);
-            });
-        match spawned {
-            Ok(_) => match rx.recv_timeout(Duration::from_millis(SCAN_TIMEOUT_MS)) {
-                Ok(outcome) => outcome,
-                // Detached: the thread finishes on its own and its result is
-                // dropped — the caller already answered `unknown`.
-                Err(_) => ScanOutcome::unknown(),
-            },
-            Err(_) => ScanOutcome::unknown(),
-        }
+        run_single_flight(
+            scan_slot(),
+            Duration::from_millis(SCAN_TIMEOUT_MS),
+            run_scan,
+        )
     }
 
     fn run_scan() -> ScanOutcome {
         unsafe {
+            // Microsoft's UI Automation threading contract: a client thread
+            // that owns no windows initializes COM as an MTA
+            // (COINIT_MULTITHREADED). See "Understanding Threading Issues".
+            // This worker does not pump messages, so an STA would be the
+            // wrong apartment for the platform contract.
             let com = CoInitializeEx(None, COINIT_MULTITHREADED);
             if com.is_err() {
                 // A fresh thread has no prior apartment: failure here means
@@ -408,7 +617,7 @@ mod native {
         unsafe {
             let windows = find_grok_bot_windows();
             if windows.is_empty() {
-                return ScanOutcome::not_running();
+                return classify_window_trees(&[]);
             }
 
             let uia: IUIAutomation =
@@ -417,26 +626,22 @@ mod native {
                     Err(_) => return ScanOutcome::unknown(),
                 };
 
-            let mut probed = 0usize;
+            let mut trees = Vec::new();
             for window in windows.iter().take(MAX_WINDOWS) {
-                probed += 1;
                 let root = match uia.ElementFromHandle(window.hwnd) {
                     Ok(root) => root,
-                    // This window exposes no accessibility tree — keep it out
-                    // of the "settings not open" verdict, try the next one.
-                    Err(_) => continue,
+                    Err(_) => {
+                        trees.push(WindowTree::Unavailable);
+                        continue;
+                    }
                 };
                 let Some(panel) = find_usage_panel(&uia, &root) else {
+                    trees.push(WindowTree::UsageAbsent);
                     continue;
                 };
                 return read_usage_panel(&uia, &panel, &window.exe_path);
             }
-            if probed == 0 {
-                return ScanOutcome::unknown();
-            }
-            // Grok Bot is running, but none of its windows shows the Usage &
-            // Billing screen.
-            ScanOutcome::screen_not_visible()
+            classify_window_trees(&trees)
         }
     }
 
@@ -569,45 +774,58 @@ mod native {
         unsafe { element.CurrentName().unwrap_or_default().to_string() }
     }
 
-    /// Reads the weekly used percentage from the panel's progress bars:
-    /// the exact `RangeValuePattern` value first, the validated single
-    /// percentage in the accessible name as a fallback. Bars whose name
-    /// names the weekly window win over unnamed ones.
-    fn read_weekly_used_percent(uia: &IUIAutomation, panel: &IUIAutomationElement) -> Option<f64> {
+    /// Progress bars and text, in tree order. Percentage prefers the
+    /// RangeValuePattern value, then one percentage token in the name.
+    /// Which bar is Weekly usage is decided later, with no first-bar fallback.
+    fn collect_usage_nodes(uia: &IUIAutomation, panel: &IUIAutomationElement) -> Vec<PanelNode> {
         unsafe {
-            let condition = property_condition_i32(
+            let progress = property_condition_i32(
                 uia,
                 UIA_ControlTypePropertyId,
                 UIA_ProgressBarControlTypeId.0,
-            )
-            .ok()?;
-            let bars: IUIAutomationElementArray =
-                panel.FindAll(TreeScope_Descendants, &condition).ok()?;
-            let count = bars
+            );
+            let text =
+                property_condition_i32(uia, UIA_ControlTypePropertyId, UIA_TextControlTypeId.0);
+            let (Ok(progress), Ok(text)) = (progress, text) else {
+                return Vec::new();
+            };
+            let Ok(condition) = uia.CreateOrCondition(&progress, &text) else {
+                return Vec::new();
+            };
+            let Ok(elements) = panel.FindAll(TreeScope_Descendants, &condition) else {
+                return Vec::new();
+            };
+            let count = elements
                 .Length()
                 .ok()
                 .unwrap_or(0)
-                .min(MAX_PROGRESS_BARS as i32);
-            let mut weekly_named: Option<f64> = None;
-            let mut any: Option<f64> = None;
+                .min((MAX_PROGRESS_BARS + MAX_TEXT_ELEMENTS) as i32);
+            let mut nodes = Vec::new();
             for index in 0..count {
-                let Ok(bar) = bars.GetElement(index) else {
+                let Ok(element) = elements.GetElement(index) else {
                     continue;
                 };
-                let name = element_name(&bar);
-                let from_pattern = read_range_value(&bar);
-                let value = from_pattern.or_else(|| parse_percent_from_name(&name));
-                if let Some(value) = value {
-                    let weekly = name.to_lowercase().contains("weekly");
-                    if weekly && weekly_named.is_none() {
-                        weekly_named = Some(value);
-                    }
-                    if any.is_none() {
-                        any = Some(value);
-                    }
+                let Ok(control_type) = element.CurrentControlType() else {
+                    continue;
+                };
+                let name = element_name(&element);
+                if control_type == UIA_ProgressBarControlTypeId {
+                    let percent =
+                        read_range_value(&element).or_else(|| parse_percent_from_name(&name));
+                    nodes.push(PanelNode {
+                        kind: PanelNodeKind::Progress,
+                        name,
+                        percent,
+                    });
+                } else if control_type == UIA_TextControlTypeId {
+                    nodes.push(PanelNode {
+                        kind: PanelNodeKind::Text,
+                        name,
+                        percent: None,
+                    });
                 }
             }
-            weekly_named.or(any)
+            nodes
         }
     }
 
@@ -625,33 +843,6 @@ mod native {
                 return sanitize_used_percent(value, 0.0, 100.0);
             }
             sanitize_used_percent(value, minimum, maximum)
-        }
-    }
-
-    /// Finds the reset countdown line among the panel's text elements and
-    /// returns it verbatim (sanitized). No absolute timestamp is derived.
-    fn read_reset_text(uia: &IUIAutomation, panel: &IUIAutomationElement) -> Option<String> {
-        unsafe {
-            let condition =
-                property_condition_i32(uia, UIA_ControlTypePropertyId, UIA_TextControlTypeId.0)
-                    .ok()?;
-            let texts: IUIAutomationElementArray =
-                panel.FindAll(TreeScope_Descendants, &condition).ok()?;
-            let count = texts
-                .Length()
-                .ok()
-                .unwrap_or(0)
-                .min(MAX_TEXT_ELEMENTS as i32);
-            for index in 0..count {
-                let Ok(text) = texts.GetElement(index) else {
-                    continue;
-                };
-                let name = element_name(&text);
-                if let Some(reset) = sanitize_reset_text(&name) {
-                    return Some(reset);
-                }
-            }
-            None
         }
     }
 
@@ -706,16 +897,13 @@ mod native {
         panel: &IUIAutomationElement,
         exe_path: &str,
     ) -> ScanOutcome {
-        let used_percent = read_weekly_used_percent(uia, panel);
-        let reset_text = read_reset_text(uia, panel);
-        if used_percent.is_none() && reset_text.is_none() {
-            // The screen is there but nothing readable surfaced — do not
-            // guess, and do not call it "not visible" either.
+        let reading = select_weekly_reading(&collect_usage_nodes(uia, panel));
+        let Some(used_percent) = reading.used_percent else {
             return ScanOutcome::unknown();
-        }
+        };
         ScanOutcome::ok(GrokBotSnapshot {
-            used_percent,
-            reset_text,
+            used_percent: Some(used_percent),
+            reset_text: reading.reset_text,
             app_version: file_version(exe_path),
             observed_at: wire_stamp(Utc::now()),
         })
@@ -727,6 +915,10 @@ mod native {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     fn stamp() -> &'static str {
         "2026-10-08T14:32:00Z"
@@ -745,6 +937,17 @@ mod tests {
         let outcome = native::scan();
         let elapsed = started.elapsed();
         println!("live probe status: {:?} in {elapsed:?}", outcome.status);
+        println!(
+            "live probe reading: used_percent={:?} reset_text={:?}",
+            outcome
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.used_percent),
+            outcome
+                .snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.reset_text.as_deref())
+        );
         assert!(
             elapsed < std::time::Duration::from_millis(SCAN_TIMEOUT_MS + 1_000),
             "scan exceeded its watchdog budget: {elapsed:?}"
@@ -898,6 +1101,191 @@ mod tests {
         let mut cache = None;
         let retained = retain_reading(&mut cache, &ScanOutcome::unknown());
         assert!(retained.is_none());
+    }
+
+    fn progress(name: &str, percent: f64) -> PanelNode {
+        PanelNode {
+            kind: PanelNodeKind::Progress,
+            name: name.to_string(),
+            percent: Some(percent),
+        }
+    }
+
+    fn text_node(name: &str) -> PanelNode {
+        PanelNode {
+            kind: PanelNodeKind::Text,
+            name: name.to_string(),
+            percent: None,
+        }
+    }
+
+    #[test]
+    fn weekly_section_beats_an_earlier_bar_and_an_unrelated_reset() {
+        let reading = select_weekly_reading(&[
+            progress("Session usage", 10.0),
+            text_node("Resets in 1 hour"),
+            text_node("Weekly usage"),
+            progress("", 73.0),
+            text_node("73% used"),
+            text_node("Resets in 3 days"),
+            text_node("Monthly usage"),
+            text_node("Resets in 12 days"),
+            progress("Monthly usage", 40.0),
+        ]);
+        assert_eq!(reading.used_percent, Some(73.0));
+        assert_eq!(reading.reset_text.as_deref(), Some("Resets in 3 days"));
+    }
+
+    #[test]
+    fn ambiguous_progress_bars_are_not_guessed() {
+        let two_named = select_weekly_reading(&[
+            progress("Weekly usage", 73.0),
+            text_node("Resets in 3 days"),
+            progress("Weekly usage", 40.0),
+            text_node("Resets in 1 day"),
+        ]);
+        assert_eq!(two_named.used_percent, None);
+        assert_eq!(two_named.reset_text, None);
+
+        let two_under_one_heading = select_weekly_reading(&[
+            text_node("Weekly usage"),
+            progress("", 73.0),
+            progress("", 40.0),
+        ]);
+        assert_eq!(two_under_one_heading.used_percent, None);
+
+        let no_weekly = select_weekly_reading(&[
+            progress("Session usage", 10.0),
+            text_node("Resets in 1 hour"),
+            progress("", 40.0),
+        ]);
+        assert_eq!(no_weekly.used_percent, None);
+        assert_eq!(no_weekly.reset_text, None);
+    }
+
+    #[test]
+    fn unrelated_reset_is_ignored_and_a_missing_reset_stays_absent() {
+        let before = select_weekly_reading(&[
+            text_node("Resets in 1 hour"),
+            progress("Weekly usage", 73.0),
+        ]);
+        assert_eq!(before.used_percent, Some(73.0));
+        assert_eq!(before.reset_text, None);
+
+        let other_section = select_weekly_reading(&[
+            progress("Weekly usage", 73.0),
+            text_node("Monthly usage"),
+            text_node("Resets in 9 days"),
+        ]);
+        assert_eq!(other_section.used_percent, Some(73.0));
+        assert_eq!(other_section.reset_text, None);
+
+        let absent = select_weekly_reading(&[progress("Weekly usage", 41.5)]);
+        assert_eq!(absent.used_percent, Some(41.5));
+        assert_eq!(absent.reset_text, None);
+    }
+
+    #[test]
+    fn reset_only_text_is_not_a_weekly_reading_and_is_not_cached() {
+        let selected =
+            select_weekly_reading(&[text_node("Weekly usage"), text_node("Resets in 3 days")]);
+        assert_eq!(selected.used_percent, None);
+        assert_eq!(selected.reset_text, None);
+
+        let partial = ScanOutcome::ok(GrokBotSnapshot {
+            used_percent: None,
+            reset_text: Some("Resets in 3 days".to_string()),
+            app_version: None,
+            observed_at: "2026-10-08T16:32:00Z".to_string(),
+        });
+        let mut empty = None;
+        assert!(retain_reading(&mut empty, &partial).is_none());
+
+        let mut cache = None;
+        let _ = retain_reading(&mut cache, &reading(73.0, stamp()));
+        let retained = retain_reading(&mut cache, &partial);
+        assert_eq!(retained.as_ref().unwrap().used_percent, Some(73.0));
+        assert_eq!(retained.as_ref().unwrap().observed_at, stamp());
+        assert_eq!(
+            retained.as_ref().unwrap().reset_text.as_deref(),
+            Some("Resets in 3 days")
+        );
+    }
+
+    #[test]
+    fn failed_element_from_handle_is_unknown_when_no_tree_is_obtained() {
+        let outcome = classify_window_trees(&[WindowTree::Unavailable, WindowTree::Unavailable]);
+        assert_eq!(outcome.status, GrokBotStatus::Unknown);
+        assert!(outcome.snapshot.is_none());
+    }
+
+    #[test]
+    fn a_visible_tree_without_usage_is_screen_not_visible() {
+        let outcome = classify_window_trees(&[WindowTree::Unavailable, WindowTree::UsageAbsent]);
+        assert_eq!(outcome.status, GrokBotStatus::ScreenNotVisible);
+        assert_eq!(classify_window_trees(&[]).status, GrokBotStatus::NotRunning);
+    }
+
+    #[test]
+    fn a_finished_scan_releases_the_slot_for_the_next_refresh() {
+        let slot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runs = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let runs = Arc::clone(&runs);
+            let outcome = run_single_flight(&slot, Duration::from_secs(1), move || {
+                runs.fetch_add(1, Ordering::SeqCst);
+                ScanOutcome::not_running()
+            });
+            assert_eq!(outcome.status, GrokBotStatus::NotRunning);
+        }
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert!(!slot.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_timed_out_scan_blocks_a_second_scan_until_the_worker_finishes() {
+        let slot = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started = Arc::new(AtomicUsize::new(0));
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let slot_for_first = Arc::clone(&slot);
+        let started_for_first = Arc::clone(&started);
+        let first = thread::spawn(move || {
+            run_single_flight(&slot_for_first, Duration::from_millis(50), move || {
+                started_for_first.fetch_add(1, Ordering::SeqCst);
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv();
+                ScanOutcome::not_running()
+            })
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker entered");
+        let first_outcome = first.join().expect("first caller");
+        assert_eq!(first_outcome.status, GrokBotStatus::Unknown);
+        assert!(slot.load(Ordering::Acquire));
+
+        let started_for_second = Arc::clone(&started);
+        let second = run_single_flight(&slot, Duration::from_millis(50), move || {
+            started_for_second.fetch_add(1, Ordering::SeqCst);
+            ScanOutcome::not_running()
+        });
+        assert_eq!(second.status, GrokBotStatus::Unknown);
+        assert_eq!(started.load(Ordering::SeqCst), 1);
+
+        let _ = release_tx.send(());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while slot.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "worker did not release the slot");
+            thread::yield_now();
+        }
+        let started_for_third = Arc::clone(&started);
+        let third = run_single_flight(&slot, Duration::from_secs(1), move || {
+            started_for_third.fetch_add(1, Ordering::SeqCst);
+            ScanOutcome::not_running()
+        });
+        assert_eq!(third.status, GrokBotStatus::NotRunning);
+        assert_eq!(started.load(Ordering::SeqCst), 2);
     }
 
     // -- wire contract --

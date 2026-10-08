@@ -2,8 +2,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import userEvent from "@testing-library/user-event";
 import { FloatingQuotaBar } from "./FloatingQuotaBar";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
+
+const invoke = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -424,6 +429,100 @@ describe("Grok detail card Grok Bot section", () => {
     } finally {
       rect.mockRestore();
     }
+  });
+});
+
+describe("Grok Bot refresh keeps the card open", () => {
+  const GROK = item({
+    providerId: "grok",
+    name: "Grok",
+    percent: 22,
+    windowLabel: "Weekly credits",
+    resetAt: RESET_AT,
+    windows: [{ label: "On-demand", usedPercent: 9, resetAt: RESET_AT }],
+    primaryReset: { label: "Weekly credits", resetAt: RESET_AT },
+  });
+
+  const OK = {
+    status: "ok",
+    observedAt: "2026-10-08T15:30:00Z",
+    usedPercent: 73,
+    resetText: "Resets in 3 days",
+  };
+
+  beforeEach(() => {
+    invoke.mockReset();
+  });
+
+  function refreshButton() {
+    const button = container.querySelector<HTMLButtonElement>(".fq-grokbot-refresh");
+    expect(button).not.toBeNull();
+    return button!;
+  }
+
+  it("closes an unpinned card when focus actually leaves Refresh", async () => {
+    const onHoverEnd = vi.fn();
+    await renderBar({ items: [GROK], detailId: "grok", pinned: false, onHoverEnd });
+    const button = refreshButton();
+    button.focus();
+    onHoverEnd.mockClear();
+    await act(async () => {
+      button.blur();
+    });
+    expect(onHoverEnd).toHaveBeenCalled();
+  });
+
+  it("keeps an unpinned card open through a pending and a resolved refresh", async () => {
+    let resolveInvoke: (value: unknown) => void = () => {};
+    invoke.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveInvoke = resolve;
+        }),
+    );
+    const onHoverEnd = vi.fn();
+    await renderBar({ items: [GROK], detailId: "grok", pinned: false, onHoverEnd });
+    const button = refreshButton();
+    onHoverEnd.mockClear();
+    button.focus();
+    const user = userEvent.setup();
+    await act(async () => {
+      await user.keyboard("{Enter}");
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(document.activeElement).toBe(button);
+    expect(onHoverEnd).not.toHaveBeenCalled();
+    expect(container.querySelector(".fq-popover")).not.toBeNull();
+
+    await act(async () => {
+      resolveInvoke(OK);
+      await Promise.resolve();
+    });
+    expect(onHoverEnd).not.toHaveBeenCalled();
+    expect(container.querySelector(".fq-popover")).not.toBeNull();
+    expect(document.activeElement).toBe(button);
+    expect(container.querySelector(".fq-grokbot-line")!.textContent).toContain("27% remaining");
+  });
+
+  it("refreshes a pinned card from the keyboard without dismissing it", async () => {
+    invoke.mockResolvedValueOnce(OK);
+    const onHoverEnd = vi.fn();
+    await renderBar({ items: [GROK], detailId: "grok", pinned: true, onHoverEnd });
+    const button = refreshButton();
+    onHoverEnd.mockClear();
+    button.focus();
+    const user = userEvent.setup();
+    await act(async () => {
+      await user.keyboard("{Enter}");
+    });
+    expect(invoke).toHaveBeenCalledWith("refresh_grok_bot_usage");
+    expect(onHoverEnd).not.toHaveBeenCalled();
+    expect(container.querySelector(".fq-popover")).not.toBeNull();
+    expect(container.querySelector(".fq-grokbot-line")!.textContent).toContain("27% remaining");
   });
 });
 

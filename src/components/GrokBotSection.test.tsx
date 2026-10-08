@@ -144,4 +144,59 @@ describe("GrokBotSection", () => {
     expect(container.querySelector(".fq-grokbot-line")).toBeNull();
     expect(container.querySelector(".fq-grokbot .fq-meter-row")).toBeNull();
   });
+
+  it("keeps the last reading and its original stamp when invoke rejects", async () => {
+    invoke.mockResolvedValueOnce(OK_RESULT);
+    await renderSection();
+    await clickRefresh();
+
+    invoke.mockRejectedValueOnce(new Error("ipc closed"));
+    await clickRefresh();
+
+    const line = container.querySelector(".fq-grokbot-line")!;
+    expect(line.textContent).toContain("27% remaining");
+    expect(line.textContent).toContain("Resets in 3 days");
+    const note = container.querySelector(".fq-grokbot-note")!;
+    expect(note.textContent).toContain("Last known");
+    expect(note.textContent).toContain("30m ago");
+    expect(note.className).toContain("is-stale");
+    expect(container.querySelector(".fq-grokbot-status")!.textContent).toContain(
+      "Couldn't read",
+    );
+  });
+
+  it("keeps keyboard focus through a pending refresh and ignores a second activation", async () => {
+    let resolveInvoke: (value: unknown) => void = () => {};
+    invoke.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveInvoke = resolve;
+        }),
+    );
+    await renderSection();
+    const button = container.querySelector<HTMLButtonElement>(".fq-grokbot-refresh")!;
+    button.focus();
+
+    await act(async () => {
+      button.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+      button.click();
+      button.click();
+    });
+
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-disabled")).toBe("true");
+    expect(button.getAttribute("aria-busy")).toBe("true");
+    expect(document.activeElement).toBe(button);
+    expect(button.textContent).toBe("Refreshing…");
+
+    await act(async () => {
+      resolveInvoke(OK_RESULT);
+      await Promise.resolve();
+    });
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute("aria-disabled")).toBeNull();
+    expect(document.activeElement).toBe(button);
+    expect(container.querySelector(".fq-grokbot-line")!.textContent).toContain("27% remaining");
+  });
 });

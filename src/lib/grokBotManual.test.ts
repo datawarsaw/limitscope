@@ -112,6 +112,32 @@ describe("refreshGrokBotUsage", () => {
     expect(result.resetText).toBeUndefined();
     expect(Number.isNaN(Date.parse(result.observedAt))).toBe(false);
   });
+
+  it("keeps the previous successful reading and its original stamp when invoke rejects", async () => {
+    const success = {
+      status: "ok" as const,
+      observedAt: "2026-10-08T14:32:00Z",
+      usedPercent: 73,
+      resetText: "Resets in 3 days",
+      appVersion: "0.68.1.0",
+    };
+    invoke.mockResolvedValueOnce(success);
+    const first = await refreshGrokBotUsage();
+    invoke.mockRejectedValueOnce(new Error("ipc closed"));
+    const failed = await refreshGrokBotUsage(first);
+
+    expect(failed.status).toBe("unknown");
+    expect(failed.usedPercent).toBeUndefined();
+    expect(failed.lastKnown).toEqual({
+      observedAt: "2026-10-08T14:32:00Z",
+      usedPercent: 73,
+      resetText: "Resets in 3 days",
+      appVersion: "0.68.1.0",
+    });
+    expect(failed.observedAt).not.toBe(success.observedAt);
+    expect(grokBotEffectiveReading(failed).reading?.observedAt).toBe("2026-10-08T14:32:00Z");
+    expect(grokBotStatusMessage(failed)).toContain("Couldn't read");
+  });
 });
 
 describe("manual-refresh-only contract", () => {
