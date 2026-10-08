@@ -501,6 +501,83 @@ html[data-window="floating"] body {
   display: contents;
 }
 
+/* Grok Bot's manual read: its own hairline section below the quota windows.
+   Same hierarchy as the secondary inventory — muted label, value line, thin
+   meter — plus the one explicit Refresh action and the observation stamp. */
+.fq-grokbot {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--divider);
+}
+
+.fq-grokbot-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fq-grokbot-label {
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.fq-grokbot-refresh {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  border: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 6px;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.fq-grokbot-refresh:hover:not(:disabled) {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.fq-grokbot-refresh:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.fq-grokbot-refresh:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
+.fq-grokbot-line {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  font-size: 12.5px;
+}
+
+.fq-grokbot-count {
+  white-space: nowrap;
+}
+
+.fq-grokbot-status {
+  margin: 6px 0 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.fq-grokbot-note {
+  margin: 6px 0 0;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* A retained reading keeps showing, but never reads as current. */
+.fq-grokbot-note.is-stale {
+  color: var(--amber);
+}
+
 .fq-window-label {
   color: var(--text);
   font-size: 12.5px;

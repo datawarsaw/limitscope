@@ -8,6 +8,7 @@ import {
   quotaColorLevel,
 } from "../lib/quotaPresentation";
 import { ProviderMark } from "./FloatingProviderItem";
+import { GrokBotSection } from "./GrokBotSection";
 
 /**
  * The primary reset line follows the approved card: window label, "reset
@@ -127,7 +128,9 @@ export function FloatingProviderPopover({
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!pinned) return;
-    const button = ref.current?.querySelector("button");
+    // Target the footer action specifically: the Grok Bot section adds its
+    // own Refresh control above, and pinning must still land focus on Open.
+    const button = ref.current?.querySelector(".fq-actions button");
     // preventScroll: the window is sized to the card, but until that resize
     // lands a focus-driven scroll would push the pill out of the viewport —
     // the bar must stay visible no matter how tall the card is.
@@ -221,6 +224,11 @@ export function FloatingProviderPopover({
           </div>
         ) : null}
 
+        {/* Grok Bot's own manual read lives below a hairline, separate from
+            the Grok Weekly quota above: different source, different meter,
+            explicit Refresh only. */}
+        {item.providerId === "grok" ? <GrokBotSection now={now} /> : null}
+
         {item.error ? (
           <p className="fq-popover-error" role="alert">
             {item.error}
@@ -242,8 +250,9 @@ export function FloatingProviderPopover({
           </footer>
         ) : null}
 
-        {/* Informational plus one Open action. Refresh, pin, and hide
-            commands live only in the right-click menu. */}
+        {/* Informational plus one Open action. Pin and hide commands live
+            only in the right-click menu; the single sanctioned in-card
+            command is the Grok Bot section's manual Refresh. */}
         <div className="fq-actions">
           <button type="button" onClick={onOpenMain}>
             Open

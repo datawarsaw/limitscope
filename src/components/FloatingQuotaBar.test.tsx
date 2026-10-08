@@ -351,6 +351,82 @@ describe("FloatingQuotaBar shared detail card", () => {
   });
 });
 
+describe("Grok detail card Grok Bot section", () => {
+  /** Grok Weekly credits stay the primary quota; the Bot read is separate. */
+  const GROK = item({
+    providerId: "grok",
+    name: "Grok",
+    percent: 22,
+    windowLabel: "Weekly credits",
+    resetAt: RESET_AT,
+    windows: [{ label: "On-demand", usedPercent: 9, resetAt: RESET_AT }],
+    primaryReset: { label: "Weekly credits", resetAt: RESET_AT },
+  });
+
+  it("adds a Grok Bot section below the quota windows, before the actions", async () => {
+    await renderBar({ items: [GROK], detailId: "grok", pinned: true });
+    const dialog = container.querySelector('[role="dialog"]')!;
+    const windows = dialog.querySelector(".fq-windows")!;
+    const grokbot = dialog.querySelector(".fq-grokbot")!;
+    const actions = dialog.querySelector(".fq-actions")!;
+    expect(grokbot).not.toBeNull();
+    expect(
+      grokbot.compareDocumentPosition(windows) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+    expect(
+      actions.compareDocumentPosition(grokbot) & Node.DOCUMENT_POSITION_PRECEDING,
+    ).toBeTruthy();
+  });
+
+  it("keeps Grok Weekly credits as the untouched primary quota", async () => {
+    await renderBar({ items: [GROK], detailId: "grok", pinned: true });
+    const dialog = container.querySelector('[role="dialog"]')!;
+    expect(dialog.querySelector(".fq-value-num")!.textContent).toBe("78%");
+    expect(dialog.querySelector(".fq-primary-reset")!.textContent).toBe(
+      "Weekly credits reset in 8h 24m",
+    );
+    const rows = Array.from(dialog.querySelectorAll(".fq-window-row"));
+    expect(rows).toHaveLength(1);
+    expect(rows[0].textContent).toBe("On-demand91% remaining · resets in 8h 24m");
+    // The section carries its own meter, separate from the window meters.
+    expect(dialog.querySelectorAll(".fq-meter-row")).toHaveLength(1);
+  });
+
+  it("renders the Grok Bot section for Grok only — other providers are untouched", async () => {
+    await renderBar({ items: [HEALTHY, UNAVAILABLE], detailId: "zai", pinned: true });
+    const dialog = container.querySelector('[role="dialog"]')!;
+    expect(dialog.querySelector(".fq-grokbot")).toBeNull();
+    // The non-Grok card keeps exactly its one Open action.
+    const buttons = dialog.querySelectorAll("button");
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0].textContent).toBe("Open");
+    expect(dialog.textContent).not.toContain("Grok Bot");
+  });
+
+  it("still reports the measured card height with the section present", async () => {
+    const onDetailCardHeight = vi.fn();
+    const rect = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockReturnValue({
+        height: 360,
+        width: 300,
+        top: 0,
+        left: 0,
+        bottom: 360,
+        right: 300,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+    try {
+      await renderBar({ items: [GROK], detailId: "grok", pinned: true, onDetailCardHeight });
+      expect(onDetailCardHeight).toHaveBeenCalledWith(360);
+    } finally {
+      rect.mockRestore();
+    }
+  });
+});
+
 describe("FloatingQuotaBar right-click menu", () => {
   it("dismisses on an outside left press and browser blur, but not inside or right press", async () => {
     const props = await renderBar({ menuOpen: true });

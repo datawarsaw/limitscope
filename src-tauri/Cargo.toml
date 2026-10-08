@@ -41,6 +41,19 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Registry"] }
+# Grok Bot manual refresh reads the app's Usage & Billing screen through
+# Windows UI Automation. Same version the toolchain already resolves
+# transitively (via tauri/wry), pinned to narrow features.
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_UI_Accessibility",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 codegen-units = 1

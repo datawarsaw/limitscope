@@ -28,6 +28,10 @@ const IPC_SURFACE = new Set([
   "zai::get_zai_usage",
   "antigravity::get_antigravity_usage",
   "grok::get_grok_usage",
+  // Grok Bot manual refresh: a read-only Windows accessibility observation
+  // triggered only by an explicit user action in the Grok detail card. It
+  // reads no files and clears nothing — deliberate, reviewed addition.
+  "grok_bot::refresh_grok_bot_usage",
   "open_main_window",
   "runtime::get_runtime_snapshot",
   "runtime::request_refresh",

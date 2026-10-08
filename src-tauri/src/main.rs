@@ -9,6 +9,7 @@ mod diagnostic_report;
 mod diagnostics;
 mod floating_drag;
 mod grok;
+mod grok_bot;
 mod history;
 mod last_good;
 mod local_data;
@@ -127,6 +128,7 @@ fn main() {
             zai::get_zai_usage,
             antigravity::get_antigravity_usage,
             grok::get_grok_usage,
+            grok_bot::refresh_grok_bot_usage,
             open_main_window,
             floating_drag::attach_floating_drag_lifecycle,
             floating_drag::detach_floating_drag_lifecycle,

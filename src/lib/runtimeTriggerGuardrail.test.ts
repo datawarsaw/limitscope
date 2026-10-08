@@ -49,6 +49,11 @@ const ALLOWED_COMMANDS = new Set([
   "export_usage_history",
   // window management
   "open_main_window",
+  // Grok Bot manual refresh (Human-Accepted Variant A): a read-only
+  // accessibility observation the user triggers explicitly from the Grok
+  // detail card. Not a provider fetch, not a refresh of the shared runtime,
+  // and never scheduled — invoke happens only inside the click handler.
+  "refresh_grok_bot_usage",
   // Native drag lifecycle (Human-Accepted Slice A): attach/detach/restore
   // the Rust-owned window drag observer. Not a fetch and not a refresh.
   "attach_floating_drag_lifecycle",
