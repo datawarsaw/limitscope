@@ -10,19 +10,91 @@ CI does **not** sign binaries, publish releases, or push tags.
 
 ## CI stages
 
+### Always-on gates (`windows` job)
+
 | # | Gate | Command |
 |---|------|---------|
 | 1 | Install frontend dependencies (lockfile-exact) | `npm ci` |
 | 2 | Rust tests (offline; live tests `#[ignore]`d) | `cargo test --locked` (in `src-tauri/`) |
 | 3 | Frontend unit tests | `npm test` (`vitest run`) |
 | 4 | Frontend build (type-check + bundle) | `npm run build` (`tsc && vite build`) |
-| 5 | Full Tauri release build + NSIS bundling | `npm run tauri build` |
-| 6 | Upload installer artifact | `src-tauri/target/release/bundle/nsis/*-setup.exe` |
+| 5 | Secret scan of build outputs | `npm run scan:secrets` |
 
-Runner: `windows-latest`. Toolchains: Node 24 (`actions/setup-node`), stable
-Rust MSVC (`dtolnay/rust-toolchain@stable`). Caching: npm cache via
+These run on every pull request and every push to `main`, produced no signed
+or published artifacts, and are the only checks that should ever be marked as
+required in branch protection.
+
+### Bundling verification gate
+
+The full `npm run tauri build` NSIS bundle used to run on every CI execution.
+It is the slowest stage (a release-profile LTO Rust build plus the NSIS
+package) and its only product is an **unsigned** installer artifact that
+ordinary CI does not consume -- releases are built, signed and published by
+`.github/workflows/release.yml`.
+
+Bundling now runs in the separate `bundling-verification` job, only when a
+bundling-specific input changed:
+
+| Gate | Command |
+|------|---------|
+| Full Tauri release build + NSIS bundling | `npm run tauri build` |
+| Upload installer artifact | `src-tauri/target/release/bundle/nsis/*-setup.exe` (`if-no-files-found: error`) |
+
+Two jobs implement this:
+
+1. `bundling-inputs` (**Linux**) resolves the paths changed by the run and
+   prints `true`/`false` from `scripts/ci-bundling-gate.mjs`. It handles both
+   events: for a pull request it diffs against the base branch tip
+   (`github.base_ref`); for a push it diffs against the previous tip of the ref
+   (`github.event.before`). When no base can be resolved (unborn ref, force
+   push, fetch failure) it prints a warning and emits `true`, so bundling
+   verification fails closed rather than silently skipping.
+2. `bundling-verification` (**Windows**) carries the `npm run tauri build`
+   bundling step and the installer upload. Its job-level
+   `if: needs.bundling-inputs.outputs.run_bundling == 'true'` means the job is
+   **skipped**, not left pending, when nothing relevant changed.
+
+Bundling inputs (see `BUNDLING_INPUTS` / `BUNDLING_INPUT_PREFIXES` in
+`scripts/ci-bundling-gate.mjs`):
+
+| Input | Why it selects the bundle |
+|-------|---------------------------|
+| `src-tauri/tauri.conf.json` | `bundle` config: `targets`, `icon`, NSIS options, product/binary identity |
+| `src-tauri/installer-hooks.nsh` | `installerHooks` NSIS script compiled into the installer |
+| `src-tauri/installer/English-custom.nsh` | `customLanguageFiles` NSIS script |
+| `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, `src-tauri/build.rs` | Rust crate inputs for the bundled binary |
+| `src-tauri/src/**` | Rust sources compiled into the bundled binary |
+| `src-tauri/icons/**` | bundler icons |
+| `src-tauri/capabilities/**` | Tauri capability config generated into the bundle |
+| `package.json`, `package-lock.json`, `.github/workflows/ci.yml` | build toolchain and the workflow that defines the bundling path |
+
+The Tauri CLI downloads NSIS at build time, so the repository vendors no NSIS
+sources; nothing else in the tree is a bundle input. `scripts/ci-bundling-gate.test.mjs`
+asserts that every configured input still exists, so a rename that is not
+mirrored in the gate fails the suite instead of silently skipping bundling.
+
+### Required checks and branch protection
+
+The workflow is **not** skipped wholesale by `paths:`/`paths-ignore:` filtering,
+because a workflow skipped that way leaves its required checks pending and can
+block a merge. Gating is per job instead: `windows` always runs, and
+`bundling-verification` is a job that is genuinely skipped.
+
+When branch protection is configured for this repository, mark only the
+always-on **`windows`** check (name `Windows build & tests`) as required.
+Do not mark `Detect bundling-input changes` or `NSIS bundling verification` as
+required: the latter is skipped when nothing relevant changed, and a skipped
+job never reports a pending status. Treating a conditional job as a required
+check is the failure mode this design avoids.
+
+Runner: `windows-latest` (both Windows jobs), `ubuntu-latest`
+(`bundling-inputs`; the changed-path computation is shell/node only).
+Toolchains: Node 24 (`actions/setup-node`), stable Rust MSVC
+(`dtolnay/rust-toolchain@stable`) on the Windows jobs. Caching: npm cache via
 `setup-node`, cargo registry + `src-tauri/target` via `Swatinem/rust-cache@v2`.
-The workflow has a 45-minute timeout and cancels superseded runs on the same ref.
+The `windows` job has a 45-minute timeout, `bundling-inputs` 10 minutes, and
+`bundling-verification` 45 minutes. The workflow cancels superseded runs on the
+same ref.
 
 ## Local equivalent commands
 
@@ -34,19 +106,27 @@ npm ci
 cargo test --locked        # from src-tauri/
 npm test
 npm run build
-npm run tauri build
+npm run scan:secrets
+npm run tauri build        # only when a bundling input changed
 ```
 
 The installer appears under `src-tauri/target/release/bundle/nsis/`.
 `npm run tauri build` internally re-runs `npm run build` as Tauri's
-`beforeBuildCommand`, so step 4 is a fast-failing type-check gate and step 5
-repeats it by design.
+`beforeBuildCommand`, so the ordinary `npm run build` gate is a fast-failing
+type-check and the bundling job repeats it by design.
+
+To see the bundling decision locally, pipe changed paths into the gate:
+
+```powershell
+"src-tauri/tauri.conf.json" | node scripts/ci-bundling-gate.mjs   # true
+"src/App.tsx"             | node scripts/ci-bundling-gate.mjs   # false
+```
 
 ## Artifact location
 
-On every successful CI run the NSIS installer is uploaded as the workflow
-artifact **`rate-limits-windows-installer`**
-(Actions → run → Artifacts). The file is named
+When the bundling verification runs and succeeds, the NSIS installer is
+uploaded as the workflow artifact **`rate-limits-windows-installer`**
+(Actions -> run -> Artifacts). The file is named
 `LimitScope_<version>_x64-setup.exe` (the product/binary name; the internal
 crate and identifier keep the `rate-limits` / `com.ratelimits.desktop`
 lineage). Artifacts are retained with the
@@ -83,7 +163,8 @@ vitest suites are offline unit tests and run everywhere.
 - **NSIS is downloaded at build time** by the Tauri CLI during bundling; no
   preinstalled NSIS is required on the runner. First uncached runs are slow
   (cargo cold build of the Tauri stack + NSIS download), typically well over
-  10 minutes; `rust-cache` keeps later runs faster.
+  10 minutes; `rust-cache` keeps later runs faster. This cost is now paid only
+  on bundling runs.
 - **WebView2**: preinstalled on GitHub `windows-latest` runners, so the app
   builds without extra setup. End-user machines need the WebView2 runtime,
   which the NSIS installer bootstraps by default.
@@ -108,13 +189,13 @@ vitest suites are offline unit tests and run everywhere.
 ## Release policy
 
 CI produces unsigned installer artifacts only. Releases remain a manual
-process — the last executed release runbook is
+process -- the last executed release runbook is
 `docs/release-runbook-v0.6.0.md`; the active v0.8 process is
 `docs/release-runbook-v0.8.0.md` with the updater architecture in
 `docs/updater-production.md`; each delivery under that runbook records the
 dated per-provider live verification gate (PASS / FAIL / UNVERIFIED) defined
 in its gate section. Release closeout is verified GitHub release provenance
-(release commit, tag, workflow run, published companion release — see the
+(release commit, tag, workflow run, published companion release -- see the
 v0.8 runbook's Phase 5); this repository keeps no separate post-release state
 ledger. Do not add release publishing, tag pushing, or signing to this
 workflow without explicitly revisiting that policy and the required secrets.
