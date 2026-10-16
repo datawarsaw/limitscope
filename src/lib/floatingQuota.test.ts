@@ -12,6 +12,7 @@ import {
   floatingBarWidth,
   floatingClickAction,
   floatingItemLabel,
+  floatingPrimaryWindow,
   floatingQuotaItems,
   floatingWindowHeight,
   haloMeterRects,
@@ -77,10 +78,10 @@ describe("floatingQuotaItems", () => {
     expect(items[0].percent).toBe(68);
   });
 
-  it("selects the highest usable window and ignores malformed ones", () => {
+  it("selects the designated long-term window and ignores malformed ones", () => {
     const items = floatingQuotaItems([
       usage("zai", [
-        limit("5-hour", 22, "2026-09-28T12:00:00.000Z"),
+        limit("5-hour", 90, "2026-09-28T12:00:00.000Z"),
         limit("Broken", Number.NaN),
         limit("Out of range", 140),
         limit("   ", 99),
@@ -270,18 +271,26 @@ describe("floatingQuotaItems", () => {
 });
 
 describe("primary reset and window context", () => {
-  it("targets the longest meaningful reset: monthly over weekly over 5-hour", () => {
+  it("counts down the selected primary window, not the farthest reset", () => {
+    // The floating bar's headline number is the designated long-term window,
+    // so its countdown describes that same window — even when a shorter
+    // window's reset lies farther in the future.
     const items = floatingQuotaItems([
       usage("openai-codex", [
         limit("5-hour", 90, "2026-09-28T14:00:00.000Z"),
         limit("Weekly", 30, "2026-10-04T18:24:00.000Z"),
-        limit("Monthly", 12, "2026-10-28T18:24:00.000Z"),
+        limit("30-day", 12, "2026-10-28T18:24:00.000Z"),
       ]),
     ]);
 
+    expect(items[0]).toMatchObject({
+      percent: 30,
+      windowLabel: "Weekly",
+      resetAt: "2026-10-04T18:24:00.000Z",
+    });
     expect(items[0].primaryReset).toEqual({
-      label: "Monthly",
-      resetAt: "2026-10-28T18:24:00.000Z",
+      label: "Weekly",
+      resetAt: "2026-10-04T18:24:00.000Z",
     });
   });
 
@@ -343,7 +352,10 @@ describe("primary reset and window context", () => {
     });
   });
 
-  it("keeps the longest-reset rule for every provider but Antigravity", () => {
+  it("counts down the selected primary window for every provider, not the farthest reset", () => {
+    // OpenCode Go's designated 30-day window is absent, so the longest
+    // declared period wins the fallback — a tie, broken by provider order —
+    // and the countdown follows it rather than the farthest reset.
     const items = floatingQuotaItems([
       usage("opencode-go", [
         limit("Gemini Weekly", 43.05, "2026-10-04T21:32:12.000Z"),
@@ -351,9 +363,11 @@ describe("primary reset and window context", () => {
       ]),
     ]);
 
+    expect(items[0].percent).toBe(43);
+    expect(items[0].windowLabel).toBe("Gemini Weekly");
     expect(items[0].primaryReset).toEqual({
-      label: "Claude Weekly",
-      resetAt: "2026-10-07T15:25:06.000Z",
+      label: "Gemini Weekly",
+      resetAt: "2026-10-04T21:32:12.000Z",
     });
   });
 
@@ -393,6 +407,188 @@ describe("primary reset and window context", () => {
 
     expect(floatingItemLabel(items[0])).toContain("78% remaining");
     expect(floatingItemLabel(items[0])).toContain("Weekly");
+  });
+});
+
+describe("floating primary quota selection", () => {
+  it("designates Codex's 7-day window even when the 5-hour window is more depleted", () => {
+    const items = floatingQuotaItems([
+      usage("openai-codex", [limit("5-hour", 95, RESET_AT), limit("Weekly", 30, RESET_AT)], {
+        name: "OpenAI / Codex",
+      }),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 30, windowLabel: "Weekly" });
+    expect(floatingItemLabel(items[0])).toContain("70% remaining");
+  });
+
+  it("designates Grok's weekly credits over the on-demand balance", () => {
+    const items = floatingQuotaItems([
+      usage("grok", [limit("Weekly credits", 25, RESET_AT), limit("On-demand", 90)], {
+        name: "Grok (xAI)",
+      }),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 25, windowLabel: "Weekly credits" });
+  });
+
+  it("designates OpenCode Go's 30-day window over both shorter windows", () => {
+    const items = floatingQuotaItems([
+      usage("opencode-go", [
+        limit("5-hour", 95, RESET_AT),
+        limit("Weekly", 90, RESET_AT),
+        limit("30-day", 40, RESET_AT),
+      ]),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 40, windowLabel: "30-day" });
+  });
+
+  it("designates Z.ai's weekly pool over the 5-hour pool", () => {
+    const items = floatingQuotaItems([
+      usage("zai", [limit("5-hour", 80, RESET_AT), limit("Weekly", 25, RESET_AT)], {
+        name: "Z.ai",
+      }),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 25, windowLabel: "Weekly" });
+  });
+
+  it("keeps Antigravity's families separate: Gemini Weekly over a depleted Claude Weekly", () => {
+    // The task's example shape: the Claude family is nearly exhausted while
+    // the Gemini weekly pool still has 70% left. The collapsed segment speaks
+    // for Gemini Weekly — never the max across families.
+    const items = floatingQuotaItems([
+      usage(
+        "antigravity",
+        [
+          limit("Gemini", 0, "2026-10-02T13:26:33.000Z"),
+          limit("Gemini Weekly", 30, "2026-10-04T21:32:12.000Z"),
+          limit("Claude", 0, "2026-10-02T13:26:33.000Z"),
+          limit("Claude Weekly", 99, "2026-10-07T15:25:06.000Z"),
+        ],
+        { name: "Google Antigravity" },
+      ),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 30,
+      usedPercent: 30,
+      windowLabel: "Gemini Weekly",
+      resetAt: "2026-10-04T21:32:12.000Z",
+    });
+    // Percentage, identity, and primary countdown all describe one window.
+    expect(items[0].primaryReset).toEqual({
+      label: "Gemini Weekly",
+      resetAt: "2026-10-04T21:32:12.000Z",
+    });
+    expect(floatingItemLabel(items[0])).toContain("70% remaining");
+    expect(floatingItemLabel(items[0])).toContain("Gemini Weekly");
+  });
+
+  it("keeps a weekly window weekly near its reset instead of re-reading it by reset distance", () => {
+    // The weekly window resets in 30 minutes — sooner than the 5-hour
+    // window's reset — but selection follows the declared period, never the
+    // time remaining, so the primary cannot flip to the shorter window.
+    const items = floatingQuotaItems([
+      usage("openai-codex", [
+        limit("5-hour", 20, "2026-09-28T14:00:00.000Z"),
+        limit("Weekly", 30, "2026-09-28T10:30:00.000Z"),
+      ]),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 30,
+      windowLabel: "Weekly",
+      resetAt: "2026-09-28T10:30:00.000Z",
+    });
+    expect(items[0].primaryReset).toEqual({
+      label: "Weekly",
+      resetAt: "2026-09-28T10:30:00.000Z",
+    });
+  });
+
+  it("falls back to the longest declared period when the preferred window is malformed", () => {
+    const items = floatingQuotaItems([
+      usage("openai-codex", [
+        limit("Weekly", Number.NaN),
+        limit("5-hour", 90, RESET_AT),
+        limit("Daily", 20),
+        limit("3-day", 10),
+      ]),
+    ]);
+
+    // The usable window with the longest declared period — 3-day, not the
+    // most depleted 5-hour window.
+    expect(items[0]).toMatchObject({ percent: 10, windowLabel: "3-day" });
+  });
+
+  it("falls back deterministically when Antigravity's Gemini Weekly is absent", () => {
+    // No Gemini weekly window: the usable window with the longest declared
+    // period is the Claude family's weekly — a predictable stand-in, still
+    // never an average across families.
+    const items = floatingQuotaItems([
+      usage("antigravity", [
+        limit("Gemini", 0, RESET_AT),
+        limit("Claude", 0, RESET_AT),
+        limit("Claude Weekly", 99, RESET_AT),
+      ]),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 99, windowLabel: "Claude Weekly" });
+    expect(floatingItemLabel(items[0])).toContain("1% remaining");
+  });
+
+  it("breaks fallback ties by provider order", () => {
+    // Neither label matches the designated "Weekly" exactly, so both fall to
+    // the longest-period rule, tie, and the provider's own order decides.
+    expect(
+      floatingPrimaryWindow(
+        usage("zai", [limit("Weekly A", 10), limit("Weekly B", 90)]),
+      )?.label,
+    ).toBe("Weekly A");
+  });
+
+  it("matches the designated label case-insensitively after trimming", () => {
+    expect(
+      floatingPrimaryWindow(usage("zai", [limit("5-hour", 90), limit("  weekly  ", 50)]))
+        ?.label,
+    ).toBe("  weekly  ");
+  });
+
+  it("counts down the longest reset when the selected primary has no reset time", () => {
+    const items = floatingQuotaItems([
+      usage("openai-codex", [
+        limit("Weekly", 30),
+        limit("5-hour", 90, RESET_AT),
+      ]),
+    ]);
+
+    // The headline stays on the designated window; only the countdown falls
+    // back, because a countdown needs a reset time to count down to.
+    expect(items[0]).toMatchObject({
+      percent: 30,
+      windowLabel: "Weekly",
+      resetAt: null,
+    });
+    expect(items[0].primaryReset).toEqual({ label: "5-hour", resetAt: RESET_AT });
+  });
+
+  it("uses the longest-period rule for providers without a designated window", () => {
+    const items = floatingQuotaItems([
+      usage("future-provider", [limit("5-hour", 90, RESET_AT), limit("Weekly", 15)]),
+    ]);
+
+    expect(items[0]).toMatchObject({ percent: 15, windowLabel: "Weekly" });
+  });
+
+  it("selects nothing when no window is usable", () => {
+    expect(floatingPrimaryWindow(usage("openai-codex", []))).toBeUndefined();
+    expect(
+      floatingPrimaryWindow(
+        usage("openai-codex", [limit("Weekly", Number.NaN), limit("", 12)]),
+      ),
+    ).toBeUndefined();
   });
 });
 

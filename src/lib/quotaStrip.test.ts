@@ -110,6 +110,22 @@ describe("primaryQuotaWindow", () => {
     expect(primaryQuotaWindow(broken)?.label).toBe("Weekly");
   });
 
+  it("keeps the most-depleted primary outside the floating window", () => {
+    // The floating bar selects Antigravity's designated Gemini Weekly; the
+    // dashboard intentionally keeps highlighting the window closest to its
+    // limit, so a depleted Claude Weekly still wins here. This divergence is
+    // deliberate — see floatingQuota's floatingPrimaryWindow.
+    const antigravity = usage("antigravity", [
+      limit("Gemini", 0),
+      limit("Gemini Weekly", 30),
+      limit("Claude", 0),
+      limit("Claude Weekly", 99),
+    ]);
+
+    expect(primaryQuotaWindow(antigravity)?.label).toBe("Claude Weekly");
+    expect(primaryQuotaWindow(antigravity)?.usedPercent).toBe(99);
+  });
+
   it("returns undefined when no window is usable", () => {
     expect(primaryQuotaWindow(usage("codex", []))).toBeUndefined();
     expect(
