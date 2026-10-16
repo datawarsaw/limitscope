@@ -1232,7 +1232,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         for _ in 0..2 {
             let runs = Arc::clone(&runs);
-            let outcome = run_single_flight(&slot, Duration::from_secs(1), move || {
+            let outcome = run_single_flight(&slot, Duration::from_secs(10), move || {
                 runs.fetch_add(1, Ordering::SeqCst);
                 ScanOutcome::not_running()
             });
