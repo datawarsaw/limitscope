@@ -3229,7 +3229,7 @@ dependencies = [
 
 [[package]]
 name = "rate-limits"
-version = "0.8.10"
+version = "0.8.11"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
