@@ -178,3 +178,19 @@ describe("CI wiring", () => {
     expect(workflow).not.toContain("TAURI_SIGNING_PRIVATE_KEY");
   });
 });
+
+describe("gate module shape", () => {
+  it("stays shebang-free so a CRLF checkout can import it", () => {
+    // This test file imports the gate module, and a `#!` first line ended by
+    // CRLF (the Windows CI runner's default checkout) breaks the Vite ESM
+    // transform with "SyntaxError: Invalid or unexpected token". The module is
+    // only ever run as `node scripts/ci-bundling-gate.mjs`, so the shebang buys
+    // nothing; verify-release-integrity.mjs, which is also imported by a test,
+    // is shebang-free for the same reason.
+    const source = readFileSync(
+      path.join(ROOT, "scripts", "ci-bundling-gate.mjs"),
+      "utf8",
+    );
+    expect(source.startsWith("#!")).toBe(false);
+  });
+});

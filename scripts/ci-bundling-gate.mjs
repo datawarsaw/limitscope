@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * Decides whether a CI run must re-run the full `npm run tauri build` NSIS
  * bundling verification, based on the paths changed by the run.
@@ -26,6 +25,12 @@
  *   node scripts/ci-bundling-gate.mjs --paths <path> [<path> ...]
  *
  * Prints `true` (run bundling verification) or `false` (skip it) to stdout.
+ *
+ * No shebang: this module is imported by scripts/ci-bundling-gate.test.mjs. A
+ * `#!` first line ended by CRLF (the Windows runner's default checkout) breaks
+ * the Vite ESM transform with "SyntaxError: Invalid or unexpected token", so
+ * the module stays shebang-free like scripts/verify-release-integrity.mjs. It is
+ * invoked as `node scripts/ci-bundling-gate.mjs`.
  */
 
 import { readFileSync } from "node:fs";
