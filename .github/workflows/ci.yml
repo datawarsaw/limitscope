@@ -1,5 +1,16 @@
 name: CI
 
+# Fast, always-on gates plus a conditional NSIS bundling verification.
+#
+# Job `windows` proves on every push to `main` and every pull request that the
+# app installs, tests, builds and ships no secrets. Job
+# `bundling-verification` re-runs the full `npm run tauri build` NSIS bundle
+# ONLY when a bundling-specific input changed (see scripts/ci-bundling-gate.mjs
+# and docs/ci-and-release.md "Bundling verification gate").
+#
+# CI does not sign binaries, publish releases, push tags, or use repository
+# secrets. Release publication stays in .github/workflows/release.yml.
+
 on:
   push:
     branches: [main]
@@ -47,6 +58,104 @@ jobs:
 
       - name: Frontend build (tsc + vite)
         run: npm run build
+
+      - name: Secret scan of build outputs
+        run: npm run scan:secrets
+
+  # Decides whether bundling-specific inputs changed. Runs for both pull
+  # requests and pushes to `main`; the changed-path computation is shared so
+  # the gate cannot silently apply to pull requests only.
+  bundling-inputs:
+    name: Detect bundling-input changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      run_bundling: ${{ steps.detect.outputs.run_bundling }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so the previous tip of a pushed ref and the base
+          # branch of a pull request are both available for the diff.
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Detect changed bundling inputs
+        id: detect
+        shell: bash
+        run: |
+          # No `set -e`: a failed fetch or diff must fall through to the
+          # fail-closed branch instead of aborting the step (which would skip
+          # the bundling verification).
+          set -uo pipefail
+
+          before="${{ github.event.before }}"
+          base_ref="${{ github.base_ref }}"
+          zero_sha="0000000000000000000000000000000000000000"
+          paths_file="$(mktemp)"
+          detected=0
+
+          if [ -n "${base_ref}" ]; then
+            # pull_request: diff the PR head against the base branch tip.
+            if git fetch --no-tags origin \
+                 "+refs/heads/${base_ref}:refs/remotes/origin/${base_ref}" \
+               && git diff --name-only "origin/${base_ref}...HEAD" > "${paths_file}"; then
+              detected=1
+            fi
+          elif [ -n "${before}" ] && [ "${before}" != "${zero_sha}" ] \
+               && git cat-file -e "${before}^{commit}" 2>/dev/null; then
+            # push: diff the previous tip of this ref against HEAD.
+            if git diff --name-only "${before}" HEAD > "${paths_file}"; then
+              detected=1
+            fi
+          fi
+
+          if [ "${detected}" -eq 1 ]; then
+            run_bundling="$(node scripts/ci-bundling-gate.mjs --paths-file "${paths_file}")"
+          else
+            echo "::warning::Could not resolve a changed-path base (unborn ref, force push, or fetch failure); running bundling verification (fail closed)."
+            run_bundling=true
+          fi
+
+          echo "run_bundling=${run_bundling}" >> "$GITHUB_OUTPUT"
+          echo "Bundling verification will run: ${run_bundling}"
+
+  # Conditional job: skipped (not pending) unless a bundling input changed.
+  # Under branch protection the required check must be the always-running
+  # `windows` job, never this job; see docs/ci-and-release.md.
+  bundling-verification:
+    name: NSIS bundling verification
+    needs: bundling-inputs
+    if: needs.bundling-inputs.outputs.run_bundling == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      TZ: Europe/Warsaw
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup stable Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
 
       - name: Tauri build (NSIS installer)
         run: npm run tauri build
