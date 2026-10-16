@@ -1,5 +1,5 @@
-import type { ProviderUsage } from "../types";
-import { isUsableQuotaWindow, primaryQuotaWindow } from "./quotaStrip";
+import type { LimitWindow, ProviderUsage } from "../types";
+import { isUsableQuotaWindow } from "./quotaStrip";
 import {
   providerStatusPresentation,
   type ProviderStatusPresentation,
@@ -36,7 +36,8 @@ export type FloatingQuotaItem = {
   providerId: string;
   name: string;
   state: FloatingQuotaState;
-  /** Whole percent of the highest usable window, or null when none exists. */
+  /** Whole percent of the selected primary window (see floatingPrimaryWindow),
+   * or null when none exists. */
   percent: number | null;
   /** Canonical raw percentage when available; `percent` stays the compact readout. */
   usedPercent?: number | null;
@@ -48,11 +49,10 @@ export type FloatingQuotaItem = {
    */
   windows: FloatingQuotaWindowRow[];
   /**
-   * The quota reset the detail card features as its primary countdown.
-   * The generic rule is the longest meaningful reset (monthly over weekly
-   * over a 5-hour window, by actual reset distance — never parsed from
-   * labels); Google Antigravity instead follows its primary quota window
-   * (see primaryResetTarget). The collapsed bar stays countdown-free.
+   * The quota reset the detail card features as its primary countdown: the
+   * selected primary window's own reset (see primaryResetTarget), so the
+   * headline number and the countdown always describe the same window. The
+   * collapsed bar stays countdown-free.
    */
   primaryReset: FloatingQuotaReset | null;
   /**
@@ -240,9 +240,10 @@ export const FLOATING_QUOTA_PERSPECTIVE: QuotaPerspective = "remaining";
 /**
  * Primary countdown target: the usable window whose reset lies farthest in
  * the future. Reset distance is what "monthly over weekly over a 5-hour
- * window" means without parsing labels, and it self-corrects as a long
- * window approaches its reset. Ties keep the earliest window in the
- * provider's own order. Windows without a reset time never qualify.
+ * window" means without parsing labels. Used as the countdown fallback when
+ * the selected primary window carries no reset time of its own (see
+ * primaryResetTarget). Ties keep the earliest window in the provider's own
+ * order. Windows without a reset time never qualify.
  */
 export function primaryResetWindow(
   usage: ProviderUsage,
@@ -258,24 +259,111 @@ export function primaryResetWindow(
   return primary;
 }
 
-/** The provider whose detail card follows its primary quota window instead
- * of the generic longest-reset rule. */
-const ANTIGRAVITY_PROVIDER_ID = "antigravity";
+// ---------- floating primary quota selection ----------
 
 /**
- * The detail card's primary countdown target.
+ * Each provider's designated long-term quota, named by the exact label its
+ * adapter composes for that window: Codex's 7-day limit, Antigravity's Gemini
+ * weekly pool, Grok's weekly credits, OpenCode Go's 30-day limit, and Z.ai's
+ * weekly pool. These are the plan-level budgets the floating bar answers
+ * "how much long-term quota do I have left?" with — not whichever window
+ * happens to be most depleted right now.
+ */
+const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
+  "openai-codex": ["Weekly"],
+  antigravity: ["Gemini Weekly"],
+  grok: ["Weekly credits"],
+  "opencode-go": ["30-day"],
+  zai: ["Weekly"],
+};
+
+const MINUTE_SECONDS = 60;
+const HOUR_SECONDS = 60 * MINUTE_SECONDS;
+const DAY_SECONDS = 24 * HOUR_SECONDS;
+const WEEK_SECONDS = 7 * DAY_SECONDS;
+
+/**
+ * The period a window's label declares, in seconds. The label is the period
+ * metadata the adapters already put on the wire (Codex composes labels from
+ * upstream window seconds, OpenCode Go from its weekly/monthly fields, Z.ai
+ * from the credit-pool unit, Antigravity from its weekly window key); 0 means
+ * the label declares no period ("Tokens", "On-demand", a sanitized fallback),
+ * ranking such windows below every real period. Reset distance is
+ * deliberately not consulted: a weekly window nearing its reset stays weekly.
+ */
+function declaredPeriodSeconds(rawLabel: string): number {
+  const label = rawLabel.trim().toLowerCase();
+  const sized = /^(\d+)-minute$|^(\d+)-hour$|^(\d+)-day$/.exec(label);
+  if (sized) {
+    if (sized[1]) return Number(sized[1]) * MINUTE_SECONDS;
+    if (sized[2]) return Number(sized[2]) * HOUR_SECONDS;
+    return Number(sized[3]) * DAY_SECONDS;
+  }
+  if (label === "hourly") return HOUR_SECONDS;
+  if (label === "daily") return DAY_SECONDS;
+  if (label === "monthly" || label.startsWith("monthly ")) {
+    return 30 * DAY_SECONDS;
+  }
+  if (label === "weekly" || label.startsWith("weekly ") || label.endsWith(" weekly")) {
+    return WEEK_SECONDS;
+  }
+  return 0;
+}
+
+function isPreferredLabel(
+  label: string,
+  preferred: readonly string[] | undefined,
+): boolean {
+  if (!preferred) return false;
+  const normalized = label.trim().toLowerCase();
+  return preferred.some((candidate) => candidate.toLowerCase() === normalized);
+}
+
+/**
+ * The floating bar's primary quota window, deterministic per snapshot:
  *
- * Google Antigravity reports two model families as one provider and their
- * weekly windows reset days apart, so reaching across families for the
- * farthest reset pairs the headline number (one family) with a countdown
- * for the other. Antigravity's countdown therefore describes the primary
- * quota window itself — the same window the headline number comes from.
- * Every other provider keeps the longest-reset rule, which is also the
- * fallback when Antigravity's primary window carries no usable reset time.
+ * 1. The provider's designated long-term window (FLOATING_PRIMARY_LABELS),
+ *    first match in provider order. Antigravity's families stay separate
+ *    here: "Gemini Weekly" is the primary even when the Claude family's
+ *    windows report heavier usage — never a max across families.
+ * 2. Otherwise the usable window whose declared period is longest, ties kept
+ *    in provider order — the closest stand-in for the designated budget.
+ * 3. Malformed windows are ignored throughout (isUsableQuotaWindow), and
+ *    percentages are never averaged or combined across windows.
+ *
+ * Deliberately scoped to the floating window: the dashboard keeps its own
+ * most-depleted primary (primaryQuotaWindow), which intentionally highlights
+ * the window closest to its limit.
+ */
+export function floatingPrimaryWindow(
+  usage: ProviderUsage,
+): LimitWindow | undefined {
+  const preferred = FLOATING_PRIMARY_LABELS[usage.id];
+  let fallback: LimitWindow | undefined;
+  let fallbackPeriod = -1;
+  for (const limit of usage.limits) {
+    if (!isUsableQuotaWindow(limit)) continue;
+    const label = limit.label.trim();
+    if (isPreferredLabel(label, preferred)) return limit;
+    const period = declaredPeriodSeconds(label);
+    if (period > fallbackPeriod) {
+      fallback = limit;
+      fallbackPeriod = period;
+    }
+  }
+  return fallback;
+}
+
+/**
+ * The detail card's primary countdown target: the selected primary window's
+ * own reset (floatingPrimaryWindow), so the headline number, its identity,
+ * and the countdown always describe the same window — including Antigravity,
+ * whose Gemini and Claude families report weekly resets days apart. When
+ * that window carries no usable reset time, the countdown falls back to the
+ * longest meaningful reset (primaryResetWindow) rather than disappearing.
  */
 export function primaryResetTarget(usage: ProviderUsage): FloatingQuotaReset | null {
-  if (usage.id !== ANTIGRAVITY_PROVIDER_ID) return primaryResetWindow(usage);
-  const primary = primaryQuotaWindow(usage);
+  const primary = floatingPrimaryWindow(usage);
   if (primary?.resetAt && !Number.isNaN(Date.parse(primary.resetAt))) {
     return { label: primary.label.trim(), resetAt: primary.resetAt };
   }
@@ -302,11 +390,14 @@ function stateFor(
 /**
  * Compact rows for the floating bar, in registry order.
  *
- * The number comes from primaryQuotaWindow: highest usable used-percent,
- * malformed windows ignored, never an average or a sum. The countdown target
- * comes from primaryResetWindow: the longest meaningful reset. Simulated
- * providers are omitted. A repeated id keeps the first real usage. A
- * production provider with no usable window stays on the bar as unavailable.
+ * The number comes from floatingPrimaryWindow: the provider's designated
+ * long-term window, or the longest declared period when that window is
+ * unavailable — malformed windows ignored, never an average or a sum. The
+ * countdown target follows the same window (primaryResetTarget), falling
+ * back to the longest meaningful reset only when it carries no reset time.
+ * Simulated providers are omitted. A repeated id keeps the first real
+ * usage. A production provider with no usable window stays on the bar as
+ * unavailable.
  */
 export function floatingQuotaItems(
   usages: readonly ProviderUsage[],
@@ -319,7 +410,7 @@ export function floatingQuotaItems(
     seen.add(usage.id);
 
     const status = providerStatusPresentation(usage);
-    const primary = primaryQuotaWindow(usage);
+    const primary = floatingPrimaryWindow(usage);
     const hasWindow = primary !== undefined;
     const windows: FloatingQuotaWindowRow[] = usage.limits
       .filter(isUsableQuotaWindow)
