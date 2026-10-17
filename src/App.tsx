@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AttentionRail } from "./components/dashboard/AttentionRail";
 import { ExecutionRunPanel } from "./components/dashboard/ExecutionRunPanel";
 import { LocalDataSection } from "./components/LocalDataSection";
+import { OpenDesignPanel } from "./components/dashboard/OpenDesignPanel";
 import { PrimaryQuotaPanel } from "./components/dashboard/PrimaryQuotaPanel";
 import { ProviderRail } from "./components/dashboard/ProviderRail";
 import { QuotaWindowList } from "./components/dashboard/QuotaWindowList";
@@ -568,6 +569,9 @@ export default function App() {
               ) : (
                 <div className="empty">Loading provider data…</div>
               )}
+              {/* OpenDesign has no automatic source: this card is a manual,
+                  read-only accessibility read of the signed-in Chrome page. */}
+              <OpenDesignPanel now={now} />
             </main>
 
         {visibleUsages.length > 0 ? (

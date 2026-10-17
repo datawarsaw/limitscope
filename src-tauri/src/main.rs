@@ -15,6 +15,7 @@ mod last_good;
 mod local_data;
 mod notifications;
 mod opencode_go;
+mod opendesign;
 mod provider_error;
 mod qwen_token_plan;
 mod reset_plausibility;
@@ -130,6 +131,7 @@ fn main() {
             antigravity::get_antigravity_usage,
             grok::get_grok_usage,
             grok_bot::refresh_grok_bot_usage,
+            opendesign::refresh_opendesign_usage,
             open_main_window,
             floating_drag::attach_floating_drag_lifecycle,
             floating_drag::detach_floating_drag_lifecycle,

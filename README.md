@@ -35,6 +35,8 @@ AI coding tools keep usage limits in different apps and local credential stores.
 
 Codex reset credits are parsed from the Codex usage response and are shown only when available and fresh. Both reset features are supplemental observations, not separate quota providers.
 
+OpenDesign Go quota is available as a manual companion card, not a provider. It reads the 5-hour and 7-day remaining shares from the signed-in OpenDesign page in Chrome through Windows UI Automation, only when you press Refresh. Chrome must already show an authenticated Plan & balance page; the card is not part of the automatic provider scan, the provider rail, or the pay-as-you-go wallet.
+
 Claude is not a supported provider. The repository contains discovery work, but Claude is not registered in the application runtime. Provider endpoints and local storage formats are unofficial and may change; check the app's status and error details if a provider changes its interface.
 
 ## Privacy & security

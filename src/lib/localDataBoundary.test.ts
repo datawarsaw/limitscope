@@ -32,6 +32,10 @@ const IPC_SURFACE = new Set([
   // triggered only by an explicit user action in the Grok detail card. It
   // reads no files and clears nothing — deliberate, reviewed addition.
   "grok_bot::refresh_grok_bot_usage",
+  // OpenDesign manual refresh: a read-only Windows accessibility observation
+  // triggered only by an explicit user action in the OpenDesign detail card.
+  // It reads no browser storage and makes no network request.
+  "opendesign::refresh_opendesign_usage",
   "open_main_window",
   "runtime::get_runtime_snapshot",
   "runtime::request_refresh",

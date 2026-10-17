@@ -54,6 +54,11 @@ const ALLOWED_COMMANDS = new Set([
   // detail card. Not a provider fetch, not a refresh of the shared runtime,
   // and never scheduled — invoke happens only inside the click handler.
   "refresh_grok_bot_usage",
+  // OpenDesign manual refresh: the same shape of deliberate exception — a
+  // read-only accessibility observation of the signed-in Chrome page,
+  // invoked only from the OpenDesign card's Refresh button. It fetches
+  // nothing, reads no browser storage, and is never scheduled.
+  "refresh_opendesign_usage",
   // Native drag lifecycle (Human-Accepted Slice A): attach/detach/restore
   // the Rust-owned window drag observer. Not a fetch and not a refresh.
   "attach_floating_drag_lifecycle",
