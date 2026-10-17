@@ -29,7 +29,7 @@
 
 ## Evidence and limits
 
-- Verified on 2026-10-17: frontend 1116 PASS; Rust 842 PASS / 15 intentionally
+- Verified on 2026-10-17: frontend 1116 PASS; Rust 843 PASS / 15 intentionally
   ignored live probes; `cargo check --locked --all-targets` PASS.
 - Focused provider/component tests cover window selection, reset text,
   missing/stale/error states, explicit refresh and provider compatibility.

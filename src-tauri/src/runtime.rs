@@ -1097,7 +1097,15 @@ fn normalize_opendesign_manual(
             checked_at: refresh.observed_at,
             error: Some(message),
             error_category: Some(category.to_string()),
-            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Unavailable, Vec::new())
+            ..base_usage(
+                ProviderKind::OpenDesign,
+                if refresh.status == OpenDesignStatus::Unknown {
+                    ProviderHealth::Error
+                } else {
+                    ProviderHealth::Unavailable
+                },
+                Vec::new(),
+            )
         };
     }
     // The successful cached pair is authoritative because it carries the
@@ -1107,7 +1115,7 @@ fn normalize_opendesign_manual(
             checked_at: refresh.observed_at,
             error: Some("OpenDesign did not retain both quota windows.".to_string()),
             error_category: Some("manual_scan_incomplete".to_string()),
-            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Unavailable, Vec::new())
+            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Error, Vec::new())
         };
     };
     opendesign_snapshot_dto(snapshot, refresh.plan, now, None)
@@ -1139,7 +1147,7 @@ fn opendesign_windows_dto(
             checked_at: observed_at,
             error: Some("OpenDesign did not return one complete, valid 5-hour and 7-day pair.".to_string()),
             error_category: Some("manual_scan_incomplete".to_string()),
-            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Unavailable, Vec::new())
+            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Error, Vec::new())
         };
     }
     let observed = DateTime::parse_from_rfc3339(&observed_at)
@@ -3097,7 +3105,7 @@ mod tests {
                 Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(snapshot))),
                 fixed_now(),
             );
-            assert_eq!(dto.health, ProviderHealth::Unavailable);
+            assert_eq!(dto.health, ProviderHealth::Error);
             assert_eq!(dto.error_category.as_deref(), Some("manual_scan_incomplete"));
             assert!(dto.limits.is_empty());
         }
@@ -3127,6 +3135,23 @@ mod tests {
             Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt-c", Some(opendesign_snapshot(&stamp)))),
         );
         assert_eq!(aged.providers[0].health, ProviderHealth::Stale);
+    }
+
+    #[test]
+    fn opendesign_unreadable_scan_is_error_but_missing_source_is_unavailable() {
+        for (status, health) in [
+            (OpenDesignStatus::Unknown, ProviderHealth::Error),
+            (OpenDesignStatus::ChromeNotRunning, ProviderHealth::Unavailable),
+            (OpenDesignStatus::DashboardNotVisible, ProviderHealth::Unavailable),
+        ] {
+            let dto = normalize_opendesign_manual(
+                Some(opendesign_refresh(status, &fixed_now().to_rfc3339(), None)),
+                fixed_now(),
+            );
+            assert_eq!(dto.health, health);
+            assert!(dto.limits.is_empty());
+            assert!(dto.error.is_some());
+        }
     }
 
     #[tokio::test]
