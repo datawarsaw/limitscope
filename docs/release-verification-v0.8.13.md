@@ -65,3 +65,14 @@ The screenshot `docs/screenshots/v0.8.13/opendesign-live.png` was captured from 
 ## Limits of this record
 
 The runtime verdict for the feature is CONDITIONAL: the read is reliable only while Chrome runs with an authenticated OpenDesign Plan & balance page open. That is a product condition of the UI approach, not a defect in this delivery, and the panel states it plainly when the condition is not met.
+
+## Release record
+
+- Source: `0f5a5838c9c6056c4376bfafae68d3c49515d54a` on `main`, tag `v0.8.13`.
+- Pull request: datawarsaw/limitscope#15, CI green (Windows build & tests, NSIS bundling verification).
+- Signed release run: datawarsaw/limitscope 39049564913, success.
+- Published assets in datawarsaw/limitscope-releases v0.8.13: `LimitScope_0.8.13_x64-setup.exe` (4,162,050 bytes), its `.sig` (444 bytes), and `latest.json` (993 bytes). The release is a normal latest release, not a prerelease.
+- `verify-release-integrity.mjs --version 0.8.13 --expected-sha 0f5a5838c9c6 --expect-tag`: PASS (16 passed, 0 failed, 1 skipped). This covers version surfaces, tag identity, the exact asset set, feed bytes, the feed URL, and byte equality between the live feed and the published `latest.json`.
+- Offline signature verification against the downloaded installer: PASS (13 passed, 0 failed, 5 skipped), including `minisign-verify 0.2.5` with `allow_legacy=false`.
+
+The first release attempt failed on this branch's own single-flight test: the worker sent its outcome before releasing the slot, so a caller could return while the slot still read busy. The fix landed as `0f5a583`, and the successful run above was dispatched from that commit.
