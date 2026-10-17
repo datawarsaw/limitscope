@@ -146,9 +146,10 @@ CI runs only offline tests. The following Rust tests are marked
 | `zai::tests::live_fetch_returns_windows` | requires a real local Z.ai plan key |
 | `opencode_go::tests::live_fetch_returns_windows` | requires a real local OpenCode Go key |
 | `antigravity::tests::live_fetch_returns_windows` | reads the real local Antigravity account cache |
+| `qwen_token_plan::tests::live_token_plan_returns_the_monthly_window` | requires the official Bailian CLI and an international Singapore console login |
 
 CI therefore needs **no provider credentials of any kind** (Codex, Z.ai,
-OpenCode, Antigravity, Claude, Grok) and no repository secrets. All frontend
+OpenCode, Antigravity, Claude, Grok, Qwen) and no repository secrets. All frontend
 vitest suites are offline unit tests and run everywhere.
 
 ## Known Windows/Tauri caveats

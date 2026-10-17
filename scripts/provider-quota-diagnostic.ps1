@@ -1,9 +1,9 @@
-# Provider quota diagnostic — unified, redacted, read-only (all five providers).
+# Provider quota diagnostic — unified, redacted, read-only (every production provider).
 #
 # One invocation runs the sanctioned Rust probe (the ignored
 # `five_provider_diagnostic_report` test in src-tauri) and prints one
 # redacted, normalized row per production provider — Codex, Z.ai,
-# OpenCode Go, Antigravity, Grok:
+# OpenCode Go, Antigravity, Grok, and Qwen Token Plan:
 #
 #   health (canonical: live/stale/unknown/cooldown/error/unavailable)
 #   checkedAt, freshness / source stamp where meaningful
@@ -33,7 +33,7 @@ $outLog = Join-Path $env:TEMP "limitscope-provider-diagnostic-$stamp.log"
 $errLog = Join-Path $env:TEMP "limitscope-provider-diagnostic-$stamp.err.log"
 
 Write-Host "== LimitScope provider quota diagnostic (redacted, read-only) =="
-Write-Host "Running the five-provider probe via cargo test (ignored live probe)..."
+Write-Host "Running the production-provider probe via cargo test (ignored live probe)..."
 Write-Host ""
 
 Push-Location (Join-Path $repoRoot "src-tauri")

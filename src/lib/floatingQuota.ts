@@ -275,6 +275,7 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   grok: ["Weekly credits"],
   "opencode-go": ["30-day"],
   zai: ["Weekly"],
+  "qwen-token-plan": ["Monthly"],
 };
 
 const MINUTE_SECONDS = 60;
