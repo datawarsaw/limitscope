@@ -14,6 +14,8 @@ Acceptance rules exercised by `src-tauri/src/opendesign.rs`:
 - Only a complete, successful pair replaces the in-memory last-known reading. A failure keeps the previous pair and its original observation stamp.
 - The scan runs on a dedicated MTA thread with a 2,500 ms watchdog. There is no network access, no cookie or token read, no browser debug port, no focus change, no reload, and no input injection.
 
+The slot that prevents overlapping reads is released by the worker before it reports its outcome, so a caller that has received a result always observes the slot free. The first CI run of this release exposed the opposite ordering as a race; the fix and its regression test are part of the released commit.
+
 The command is `refresh_opendesign_usage`. It is invoked only by the panel's button; there is no timer, scheduler, or automatic retry.
 
 ## Live reads against the authenticated page

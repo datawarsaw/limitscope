@@ -534,9 +534,17 @@ fn scan_slot() -> &'static Arc<AtomicBool> {
 
 struct SlotRelease(Arc<AtomicBool>);
 
+impl SlotRelease {
+    /// Releases the slot exactly once; the guard's Drop stays as a panic
+    /// backstop and a second release is harmless.
+    fn release(&self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl Drop for SlotRelease {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.release();
     }
 }
 
@@ -558,9 +566,12 @@ where
     let spawned = thread::Builder::new()
         .name("opendesign-uia-read".to_string())
         .spawn(move || {
-            let _release = SlotRelease(slot_for_worker);
+            let release = SlotRelease(slot_for_worker);
             let outcome =
                 catch_unwind(AssertUnwindSafe(body)).unwrap_or_else(|_| ScanOutcome::unknown());
+            // Release before signalling: once the caller holds the outcome,
+            // the slot must already read free so the next refresh can start.
+            release.release();
             let _ = tx.send(outcome);
         });
     if spawned.is_err() {
