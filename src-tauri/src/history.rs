@@ -777,6 +777,9 @@ fn valid_time(value: &str) -> Option<String> {
 pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObservation> {
     let mut observations = Vec::new();
     for usage in usages {
+        if usage.id == crate::runtime::ProviderKind::OpenDesign.id() {
+            continue;
+        }
         if usage.health != crate::runtime::ProviderHealth::Live {
             continue;
         }
@@ -1516,10 +1519,12 @@ mod tests {
                 label: "  ".to_string(),
                 used_percent: 10.0,
                 reset_at: None,
+                reset_text: None,
             },
             UsageLimitDto {
                 label: "5-hour".to_string(),
                 used_percent: f64::NAN,
+                reset_text: None,
                 reset_at: None,
             },
             // An unparseable resetAt degrades to absent — the window is
@@ -1528,10 +1533,12 @@ mod tests {
                 label: "weekly".to_string(),
                 used_percent: 20.0,
                 reset_at: Some("garbage".to_string()),
+                reset_text: None,
             },
             UsageLimitDto {
                 label: "weekly".to_string(),
                 used_percent: 25.0,
+                reset_text: None,
                 reset_at: Some("2026-10-01T00:00:00.000Z".to_string()),
             },
         ];
@@ -1964,6 +1971,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "5-hour".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: None,
             }],
             account: None,

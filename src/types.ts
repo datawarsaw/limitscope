@@ -2,6 +2,8 @@ export type LimitWindow = {
   label: string;
   usedPercent: number;
   resetAt?: string;
+  /** Source countdown at observation time; never an inferred timestamp. */
+  resetText?: string;
 };
 
 /**

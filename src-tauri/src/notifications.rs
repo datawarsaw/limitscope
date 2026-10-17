@@ -909,6 +909,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "Weekly credits".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: Some(RESET_LATER.to_string()),
             }],
             account: None,
@@ -936,6 +937,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "Weekly credits".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: Some(RESET_LATER.to_string()),
             }],
             account: None,
@@ -1184,7 +1186,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
         );
         let serialized = serde_json::to_string(&ids).unwrap();
         assert!(!serialized.contains("mock"), "no mock adapters in the notification path");

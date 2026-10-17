@@ -14,6 +14,7 @@ import {
  * pinned cards carry the same identity as the segment they expand.
  */
 export function ProviderMark({ id }: { id: string }) {
+  if (id === "opendesign") return <span className="fq-mark-fallback">OD</span>;
   if (id === "openai-codex") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">

@@ -24,6 +24,7 @@ export type FloatingQuotaWindowRow = {
   label: string;
   usedPercent: number;
   resetAt: string | null;
+  resetText?: string;
 };
 
 /** The provider's primary countdown target: its longest meaningful reset. */
@@ -43,6 +44,7 @@ export type FloatingQuotaItem = {
   usedPercent?: number | null;
   windowLabel: string | null;
   resetAt: string | null;
+  resetText?: string;
   /**
    * Usable windows in provider order; the expanded popover lists the ones
    * other than the primary reset as secondary rows.
@@ -108,6 +110,10 @@ const ITEM_COL_GAP = 8; // .fq-item column-gap between mark and meter column
 /** Horizontal distance from an item's left edge to its meter's left edge. */
 const METER_INSET = ITEM_PAD_X + MARK_COL + ITEM_COL_GAP;
 
+function meterInset(providerCount: number): number {
+  return providerCount >= 7 ? 6 + 18 + 4 : METER_INSET;
+}
+
 /**
  * Meter x-geometry of the production Halo bar for a window of `windowWidth`
  * logical px hosting `providerCount` segments: one rect per provider, in
@@ -123,11 +129,15 @@ export function haloMeterRects(
   const shellContent =
     windowWidth - ROOT_PAD * 2 - SHELL_BORDER * 2 - SHELL_PAD * 2;
   const itemWidth = (shellContent - GRIP_WIDTH - count * SHELL_GAP) / count;
+  // Seven providers use the compact item geometry in floating.css. Keep the
+  // resting dock's meters aligned with that same rendered geometry.
+  const inset = meterInset(count);
+  const rightPad = count >= 7 ? 6 : ITEM_PAD_X;
   const firstItemLeft =
     ROOT_PAD + SHELL_BORDER + SHELL_PAD + GRIP_WIDTH + SHELL_GAP;
   return Array.from({ length: count }, (_, index) => ({
-    left: firstItemLeft + index * (itemWidth + SHELL_GAP) + METER_INSET,
-    width: itemWidth - METER_INSET - ITEM_PAD_X,
+    left: firstItemLeft + index * (itemWidth + SHELL_GAP) + inset,
+    width: itemWidth - inset - rightPad,
   }));
 }
 
@@ -155,7 +165,7 @@ export function dockMeterRects(providerCount: number): MeterRect[] {
  */
 export function dockSeparatorLefts(providerCount: number): number[] {
   const rects = dockMeterRects(providerCount);
-  return rects.slice(1).map((rect) => rect.left - METER_INSET);
+  return rects.slice(1).map((rect) => rect.left - meterInset(providerCount));
 }
 
 /** Extra logical height while the shared detail card or menu is open. For
@@ -276,6 +286,7 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   "opencode-go": ["30-day"],
   zai: ["Weekly"],
   "qwen-token-plan": ["Monthly"],
+  opendesign: ["7-day"],
 };
 
 const MINUTE_SECONDS = 60;
@@ -419,6 +430,7 @@ export function floatingQuotaItems(
         label: limit.label.trim(),
         usedPercent: limit.usedPercent,
         resetAt: limit.resetAt ?? null,
+        ...(limit.resetText ? { resetText: limit.resetText } : {}),
       }));
     items.push({
       providerId: usage.id,
@@ -428,6 +440,7 @@ export function floatingQuotaItems(
       usedPercent: hasWindow ? primary.usedPercent : null,
       windowLabel: hasWindow ? primary.label.trim() : null,
       resetAt: hasWindow && primary.resetAt ? primary.resetAt : null,
+      ...(primary?.resetText ? { resetText: primary.resetText } : {}),
       windows,
       primaryReset: primaryResetTarget(usage),
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),

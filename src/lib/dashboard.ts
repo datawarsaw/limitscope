@@ -26,6 +26,7 @@ const SHORT_NAMES: Readonly<Record<string, string>> = {
   antigravity: "Antigravity",
   grok: "Grok",
   "qwen-token-plan": "Qwen",
+  opendesign: "OpenDesign",
 };
 
 export function shortProviderName(usage: ProviderUsage): string {
@@ -209,13 +210,14 @@ function attentionItemFor(
   perspective: QuotaPerspective,
 ): AttentionItem | null {
   const { usage, shortName, primary, percent } = source;
+  const displayPerspective = usage.id === "opendesign" ? "remaining" : perspective;
 
   // A ≥95% primary window is the loudest displayed fact: the number stays on
   // screen through stale and retained-error states, so it outranks the
   // freshness caveats those states add.
   if (primary !== undefined && percent !== undefined) {
     const windowLabel = primary.label.trim();
-    const presentation = quotaPresentation(primary.usedPercent, perspective);
+    const presentation = quotaPresentation(primary.usedPercent, displayPerspective);
     if (percent >= ATTENTION_CRITICAL_PERCENT) {
       return {
         providerId: usage.id,
@@ -245,7 +247,7 @@ function attentionItemFor(
   }
   if (primary !== undefined && percent !== undefined) {
     const windowLabel = primary.label.trim();
-    const presentation = quotaPresentation(primary.usedPercent, perspective);
+    const presentation = quotaPresentation(primary.usedPercent, displayPerspective);
     // The gate wants the raw window percent: the display figure is rounded,
     // and a 99.6% window must still read as <100 while it truly is.
     const prediction = visiblePrediction(

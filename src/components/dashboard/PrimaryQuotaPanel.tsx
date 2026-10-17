@@ -16,6 +16,7 @@ import {
   type QuotaPerspective,
 } from "../../lib/quotaPresentation";
 import type { ProviderUsage } from "../../types";
+import { OpenDesignRefreshControl } from "../OpenDesignRefreshControl";
 
 /**
  * Zone A — the visual anchor: the selected provider, its primary quota
@@ -42,9 +43,9 @@ export function PrimaryQuotaPanel({
 }) {
   const status = providerStatusPresentation(usage);
   const primary = primaryQuotaWindow(usage);
-  const presentation = mainQuotaPresentation(primary?.usedPercent, perspective);
+  const presentation = mainQuotaPresentation(primary?.usedPercent, usage.id === "opendesign" ? "remaining" : perspective);
   const tone = primary === undefined ? "calm" : toneFor(primary.usedPercent);
-  const resetLine = primary?.resetAt ? formatResetLine(primary.resetAt, now) : null;
+  const resetLine = primary?.resetText ? `At observation: ${primary.resetText}` : primary?.resetAt ? formatResetLine(primary.resetAt, now) : null;
   const resetCredits = formatResetCredits(usage, now.getTime());
   const prediction =
     primary === undefined
@@ -64,6 +65,8 @@ export function PrimaryQuotaPanel({
           <span>{status.label}</span>
         </span>
       </header>
+      {usage.id === "opendesign" && usage.planType ? <p className="opendesign-plan">{`OpenDesign ${usage.planType}`}</p> : null}
+      {usage.id === "opendesign" ? <OpenDesignRefreshControl /> : null}
 
       {primary === undefined || presentation.displayPercent === null ? (
         // An errored provider's own source note already says "No saved

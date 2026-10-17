@@ -9,6 +9,7 @@ import {
 } from "../lib/quotaPresentation";
 import { ProviderMark } from "./FloatingProviderItem";
 import { GrokBotSection } from "./GrokBotSection";
+import { OpenDesignRefreshControl } from "./OpenDesignRefreshControl";
 
 /**
  * The primary reset line follows the approved card: window label, "reset
@@ -19,6 +20,7 @@ function primaryResetLine(
   item: FloatingQuotaItem,
   now: Date,
 ): { muted: string; strong: string | null } {
+  if (item.resetText) return { muted: `${item.windowLabel} · At observation: ${item.resetText}`, strong: null };
   const primary = item.primaryReset;
   if (primary) {
     const countdown = formatCountdown(primary.resetAt, now);
@@ -44,12 +46,14 @@ function WindowRow({
   label,
   usedPercent,
   resetAt,
+  resetText,
   now,
 }: {
   item: FloatingQuotaItem;
   label: string;
   usedPercent: number;
   resetAt: string | null;
+  resetText?: string;
   now: Date;
 }) {
   const presentation = floatingQuotaPresentation(
@@ -74,6 +78,7 @@ function WindowRow({
               <span className="fq-window-strong">{countdown}</span>
             </span>
           ) : null}
+          {resetText ? <span className="fq-observed-reset">{` · At observation: ${resetText}`}</span> : null}
         </p>
         <span
           className="fq-meter fq-meter-row"
@@ -218,6 +223,7 @@ export function FloatingProviderPopover({
                 label={window.label}
                 usedPercent={window.usedPercent}
                 resetAt={window.resetAt}
+                resetText={window.resetText}
                 now={now}
               />
             ))}
@@ -228,6 +234,7 @@ export function FloatingProviderPopover({
             the Grok Weekly quota above: different source, different meter,
             explicit Refresh only. */}
         {item.providerId === "grok" ? <GrokBotSection now={now} /> : null}
+        {item.providerId === "opendesign" ? <OpenDesignRefreshControl /> : null}
 
         {item.error ? (
           <p className="fq-popover-error" role="alert">
@@ -250,9 +257,8 @@ export function FloatingProviderPopover({
           </footer>
         ) : null}
 
-        {/* Informational plus one Open action. Pin and hide commands live
-            only in the right-click menu; the single sanctioned in-card
-            command is the Grok Bot section's manual Refresh. */}
+        {/* Open is the footer action; manual sources own their explicit
+            Refresh controls above. Pin/hide stay in the context menu. */}
         <div className="fq-actions">
           <button type="button" onClick={onOpenMain}>
             Open

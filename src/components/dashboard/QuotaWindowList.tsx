@@ -75,9 +75,9 @@ function WindowRow({
   ) => QuotaPrediction | undefined;
   perspective: QuotaPerspective;
 }) {
-  const presentation = mainQuotaPresentation(limit.usedPercent, perspective);
+  const presentation = mainQuotaPresentation(limit.usedPercent, usage.id === "opendesign" ? "remaining" : perspective);
   const tone = toneFor(limit.usedPercent);
-  const resetLine = limit.resetAt ? formatResetLine(limit.resetAt, now) : null;
+  const resetLine = limit.resetText ? `At observation: ${limit.resetText}` : limit.resetAt ? formatResetLine(limit.resetAt, now) : null;
   const prediction = visiblePrediction(
     usage,
     limit.usedPercent,
