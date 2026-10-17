@@ -454,6 +454,22 @@ describe("floating primary quota selection", () => {
     expect(items[0]).toMatchObject({ percent: 25, windowLabel: "Weekly" });
   });
 
+  it("designates the Qwen Token Plan monthly window", () => {
+    const items = floatingQuotaItems([
+      usage(
+        "qwen-token-plan",
+        [limit("Monthly", 43.78, "2026-11-16T16:00:00.000Z")],
+        { name: "Qwen Token Plan" },
+      ),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 44,
+      usedPercent: 43.78,
+      windowLabel: "Monthly",
+    });
+  });
+
   it("keeps Antigravity's families separate: Gemini Weekly over a depleted Claude Weekly", () => {
     // The task's example shape: the Claude family is nearly exhausted while
     // the Gemini weekly pool still has 70% left. The collapsed segment speaks

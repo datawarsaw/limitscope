@@ -93,6 +93,7 @@ use crate::grok::{self, GrokError, GrokUsage};
 use crate::notifications::NotificationLane;
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
+use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
 use crate::zai::{self, ZaiUsage};
 use crate::zcode_plans::{self, ZCodePlansObservation};
 use crate::zcode_reset::{self, ZCodeResetStatus};
@@ -456,6 +457,7 @@ pub enum ProviderKind {
     OpenCodeGo,
     Antigravity,
     Grok,
+    QwenTokenPlan,
 }
 
 impl ProviderKind {
@@ -466,6 +468,7 @@ impl ProviderKind {
             ProviderKind::OpenCodeGo => "opencode-go",
             ProviderKind::Antigravity => "antigravity",
             ProviderKind::Grok => "grok",
+            ProviderKind::QwenTokenPlan => "qwen-token-plan",
         }
     }
 
@@ -476,6 +479,7 @@ impl ProviderKind {
             ProviderKind::OpenCodeGo => "OpenCode Go",
             ProviderKind::Antigravity => "Google Antigravity",
             ProviderKind::Grok => "Grok (xAI)",
+            ProviderKind::QwenTokenPlan => "Qwen Token Plan",
         }
     }
 
@@ -486,6 +490,7 @@ impl ProviderKind {
             "opencode-go" => Some(ProviderKind::OpenCodeGo),
             "antigravity" => Some(ProviderKind::Antigravity),
             "grok" => Some(ProviderKind::Grok),
+            "qwen-token-plan" => Some(ProviderKind::QwenTokenPlan),
             _ => None,
         }
     }
@@ -497,6 +502,7 @@ impl ProviderKind {
             ProviderKind::OpenCodeGo => "OpenCode Go usage could not be fetched.",
             ProviderKind::Antigravity => "Google Antigravity usage could not be fetched.",
             ProviderKind::Grok => "Grok usage could not be fetched.",
+            ProviderKind::QwenTokenPlan => "Qwen Token Plan usage could not be fetched.",
         }
     }
 }
@@ -999,6 +1005,41 @@ fn normalize_grok(
     }
 }
 
+fn normalize_qwen_token_plan(
+    result: Result<QwenTokenPlanUsage, ProviderError>,
+    now_ms: i64,
+) -> Result<ProviderUsageDto, ProviderFailure> {
+    match result {
+        Ok(usage) => {
+            let limits = limits_from(
+                &usage
+                    .limits
+                    .iter()
+                    .map(|limit| (limit.label.clone(), limit.used_percent, limit.reset_at.clone()))
+                    .collect::<Vec<_>>(),
+                now_ms,
+            );
+            let health = if limits.is_empty() {
+                ProviderHealth::Unknown
+            } else {
+                ProviderHealth::Live
+            };
+            let mut dto = base_usage(ProviderKind::QwenTokenPlan, health, limits);
+            dto.plan_type = Some(usage.plan_type.to_string());
+            dto.account = Some(AccountAttributionDto {
+                label: "Qwen Cloud Token Plan".to_string(),
+                note: Some(
+                    "International console, Singapore (ap-southeast-1). Monthly quota only."
+                        .to_string(),
+                ),
+                identity: Some("qwen-token-plan:international:ap-southeast-1".to_string()),
+            });
+            Ok(dto)
+        }
+        Err(error) => Err(failure_from_provider_error(error)),
+    }
+}
+
 /// The production provider set — the exact registry the TS `registry.ts`
 /// pinned (same ids, same order, no simulated providers). Order is wire
 /// order: the frontend renders and summarizes in this order.
@@ -1068,6 +1109,18 @@ pub fn production_specs() -> Vec<ProviderSpec> {
                         cursor_grok_bot::observe_grok_bot_usage()
                     );
                     normalize_grok(usage, grok_bot.ok(), now_ms)
+                })
+            }),
+        },
+        ProviderSpec {
+            kind: ProviderKind::QwenTokenPlan,
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    let now_ms = Utc::now().timestamp_millis();
+                    normalize_qwen_token_plan(
+                        qwen_token_plan::get_qwen_token_plan_usage().await,
+                        now_ms,
+                    )
                 })
             }),
         },
@@ -1842,7 +1895,8 @@ impl RuntimeCore {
             // even an "unknown" one (the TS adapters stored whatever the
             // success produced).
             ProviderKind::Codex | ProviderKind::Zai | ProviderKind::OpenCodeGo
-            | ProviderKind::Antigravity => {
+            | ProviderKind::Antigravity
+            | ProviderKind::QwenTokenPlan => {
                 self.inner
                     .lock()
                     .unwrap()
@@ -3301,12 +3355,13 @@ mod tests {
                 ProviderKind::OpenCodeGo,
                 ProviderKind::Antigravity,
                 ProviderKind::Grok,
+                ProviderKind::QwenTokenPlan,
             ]
         );
         let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan"]
         );
         assert!(ids.contains(&"grok"), "Grok must remain production");
         // No simulated providers: the production runtime never carries the
@@ -5582,7 +5637,10 @@ mod tests {
     #[test]
     fn registry_ids_are_unchanged_by_the_health_contract() {
         let ids: Vec<&str> = production_specs().iter().map(|s| s.kind.id()).collect();
-        assert_eq!(ids, ["openai-codex", "zai", "opencode-go", "antigravity", "grok"]);
+        assert_eq!(
+            ids,
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan"]
+        );
     }
 
     #[test]

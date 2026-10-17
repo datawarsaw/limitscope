@@ -57,6 +57,9 @@ describe("shortProviderName", () => {
     ).toBe("Codex");
     expect(shortProviderName(usage({ id: "grok", name: "Grok (xAI)" }))).toBe("Grok");
     expect(
+      shortProviderName(usage({ id: "qwen-token-plan", name: "Qwen Token Plan" })),
+    ).toBe("Qwen");
+    expect(
       shortProviderName(usage({ id: "antigravity", name: "Google Antigravity" })),
     ).toBe("Antigravity");
   });

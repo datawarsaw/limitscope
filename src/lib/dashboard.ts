@@ -16,7 +16,7 @@ import { CRITICAL_PERCENT, NEAR_LIMIT_PERCENT } from "./thresholds";
  * quota number shown is a number a provider actually reported.
  */
 
-/** Rail/detail short names for the five production providers. The wire names
+/** Rail/detail short names for the production providers. The wire names
  * (`usage.name`) are unchanged everywhere else; this is display compaction
  * for the narrow rail only, with a generic fallback for unknown providers. */
 const SHORT_NAMES: Readonly<Record<string, string>> = {
@@ -25,6 +25,7 @@ const SHORT_NAMES: Readonly<Record<string, string>> = {
   "opencode-go": "OpenCode",
   antigravity: "Antigravity",
   grok: "Grok",
+  "qwen-token-plan": "Qwen",
 };
 
 export function shortProviderName(usage: ProviderUsage): string {

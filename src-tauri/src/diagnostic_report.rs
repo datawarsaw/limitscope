@@ -2,7 +2,7 @@
 //!
 //! The unified acceptance command (`scripts/provider-quota-diagnostic.ps1`)
 //! runs the single ignored probe below (`five_provider_diagnostic_report`)
-//! through `cargo test`: it invokes the five production fetch paths exactly
+//! through `cargo test`: it invokes the production fetch paths exactly
 //! as the runtime does — the same read-only credential resolution, the same
 //! normalization, no inference, no quota spend, no credential rotation — and
 //! prints one redacted row per provider.
@@ -121,7 +121,7 @@ pub(crate) fn secret_shaped_material(text: &str) -> Option<&'static str> {
     None
 }
 
-/// The sanctioned read-only five-provider probe. Runs the production fetch
+/// The sanctioned read-only production-provider probe. Runs the production fetch
 /// for every registered provider (concurrently, each bounded by its own
 /// request timeout) and prints the redacted rows in registry order. No
 /// secrets are printed; the wrapper scans the captured output anyway.
@@ -297,13 +297,20 @@ mod tests {
         assert!(secret_shaped_material("reset 2026-10-05T00:00:00.000Z v1.2.3").is_none());
     }
 
-    // The five production providers are all covered by the probe.
+    // The production providers are all covered by the probe.
     #[test]
     fn the_probe_covers_the_production_registry() {
         let specs = production_specs();
-        assert_eq!(specs.len(), 5);
+        assert_eq!(specs.len(), 6);
         let ids: Vec<_> = specs.iter().map(|s| s.kind.id()).collect();
-        for id in ["openai-codex", "zai", "opencode-go", "antigravity", "grok"] {
+        for id in [
+            "openai-codex",
+            "zai",
+            "opencode-go",
+            "antigravity",
+            "grok",
+            "qwen-token-plan",
+        ] {
             assert!(ids.contains(&id), "probe misses {id}");
         }
         // ProviderKind must be nameable for the report; silence the unused

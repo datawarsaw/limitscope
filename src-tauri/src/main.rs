@@ -16,6 +16,7 @@ mod local_data;
 mod notifications;
 mod opencode_go;
 mod provider_error;
+mod qwen_token_plan;
 mod reset_plausibility;
 mod runtime;
 mod secret_scrub;
