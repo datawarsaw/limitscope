@@ -543,6 +543,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "5h".to_string(),
                 used_percent: 42.5,
+                reset_text: None,
                 reset_at: Some("2026-09-29T14:00:00.000Z".to_string()),
             }],
             account: Some(AccountAttributionDto {
@@ -838,6 +839,7 @@ mod tests {
         source.usage.limits.push(UsageLimitDto {
             label: "".into(),
             used_percent: f64::NAN,
+            reset_text: None,
             reset_at: Some("invalid".into()),
         });
         source.cooldown_until = Some(now() - chrono::Duration::minutes(1));

@@ -145,6 +145,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "5-hour limit".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: reset_at.map(str::to_string),
             }],
             account: Some(AccountAttributionDto {

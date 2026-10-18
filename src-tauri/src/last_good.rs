@@ -196,6 +196,9 @@ impl ProviderLastGoodStore {
 
         for spec in specs {
             let kind = spec.kind;
+            if kind.is_manual_only() {
+                continue;
+            }
             let Some(persisted) = state.get(kind.id()) else {
                 continue;
             };
@@ -242,6 +245,7 @@ impl ProviderLastGoodStore {
                     label: limit.label.clone(),
                     used_percent: limit.used_percent.clamp(0.0, 100.0),
                     reset_at: limit.reset_at.clone(),
+                    reset_text: None,
                 });
             }
 
@@ -297,6 +301,9 @@ impl ProviderLastGoodStore {
     /// - Must have non-empty valid limits
     /// - Errors, cooldown skips, and unavailable states are never recorded
     pub fn record_success(&self, kind: ProviderKind, dto: &ProviderUsageDto) {
+        if kind.is_manual_only() {
+            return;
+        }
         if dto.health != ProviderHealth::Live
             || dto.data_freshness == Some("stale")
             || dto.limits.is_empty()
@@ -498,6 +505,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "5-hour limit".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: reset_at.map(str::to_string),
             }],
             account: Some(AccountAttributionDto {
@@ -1351,6 +1359,7 @@ mod tests {
                 label: "Weekly".to_string(),
                 used_percent: plausible.limits[0].used_percent,
                 reset_at: plausible.limits[0].reset_at.clone(),
+                reset_text: None,
             }],
             ..plausible
         };

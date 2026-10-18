@@ -37,6 +37,12 @@ pub(crate) fn format_row(
             // snapshot broadcasts (`ProviderHealth::as_str`).
             out.push_str(&format!("health: {}\n", usage.health.as_str()));
             out.push_str(&format!("checkedAt: {checked_at}\n"));
+            // Some manual/local providers intentionally return a normalized
+            // DTO for an unavailable attempt instead of a transport Err.
+            // Surface only their stable category, never the free-form error.
+            if let Some(category) = &usage.error_category {
+                out.push_str(&format!("reason: {category}\n"));
+            }
             if let Some(freshness) = usage.data_freshness {
                 out.push_str(&format!("freshness: {freshness}\n"));
             }
@@ -224,6 +230,19 @@ mod tests {
         assert!(secret_shaped_material(&row).is_none(), "row: {row}");
     }
 
+    #[test]
+    fn normalized_unavailable_dto_keeps_its_safe_reason() {
+        let mut dto = sample_live_dto();
+        dto.health = ProviderHealth::Unavailable;
+        dto.status = ProviderHealth::Unavailable.legacy_status();
+        dto.limits.clear();
+        dto.error = None;
+        dto.error_category = Some("manual_refresh_required".to_string());
+        let row = format_row("opendesign", "OpenDesign", &fixed_checked_at(), &Ok(dto));
+        assert!(row.contains("health: unavailable"), "row: {row}");
+        assert!(row.contains("reason: manual_refresh_required"), "row: {row}");
+    }
+
     // Failure rows carry the normalized category (never the message) and
     // the canonical unavailable/error health split.
     #[test]
@@ -301,7 +320,7 @@ mod tests {
     #[test]
     fn the_probe_covers_the_production_registry() {
         let specs = production_specs();
-        assert_eq!(specs.len(), 6);
+        assert_eq!(specs.len(), 7);
         let ids: Vec<_> = specs.iter().map(|s| s.kind.id()).collect();
         for id in [
             "openai-codex",
@@ -310,6 +329,7 @@ mod tests {
             "antigravity",
             "grok",
             "qwen-token-plan",
+            "opendesign",
         ] {
             assert!(ids.contains(&id), "probe misses {id}");
         }

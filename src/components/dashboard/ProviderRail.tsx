@@ -144,7 +144,7 @@ function RailItem({
 }) {
   const { usage, shortName, mark, primary, percent } = entry;
   const status = providerStatusPresentation(usage);
-  const presentation = mainQuotaPresentation(primary?.usedPercent, perspective);
+  const presentation = mainQuotaPresentation(primary?.usedPercent, entry.usage.id === "opendesign" ? "remaining" : perspective);
   const tone = percent === undefined ? undefined : toneFor(percent);
   const meterWidth = Math.min(100, Math.max(0, presentation.meterPercent ?? 0));
   const state = status.label.toLowerCase();

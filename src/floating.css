@@ -167,6 +167,14 @@ html[data-window="floating"] body {
   background: var(--divider);
 }
 
+/* The seventh provider needs room for a percent plus stale/error marker.
+   Keep the six-provider layout and the dock alignment unchanged. */
+.fq-shell[data-density="compact"] .fq-item {
+  grid-template-columns: 18px minmax(0, 1fr);
+  column-gap: 4px;
+  padding-inline: 6px;
+}
+
 .fq-item:hover,
 .fq-item:focus-visible {
   background: rgba(255, 255, 255, 0.06);
@@ -249,6 +257,8 @@ html[data-window="floating"] body {
   font-size: 11px;
   font-weight: 700;
 }
+
+.fq-shell[data-density="compact"] .fq-mark { width: 18px; }
 
 .fq-readout {
   display: flex;
@@ -419,6 +429,9 @@ html[data-window="floating"] body {
 
 .fq-status {
   margin-left: auto;
+  /* Global status-* backgrounds belong to dots, not this text label. */
+  background: transparent;
+  box-shadow: none;
   color: var(--text-dim);
   font-size: 11px;
 }
@@ -431,6 +444,7 @@ html[data-window="floating"] body {
 .fq-status.status-error {
   color: var(--red);
 }
+
 
 /* The approved card's primary section: the large remaining value dominates,
    the muted unit shrinks beside it, then the reset line and the full-width
@@ -508,6 +522,31 @@ html[data-window="floating"] body {
   margin-top: 9px;
   padding-top: 9px;
   border-top: 1px solid var(--divider);
+}
+
+.fq-popover .opendesign-control {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--divider);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.fq-popover .opendesign-control p { margin: 0 0 6px; }
+.fq-popover .opendesign-refresh {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.fq-popover .opendesign-refresh[aria-disabled="true"] { opacity: .6; cursor: default; }
+.fq-popover .opendesign-refresh:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
 }
 
 .fq-grokbot-head {
@@ -607,6 +646,9 @@ html[data-window="floating"] body {
 .fq-window-count {
   white-space: nowrap;
 }
+
+/* A source-relative reset may be a sentence, rather than a short clock. */
+.fq-observed-reset { white-space: normal; overflow-wrap: anywhere; }
 
 .fq-popover-note {
   margin: 7px 0 0;

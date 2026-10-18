@@ -6,11 +6,10 @@
 //! that screen through the standard Windows accessibility tree.
 //!
 //! Contract — manual and read-only, by design:
-//! - the ONLY entry point is the refresh_opendesign_usage command, invoked
-//!   exclusively by an explicit user action in the OpenDesign detail card.
-//!   There is no scheduler, no timer, and no hook into the shared runtime
-//!   cycle: this module never runs unless the user asked for it, because the
-//!   network refresh cycle must never drive UI automation;
+//! - the ONLY UIA entry point is the `refresh_opendesign_usage` command,
+//!   invoked by the explicit OpenDesign refresh control in the main or
+//!   floating view. There is no scheduler or timer: the shared runtime only
+//!   projects this command's latest in-memory result and never drives UIA;
 //! - enumeration is scoped strictly to processes whose image name is
 //!   chrome.exe and to that process's own top-level windows. No other
 //!   application is ever touched;
@@ -345,9 +344,39 @@ pub fn is_dashboard_url(url: &str) -> bool {
 /// deliberately no TTL: manual refresh means the cadence is the user's, and
 /// the panel always shows the reading's own observation stamp.
 static LAST_KNOWN: OnceLock<Mutex<Option<OpenDesignSnapshot>>> = OnceLock::new();
+/// Latest explicit manual attempt, including typed failures. The runtime
+/// reads this in-memory slot only; it never invokes UIA itself.
+static LATEST_MANUAL_REFRESH: OnceLock<Mutex<Option<(u64, OpenDesignRefresh)>>> = OnceLock::new();
 
 fn last_known() -> &'static Mutex<Option<OpenDesignSnapshot>> {
     LAST_KNOWN.get_or_init(|| Mutex::new(None))
+}
+
+fn latest_manual_refresh_slot() -> &'static Mutex<Option<(u64, OpenDesignRefresh)>> {
+    LATEST_MANUAL_REFRESH.get_or_init(|| Mutex::new(None))
+}
+
+pub(crate) fn latest_manual_refresh() -> Option<OpenDesignRefresh> {
+    latest_manual_refresh_slot()
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|(_, refresh)| refresh.clone())
+}
+
+pub(crate) fn latest_manual_refresh_with_revision() -> (u64, Option<OpenDesignRefresh>) {
+    latest_manual_refresh_slot()
+        .lock()
+        .unwrap()
+        .clone()
+        .map(|(revision, refresh)| (revision, Some(refresh)))
+        .unwrap_or((0, None))
+}
+
+fn record_manual_refresh(refresh: OpenDesignRefresh) {
+    let mut slot = latest_manual_refresh_slot().lock().unwrap();
+    let revision = slot.as_ref().map(|(revision, _)| revision + 1).unwrap_or(1);
+    *slot = Some((revision, refresh));
 }
 
 /// Retention core (pure, testable): a complete successful pair replaces the
@@ -591,7 +620,7 @@ where
 /// Callers must invoke this only on explicit user action — nothing in this
 /// module ever schedules itself.
 #[tauri::command]
-pub async fn refresh_opendesign_usage() -> OpenDesignRefresh {
+pub async fn refresh_opendesign_usage(app: tauri::AppHandle) -> OpenDesignRefresh {
     let observed_at = wire_stamp(Utc::now());
     let outcome = tauri::async_runtime::spawn_blocking(perform_scan)
         .await
@@ -603,7 +632,7 @@ pub async fn refresh_opendesign_usage() -> OpenDesignRefresh {
         retain_reading(&mut cache, &outcome)
     };
 
-    match snapshot {
+    let refresh = match snapshot {
         Some(snapshot) => OpenDesignRefresh {
             status: outcome.status,
             observed_at,
@@ -620,7 +649,14 @@ pub async fn refresh_opendesign_usage() -> OpenDesignRefresh {
             period_ends_text: None,
             last_known,
         },
-    }
+    };
+    record_manual_refresh(refresh.clone());
+    // Publish only the in-memory manual result now. This does not wait for
+    // or trigger other provider fetches; ordinary cycles read the same slot.
+    use tauri::Manager;
+    app.state::<crate::runtime::RuntimeHandle>()
+        .publish_opendesign_manual();
+    refresh
 }
 
 /// Dispatches to the platform reader. Off-Windows builds answer unknown:

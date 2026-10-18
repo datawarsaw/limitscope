@@ -221,7 +221,7 @@ export function FloatingQuotaBar({
       }}
     >
       {dockSlot}
-      <div className="fq-shell" data-tauri-drag-region="deep" ref={shellRef}>
+      <div className="fq-shell" data-density={items.length >= 7 ? "compact" : undefined} data-tauri-drag-region="deep" ref={shellRef}>
         <span
           className="fq-active"
           aria-hidden="true"

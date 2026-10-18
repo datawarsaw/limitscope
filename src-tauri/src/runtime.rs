@@ -91,6 +91,7 @@ use crate::diagnostics::{
 };
 use crate::grok::{self, GrokError, GrokUsage};
 use crate::notifications::NotificationLane;
+use crate::opendesign::{self, OpenDesignRefresh, OpenDesignStatus};
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
@@ -191,6 +192,10 @@ pub struct UsageLimitDto {
     pub used_percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_at: Option<String>,
+    /// Provider-supplied reset wording when no trustworthy absolute timestamp
+    /// exists. OpenDesign deliberately preserves its UIA countdown verbatim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -458,6 +463,7 @@ pub enum ProviderKind {
     Antigravity,
     Grok,
     QwenTokenPlan,
+    OpenDesign,
 }
 
 impl ProviderKind {
@@ -469,6 +475,7 @@ impl ProviderKind {
             ProviderKind::Antigravity => "antigravity",
             ProviderKind::Grok => "grok",
             ProviderKind::QwenTokenPlan => "qwen-token-plan",
+            ProviderKind::OpenDesign => "opendesign",
         }
     }
 
@@ -480,6 +487,7 @@ impl ProviderKind {
             ProviderKind::Antigravity => "Google Antigravity",
             ProviderKind::Grok => "Grok (xAI)",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan",
+            ProviderKind::OpenDesign => "OpenDesign",
         }
     }
 
@@ -491,6 +499,7 @@ impl ProviderKind {
             "antigravity" => Some(ProviderKind::Antigravity),
             "grok" => Some(ProviderKind::Grok),
             "qwen-token-plan" => Some(ProviderKind::QwenTokenPlan),
+            "opendesign" => Some(ProviderKind::OpenDesign),
             _ => None,
         }
     }
@@ -503,7 +512,14 @@ impl ProviderKind {
             ProviderKind::Antigravity => "Google Antigravity usage could not be fetched.",
             ProviderKind::Grok => "Grok usage could not be fetched.",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan usage could not be fetched.",
+            ProviderKind::OpenDesign => "OpenDesign usage could not be read.",
         }
+    }
+
+    /// OpenDesign is fed only by an explicit UIA scan. It must never enter
+    /// durable cache, history, prediction, or notification paths.
+    pub(crate) fn is_manual_only(self) -> bool {
+        matches!(self, ProviderKind::OpenDesign)
     }
 }
 
@@ -623,6 +639,7 @@ fn limits_from(
                     crate::reset_plausibility::plausible_reset_at(label, reset, now_ms)
                 })
                 .map(str::to_string),
+            reset_text: None,
         })
         .collect()
 }
@@ -1040,6 +1057,139 @@ fn normalize_qwen_token_plan(
     }
 }
 
+/// OpenDesign's collector owns the only UIA scan. The runtime merely maps
+/// its latest in-memory manual result into the common provider contract.
+/// `checked_at` and `source_updated_at` stay at the collector's observation
+/// time so ordinary runtime cycles never make manual data appear newer.
+fn normalize_opendesign_manual(
+    refresh: Option<OpenDesignRefresh>,
+    now: DateTime<Utc>,
+) -> ProviderUsageDto {
+    let Some(refresh) = refresh else {
+        return ProviderUsageDto {
+            checked_at: now.to_rfc3339_opts(SecondsFormat::Millis, true),
+            // The UI already renders the manual-action instruction. Before
+            // the first attempt this is unavailable, not a failed refresh.
+            error: None,
+            error_category: Some("manual_refresh_required".to_string()),
+            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Unavailable, Vec::new())
+        };
+    };
+    if refresh.status != OpenDesignStatus::Ok {
+        let (category, message) = match refresh.status {
+            OpenDesignStatus::ChromeNotRunning => ("chrome_not_running", "Chrome is not running."),
+            OpenDesignStatus::DashboardNotVisible => (
+                "dashboard_not_visible",
+                "OpenDesign Plan & balance is not visible.",
+            ),
+            OpenDesignStatus::Unknown | OpenDesignStatus::Ok => (
+                "unknown",
+                "OpenDesign usage could not be read.",
+            ),
+        };
+        let message = message.to_string();
+        if let Some(snapshot) = refresh.last_known {
+            let mut dto = opendesign_snapshot_dto(snapshot, refresh.plan, now, Some(message));
+            dto.error_category = Some(category.to_string());
+            return dto;
+        }
+        return ProviderUsageDto {
+            checked_at: refresh.observed_at,
+            error: Some(message),
+            error_category: Some(category.to_string()),
+            ..base_usage(
+                ProviderKind::OpenDesign,
+                if refresh.status == OpenDesignStatus::Unknown {
+                    ProviderHealth::Error
+                } else {
+                    ProviderHealth::Unavailable
+                },
+                Vec::new(),
+            )
+        };
+    }
+    // The successful cached pair is authoritative because it carries the
+    // UIA scan timestamp. The top-level response timestamp is attempt-only.
+    let Some(snapshot) = refresh.last_known else {
+        return ProviderUsageDto {
+            checked_at: refresh.observed_at,
+            error: Some("OpenDesign did not retain both quota windows.".to_string()),
+            error_category: Some("manual_scan_incomplete".to_string()),
+            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Error, Vec::new())
+        };
+    };
+    opendesign_snapshot_dto(snapshot, refresh.plan, now, None)
+}
+
+fn opendesign_snapshot_dto(
+    snapshot: crate::opendesign::OpenDesignSnapshot,
+    plan: Option<String>,
+    now: DateTime<Utc>,
+    error: Option<String>,
+) -> ProviderUsageDto {
+    opendesign_windows_dto(snapshot.windows, plan.or(snapshot.plan), snapshot.observed_at, now, error)
+}
+
+fn opendesign_windows_dto(
+    windows: Vec<crate::opendesign::OpenDesignWindowReading>,
+    plan: Option<String>,
+    observed_at: String,
+    now: DateTime<Utc>,
+    error: Option<String>,
+) -> ProviderUsageDto {
+    let complete_pair = windows.len() == 2
+        && windows.iter().all(|window| window.remaining_percent.is_finite()
+            && (0.0..=100.0).contains(&window.remaining_percent))
+        && windows.iter().any(|window| matches!(window.label, crate::opendesign::OpenDesignWindowLabel::FiveHour))
+        && windows.iter().any(|window| matches!(window.label, crate::opendesign::OpenDesignWindowLabel::SevenDay));
+    if !complete_pair {
+        return ProviderUsageDto {
+            checked_at: observed_at,
+            error: Some("OpenDesign did not return one complete, valid 5-hour and 7-day pair.".to_string()),
+            error_category: Some("manual_scan_incomplete".to_string()),
+            ..base_usage(ProviderKind::OpenDesign, ProviderHealth::Error, Vec::new())
+        };
+    }
+    let observed = DateTime::parse_from_rfc3339(&observed_at)
+        .ok()
+        .map(|stamp| stamp.with_timezone(&Utc));
+    let fresh = observed
+        .map(|stamp| {
+            let age_ms = (now - stamp).num_milliseconds();
+            (0..=OPENDESIGN_FRESHNESS_MS).contains(&age_ms)
+        })
+        .unwrap_or(false);
+    let health = if error.is_some() {
+        ProviderHealth::Error
+    } else if fresh {
+        ProviderHealth::Live
+    } else {
+        ProviderHealth::Stale
+    };
+    let limits = windows
+        .into_iter()
+        .map(|window| UsageLimitDto {
+            label: match window.label {
+                crate::opendesign::OpenDesignWindowLabel::FiveHour => "5-hour".to_string(),
+                crate::opendesign::OpenDesignWindowLabel::SevenDay => "7-day".to_string(),
+            },
+            // The collector reports remaining allowance. The standard DTO
+            // reports used allowance, hence the normalized complement.
+            used_percent: clamp_percent(100.0 - window.remaining_percent),
+            reset_at: None,
+            reset_text: window.reset_text,
+        })
+        .collect();
+    let mut dto = base_usage(ProviderKind::OpenDesign, health, limits);
+    dto.checked_at = observed_at.clone();
+    dto.source_updated_at = Some(observed_at);
+    dto.data_freshness = Some(if fresh && error.is_none() { "fresh" } else { "stale" });
+    dto.plan_type = plan;
+    dto.error = error;
+    dto.error_category = dto.error.as_ref().map(|_| "manual_scan_unavailable".to_string());
+    dto
+}
+
 /// The production provider set — the exact registry the TS `registry.ts`
 /// pinned (same ids, same order, no simulated providers). Order is wire
 /// order: the frontend renders and summarizes in this order.
@@ -1124,6 +1274,14 @@ pub fn production_specs() -> Vec<ProviderSpec> {
                 })
             }),
         },
+        ProviderSpec {
+            kind: ProviderKind::OpenDesign,
+            // This closure is intentionally offline: it reads only the
+            // latest result recorded by the explicit manual UIA command.
+            fetch: Arc::new(|| {
+                Box::pin(async { Ok(normalize_opendesign_manual(opendesign::latest_manual_refresh(), Utc::now())) })
+            }),
+        },
     ]
 }
 
@@ -1135,6 +1293,10 @@ const RETRY_JITTER_MS: u64 = 250;
 /// undocumented CLI plane, so it is polled at most once per 15 minutes
 /// regardless of the global refresh interval.
 const GROK_MIN_POLL_INTERVAL_MS: i64 = 15 * 60_000;
+/// A manual OpenDesign UIA observation remains live for five minutes. Its
+/// original observed timestamp is retained afterwards; runtime cycles do
+/// not renew it.
+const OPENDESIGN_FRESHNESS_MS: i64 = 5 * 60_000;
 /// Grok failures resolved without network traffic; never cached, so a
 /// re-auth takes effect on the next poll.
 const GROK_LOCAL_CREDENTIAL_CODES: [&str; 3] =
@@ -1250,6 +1412,7 @@ struct RuntimeInner {
     /// logical window. In-memory only (dropped at cold start — held
     /// candidates were never persisted, so nothing is lost).
     pending_confirmations: HashMap<WindowKey, PendingConfirmation>,
+    opendesign_manual_revision: u64,
 }
 
 
@@ -1355,6 +1518,7 @@ impl RuntimeCore {
                 seq: 0,
                 interval_minutes,
                 pending_confirmations: HashMap::new(),
+                opendesign_manual_revision: 0,
             }),
             specs,
             retry_delay_ms,
@@ -1463,7 +1627,11 @@ impl RuntimeCore {
     /// the former `Promise.all`), then updates the shared state under one
     /// lock. Provider order in the snapshot is always the spec order.
     pub async fn run_cycle(self: &Arc<Self>) {
-        self.inner.lock().unwrap().last_cycle_started_at = Some(self.now());
+        let cycle_opendesign_revision = {
+            let mut inner = self.inner.lock().unwrap();
+            inner.last_cycle_started_at = Some(self.now());
+            inner.opendesign_manual_revision
+        };
         let mut jobs = tokio::task::JoinSet::new();
         for (index, spec) in self.specs.iter().enumerate() {
             let core = self.clone();
@@ -1509,7 +1677,7 @@ impl RuntimeCore {
         }
         results.sort_by_key(|(index, _)| *index);
 
-        let usages: Vec<ProviderUsageDto> = results.into_iter().map(|(_, dto)| dto).collect();
+        let mut usages: Vec<ProviderUsageDto> = results.into_iter().map(|(_, dto)| dto).collect();
         // History recording (phase 2): one batch per completed cycle, from
         // the same normalized snapshot that is about to be broadcast.
         // Recording before the snapshot state update means any snapshot
@@ -1573,6 +1741,25 @@ impl RuntimeCore {
         }
         let completed_at = self.now();
         let mut inner = self.inner.lock().unwrap();
+        // A manual publication may have landed while this full cycle was
+        // fetching other providers. Preserve that newer shared entry rather
+        // than letting this cycle's earlier OpenDesign projection overwrite
+        // it (including when both retain the same scan timestamp).
+        if inner.opendesign_manual_revision > cycle_opendesign_revision {
+            if let Some(current) = inner
+                .usages
+                .iter()
+                .find(|usage| usage.id == ProviderKind::OpenDesign.id())
+                .cloned()
+            {
+                if let Some(slot) = usages
+                    .iter_mut()
+                    .find(|usage| usage.id == ProviderKind::OpenDesign.id())
+                {
+                    *slot = current;
+                }
+            }
+        }
         // A cycle is globally successful when at least one real source
         // returned usable data (live or stale) — the same verdict the
         // frontend's refreshCycleSucceeded applied.
@@ -1588,6 +1775,14 @@ impl RuntimeCore {
     }
 
     async fn run_provider_job(self: &Arc<Self>, spec: &ProviderSpec) -> ProviderUsageDto {
+        if spec.kind == ProviderKind::OpenDesign {
+            // Keep the offline registry closure as the only runtime input,
+            // then reproject the newest manual attempt before assigning
+            // state. Only direct publication advances the revision marker.
+            let _ = self.fetch_with_retry(spec).await;
+            let (_, refresh) = opendesign::latest_manual_refresh_with_revision();
+            return normalize_opendesign_manual(refresh, self.now());
+        }
         // Server-directed cooldown first: while it lasts the provider is not
         // fetched at all, by any trigger. Eligibility is the later of this
         // and the provider cadence below.
@@ -1870,7 +2065,34 @@ impl RuntimeCore {
 
     fn apply_success(&self, kind: ProviderKind, dto: ProviderUsageDto) -> ProviderUsageDto {
         let mut dto = dto;
-        dto.checked_at = self.now_iso();
+        if kind.is_manual_only() {
+            // A delayed regular cycle can only read an older in-memory
+            // manual attempt. Keep a newer directly-published observation.
+            if let Some(current) = self
+                .inner
+                .lock()
+                .unwrap()
+                .usages
+                .iter()
+                .find(|usage| usage.id == kind.id())
+                .cloned()
+            {
+                let newer_current = current
+                    .source_updated_at
+                    .as_deref()
+                    .zip(dto.source_updated_at.as_deref())
+                    .and_then(|(current, incoming)| {
+                        Some(DateTime::parse_from_rfc3339(current).ok()?
+                            > DateTime::parse_from_rfc3339(incoming).ok()?)
+                    })
+                    .unwrap_or(false);
+                if newer_current {
+                    return current;
+                }
+            }
+        } else {
+            dto.checked_at = self.now_iso();
+        }
         // A structurally successful refresh that degraded to cached data
         // (today: only the Antigravity adapter) carries the fresh
         // live-failure cause on its internal, never-serialized field.
@@ -1934,6 +2156,17 @@ impl RuntimeCore {
                     if let Some(store) = &self.last_good_store {
                         store.record_success(kind, &dto);
                     }
+                }
+            }
+            ProviderKind::OpenDesign => {
+                // Process-local retention supports an honest failed-manual-
+                // scan projection, but no manual observation reaches disk.
+                if matches!(dto.health, ProviderHealth::Live | ProviderHealth::Stale) {
+                    self.inner
+                        .lock()
+                        .unwrap()
+                        .last_good
+                        .insert(kind.id(), dto.clone());
                 }
             }
         }
@@ -2015,6 +2248,11 @@ impl RuntimeCore {
                 trim_stale_zcode_reset_cards(&mut retained, failure_at);
                 trim_stale_zcode_plans(&mut retained, failure_at);
                 trim_stale_grok_bot(&mut retained, failure_at);
+                if kind.is_manual_only() {
+                    // A failed manual scan retains its last complete pair,
+                    // visibly errored and explicitly stale.
+                    retained.data_freshness = Some("stale");
+                }
                 return retained;
             }
         }
@@ -2063,6 +2301,61 @@ impl RuntimeCore {
             history_revision,
             usage_intelligence_revision,
         }
+    }
+
+    /// Publishes the latest explicit OpenDesign attempt without starting a
+    /// network refresh chain. Revision checks and entry replacement share
+    /// the state lock; completed cycles preserve a newer manual publication.
+    pub fn publish_opendesign_manual(&self) -> RuntimeSnapshot {
+        let (revision, refresh) = opendesign::latest_manual_refresh_with_revision();
+        self.publish_opendesign_manual_result(revision, refresh)
+    }
+
+    /// Pure-input publication seam used by the command and race tests. The
+    /// collector slot is deliberately outside this function.
+    fn publish_opendesign_manual_result(
+        &self,
+        revision: u64,
+        refresh: Option<OpenDesignRefresh>,
+    ) -> RuntimeSnapshot {
+        let dto = normalize_opendesign_manual(refresh, self.now());
+        let mut inner = self.inner.lock().unwrap();
+        if revision < inner.opendesign_manual_revision {
+            drop(inner);
+            return self.snapshot();
+        }
+        inner.opendesign_manual_revision = revision;
+        if matches!(dto.health, ProviderHealth::Live | ProviderHealth::Stale) {
+            inner.last_good.insert(ProviderKind::OpenDesign.id(), dto.clone());
+        }
+        if let Some(existing) = inner
+            .usages
+            .iter_mut()
+            .find(|usage| usage.id == ProviderKind::OpenDesign.id())
+        {
+            *existing = dto;
+        } else {
+            let open_design_order = self
+                .specs
+                .iter()
+                .position(|spec| spec.kind == ProviderKind::OpenDesign)
+                .unwrap_or(self.specs.len());
+            let insert_at = inner
+                .usages
+                .iter()
+                .position(|usage| {
+                    self.specs
+                        .iter()
+                        .position(|spec| spec.kind.id() == usage.id)
+                        .unwrap_or(self.specs.len())
+                        > open_design_order
+                })
+                .unwrap_or(inner.usages.len());
+            inner.usages.insert(insert_at, dto);
+        }
+        inner.seq += 1;
+        drop(inner);
+        self.snapshot()
     }
 
     /// Read-only source data for the diagnostics safety layer. These are the
@@ -2243,6 +2536,13 @@ impl RuntimeHandle {
     /// otherwise coalesces into the single pending follow-up.
     pub fn request_refresh(&self) {
         self.spawn_chain_if(self.core.try_begin_cycle());
+    }
+
+    /// Emits the immediately updated shared snapshot for an explicit
+    /// OpenDesign scan. It does not schedule other provider fetches.
+    pub fn publish_opendesign_manual(&self) {
+        let snapshot = self.core.publish_opendesign_manual();
+        let _ = self.app.emit(SNAPSHOT_EVENT, &snapshot);
     }
 
     /// Requests one shared cycle after the system wakes from sleep or
@@ -2668,6 +2968,7 @@ mod tests {
             limits: vec![UsageLimitDto {
                 label: "Weekly".to_string(),
                 used_percent: percent,
+                reset_text: None,
                 reset_at: None,
             }],
             account: None,
@@ -2683,6 +2984,198 @@ mod tests {
             grok_bot: None,
             fallback_failure: None,
         }
+    }
+
+    fn opendesign_snapshot(stamp: &str) -> crate::opendesign::OpenDesignSnapshot {
+        crate::opendesign::OpenDesignSnapshot {
+            windows: vec![
+                crate::opendesign::OpenDesignWindowReading {
+                    label: crate::opendesign::OpenDesignWindowLabel::FiveHour,
+                    remaining_percent: 73.0,
+                    reset_text: Some("Resets in 39 min".to_string()),
+                },
+                crate::opendesign::OpenDesignWindowReading {
+                    label: crate::opendesign::OpenDesignWindowLabel::SevenDay,
+                    remaining_percent: 42.5,
+                    reset_text: Some("Resets in 3 days".to_string()),
+                },
+            ],
+            plan: Some("Go".to_string()),
+            period_ends_text: None,
+            observed_at: stamp.to_string(),
+        }
+    }
+
+    fn opendesign_refresh(
+        status: OpenDesignStatus,
+        attempt_stamp: &str,
+        last_known: Option<crate::opendesign::OpenDesignSnapshot>,
+    ) -> OpenDesignRefresh {
+        OpenDesignRefresh {
+            status,
+            observed_at: attempt_stamp.to_string(),
+            windows: None,
+            plan: None,
+            period_ends_text: None,
+            last_known,
+        }
+    }
+
+    fn opendesign_spec() -> ProviderSpec {
+        ProviderSpec {
+            kind: ProviderKind::OpenDesign,
+            // Test-local closure proves the runtime seam needs only a DTO;
+            // no UIA collector is reachable from injected provider specs.
+            fetch: Arc::new(|| Box::pin(async { Ok(base_usage(ProviderKind::OpenDesign, ProviderHealth::Unavailable, Vec::new())) })),
+        }
+    }
+
+    #[test]
+    fn opendesign_manual_mapping_complements_windows_and_preserves_reset_text() {
+        let stamp = fixed_now().to_rfc3339();
+        let dto = normalize_opendesign_manual(
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(opendesign_snapshot(&stamp)))),
+            fixed_now(),
+        );
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.data_freshness, Some("fresh"));
+        assert_eq!(dto.checked_at, stamp);
+        assert_eq!(dto.source_updated_at.as_deref(), Some(dto.checked_at.as_str()));
+        assert_eq!(dto.limits[0].label, "5-hour");
+        assert_eq!(dto.limits[0].used_percent, 27.0);
+        assert_eq!(dto.limits[0].reset_at, None);
+        assert_eq!(dto.limits[0].reset_text.as_deref(), Some("Resets in 39 min"));
+        assert_eq!(dto.limits[1].used_percent, 57.5);
+    }
+
+    #[test]
+    fn opendesign_manual_ttl_and_initial_unavailable_are_honest() {
+        let stamp = fixed_now().to_rfc3339();
+        let fresh = normalize_opendesign_manual(
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(opendesign_snapshot(&stamp)))),
+            fixed_now() + chrono::Duration::milliseconds(OPENDESIGN_FRESHNESS_MS),
+        );
+        assert_eq!(fresh.health, ProviderHealth::Live);
+        let stale = normalize_opendesign_manual(
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(opendesign_snapshot(&stamp)))),
+            fixed_now() + chrono::Duration::milliseconds(OPENDESIGN_FRESHNESS_MS + 1),
+        );
+        assert_eq!(stale.health, ProviderHealth::Stale);
+        assert_eq!(stale.data_freshness, Some("stale"));
+        let initial = normalize_opendesign_manual(None, fixed_now());
+        assert_eq!(initial.health, ProviderHealth::Unavailable);
+        assert_eq!(initial.error_category.as_deref(), Some("manual_refresh_required"));
+        assert_eq!(initial.error, None);
+        assert!(initial.limits.is_empty());
+    }
+
+    #[test]
+    fn opendesign_failure_uses_last_known_scan_stamp_and_status_category() {
+        let scan_stamp = (fixed_now() - chrono::Duration::minutes(2)).to_rfc3339();
+        let dto = normalize_opendesign_manual(
+            Some(opendesign_refresh(
+                OpenDesignStatus::DashboardNotVisible,
+                &fixed_now().to_rfc3339(),
+                Some(opendesign_snapshot(&scan_stamp)),
+            )),
+            fixed_now(),
+        );
+        assert_eq!(dto.health, ProviderHealth::Error);
+        assert_eq!(dto.error_category.as_deref(), Some("dashboard_not_visible"));
+        assert_eq!(dto.checked_at, scan_stamp);
+        assert_eq!(dto.source_updated_at.as_deref(), Some(dto.checked_at.as_str()));
+        assert_eq!(dto.data_freshness, Some("stale"));
+        assert_eq!(dto.error.as_deref(), Some("OpenDesign Plan & balance is not visible."));
+    }
+
+    #[test]
+    fn opendesign_rejects_missing_duplicate_and_invalid_window_pairs() {
+        let stamp = fixed_now().to_rfc3339();
+        for windows in [
+            vec![opendesign_snapshot(&stamp).windows[0].clone()],
+            vec![opendesign_snapshot(&stamp).windows[0].clone(), opendesign_snapshot(&stamp).windows[0].clone()],
+            vec![
+                crate::opendesign::OpenDesignWindowReading { remaining_percent: f64::NAN, ..opendesign_snapshot(&stamp).windows[0].clone() },
+                opendesign_snapshot(&stamp).windows[1].clone(),
+            ],
+        ] {
+            let mut snapshot = opendesign_snapshot(&stamp);
+            snapshot.windows = windows;
+            let dto = normalize_opendesign_manual(
+                Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(snapshot))),
+                fixed_now(),
+            );
+            assert_eq!(dto.health, ProviderHealth::Error);
+            assert_eq!(dto.error_category.as_deref(), Some("manual_scan_incomplete"));
+            assert!(dto.limits.is_empty());
+        }
+    }
+
+    #[test]
+    fn opendesign_revision_preserves_later_failed_attempt_and_allows_ttl_aging() {
+        let (core, clock) = manual_clock_core(vec![opendesign_spec()]);
+        let stamp = fixed_now().to_rfc3339();
+        core.publish_opendesign_manual_result(
+            1,
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt-a", Some(opendesign_snapshot(&stamp)))),
+        );
+        let failed = core.publish_opendesign_manual_result(
+            2,
+            Some(opendesign_refresh(OpenDesignStatus::Unknown, "attempt-b", Some(opendesign_snapshot(&stamp)))),
+        );
+        assert_eq!(failed.providers[0].health, ProviderHealth::Error);
+        let delayed = core.publish_opendesign_manual_result(
+            1,
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "old", Some(opendesign_snapshot(&stamp)))),
+        );
+        assert_eq!(delayed.providers[0].health, ProviderHealth::Error);
+        advance(&clock, OPENDESIGN_FRESHNESS_MS + 1);
+        let aged = core.publish_opendesign_manual_result(
+            3,
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt-c", Some(opendesign_snapshot(&stamp)))),
+        );
+        assert_eq!(aged.providers[0].health, ProviderHealth::Stale);
+    }
+
+    #[test]
+    fn opendesign_unreadable_scan_is_error_but_missing_source_is_unavailable() {
+        for (status, health) in [
+            (OpenDesignStatus::Unknown, ProviderHealth::Error),
+            (OpenDesignStatus::ChromeNotRunning, ProviderHealth::Unavailable),
+            (OpenDesignStatus::DashboardNotVisible, ProviderHealth::Unavailable),
+        ] {
+            let dto = normalize_opendesign_manual(
+                Some(opendesign_refresh(status, &fixed_now().to_rfc3339(), None)),
+                fixed_now(),
+            );
+            assert_eq!(dto.health, health);
+            assert!(dto.limits.is_empty());
+            assert!(dto.error.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn opendesign_production_closure_reads_only_manual_memory() {
+        let spec = production_specs()
+            .into_iter()
+            .find(|spec| spec.kind == ProviderKind::OpenDesign)
+            .expect("production registry carries OpenDesign");
+        let dto = (spec.fetch)().await.expect("in-memory projection never scans");
+        assert_eq!(dto.health, ProviderHealth::Unavailable);
+        assert_eq!(dto.error_category.as_deref(), Some("manual_refresh_required"));
+        assert_eq!(dto.error, None);
+    }
+
+    #[test]
+    fn opendesign_observations_are_excluded_before_history_and_notifications() {
+        let stamp = fixed_now().to_rfc3339();
+        let dto = normalize_opendesign_manual(
+            Some(opendesign_refresh(OpenDesignStatus::Ok, "attempt", Some(opendesign_snapshot(&stamp)))),
+            fixed_now(),
+        );
+        // NotificationLane uses this exact candidate builder, so a manual
+        // observation cannot become history, prediction input, or a toast.
+        assert!(crate::history::observations_from_usages(&[dto]).is_empty());
     }
 
     // ---------- v0.7 Codex banked reset credits ----------
@@ -3356,12 +3849,13 @@ mod tests {
                 ProviderKind::Antigravity,
                 ProviderKind::Grok,
                 ProviderKind::QwenTokenPlan,
+                ProviderKind::OpenDesign,
             ]
         );
         let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
         );
         assert!(ids.contains(&"grok"), "Grok must remain production");
         // No simulated providers: the production runtime never carries the
@@ -4934,6 +5428,7 @@ mod tests {
         usage.limits = vec![UsageLimitDto {
             label: label.to_string(),
             used_percent: 10.0,
+            reset_text: None,
             reset_at: reset_at.map(str::to_string),
         }];
         usage
@@ -5026,6 +5521,7 @@ mod tests {
         zai.limits.push(UsageLimitDto {
             label: "5 hours".to_string(),
             used_percent: 20.0,
+            reset_text: None,
             reset_at: Some(reset_at_ms(60 * 60_000)),
         });
         let wake = earliest_reset_wake_at(&[codex, zai], fixed_now())
@@ -5639,7 +6135,7 @@ mod tests {
         let ids: Vec<&str> = production_specs().iter().map(|s| s.kind.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
         );
     }
 
@@ -5746,6 +6242,7 @@ mod tests {
                 label: label.to_string(),
                 used_percent: percent,
                 reset_at: reset_at.map(str::to_string),
+                reset_text: None,
             }],
             account: None,
             plan_type: None,
@@ -5770,6 +6267,7 @@ mod tests {
                     label: label.to_string(),
                     used_percent: *percent,
                     reset_at: None,
+                    reset_text: None,
                 })
                 .collect(),
             ..ok_usage(id, name, 0.0)
