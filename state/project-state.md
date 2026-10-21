@@ -37,6 +37,8 @@
   with the OpenCode auth entry; the key never leaves the process.
 - The compact wallet slot adds 44 px beside the unchanged provider meters
   (revealed bar 646 px). The resting dock stays 600 px and shows meters only.
+  The floating window's declared native maximum is 646 px, matching that
+  widest layout; a regression test pins the two together.
 
 ## Evidence and limits
 
@@ -46,10 +48,12 @@
   2026-10-18: 17 PASS / 0 FAIL.
 - Focused provider/component tests cover window selection, reset text,
   missing/stale/error states, explicit refresh and provider compatibility.
-- Wallet candidate verified on 2026-10-21 at `0e829c0`: frontend 1156 PASS;
-  Rust 875 PASS / 16 intentionally ignored live probes; `npm run build` PASS;
-  `npm run scan:secrets` PASS. Native Tauri visuals and a live authenticated
-  OpenRouter balance remain Human Acceptance checks.
+- Wallet candidate verified on 2026-10-21 at `faa87c9378507f3daf72f6ac818a82bf94a5beab`
+  (`0e829c0` plus the 646 px maximum-width correction): frontend 1157 PASS;
+  Rust 875 PASS / 16 intentionally ignored live probes; `cargo check --locked
+  --all-targets` PASS; `npm run build` PASS; `npm run scan:secrets` PASS.
+  Native Tauri visuals and a live authenticated OpenRouter balance remain
+  Human Acceptance checks.
 - Authenticated OpenDesign validation requires the user-owned Plan & balance
   page in Chrome. Agent validation is separate from Human Acceptance, which the
   operator recorded against the candidate SHA before the release.
