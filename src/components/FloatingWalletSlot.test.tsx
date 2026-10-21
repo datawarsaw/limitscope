@@ -128,4 +128,3 @@ describe("FloatingWalletSlot", () => {
     expect(props.onContextMenu).toHaveBeenCalledTimes(1);
   });
 });
-

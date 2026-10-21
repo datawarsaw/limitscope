@@ -228,10 +228,15 @@ pub struct ApiWalletDto {
     pub checked_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_usd: Option<f64>,
-    /// Masked credential identity (`key:1234`), used only to keep last-good
-    /// data bound to the account that produced it.
+    /// Display-safe masked credential identity (`key:1234`). Shown in the
+    /// UI; never used for last-good isolation because short tails collide.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// Internal account-isolation identity: a deterministic fingerprint of
+    /// the full credential that produced this balance. Never serialized to
+    /// the WebView and never displayed.
+    #[serde(skip)]
+    pub credential_binding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -397,6 +402,11 @@ pub struct ProviderFailure {
     /// compares it against the retained snapshot's attribution: last-good
     /// data may only be retained for the same account.
     pub identity: Option<String>,
+    /// Deterministic binding of the full credential the failed refresh
+    /// attempted, when the backend resolved one. Wallet last-good retention
+    /// requires an exact match with the retained observation; a missing
+    /// binding never authorizes retention.
+    pub credential_binding: Option<String>,
     /// The failure was a transport timeout: the client's request budget
     /// expired during connect, TLS, response, or body read. Input to the
     /// bounded-retry rule only — never serialized, never part of the wire.
@@ -446,6 +456,7 @@ fn failure_from_provider_error(error: ProviderError) -> ProviderFailure {
         transient: error.transient,
         retry_after_ms: error.retry_after_ms,
         identity: error.identity_hint,
+        credential_binding: error.credential_binding,
         transport_timeout: error.transport_timeout,
     }
 }
@@ -458,6 +469,7 @@ fn failure_from_grok_error(error: GrokError) -> ProviderFailure {
         transient: error.transient,
         retry_after_ms: error.retry_after_ms,
         identity: error.identity_hint,
+        credential_binding: None,
         transport_timeout: error.transport_timeout,
     }
 }
@@ -470,6 +482,7 @@ fn failure_from_antigravity_error(error: AntigravityError) -> ProviderFailure {
         transient: None,
         retry_after_ms: None,
         identity: None,
+        credential_binding: None,
         transport_timeout: false,
     }
 }
@@ -611,6 +624,10 @@ pub struct WalletSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub fetch: WalletFetchFn,
+    /// Resolves the deterministic binding of the credential currently stored
+    /// for this wallet. Read-only and secret-free. `None` means the current
+    /// credential cannot be verified, which always fails closed.
+    pub current_credential_binding: Arc<dyn Fn() -> Option<String> + Send + Sync>,
 }
 
 // ---------- runtime panic containment ----------
@@ -635,6 +652,7 @@ fn failure_from_panic() -> ProviderFailure {
         transient: Some(false),
         retry_after_ms: None,
         identity: None,
+        credential_binding: None,
         transport_timeout: false,
     }
 }
@@ -650,6 +668,7 @@ fn job_lost_failure() -> ProviderFailure {
         transient: Some(false),
         retry_after_ms: None,
         identity: None,
+        credential_binding: None,
         transport_timeout: false,
     }
 }
@@ -1376,6 +1395,7 @@ pub fn production_wallets() -> Vec<WalletSpec> {
     vec![WalletSpec {
         id: "openrouter",
         name: "OpenRouter",
+        current_credential_binding: Arc::new(wallet::current_credential_binding),
         fetch: Arc::new(|| {
             Box::pin(async {
                 wallet::get_openrouter_credits()
@@ -1436,6 +1456,84 @@ fn wallet_failure_health(failure: &ProviderFailure) -> WalletHealth {
     }
 }
 
+/// A failure that describes an observation of a credential which is no longer
+/// the one on disk. It carries no identity, no binding and no HTTP status, so
+/// nothing about the previous account -- its masked key tail, its status code,
+/// its error text or its `Retry-After` -- can be published, retained or turned
+/// into a cooldown for the new credential.
+fn credential_changed_failure(message: &str) -> ProviderFailure {
+    ProviderFailure {
+        code: "credential_changed".to_string(),
+        message: message.to_string(),
+        http_status: None,
+        transient: Some(false),
+        retry_after_ms: None,
+        identity: None,
+        credential_binding: None,
+        transport_timeout: false,
+    }
+}
+
+/// Replaces a failure attributed to a credential that is no longer current.
+///
+/// Only failures that actually name a credential are neutralized: local
+/// resolution failures (`credential_missing`, `credential_ambiguous`,
+/// `auth_file_missing`, ...) carry no binding and describe the source the
+/// user has now, so their health and error semantics stay intact.
+fn neutralize_wallet_failure(
+    failure: ProviderFailure,
+    current: Option<&str>,
+) -> ProviderFailure {
+    if failure.credential_binding.is_some()
+        && !wallet::credential_bindings_match(failure.credential_binding.as_deref(), current)
+    {
+        credential_changed_failure(
+            "The OpenRouter credential changed during the balance refresh; the previous observation was discarded.",
+        )
+    } else {
+        failure
+    }
+}
+
+/// Read-side projection of one wallet slot for the credential currently on
+/// disk.
+///
+/// A credential can change between wallet jobs — including while the app is
+/// idle — so the stored slot alone is not proof that its money belongs to the
+/// account the user has now. Any slot carrying a balance is surfaced only
+/// when its binding matches the live credential; otherwise it is blanked to
+/// `unknown`. This is a read-only projection: the next wallet job performs the
+/// eviction from memory and persistence.
+fn project_wallet_for_current_credential(
+    wallet: &ApiWalletDto,
+    current: Option<&str>,
+) -> ApiWalletDto {
+    // Money and error metadata are both credential-scoped. A failure keeps
+    // its health, status and text only while the binding it carries still
+    // names the credential on disk; otherwise the masked key tail and the
+    // status code of a replaced credential would be presented as the new
+    // one's state. Entries without a binding (local resolution failures)
+    // describe the source the user has now and stay visible.
+    let protected = wallet.remaining_usd.is_some() || wallet.credential_binding.is_some();
+    if !protected
+        || wallet::credential_bindings_match(wallet.credential_binding.as_deref(), current)
+    {
+        return wallet.clone();
+    }
+    ApiWalletDto {
+        id: wallet.id.clone(),
+        name: wallet.name.clone(),
+        health: WalletHealth::Unknown,
+        checked_at: None,
+        remaining_usd: None,
+        identity: None,
+        credential_binding: None,
+        error: None,
+        error_category: None,
+        error_http_status: None,
+    }
+}
+
 /// A server-directed provider cooldown from a `Retry-After` hint. Ephemeral
 /// runtime state: never persisted, never spans an app restart, and its
 /// `failure` is reused verbatim for the skip projection so a cooling-down
@@ -1445,6 +1543,11 @@ struct ProviderCooldown {
     until: DateTime<Utc>,
     failure: ProviderFailure,
     failure_at: DateTime<Utc>,
+    /// Wallet cooldowns are credential-scoped: a `Retry-After` observed with
+    /// credential A says nothing about credential B's budget, so a cooldown
+    /// may only defer the credential that produced it. Provider cooldowns
+    /// carry `None`; the field is never persisted and never reaches the wire.
+    credential_binding: Option<String>,
 }
 
 /// The automatic resilience triggers. Unlike manual refreshes they arrive
@@ -1660,6 +1763,7 @@ impl RuntimeCore {
                     checked_at: None,
                     remaining_usd: None,
                     identity: None,
+                    credential_binding: None,
                     error: None,
                     error_category: None,
                     error_http_status: None,
@@ -2093,13 +2197,16 @@ impl RuntimeCore {
     }
 
     async fn run_wallet_job(self: &Arc<Self>, spec: &WalletSpec) -> ApiWalletDto {
+        // A credential change invalidates retained and cached balances before
+        // either can be served. This also covers the cooldown path below.
+        self.reconcile_wallet_credential(spec);
         // A server-directed Retry-After cooldown wins over a manual force.
-        if let Some(cooldown) = self.active_wallet_cooldown(spec.id) {
+        if let Some(cooldown) = self.active_wallet_cooldown(spec) {
             return self.wallet_cooldown_dto(spec, cooldown);
         }
         let force = self.inner.lock().unwrap().wallet_force;
         if !force {
-            if let Some(cached) = self.wallet_cached_result(spec.id) {
+            if let Some(cached) = self.wallet_cached_result(spec) {
                 return cached;
             }
         }
@@ -2112,11 +2219,38 @@ impl RuntimeCore {
         let outcome = self.fetch_wallet_with_retry(spec).await;
         let (dto, failure) = match outcome {
             Ok(balance) => {
-                self.inner.lock().unwrap().wallet_cooldowns.remove(spec.id);
-                (self.apply_wallet_success(spec, balance), None)
+                // The credential can change while the request is in flight.
+                // A balance fetched with the previous credential is not the
+                // new credential's money, so it is never surfaced or saved.
+                let current = (spec.current_credential_binding)();
+                if !wallet::credential_bindings_match(
+                    balance.credential_binding.as_deref(),
+                    current.as_deref(),
+                ) {
+                    self.reconcile_wallet_credential(spec);
+                    let failure = credential_changed_failure(
+                        "The OpenRouter credential changed during the balance refresh; the previous balance was discarded.",
+                    );
+                    (self.apply_wallet_failure(spec, failure.clone()), Some(failure))
+                } else {
+                    self.inner.lock().unwrap().wallet_cooldowns.remove(spec.id);
+                    (self.apply_wallet_success(spec, balance), None)
+                }
             }
             Err(failure) => {
-                self.maybe_apply_wallet_cooldown(spec.id, &failure);
+                // The request may have been served by a credential that the
+                // user replaced while it was in flight. Its status, error
+                // text and `Retry-After` belong to that credential, so they
+                // are replaced by a neutral failure before anything is
+                // published or used to defer the new credential.
+                let current = (spec.current_credential_binding)();
+                let failure = neutralize_wallet_failure(failure, current.as_deref());
+                if wallet::credential_bindings_match(
+                    failure.credential_binding.as_deref(),
+                    current.as_deref(),
+                ) {
+                    self.maybe_apply_wallet_cooldown(spec.id, &failure);
+                }
                 let dto = self.apply_wallet_failure(spec, failure.clone());
                 (dto, Some(failure))
             }
@@ -2363,6 +2497,7 @@ impl RuntimeCore {
                 until,
                 failure: failure.clone(),
                 failure_at: now,
+                credential_binding: None,
             },
         );
     }
@@ -2386,10 +2521,22 @@ impl RuntimeCore {
 
     // ---- wallet transitions ----
 
-    fn active_wallet_cooldown(&self, id: &'static str) -> Option<ProviderCooldown> {
-        let inner = self.inner.lock().unwrap();
-        let cooldown = inner.wallet_cooldowns.get(id)?;
-        (self.now() < cooldown.until).then(|| cooldown.clone())
+    /// A wallet cooldown authorizes deferral only for the credential that
+    /// received the `Retry-After`. Any missing or mismatched binding drops
+    /// the entry: another credential must not inherit it, and its failure
+    /// metadata must not be presented as that credential's state.
+    fn active_wallet_cooldown(&self, spec: &WalletSpec) -> Option<ProviderCooldown> {
+        let current = (spec.current_credential_binding)();
+        let mut inner = self.inner.lock().unwrap();
+        let cooldown = inner.wallet_cooldowns.get(spec.id).cloned()?;
+        if !wallet::credential_bindings_match(
+            cooldown.credential_binding.as_deref(),
+            current.as_deref(),
+        ) {
+            inner.wallet_cooldowns.remove(spec.id);
+            return None;
+        }
+        (self.now() < cooldown.until).then_some(cooldown)
     }
 
     fn maybe_apply_wallet_cooldown(&self, id: &'static str, failure: &ProviderFailure) {
@@ -2405,14 +2552,120 @@ impl RuntimeCore {
                 until,
                 failure: failure.clone(),
                 failure_at: now,
+                credential_binding: failure.credential_binding.clone(),
             },
         );
     }
 
-    fn wallet_cached_result(&self, id: &'static str) -> Option<ApiWalletDto> {
-        let inner = self.inner.lock().unwrap();
-        let attempt = *inner.wallet_last_attempt_at.get(id)?;
-        let cached = inner.wallet_last_result.get(id)?.clone();
+    /// Drops retained and cached balances that cannot be proven to belong to
+    /// the credential currently stored on disk.
+    ///
+    /// Runs before any wallet result can be served. `None` from the resolver
+    /// is a mismatch: an unverifiable credential must never surface a prior
+    /// observation. The persisted entry is removed in the same pass so a
+    /// restart cannot resurrect it.
+    fn reconcile_wallet_credential(&self, spec: &WalletSpec) {
+        let current = (spec.current_credential_binding)();
+        let mut dropped = false;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            // A rate-limit deadline belongs to the credential that received
+            // it. An entry without a matching binding is dropped before it
+            // can defer the new credential, including a manual refresh, or
+            // surface the old credential's failure state as the new one's.
+            let cooldown_mismatch = inner
+                .wallet_cooldowns
+                .get(spec.id)
+                .is_some_and(|cooldown| {
+                    !wallet::credential_bindings_match(
+                        cooldown.credential_binding.as_deref(),
+                        current.as_deref(),
+                    )
+                });
+            if cooldown_mismatch {
+                inner.wallet_cooldowns.remove(spec.id);
+            }
+            let retained_mismatch = inner.wallet_last_good.get(spec.id).is_some_and(|last_good| {
+                !wallet::credential_bindings_match(
+                    current.as_deref(),
+                    last_good.credential_binding.as_deref(),
+                )
+            });
+            if retained_mismatch {
+                inner.wallet_last_good.remove(spec.id);
+                dropped = true;
+            }
+            let cached_mismatch = inner
+                .wallet_last_result
+                .get(spec.id)
+                .is_some_and(|cached| {
+                    let protected = cached.remaining_usd.is_some()
+                        || cached.credential_binding.is_some();
+                    protected
+                        && !wallet::credential_bindings_match(
+                            current.as_deref(),
+                            cached.credential_binding.as_deref(),
+                        )
+                });
+            if cached_mismatch {
+                inner.wallet_last_result.remove(spec.id);
+                dropped = true;
+            }
+            // A displayed balance is also guarded: removing the retention
+            // maps alone would leave the old account's money in the snapshot
+            // until the in-flight refresh finishes.
+            let displayed_mismatch = inner.wallets.iter().any(|wallet| {
+                let protected =
+                    wallet.remaining_usd.is_some() || wallet.credential_binding.is_some();
+                wallet.id == spec.id
+                    && protected
+                    && !wallet::credential_bindings_match(
+                        current.as_deref(),
+                        wallet.credential_binding.as_deref(),
+                    )
+            });
+            if displayed_mismatch {
+                if let Some(wallet) = inner.wallets.iter_mut().find(|wallet| wallet.id == spec.id) {
+                    *wallet = ApiWalletDto {
+                        id: spec.id.to_string(),
+                        name: spec.name.to_string(),
+                        health: WalletHealth::Unknown,
+                        checked_at: None,
+                        remaining_usd: None,
+                        identity: None,
+                        credential_binding: None,
+                        error: None,
+                        error_category: None,
+                        error_http_status: None,
+                    };
+                }
+                dropped = true;
+            }
+        }
+        if dropped {
+            if let Some(store) = &self.last_good_store {
+                store.discard_wallet(spec.id);
+            }
+        }
+    }
+
+    fn wallet_cached_result(&self, spec: &WalletSpec) -> Option<ApiWalletDto> {
+        let current = (spec.current_credential_binding)();
+        let mut inner = self.inner.lock().unwrap();
+        let attempt = *inner.wallet_last_attempt_at.get(spec.id)?;
+        let cached = inner.wallet_last_result.get(spec.id)?.clone();
+        // Defense in depth: even a cache entry written for another credential
+        // is never served as current.
+        let protected = cached.remaining_usd.is_some() || cached.credential_binding.is_some();
+        if protected
+            && !wallet::credential_bindings_match(
+                current.as_deref(),
+                cached.credential_binding.as_deref(),
+            )
+        {
+            inner.wallet_last_result.remove(spec.id);
+            return None;
+        }
         let age_ms = (self.now() - attempt).num_milliseconds();
         (age_ms < WALLET_MIN_POLL_INTERVAL_MS).then_some(cached)
     }
@@ -2423,7 +2676,13 @@ impl RuntimeCore {
         cooldown: ProviderCooldown,
     ) -> ApiWalletDto {
         let mut dto = self.apply_wallet_failure_at(spec, cooldown.failure, cooldown.failure_at);
-        dto.health = WalletHealth::Cooldown;
+        // The credential can change between the cooldown eligibility check
+        // and this projection. Then the cooldown no longer describes the
+        // credential on disk, and the neutral failure must not be dressed up
+        // as the new credential's cooling state.
+        if dto.error_category.as_deref() != Some("credential_changed") {
+            dto.health = WalletHealth::Cooldown;
+        }
         dto
     }
 
@@ -2435,6 +2694,7 @@ impl RuntimeCore {
             checked_at: Some(self.now_iso()),
             remaining_usd: Some(balance.remaining_usd),
             identity: balance.identity,
+            credential_binding: balance.credential_binding,
             error: None,
             error_category: None,
             error_http_status: None,
@@ -2464,6 +2724,12 @@ impl RuntimeCore {
         failure: ProviderFailure,
         _failure_at: DateTime<Utc>,
     ) -> ApiWalletDto {
+        // Neutralize before deriving any published field: the message, the
+        // error category and the HTTP status all describe the credential that
+        // produced the failure, and that credential may already be gone.
+        let current = (spec.current_credential_binding)();
+        let failure = neutralize_wallet_failure(failure, current.as_deref());
+        let current = (spec.current_credential_binding)();
         let message = failure.describe("OpenRouter balance could not be fetched.");
         let error_category = if failure.code.is_empty() {
             None
@@ -2471,14 +2737,25 @@ impl RuntimeCore {
             Some(failure.code.clone())
         };
         let error_http_status = failure.http_status;
+        // The credential can change after the request resolved one and
+        // before this failure is applied. Retention is authorized only when
+        // the attempt, the retained observation, and the credential now on
+        // disk all name the same credential.
         let mut inner = self.inner.lock().unwrap();
+        let mut rejected = false;
         if let Some(last_good) = inner.wallet_last_good.get(spec.id).cloned() {
-            // Money from account A must never stand in for account B.
-            let same_account = match (failure.identity.as_deref(), last_good.identity.as_deref()) {
-                (Some(attempted), Some(retained)) => attempted == retained,
-                _ => true,
-            };
-            if same_account {
+            // Fail closed: money from credential A must never stand in for
+            // credential B. Every binding must be present and exactly equal;
+            // a missing or ambiguous binding on any side is a mismatch.
+            let same_attempt = wallet::credential_bindings_match(
+                failure.credential_binding.as_deref(),
+                last_good.credential_binding.as_deref(),
+            );
+            let same_current = wallet::credential_bindings_match(
+                failure.credential_binding.as_deref(),
+                current.as_deref(),
+            );
+            if same_attempt && same_current {
                 let mut retained = last_good;
                 retained.health = WalletHealth::Error;
                 retained.error = Some(format!("Refresh failed: {message}"));
@@ -2486,9 +2763,18 @@ impl RuntimeCore {
                 retained.error_http_status = error_http_status;
                 return retained;
             }
-            // Drop the stale other-account balance from this process so a
-            // later identity-less failure cannot resurrect it.
+            // Drop the stale other-account balance from this process and
+            // from the persisted cache, so neither a later identity-less
+            // failure nor a restart can resurrect it.
             inner.wallet_last_good.remove(spec.id);
+            inner.wallet_last_result.remove(spec.id);
+            rejected = true;
+        }
+        drop(inner);
+        if rejected {
+            if let Some(store) = &self.last_good_store {
+                store.discard_wallet(spec.id);
+            }
         }
         let health = wallet_failure_health(&failure);
         ApiWalletDto {
@@ -2498,6 +2784,7 @@ impl RuntimeCore {
             checked_at: None,
             remaining_usd: None,
             identity: failure.identity,
+            credential_binding: failure.credential_binding,
             error: Some(message),
             error_category,
             error_http_status,
@@ -2731,11 +3018,51 @@ impl RuntimeCore {
             .as_ref()
             .map(|store| store.revision())
             .unwrap_or(0);
+        // Resolve every wallet's live credential before taking the state
+        // lock: the resolver reads the auth file and never touches runtime
+        // state. Snapshots are served between cycles, so this is the gate
+        // that stops an idle credential change from presenting the previous
+        // credential's balance as current.
+        let current_bindings: HashMap<&'static str, Option<String>> = self
+            .wallet_specs
+            .iter()
+            .map(|spec| (spec.id, (spec.current_credential_binding)()))
+            .collect();
         let inner = self.inner.lock().unwrap();
+        let mut wallets: Vec<ApiWalletDto> = inner
+            .wallets
+            .iter()
+            .map(|wallet| {
+                let current = current_bindings
+                    .get(wallet.id.as_str())
+                    .and_then(|binding| binding.as_deref());
+                project_wallet_for_current_credential(wallet, current)
+            })
+            .collect();
+        // Each resolver reads the auth file before this state copy, so a
+        // credential change can land between resolution and the copy above.
+        // Re-read every wallet credential now that the copied slots exist
+        // and refuse any slot whose credential moved (or became
+        // unverifiable) between the two reads: a balance verified only
+        // against the first read would present another credential's money
+        // as current. The state lock keeps the copied slots stable while the
+        // second read happens.
+        for spec in &self.wallet_specs {
+            let settled = (spec.current_credential_binding)();
+            let unchanged = current_bindings
+                .get(spec.id)
+                .is_some_and(|resolved| resolved == &settled);
+            if !unchanged {
+                if let Some(wallet) = wallets.iter_mut().find(|wallet| wallet.id == spec.id) {
+                    let blanked = project_wallet_for_current_credential(&*wallet, None);
+                    *wallet = blanked;
+                }
+            }
+        }
         RuntimeSnapshot {
             seq: inner.seq,
             providers: inner.usages.clone(),
-            wallets: inner.wallets.clone(),
+            wallets,
             last_updated_at: inner
                 .last_updated_at
                 .map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -3435,15 +3762,64 @@ mod tests {
         (Arc::new(core), clock)
     }
 
+    const WALLET_BINDING_A: &str =
+        "key:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const WALLET_BINDING_B: &str =
+        "key:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// Simulates the credential store a wallet fetch would read. Tests hold
+    /// the returned handle so they can rotate the credential mid-scenario.
+    fn wallet_credential(binding: Option<&str>) -> Arc<Mutex<Option<String>>> {
+        Arc::new(Mutex::new(binding.map(str::to_string)))
+    }
+
+    /// A fresh last-good file per test. The store persists the parent
+    /// directory itself, so only the file and its interrupted-write sibling
+    /// need cleanup.
+    fn wallet_store_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let path = std::env::temp_dir().join(format!(
+            "limitscope-wallet-p1-{tag}-{}-{n}.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    fn remove_wallet_store(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    fn manual_clock_core_with_wallet_store(
+        wallets: Vec<WalletSpec>,
+        store: Arc<ProviderLastGoodStore>,
+    ) -> (Arc<RuntimeCore>, Arc<Mutex<DateTime<Utc>>>) {
+        let clock = Arc::new(Mutex::new(fixed_now()));
+        let getter_clock = clock.clone();
+        let core = RuntimeCore::with_injections(
+            vec![],
+            5,
+            Box::new(|| 0),
+            Box::new(move || *getter_clock.lock().unwrap()),
+        )
+        .with_wallets(wallets)
+        .with_last_good_store(Some(store));
+        (Arc::new(core), clock)
+    }
+
     fn counting_wallet(
         id: &'static str,
         name: &'static str,
+        credential: Arc<Mutex<Option<String>>>,
         calls: Arc<AtomicUsize>,
         outcome: impl Fn(usize) -> Result<WalletBalance, ProviderFailure> + Send + Sync + 'static,
     ) -> WalletSpec {
         WalletSpec {
             id,
             name,
+            current_credential_binding: Arc::new(move || credential.lock().unwrap().clone()),
             fetch: Arc::new(move || {
                 let calls = calls.clone();
                 let nth = calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -3453,10 +3829,15 @@ mod tests {
         }
     }
 
-    fn wallet_balance(remaining_usd: f64, identity: Option<&str>) -> WalletBalance {
+    fn wallet_balance(
+        remaining_usd: f64,
+        identity: Option<&str>,
+        binding: Option<&str>,
+    ) -> WalletBalance {
         WalletBalance {
             remaining_usd,
             identity: identity.map(str::to_string),
+            credential_binding: binding.map(str::to_string),
         }
     }
 
@@ -4268,6 +4649,7 @@ mod tests {
             transient: Some(true),
             retry_after_ms: None,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -4280,6 +4662,7 @@ mod tests {
             transient: Some(false),
             retry_after_ms: None,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -4292,7 +4675,18 @@ mod tests {
             transient: Some(true),
             retry_after_ms,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
+        }
+    }
+
+    /// A Retry-After failure attributed to a wallet credential. Wallet
+    /// cooldowns are credential-scoped, so wallet tests must exercise the
+    /// binding a real adapter always attaches.
+    fn wallet_rate_limited_failure(retry_after_ms: Option<u64>) -> ProviderFailure {
+        ProviderFailure {
+            credential_binding: Some(WALLET_BINDING_A.to_string()),
+            ..rate_limited_failure(retry_after_ms)
         }
     }
 
@@ -4304,6 +4698,7 @@ mod tests {
             transient: Some(true),
             retry_after_ms,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -4318,6 +4713,7 @@ mod tests {
             transient: Some(true),
             retry_after_ms: None,
             identity: None,
+            credential_binding: None,
             transport_timeout: true,
         }
     }
@@ -5231,6 +5627,7 @@ mod tests {
                 transient: Some(true),
                 retry_after_ms: Some(60_000),
                 identity: None,
+                credential_binding: None,
                 transport_timeout: false,
             })
         });
@@ -5251,6 +5648,7 @@ mod tests {
                 transient: Some(false),
                 retry_after_ms: None,
                 identity: None,
+                credential_binding: None,
                 transport_timeout: false,
             }),
             _ => Ok(ok_usage("grok", "Grok (xAI)", 5.0)),
@@ -6215,6 +6613,7 @@ mod tests {
             transient: Some(false),
             retry_after_ms: None,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -8580,9 +8979,13 @@ mod tests {
     #[tokio::test]
     async fn wallet_is_polled_at_most_once_per_fifteen_minutes() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
-            Ok(wallet_balance(nth as f64, None))
-        });
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls.clone(),
+            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+        );
         let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
 
         core.run_cycle().await;
@@ -8616,14 +9019,18 @@ mod tests {
     #[tokio::test]
     async fn a_manual_wallet_refresh_bypasses_the_cadence_cache_but_not_a_cooldown() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
-            match nth {
-                1 => Ok(wallet_balance(10.0, None)),
-                2 => Ok(wallet_balance(9.0, None)),
-                3 => Err(rate_limited_failure(Some(120_000))),
-                _ => Ok(wallet_balance(8.0, None)),
-            }
-        });
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls.clone(),
+            |nth| match nth {
+                1 => Ok(wallet_balance(10.0, None, Some(WALLET_BINDING_A))),
+                2 => Ok(wallet_balance(9.0, None, Some(WALLET_BINDING_A))),
+                3 => Err(wallet_rate_limited_failure(Some(120_000))),
+                _ => Ok(wallet_balance(8.0, None, Some(WALLET_BINDING_A))),
+            },
+        );
         let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
 
         core.run_cycle().await;
@@ -8672,14 +9079,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cooldown_from_one_credential_never_defers_or_describes_another() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls.clone(),
+            |nth| match nth {
+                1 => Ok(wallet_balance(
+                    10.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
+                2 => Err(wallet_rate_limited_failure(Some(120_000))),
+                _ => Ok(wallet_balance(
+                    3.0,
+                    Some("key:B1"),
+                    Some(WALLET_BINDING_B),
+                )),
+            },
+        );
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+        core.run_cycle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        advance(&clock, 16 * 60_000);
+        core.run_cycle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(core.snapshot().wallets[0].error_http_status, Some(429));
+
+        // A -> B while A's Retry-After is still live. B must neither inherit
+        // A's deferral nor the 429 metadata that described A's request.
+        *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        advance(&clock, 30_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "credential B is polled instead of consuming credential A's cooldown"
+        );
+        let refreshed = &core.snapshot().wallets[0];
+        assert_eq!(refreshed.health, WalletHealth::Live);
+        assert_eq!(refreshed.remaining_usd, Some(3.0));
+        assert_eq!(refreshed.identity.as_deref(), Some("key:B1"));
+        assert_eq!(refreshed.error_http_status, None);
+        assert_eq!(refreshed.error_category, None);
+    }
+
+    #[tokio::test]
     async fn a_transient_wallet_failure_is_retried_once_and_a_rate_limit_becomes_a_cooldown() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
-            match nth {
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls.clone(),
+            |nth| match nth {
                 1 | 2 => Err(transient_failure("network")),
-                _ => Err(rate_limited_failure(Some(60_000))),
-            }
-        });
+                _ => Err(wallet_rate_limited_failure(Some(60_000))),
+            },
+        );
         let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
 
         core.run_cycle().await;
@@ -8726,16 +9190,25 @@ mod tests {
     #[tokio::test]
     async fn a_failed_refresh_keeps_the_last_good_balance_and_its_original_stamp() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
-            match nth {
-                1 => Ok(wallet_balance(12.34, Some("key:A1"))),
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls.clone(),
+            |nth| match nth {
+                1 => Ok(wallet_balance(
+                    12.34,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
                 _ => Err({
                     let mut failure = transient_failure("network");
                     failure.identity = Some("key:A1".to_string());
+                    failure.credential_binding = Some(WALLET_BINDING_A.to_string());
                     failure
                 }),
-            }
-        });
+            },
+        );
         let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
 
         core.run_cycle().await;
@@ -8768,17 +9241,29 @@ mod tests {
     #[tokio::test]
     async fn a_balance_from_another_account_is_never_retained() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
-            match nth {
-                1 => Ok(wallet_balance(40.0, Some("key:A1"))),
-                2 => Err({
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls.clone(),
+            move |nth| match nth {
+                1 => Ok(wallet_balance(
+                    40.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
+                2 => {
+                    *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
                     let mut failure = permanent_failure();
                     failure.identity = Some("key:B2".to_string());
-                    failure
-                }),
+                    failure.credential_binding = Some(WALLET_BINDING_B.to_string());
+                    Err(failure)
+                }
                 _ => Err(permanent_failure()),
-            }
-        });
+            },
+        );
         let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
 
         core.run_cycle().await;
@@ -8816,9 +9301,13 @@ mod tests {
             Err(transient_failure("network"))
         });
         let wallet_calls = Arc::new(AtomicUsize::new(0));
-        let wallet = counting_wallet("openrouter", "OpenRouter", wallet_calls, |_| {
-            Ok(wallet_balance(3.5, Some("key:A1")))
-        });
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            wallet_calls,
+            |_| Ok(wallet_balance(3.5, Some("key:A1"), Some(WALLET_BINDING_A))),
+        );
 
         let delivered: Arc<Mutex<Vec<crate::notifications::QuotaNotification>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -8882,9 +9371,13 @@ mod tests {
     #[tokio::test]
     async fn a_real_zero_balance_is_not_confused_with_no_balance() {
         let zero_calls = Arc::new(AtomicUsize::new(0));
-        let zero_wallet = counting_wallet("openrouter", "OpenRouter", zero_calls, |_| {
-            Ok(wallet_balance(0.0, None))
-        });
+        let zero_wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            zero_calls,
+            |_| Ok(wallet_balance(0.0, None, Some(WALLET_BINDING_A))),
+        );
         let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![zero_wallet]);
         core.run_cycle().await;
         let zero = &core.snapshot().wallets[0];
@@ -8897,9 +9390,13 @@ mod tests {
         assert!(zero.checked_at.is_some());
 
         let missing_calls = Arc::new(AtomicUsize::new(0));
-        let missing_wallet = counting_wallet("openrouter", "OpenRouter", missing_calls, |_| {
-            Err(permanent_failure())
-        });
+        let missing_wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            missing_calls,
+            |_| Err(permanent_failure()),
+        );
         let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![missing_wallet]);
         core.run_cycle().await;
         let missing = &core.snapshot().wallets[0];
@@ -8921,17 +9418,24 @@ mod tests {
         ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let error_code = code.to_string();
-            let wallet = counting_wallet("openrouter", "OpenRouter", calls, move |_| {
-                Err(ProviderFailure {
-                    code: error_code.clone(),
-                    message: "openrouter refused".to_string(),
-                    http_status: None,
-                    transient: Some(false),
-                    retry_after_ms: None,
-                    identity: None,
-                    transport_timeout: false,
-                })
-            });
+            let wallet = counting_wallet(
+                "openrouter",
+                "OpenRouter",
+                wallet_credential(Some(WALLET_BINDING_A)),
+                calls,
+                move |_| {
+                    Err(ProviderFailure {
+                        code: error_code.clone(),
+                        message: "openrouter refused".to_string(),
+                        http_status: None,
+                        transient: Some(false),
+                        retry_after_ms: None,
+                        identity: None,
+                        credential_binding: None,
+                        transport_timeout: false,
+                    })
+                },
+            );
             let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
             core.run_cycle().await;
 
@@ -8951,6 +9455,9 @@ mod tests {
         let wallet = WalletSpec {
             id: "openrouter",
             name: "OpenRouter",
+            current_credential_binding: Arc::new(|| {
+                Some(WALLET_BINDING_A.to_string())
+            }),
             fetch: Arc::new(move || {
                 let calls = panic_calls.clone();
                 Box::pin(async move {
@@ -8958,7 +9465,11 @@ mod tests {
                     if calls.load(Ordering::SeqCst) > 0 {
                         panic!("wallet fetch exploded")
                     }
-                    Ok::<WalletBalance, ProviderFailure>(wallet_balance(1.0, None))
+                    Ok::<WalletBalance, ProviderFailure>(wallet_balance(
+                        1.0,
+                        None,
+                        Some(WALLET_BINDING_A),
+                    ))
                 }) as WalletFetchFuture
             }),
         };
@@ -8971,5 +9482,579 @@ mod tests {
         assert_eq!(failed.error_category.as_deref(), Some("unexpected"));
         assert_eq!(failed.remaining_usd, None);
         assert!(!core.snapshot().cycle_in_flight, "the panic wedges nothing");
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_credential_binding_never_retains_the_previous_balance() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls.clone(),
+            |nth| match nth {
+                1 => Ok(wallet_balance(
+                    40.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
+                _ => Err(transient_failure("network")),
+            },
+        );
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(40.0));
+
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+
+        let failed = &core.snapshot().wallets[0];
+        assert_eq!(failed.health, WalletHealth::Error);
+        assert_eq!(
+            failed.remaining_usd, None,
+            "an attempt with no verifiable identity cannot authorize retention"
+        );
+        assert_eq!(failed.checked_at, None);
+        assert_eq!(failed.error_category.as_deref(), Some("network"));
+        assert_eq!(failed.identity, None);
+
+        // The rejected entry is gone, so a later identity-less failure cannot
+        // resurrect it either.
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, None);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "the third failure was the second bounded retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_credential_swap_between_cycles_discards_the_retained_and_persisted_balance() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let path = wallet_store_path("credential-swap");
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls.clone(),
+            |nth| match nth {
+                1 => Ok(wallet_balance(
+                    40.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
+                _ => {
+                    let mut failure = permanent_failure();
+                    failure.identity = Some("key:B2".to_string());
+                    failure.credential_binding = Some(WALLET_BINDING_B.to_string());
+                    Err(failure)
+                }
+            },
+        );
+        let (core, clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(40.0));
+        assert!(store.get_persisted_wallet("openrouter").is_some());
+
+        *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+
+        let other = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(other.health, WalletHealth::Error);
+        assert_eq!(other.remaining_usd, None);
+        assert_eq!(other.error_category.as_deref(), Some("auth_expired"));
+        assert!(
+            store.get_persisted_wallet("openrouter").is_none(),
+            "the other account's persisted balance is evicted"
+        );
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_or_missing_credential_never_retains_another_accounts_balance() {
+        for code in ["credential_missing", "credential_ambiguous"] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let credential = wallet_credential(Some(WALLET_BINDING_A));
+            let clear = credential.clone();
+            let path = wallet_store_path(code);
+            let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+                path.clone(),
+                Box::new(fixed_now),
+            ));
+            let error_code = code.to_string();
+            let wallet = counting_wallet(
+                "openrouter",
+                "OpenRouter",
+                credential,
+                calls,
+                move |nth| match nth {
+                    1 => Ok(wallet_balance(
+                        18.0,
+                        Some("key:A1"),
+                        Some(WALLET_BINDING_A),
+                    )),
+                    _ => Err(ProviderFailure {
+                        code: error_code.clone(),
+                        message: "credential state is not usable".to_string(),
+                        http_status: None,
+                        transient: Some(false),
+                        retry_after_ms: None,
+                        identity: None,
+                        credential_binding: None,
+                        transport_timeout: false,
+                    }),
+                },
+            );
+            let (core, clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+            core.run_cycle().await;
+            assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(18.0));
+            assert!(store.get_persisted_wallet("openrouter").is_some());
+
+            *clear.lock().unwrap() = None;
+            advance(&clock, 60_000);
+            assert!(core.try_begin_wallet_cycle());
+            core.run_cycle().await;
+            core.finish_cycle();
+
+            let dto = &core.snapshot().wallets[0];
+            assert_eq!(dto.health, WalletHealth::Unavailable, "code {code}");
+            assert_eq!(dto.remaining_usd, None, "code {code}");
+            assert_eq!(dto.checked_at, None, "code {code}");
+            assert_eq!(
+                dto.error_category.as_deref(),
+                Some(code),
+                "the source-absent category stays intact"
+            );
+            assert!(
+                store.get_persisted_wallet("openrouter").is_none(),
+                "code {code}: the persisted balance is evicted"
+            );
+            drop(core);
+            drop(store);
+            remove_wallet_store(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restart_with_a_different_credential_never_hydrates_the_persisted_balance() {
+        let path = wallet_store_path("restart");
+        let first_store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet_a = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls,
+            |_| Ok(wallet_balance(25.5, Some("key:A1"), Some(WALLET_BINDING_A))),
+        );
+        let (first_core, _clock) =
+            manual_clock_core_with_wallet_store(vec![wallet_a], first_store.clone());
+        first_core.run_cycle().await;
+        assert!(first_store.get_persisted_wallet("openrouter").is_some());
+        drop(first_core);
+        drop(first_store);
+
+        let second_store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let calls_b = Arc::new(AtomicUsize::new(0));
+        let wallet_b = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_B)),
+            calls_b.clone(),
+            |_| Err(permanent_failure()),
+        );
+        let (second_core, _clock) =
+            manual_clock_core_with_wallet_store(vec![wallet_b], second_store.clone());
+        let hydrated = &second_core.snapshot().wallets[0];
+        assert_eq!(hydrated.health, WalletHealth::Unknown);
+        assert_eq!(hydrated.remaining_usd, None);
+        assert_eq!(hydrated.identity, None);
+        assert!(hydrated.checked_at.is_none());
+        assert_eq!(calls_b.load(Ordering::SeqCst), 0, "hydration never fetches");
+        assert!(second_store.get_persisted_wallet("openrouter").is_none());
+
+        drop(second_core);
+        drop(second_store);
+        let third_store = ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        );
+        assert!(
+            third_store.get_persisted_wallet("openrouter").is_none(),
+            "a third restart cannot resurrect the evicted balance"
+        );
+        drop(third_store);
+        remove_wallet_store(&path);
+    }
+
+    #[tokio::test]
+    async fn a_success_from_a_replaced_credential_is_never_published_or_persisted() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let path = wallet_store_path("late-success");
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls.clone(),
+            move |_| {
+                *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+                Ok(wallet_balance(
+                    30.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                ))
+            },
+        );
+        let (core, _clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+        core.run_cycle().await;
+
+        let dto = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dto.health, WalletHealth::Error);
+        assert_eq!(dto.error_category.as_deref(), Some("credential_changed"));
+        assert_eq!(dto.remaining_usd, None);
+        assert_eq!(dto.checked_at, None);
+        assert_eq!(dto.identity, None, "the replaced key tail must not survive");
+        assert_eq!(dto.error_http_status, None);
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+        let wire = serde_json::to_value(dto).unwrap();
+        assert!(wire.get("credentialBinding").is_none());
+        assert!(!wire.to_string().contains("key:sha256:"));
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
+    }
+
+    #[tokio::test]
+    async fn a_failure_from_a_replaced_credential_is_never_published_as_the_new_one() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let path = wallet_store_path("failure-rotation");
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        // The second call answers with credential A's rate limit after the
+        // user has already replaced A with B on disk.
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls.clone(),
+            move |nth| match nth {
+                1 => Ok(wallet_balance(
+                    10.0,
+                    Some("key:A1"),
+                    Some(WALLET_BINDING_A),
+                )),
+                2 => {
+                    *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+                    Err(wallet_rate_limited_failure(Some(120_000)))
+                }
+                _ => Ok(wallet_balance(
+                    3.0,
+                    Some("key:B1"),
+                    Some(WALLET_BINDING_B),
+                )),
+            },
+        );
+        let (core, clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(10.0));
+        assert!(store.get_persisted_wallet("openrouter").is_some());
+
+        advance(&clock, 16 * 60_000);
+        core.run_cycle().await;
+        let failed = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(failed.remaining_usd, None, "A's money is not B's money");
+        assert_eq!(failed.health, WalletHealth::Error);
+        assert_eq!(failed.error_category.as_deref(), Some("credential_changed"));
+        assert_eq!(failed.error_http_status, None, "A's 429 is not B's state");
+        assert_eq!(failed.identity, None, "A's key tail must not survive");
+        assert!(
+            !failed.error.as_deref().unwrap_or("").contains("key:A1"),
+            "A's error text must not survive"
+        );
+        assert!(
+            store.get_persisted_wallet("openrouter").is_none(),
+            "the evicted balance cannot come back after a restart"
+        );
+
+        // A's Retry-After must not defer B: a forced refresh still fetches.
+        advance(&clock, 30_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let refreshed = &core.snapshot().wallets[0];
+        assert_eq!(refreshed.health, WalletHealth::Live);
+        assert_eq!(refreshed.remaining_usd, Some(3.0));
+        assert_eq!(refreshed.identity.as_deref(), Some("key:B1"));
+
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
+    }
+
+    #[test]
+    fn a_wallet_snapshot_never_carries_the_credential_binding() {
+        let dto = ApiWalletDto {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            health: WalletHealth::Stale,
+            checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+            remaining_usd: Some(1.25),
+            identity: Some("key:A1".to_string()),
+            credential_binding: Some(WALLET_BINDING_A.to_string()),
+            error: None,
+            error_category: None,
+            error_http_status: None,
+        };
+        let wire = serde_json::to_value(&dto).unwrap();
+        assert!(wire.get("credentialBinding").is_none());
+        assert_eq!(
+            wire.get("remainingUsd").and_then(|value| value.as_f64()),
+            Some(1.25)
+        );
+        assert_eq!(
+            wire.get("identity").and_then(|value| value.as_str()),
+            Some("key:A1")
+        );
+        assert!(!wire.to_string().contains("key:sha256:"));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_never_serves_a_balance_after_the_credential_changed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let path = wallet_store_path("snapshot-rotation");
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls,
+            |_| Ok(wallet_balance(42.0, Some("key:A1"), Some(WALLET_BINDING_A))),
+        );
+        let (core, _clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(42.0));
+        assert!(store.get_persisted_wallet("openrouter").is_some());
+
+        // No cycle runs here. The credential changes while the app is idle,
+        // and the very next snapshot must already stop presenting A's money.
+        *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        let idle = &core.snapshot().wallets[0];
+        assert_eq!(idle.health, WalletHealth::Unknown);
+        assert_eq!(idle.remaining_usd, None);
+        assert_eq!(idle.checked_at, None);
+        assert_eq!(idle.identity, None);
+
+        // The next job performs the durable eviction.
+        core.run_cycle().await;
+        assert!(
+            store.get_persisted_wallet("openrouter").is_none(),
+            "the next wallet job removes the other credential's persisted balance"
+        );
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, None);
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_never_serves_a_replaced_credentials_failure_metadata() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            calls,
+            |_| {
+                Err(ProviderFailure {
+                    identity: Some("key:A1".to_string()),
+                    credential_binding: Some(WALLET_BINDING_A.to_string()),
+                    ..wallet_rate_limited_failure(None)
+                })
+            },
+        );
+        let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        let failed = &core.snapshot().wallets[0];
+        assert_eq!(failed.health, WalletHealth::Error);
+        assert_eq!(failed.error_http_status, Some(429));
+        assert_eq!(failed.identity.as_deref(), Some("key:A1"));
+
+        // No cycle runs: the credential changes while the app is idle, so the
+        // very next snapshot must stop describing A as B's state.
+        *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        let idle = &core.snapshot().wallets[0];
+        assert_eq!(idle.health, WalletHealth::Unknown);
+        assert_eq!(idle.remaining_usd, None);
+        assert_eq!(idle.identity, None, "A's key tail must not describe B");
+        assert_eq!(idle.error, None);
+        assert_eq!(idle.error_category, None);
+        assert_eq!(idle.error_http_status, None);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_rejects_a_change_between_its_two_credential_reads() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let switch_after = Arc::new(AtomicUsize::new(usize::MAX));
+        let read_counter = reads.clone();
+        let switch = switch_after.clone();
+        let path = wallet_store_path("snapshot-interleaving");
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let wallet = WalletSpec {
+            id: "openrouter",
+            name: "OpenRouter",
+            current_credential_binding: Arc::new(move || {
+                let nth = read_counter.fetch_add(1, Ordering::SeqCst);
+                Some(
+                    if nth < switch.load(Ordering::SeqCst) {
+                        WALLET_BINDING_A
+                    } else {
+                        WALLET_BINDING_B
+                    }
+                    .to_string(),
+                )
+            }),
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    Ok(wallet_balance(
+                        42.0,
+                        Some("key:A1"),
+                        Some(WALLET_BINDING_A),
+                    ))
+                }) as WalletFetchFuture
+            }),
+        };
+        let (core, _clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(42.0));
+
+        // The auth-file writer lands between the snapshot's two credential
+        // reads: the first still sees A, the second sees B. The slot copied
+        // in between belongs to A, so the first read alone must not
+        // authorize publishing it.
+        let resumed_at = reads.load(Ordering::SeqCst);
+        switch_after.store(resumed_at + 1, Ordering::SeqCst);
+        let raced = &core.snapshot().wallets[0];
+        assert_eq!(
+            raced.remaining_usd, None,
+            "a balance verified only against the earlier credential read is not current"
+        );
+        assert_eq!(raced.health, WalletHealth::Unknown);
+        assert_eq!(raced.checked_at, None);
+        assert_eq!(raced.identity, None);
+
+        // The next job evicts the retained copy durably.
+        core.run_cycle().await;
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
+    }
+
+    #[tokio::test]
+    async fn a_hydrated_balance_is_not_served_after_the_credential_changes() {
+        let path = wallet_store_path("snapshot-hydrated");
+        {
+            let writer = ProviderLastGoodStore::open_with_clock(
+                path.clone(),
+                Box::new(fixed_now),
+            );
+            writer.record_wallet_success(&ApiWalletDto {
+                id: "openrouter".to_string(),
+                name: "OpenRouter".to_string(),
+                health: WalletHealth::Live,
+                checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+                remaining_usd: Some(21.0),
+                identity: Some("key:A1".to_string()),
+                credential_binding: Some(WALLET_BINDING_A.to_string()),
+                error: None,
+                error_category: None,
+                error_http_status: None,
+            });
+        }
+
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        ));
+        let credential = wallet_credential(Some(WALLET_BINDING_A));
+        let rotate = credential.clone();
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            credential,
+            Arc::new(AtomicUsize::new(0)),
+            |_| Err(permanent_failure()),
+        );
+        let (core, _clock) = manual_clock_core_with_wallet_store(vec![wallet], store.clone());
+
+        let hydrated = &core.snapshot().wallets[0];
+        assert_eq!(hydrated.health, WalletHealth::Stale);
+        assert_eq!(hydrated.remaining_usd, Some(21.0));
+
+        // The credential changes after hydration but before the first wallet
+        // job; the published snapshot must not keep the hydrated balance.
+        *rotate.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        let idle = &core.snapshot().wallets[0];
+        assert_eq!(idle.health, WalletHealth::Unknown);
+        assert_eq!(idle.remaining_usd, None);
+        assert_eq!(idle.checked_at, None);
+        assert_eq!(idle.identity, None);
+
+        core.run_cycle().await;
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+        drop(core);
+        drop(store);
+        remove_wallet_store(&path);
     }
 }

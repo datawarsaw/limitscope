@@ -2003,6 +2003,7 @@ mod tests {
                         transient: Some(false),
                         retry_after_ms: None,
                         identity: None,
+                        credential_binding: None,
                         transport_timeout: false,
                     }) as Result<ProviderUsageDto, crate::runtime::ProviderFailure>
                 }) as crate::runtime::FetchFuture

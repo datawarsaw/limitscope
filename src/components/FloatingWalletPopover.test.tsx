@@ -217,4 +217,3 @@ describe("FloatingWalletPopover", () => {
     expect(props.onFocus).toHaveBeenCalled();
   });
 });
-

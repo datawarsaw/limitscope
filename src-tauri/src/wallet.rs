@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::opencode_go::{self, AuthEntryError};
 use crate::provider_error::ProviderError;
@@ -36,7 +37,39 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalletBalance {
     pub remaining_usd: f64,
+    /// Display-safe masked tail (`key:1234`). Never used as an isolation
+    /// boundary: short suffixes collide.
     pub identity: Option<String>,
+    /// Deterministic fingerprint of the full credential that produced this
+    /// observation. This is the account-isolation identity used for last-good
+    /// retention and persistence.
+    pub credential_binding: Option<String>,
+}
+
+/// Deterministic, collision-resistant binding of the full credential.
+///
+/// The OpenRouter credits response carries no account identifier, so the
+/// credential itself is the only verifiable boundary available to this
+/// process. A full SHA-256 digest distinguishes credentials that share the
+/// four-character display tail, and it is not reversible key material.
+pub(crate) fn credential_fingerprint(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    format!("key:sha256:{hex}")
+}
+
+/// Fail-closed identity comparison: both sides must be present, non-blank,
+/// and exactly equal. A missing binding on either side can never authorize
+/// retaining the other side's balance.
+pub(crate) fn credential_bindings_match(attempted: Option<&str>, retained: Option<&str>) -> bool {
+    match (attempted.map(str::trim), retained.map(str::trim)) {
+        (Some(attempted), Some(retained)) => !attempted.is_empty() && attempted == retained,
+        _ => false,
+    }
 }
 
 // Manual impl so the key can never reach logs through Debug formatting.
@@ -170,6 +203,19 @@ fn resolve_active_key() -> Result<OpenRouterKey, ProviderError> {
     resolve_key(&home)
 }
 
+/// Read-only resolution of the active credential's binding.
+///
+/// Used by the runtime to invalidate a retained balance when the stored
+/// credential changed, and by cold-start hydration to prove that a persisted
+/// balance still belongs to the credential currently on disk. `None` means
+/// "no verifiable identity" and must be treated as a mismatch by callers; it
+/// never means "unchanged".
+pub fn current_credential_binding() -> Option<String> {
+    resolve_active_key()
+        .ok()
+        .map(|key| credential_fingerprint(&key.0))
+}
+
 fn http_client() -> Result<&'static reqwest::Client, ProviderError> {
     static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
     match CLIENT.get_or_init(|| {
@@ -193,13 +239,15 @@ fn scrub_for_key(error: ProviderError, key: &OpenRouterKey) -> ProviderError {
 }
 
 /// The credits fetch for an already-resolved credential. Every failure after
-/// this point carries the masked credential identity so the runtime can tell
-/// a balance observed for one account from a retained balance of another.
+/// this point carries both the display-safe tail and the full-credential
+/// binding, so the runtime can tell a balance observed for one credential
+/// from a retained balance of another.
 async fn fetch_credits_from(
     url: &str,
     key: &OpenRouterKey,
 ) -> Result<WalletBalance, ProviderError> {
     let identity = opencode_go::key_tail(&key.0).map(|tail| format!("key:{tail}"));
+    let binding = Some(credential_fingerprint(&key.0));
     let client = http_client()?;
     let response = client
         .get(url)
@@ -214,11 +262,14 @@ async fn fetch_credits_from(
                 &error,
             )
             .with_identity_hint(identity.clone())
+            .with_credential_binding(binding.clone())
         })?;
 
     let status = response.status();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        return Err(auth_invalid().with_identity_hint(identity.clone()));
+        return Err(auth_invalid()
+            .with_identity_hint(identity.clone())
+            .with_credential_binding(binding.clone()));
     }
     let retry_after =
         crate::provider_error::retry_after_header(response.headers()).map(String::from);
@@ -229,6 +280,7 @@ async fn fetch_credits_from(
             &error,
         )
         .with_identity_hint(identity.clone())
+        .with_credential_binding(binding.clone())
     })?;
     if !status.is_success() {
         return Err(ProviderError::http_failure_with_retry_after(
@@ -237,14 +289,18 @@ async fn fetch_credits_from(
             retry_after.as_deref(),
             chrono::Utc::now(),
         )
-        .with_identity_hint(identity.clone()));
+        .with_identity_hint(identity.clone())
+        .with_credential_binding(binding.clone()));
     }
 
     Ok(WalletBalance {
         remaining_usd: parse_credits(&body).map_err(|error| {
-            error.with_identity_hint(identity.clone())
+            error
+                .with_identity_hint(identity.clone())
+                .with_credential_binding(binding.clone())
         })?,
         identity,
+        credential_binding: binding,
     })
 }
 
@@ -548,10 +604,46 @@ mod tests {
     }
 
     #[test]
+    fn the_credential_fingerprint_is_stable_and_collision_resistant_for_display_tails() {
+        let first = credential_fingerprint("sk-or-test-key-1234");
+        let again = credential_fingerprint("sk-or-test-key-1234");
+        let other = credential_fingerprint("sk-or-other-key-1234");
+
+        assert_eq!(first, again, "the same credential maps to one binding");
+        assert_ne!(
+            first, other,
+            "credentials sharing the four-character display tail stay distinct"
+        );
+        assert!(first.starts_with("key:sha256:"));
+        assert_eq!(first.len(), "key:sha256:".len() + 64);
+        assert_eq!(
+            opencode_go::key_tail("sk-or-test-key-1234"),
+            opencode_go::key_tail("sk-or-other-key-1234"),
+            "the display tail alone is not an isolation boundary"
+        );
+    }
+
+    #[test]
+    fn the_binding_comparator_fails_closed() {
+        let first = credential_fingerprint("sk-or-test-key-1234");
+        let other = credential_fingerprint("sk-or-other-key-1234");
+
+        assert!(credential_bindings_match(Some(&first), Some(&first)));
+        assert!(!credential_bindings_match(Some(&first), Some(&other)));
+        assert!(!credential_bindings_match(None, Some(&first)));
+        assert!(!credential_bindings_match(Some(&first), None));
+        assert!(!credential_bindings_match(None, None));
+        assert!(!credential_bindings_match(Some(""), Some("")));
+        assert!(!credential_bindings_match(Some("   "), Some("   ")));
+        assert!(!credential_bindings_match(Some(&first), Some("   ")));
+    }
+
+    #[test]
     fn short_or_odd_keys_get_no_identity() {
         let balance = WalletBalance {
             remaining_usd: 1.0,
             identity: opencode_go::key_tail("short").map(|tail| format!("key:{tail}")),
+            credential_binding: None,
         };
         assert_eq!(balance.identity, None);
     }
