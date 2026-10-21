@@ -8,15 +8,17 @@
 
 ## Current status
 
+- v0.8.15 released: API Wallets Phase 1 (OpenRouter prepaid balance) is on
+  `main`. Release commit `c048d9ac0b1ec0c9e43ff44ec929ed08d8a9809c`, annotated
+  tag `v0.8.15`, published in `datawarsaw/limitscope-releases` as the live
+  stable release. See `docs/release-verification-v0.8.15.md`.
 - v0.8.14 released: OpenDesign is a standard provider on `main`. Release
   commit `d640f052762e409461746b6ee7e2538c641a3b77`, annotated tag `v0.8.14`,
   published in `datawarsaw/limitscope-releases`. See
   `docs/release-verification-v0.8.14.md`.
-- API Wallets Phase 1 (OpenRouter) candidate on
-  `codex/api-wallets-openrouter-phase1`: a real prepaid USD balance beside the
-  quota providers. Awaiting Human Acceptance; no release is claimed.
-- Technical baseline for the release: `67c2df3e6e37d48e4c329a06c9465116d5c0d460`.
-- Integrated branch: `codex/v0.8.14-opendesign`, merged as PR #16.
+- API Wallets Phase 1 merged as PR #18, merge commit
+  `feaff647f8f6fd6c3ad0115129c4a6a614464311`.
+- Technical baseline for the release: `feaff647f8f6fd6c3ad0115129c4a6a614464311`.
 - Historical dirty checkout `C:/AI/Token_Monitor` is outside the mutation scope.
 
 ## Architecture and boundaries
@@ -54,6 +56,11 @@
   --all-targets` PASS; `npm run build` PASS; `npm run scan:secrets` PASS.
   Native Tauri visuals and a live authenticated OpenRouter balance remain
   Human Acceptance checks.
+- Release integrity verification on 2026-10-22 for v0.8.15: 18 PASS / 0 FAIL
+  (1 skipped: local worktree cleanliness). The published installer and
+  signature were re-downloaded after publication and re-hashed; both match
+  the run manifest, and `minisign-verify 0.2.5` with `allow_legacy=false`
+  passes against the published installer.
 - Authenticated OpenDesign validation requires the user-owned Plan & balance
   page in Chrome. Agent validation is separate from Human Acceptance, which the
   operator recorded against the candidate SHA before the release.
