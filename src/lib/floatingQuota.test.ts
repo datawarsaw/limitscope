@@ -737,6 +737,29 @@ describe("API wallet geometry", () => {
     expect(floatingBarWidth(4, true)).toBe(566);
   });
 
+  it("declares a native max width that covers the widest wallet-aware bar", () => {
+    // The floating window's declared maximum is the native size constraint
+    // (tauri.conf.json maxWidth). It must cover the widest layout the bar
+    // can ever reach — five providers plus the wallet slot — or the native
+    // window advertises a maximum narrower than the bar actually draws, and
+    // the reveal would be clipped at the window edge. The provider count is
+    // the production registry's five, and the wallet adds its own slot.
+    const config = JSON.parse(
+      readFileSync(
+        new URL("../../src-tauri/tauri.conf.json", import.meta.url),
+        "utf8",
+      ),
+    ) as { app: { windows: Array<Record<string, unknown>> } };
+    const floating = config.app.windows.find(
+      (window) => window.label === "floating-quota",
+    );
+    expect(floating).toBeDefined();
+    const declaredMaxWidth = floating!.maxWidth as number;
+    const widestBar = floatingBarWidth(5, true);
+    expect(widestBar).toBe(646);
+    expect(declaredMaxWidth).toBe(widestBar);
+  });
+
   it("keeps every provider meter exactly where it was at 600px", () => {
     const expected = [
       { left: 63, width: 62 },
