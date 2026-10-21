@@ -1,11 +1,12 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import type { LimitWindow, ProviderUsage } from "../types";
+import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
 import {
   DOCK_HEIGHT,
   DOCK_METER_HEIGHT,
   DOCK_WIDTH,
   FLOATING_WINDOW_HEIGHT,
+  WALLET_SLOT_WIDTH,
   clampPopoverAlign,
   dockMeterRects,
   dockSeparatorLefts,
@@ -14,8 +15,13 @@ import {
   floatingItemLabel,
   floatingPrimaryWindow,
   floatingQuotaItems,
+  floatingWalletBalanceText,
+  floatingWalletItem,
+  floatingWalletItems,
+  floatingWalletLabel,
   floatingWindowHeight,
   haloMeterRects,
+  haloWalletRect,
   primaryResetWindow,
 } from "./floatingQuota";
 
@@ -720,5 +726,136 @@ describe("resting dock geometry", () => {
     // bar draws its own divider at (63 − 40 → 23 first item, etc.).
     expect(dockSeparatorLefts(5)).toEqual([137, 251, 365, 479]);
     expect(dockSeparatorLefts(1)).toEqual([]);
+  });
+});
+
+describe("API wallet geometry", () => {
+  it("adds one fixed 44px slot and one shell gap to the revealed width", () => {
+    expect(WALLET_SLOT_WIDTH).toBe(44);
+    expect(floatingBarWidth(5)).toBe(600);
+    expect(floatingBarWidth(5, true)).toBe(646);
+    expect(floatingBarWidth(4, true)).toBe(566);
+  });
+
+  it("keeps every provider meter exactly where it was at 600px", () => {
+    const expected = [
+      { left: 63, width: 62 },
+      { left: 177, width: 62 },
+      { left: 291, width: 62 },
+      { left: 405, width: 62 },
+      { left: 519, width: 62 },
+    ];
+    expect(haloMeterRects(600, 5)).toEqual(expected);
+    expect(haloMeterRects(646, 5, true)).toEqual(expected);
+    expect(haloWalletRect(646, 5)).toEqual({ left: 593, width: 44 });
+  });
+
+  it("keeps the resting 600px dock meters on the same revealed positions", () => {
+    // The 646px reveal re-centers over the fixed 600px strip, so each meter
+    // moves 23px left on screen but lands on the same bar segment.
+    expect(dockMeterRects(5, true)).toEqual([
+      { left: 40, width: 62 },
+      { left: 154, width: 62 },
+      { left: 268, width: 62 },
+      { left: 382, width: 62 },
+      { left: 496, width: 62 },
+    ]);
+    expect(dockSeparatorLefts(5, true)).toEqual([114, 228, 342, 456]);
+    // The strip itself stays meters-only and 600×16 while the wallet shows
+    // only in the revealed bar.
+    expect(DOCK_WIDTH).toBe(600);
+    expect(DOCK_HEIGHT).toBe(16);
+  });
+});
+
+function wallet(extra: Partial<ApiWallet> = {}): ApiWallet {
+  return {
+    id: "openrouter",
+    name: "OpenRouter",
+    health: "live",
+    checkedAt: CHECKED_AT,
+    remainingUsd: 12.5,
+    ...extra,
+  };
+}
+
+describe("floating wallet presentation", () => {
+  it("maps a live reading to a healthy wallet with two decimals", () => {
+    const item = floatingWalletItem(wallet());
+    expect(item).toMatchObject({
+      id: "openrouter",
+      name: "OpenRouter",
+      state: "healthy",
+      remainingUsd: 12.5,
+      checkedAt: CHECKED_AT,
+      statusLabel: "Live",
+    });
+    expect(floatingWalletBalanceText(item)).toBe("$12.50");
+    expect(floatingWalletLabel(item)).toBe(
+      "OpenRouter API wallet, $12.50 remaining, Live",
+    );
+  });
+
+  it("keeps a real zero balance as $0.00", () => {
+    const item = floatingWalletItem(wallet({ remainingUsd: 0 }));
+    expect(item.state).toBe("healthy");
+    expect(item.remainingUsd).toBe(0);
+    expect(floatingWalletBalanceText(item)).toBe("$0.00");
+  });
+
+  it.each([undefined, -0.01, Number.NaN, Number.POSITIVE_INFINITY])(
+    "never turns an untrustworthy balance (%s) into money",
+    (remainingUsd) => {
+      const item = floatingWalletItem(wallet({ remainingUsd }));
+      expect(item.state).toBe("unavailable");
+      expect(item.remainingUsd).toBeNull();
+      expect(floatingWalletBalanceText(item)).toBeNull();
+      expect(floatingWalletLabel(item)).toBe(
+        "OpenRouter API wallet, balance unavailable, Unavailable",
+      );
+      expect(floatingWalletLabel(item)).not.toContain("$0.00");
+    },
+  );
+
+  it("keeps every non-live health as its own slot state", () => {
+    expect(floatingWalletItem(wallet({ health: "stale" })).statusLabel).toBe(
+      "Stale",
+    );
+    expect(
+      floatingWalletItem(wallet({ health: "cooldown" })).statusLabel,
+    ).toBe("Cooling down");
+    expect(
+      floatingWalletItem(
+        wallet({ health: "error", errorHttpStatus: 429 }),
+      ).statusLabel,
+    ).toBe("Rate limited");
+    expect(
+      floatingWalletItem(wallet({ health: "error" })).statusLabel,
+    ).toBe("Refresh failed");
+    expect(
+      floatingWalletItem(wallet({ health: "unknown" })).state,
+    ).toBe("unavailable");
+  });
+
+  it("drops an invalid stamp instead of claiming a fresh check", () => {
+    const item = floatingWalletItem(wallet({ checkedAt: "not-a-date" }));
+    expect(item.checkedAt).toBeNull();
+    expect(item.state).toBe("healthy");
+  });
+
+  it("carries identity, error details and one item per non-empty id", () => {
+    const items = floatingWalletItems([
+      wallet({ identity: "key:1234" }),
+      wallet({ name: "duplicate" }),
+      wallet({ id: "  " }),
+      wallet({ id: "openrouter-2", error: "refresh failed", errorCategory: "http" }),
+    ]);
+    expect(items.map((item) => item.id)).toEqual([
+      "openrouter",
+      "openrouter-2",
+    ]);
+    expect(items[0].identity).toBe("key:1234");
+    expect(items[1].error).toBe("refresh failed");
+    expect(items[1].errorCategory).toBe("http");
   });
 });

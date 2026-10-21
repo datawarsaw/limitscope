@@ -286,3 +286,21 @@ describe("resting dock guards", () => {
     expect(block).toContain('.fq-root[data-dock-state="revealing"] .fq-shell');
   });
 });
+
+describe("API wallet slot guards", () => {
+  it("pins the compact slot to its 44px geometry and status-only content", () => {
+    const block = css.match(/\.fq-wallet \{[^}]*\}/)?.[0] ?? "";
+    expect(block).toContain("flex: 0 0 44px");
+    expect(block).toContain("place-items: center");
+    // The slot carries a mark and a dot; no money text is rendered into it.
+    expect(css).toContain(".fq-wallet-dot");
+    expect(css).toContain(".fq-wallet-mark");
+  });
+
+  it("stops the wallet pulse under prefers-reduced-motion", () => {
+    const block = css.match(
+      /@media \(prefers-reduced-motion: reduce\) \{[\s\S]*\n\}/,
+    )?.[0];
+    expect(block).toContain(".fq-wallet.is-refreshing .fq-wallet-dot");
+  });
+});

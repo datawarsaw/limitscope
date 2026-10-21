@@ -40,6 +40,7 @@ const IPC_SURFACE = new Set([
   "runtime::get_runtime_snapshot",
   "runtime::request_refresh",
   "runtime::request_refresh_on_reconnect",
+  "runtime::request_wallet_refresh",
   "runtime::set_refresh_interval",
   "runtime::set_quota_notifications_enabled",
   "history::get_history",

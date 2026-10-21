@@ -52,6 +52,7 @@ function currentSnapshot(): RuntimeSnapshot {
         limits: [{ label: "5-hour", usedPercent: 42 }],
       },
     ],
+    wallets: [],
     lastUpdatedAt: "2026-09-29T12:00:00.000Z",
     cycleSucceeded: true,
     cycleInFlight: false,
@@ -139,6 +140,38 @@ describe("useProviderUsage (shared runtime consumer)", () => {
     // The closing snapshot of the chain clears the optimistic span.
     emitSnapshot(snapshotWith({ seq: 2 }));
     expect(result.current.loading).toBe(false);
+  });
+
+  it("refreshes a wallet through its own busy state and applies its snapshot", async () => {
+    const { result } = renderHook(() => useProviderUsage(5));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.wallets).toEqual([]);
+
+    act(() => result.current.refreshWallet());
+    expect(result.current.walletRefreshing).toBe(true);
+    // The provider loading span is untouched: a wallet action is its own.
+    expect(result.current.loading).toBe(false);
+    expect(
+      mocks.invocations.filter((c) => c.command === "request_wallet_refresh"),
+    ).toHaveLength(1);
+
+    emitSnapshot(
+      snapshotWith({
+        seq: 2,
+        wallets: [
+          {
+            id: "openrouter",
+            name: "OpenRouter",
+            health: "live",
+            checkedAt: "2026-09-29T12:00:00.000Z",
+            remainingUsd: 12.5,
+          },
+        ],
+      }),
+    );
+    expect(result.current.walletRefreshing).toBe(false);
+    expect(result.current.wallets).toHaveLength(1);
+    expect(result.current.wallets[0].remainingUsd).toBe(12.5);
   });
 
   it("the reconnect trigger only asks the shared runtime for one cycle", async () => {

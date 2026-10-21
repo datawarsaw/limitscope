@@ -148,6 +148,7 @@ html[data-window="floating"] body {
 /* Tauri's drag-region rule is injected later and would swallow clicks on the
    provider buttons unless the interactive surface opts out with priority. */
 .fq-shell .fq-item,
+.fq-wallet,
 .fq-popover,
 .fq-menu,
 .fq-popover button,
@@ -185,6 +186,7 @@ html[data-window="floating"] body {
 }
 
 .fq-item:focus-visible,
+.fq-wallet:focus-visible,
 .fq-actions button:focus-visible,
 .fq-menu button:focus-visible {
   outline: 2px solid var(--teal);
@@ -307,6 +309,96 @@ html[data-window="floating"] body {
   border-radius: 99px;
   background: var(--amber);
   box-shadow: 0 0 0 2px rgba(251, 191, 36, 0.18);
+}
+
+/* The API wallet slot: one fixed 44px segment after the providers. It has
+   no quota meter and no dollar text — identity is the wallet glyph, state is
+   the dot, and the shared detail card carries the balance. */
+.fq-wallet {
+  position: relative;
+  flex: 0 0 44px;
+  display: grid;
+  grid-template-rows: 18px 4px;
+  row-gap: 5px;
+  place-items: center;
+  align-content: center;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 15px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+/* The wallet follows the last provider, so it carries the same hairline a
+   provider segment uses to separate itself from the one before it. */
+.fq-item + .fq-wallet::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 1px;
+  background: var(--divider);
+}
+
+.fq-wallet:hover,
+.fq-wallet:focus-visible {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.fq-wallet:focus {
+  outline: none;
+}
+
+.fq-wallet-mark {
+  width: 18px;
+  height: 18px;
+  display: grid;
+  place-items: center;
+  color: var(--text-dim);
+}
+
+.fq-wallet-mark svg {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+.fq-wallet-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 99px;
+  background: var(--green);
+}
+
+.fq-wallet[data-state="stale"] .fq-wallet-mark {
+  opacity: 0.72;
+}
+
+.fq-wallet[data-state="stale"] .fq-wallet-dot,
+.fq-wallet[data-state="cooldown"] .fq-wallet-dot {
+  background: var(--amber);
+}
+
+.fq-wallet[data-state="error"] .fq-wallet-dot {
+  background: var(--red);
+}
+
+.fq-wallet[data-state="unavailable"] .fq-wallet-dot {
+  background: var(--text-faint);
+}
+
+.fq-wallet.is-refreshing .fq-wallet-dot {
+  animation: fq-wallet-pulse 900ms ease-in-out infinite;
+}
+
+@keyframes fq-wallet-pulse {
+  50% {
+    opacity: 0.35;
+  }
 }
 
 :root[data-theme="oled"] .fq-stale-dot {
@@ -721,6 +813,38 @@ html[data-window="floating"] body {
   background: rgba(255, 255, 255, 0.06);
 }
 
+/* Wallet card: the balance uses the provider card's large value treatment;
+   the refresh action is the card's one command and states its disabled
+   reason in the hint line above it. */
+.fq-wallet-balance.is-unavailable {
+  color: var(--text-faint);
+}
+
+.fq-wallet-hint {
+  margin: 7px 0 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.fq-wallet-actions {
+  gap: 8px;
+}
+
+.fq-actions .fq-wallet-refresh {
+  color: var(--text);
+}
+
+.fq-actions .fq-wallet-refresh:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.fq-actions .fq-wallet-refresh:disabled {
+  opacity: 0.55;
+  cursor: default;
+  background: transparent;
+}
+
 .fq-menu {
   align-self: flex-end;
   width: min(220px, 100%);
@@ -912,6 +1036,7 @@ html[data-window="floating"] body {
   .fq-popover.is-exiting,
   .fq-menu,
   .fq-card,
+  .fq-wallet.is-refreshing .fq-wallet-dot,
   .fq-dock-strip.is-exiting,
   .fq-root[data-dock-state="revealing"] .fq-shell {
     animation: none;

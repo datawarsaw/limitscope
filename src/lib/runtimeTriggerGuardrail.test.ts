@@ -26,6 +26,9 @@ const ALLOWED_COMMANDS = new Set([
   "set_quota_notifications_enabled",
   "request_refresh",
   "request_refresh_on_reconnect",
+  // Wallet refresh rides the same runtime: it asks the existing owner to
+  // check the wallet, and never fetches from TS.
+  "request_wallet_refresh",
   // history is read from Rust only
   "get_history",
   "get_history_range",

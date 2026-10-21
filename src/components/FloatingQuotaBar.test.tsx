@@ -4,7 +4,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import userEvent from "@testing-library/user-event";
 import { FloatingQuotaBar } from "./FloatingQuotaBar";
-import type { FloatingQuotaItem } from "../lib/floatingQuota";
+import type {
+  FloatingQuotaItem,
+  FloatingWalletItem,
+} from "../lib/floatingQuota";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -353,6 +356,105 @@ describe("FloatingQuotaBar shared detail card", () => {
     expect(container.querySelector(".fq-popover")!.className).not.toContain(
       "is-exiting",
     );
+  });
+});
+
+function wallet(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
+  return {
+    id: "openrouter",
+    name: "OpenRouter",
+    state: "healthy",
+    remainingUsd: 12.5,
+    checkedAt: "2026-09-28T09:55:00.000Z",
+    statusLabel: "Live",
+    ...extra,
+  };
+}
+
+describe("FloatingQuotaBar wallet slot", () => {
+  it("renders the wallet after every provider as one fixed slot", async () => {
+    await renderBar({ items: [HEALTHY, UNAVAILABLE], wallets: [wallet()] });
+    const shell = container.querySelector(".fq-shell")!;
+    const order = Array.from(
+      shell.querySelectorAll("[data-provider-id], [data-wallet-id]"),
+    ).map((element) =>
+      element.hasAttribute("data-wallet-id")
+        ? element.getAttribute("data-wallet-id")
+        : element.getAttribute("data-provider-id"),
+    );
+    expect(order).toEqual(["zai", "grok", "openrouter"]);
+    const slot = container.querySelector<HTMLElement>(
+      '[data-wallet-id="openrouter"]',
+    )!;
+    expect(slot.className).toContain("fq-wallet");
+    expect(slot.textContent).toBe("");
+  });
+
+  it("opens the wallet card through the shared detail slot", async () => {
+    await renderBar({ wallets: [wallet()], detailId: "openrouter" });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.getAttribute("data-wallet")).toBe("openrouter");
+    expect(dialog!.textContent).toContain("OpenRouter");
+    expect(dialog!.textContent).toContain("$12.50");
+  });
+
+  it("keeps one detail card at a time when a provider is open", async () => {
+    await renderBar({
+      items: [HEALTHY],
+      wallets: [wallet()],
+      detailId: "zai",
+    });
+    const dialogs = container.querySelectorAll('[role="dialog"]');
+    expect(dialogs).toHaveLength(1);
+    expect(dialogs[0].getAttribute("data-provider")).toBe("zai");
+    expect(container.querySelector(".fq-wallet-popover")).toBeNull();
+
+    await renderBar({
+      items: [HEALTHY],
+      wallets: [wallet()],
+      detailId: "openrouter",
+    });
+    const walletDialogs = container.querySelectorAll('[role="dialog"]');
+    expect(walletDialogs).toHaveLength(1);
+    expect(walletDialogs[0].getAttribute("data-wallet")).toBe("openrouter");
+    expect(container.querySelector(".fq-wallet-popover")).not.toBeNull();
+  });
+
+  it("routes the wallet card's Refresh to the wallet action only", async () => {
+    const props = await renderBar({
+      wallets: [wallet()],
+      detailId: "openrouter",
+      onRefreshWallet: vi.fn(),
+    });
+    const refresh = container.querySelector<HTMLButtonElement>(
+      ".fq-wallet-refresh",
+    )!;
+    expect(refresh.disabled).toBe(false);
+    await click(refresh);
+    expect(props.onRefreshWallet).toHaveBeenCalledTimes(1);
+    expect(props.onRefresh).not.toHaveBeenCalled();
+  });
+
+  it("marks only the wallet slot busy while a wallet refresh runs", async () => {
+    await renderBar({
+      wallets: [wallet()],
+      detailId: "openrouter",
+      walletBusy: true,
+    });
+    const slot = container.querySelector('[data-wallet-id="openrouter"]')!;
+    expect(slot.getAttribute("aria-busy")).toBe("true");
+    expect(slot.className).toContain("is-refreshing");
+    expect(
+      container.querySelector<HTMLButtonElement>(".fq-wallet-refresh")!
+        .disabled,
+    ).toBe(true);
+  });
+
+  it("renders a wallet-only bar without the empty state", async () => {
+    await renderBar({ items: [], wallets: [wallet()] });
+    expect(container.querySelector(".fq-empty")).toBeNull();
+    expect(container.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
   });
 });
 
