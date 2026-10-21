@@ -275,6 +275,45 @@ export type CommandError = {
 };
 
 /**
+ * Health of one prepaid API wallet, mirroring the Rust `WalletHealth`
+ * (src-tauri/src/runtime.rs). `live` is a confirmed balance, `stale` is a
+ * retained last-good reading, `cooldown` means the upstream rate limit is
+ * still in force, `error` is a failed attempt (which may still carry the
+ * last-good balance), and `unavailable`/`unknown` mean no balance can be
+ * stated at all.
+ */
+export type WalletHealth =
+  | "live"
+  | "stale"
+  | "cooldown"
+  | "error"
+  | "unavailable"
+  | "unknown";
+
+/**
+ * One prepaid API wallet entry from the shared runtime snapshot
+ * (src-tauri/src/runtime.rs, `ApiWalletDto`). Deliberately not a provider:
+ * `remainingUsd` is an absolute upstream money balance and is absent — never
+ * zero — when no trustworthy reading exists. A real $0.00 balance is a
+ * valid, distinct value.
+ */
+export type ApiWallet = {
+  id: string;
+  name: string;
+  health: WalletHealth;
+  /** RFC-3339 stamp of the balance observation. A retained last-good value
+   * keeps its original stamp; an error without last-good carries none. */
+  checkedAt?: string;
+  remainingUsd?: number;
+  /** Masked credential identity (`key:1234`); binds last-good data to the
+   * account that produced it. */
+  identity?: string;
+  error?: string;
+  errorCategory?: string;
+  errorHttpStatus?: number;
+};
+
+/**
  * Full state of the shared Rust provider runtime (src-tauri/src/runtime.rs),
  * pulled once on attach (`get_runtime_snapshot`) and re-delivered after every
  * completed cycle (`runtime://snapshot`). `seq` is a monotonic snapshot
@@ -285,6 +324,13 @@ export type CommandError = {
 export type RuntimeSnapshot = {
   seq: number;
   providers: ProviderUsage[];
+  /**
+   * Prepaid API wallets (Phase 1: OpenRouter). Deliberately separate from
+   * `providers`: a wallet has an absolute money balance, no quota windows,
+   * no percentages and no reset clocks. The Rust snapshot always serializes
+   * this field (an empty array when the runtime has no wallet sources).
+   */
+  wallets: ApiWallet[];
   /** RFC-3339 completion time of the last cycle with usable data. */
   lastUpdatedAt?: string;
   /** Whether the last completed cycle produced at least one usable source. */

@@ -40,9 +40,13 @@ vi.mock("../hooks/useProviderUsage", () => ({
         checkedAt: "2026-09-28T09:50:00.000Z",
         limits: [],
       },
+      ...mocks.extraProviders,
     ],
+    wallets: mocks.wallets,
     loading: false,
     refresh: vi.fn(),
+    refreshWallet: mocks.refreshWallet,
+    walletRefreshing: false,
   }),
 }));
 
@@ -83,6 +87,9 @@ import { DOCK_REVEAL_MS, FloatingQuotaWindow } from "./FloatingQuotaWindow";
 
 const mocks = vi.hoisted(() => ({
   prefs: { order: [] as string[], hidden: [] as string[] },
+  extraProviders: [] as unknown[],
+  wallets: [] as Array<Record<string, unknown>>,
+  refreshWallet: vi.fn(),
   resizeCalls: [] as Array<[number, number, boolean, boolean]>,
   onDockChange: undefined as undefined | ((dock: "none" | "top") => void),
   onBlur: undefined as undefined | (() => void),
@@ -101,6 +108,10 @@ beforeEach(() => {
   document.body.appendChild(container);
   root = createRoot(container);
   mocks.resizeCalls.length = 0;
+  mocks.extraProviders.length = 0;
+  mocks.wallets.length = 0;
+  mocks.prefs.hidden = [];
+  mocks.refreshWallet.mockClear();
   mocks.onDockChange = undefined;
   mocks.onGesturePreview = undefined;
   window.localStorage.clear();
@@ -646,5 +657,124 @@ describe("FloatingQuotaWindow resting dock", () => {
     });
     expect(mocks.resizeCalls.at(-1)).toEqual([300, 64, false, false]);
     expect(dockStrip()).toBeNull();
+  });
+});
+
+const WALLET = {
+  id: "openrouter",
+  name: "OpenRouter",
+  health: "live",
+  checkedAt: "2026-09-28T09:55:00.000Z",
+  remainingUsd: 12.5,
+};
+
+function extraProvider(index: number) {
+  return {
+    id: `extra-${index}`,
+    name: `Extra ${index}`,
+    status: "ok",
+    health: "live",
+    checkedAt: "2026-09-28T09:50:00.000Z",
+    limits: [{ label: "Weekly", usedPercent: 20 + index }],
+  };
+}
+
+describe("FloatingQuotaWindow API wallet slot", () => {
+  it("reveals the five-provider bar at 646px while the resting strip stays 600×16", () => {
+    return withFakeTimers(async () => {
+      mocks.wallets.push(WALLET);
+      mocks.extraProviders.push(
+        extraProvider(1),
+        extraProvider(2),
+        extraProvider(3),
+      );
+      window.localStorage.setItem(
+        FLOATING_PREFS_STORAGE_KEY,
+        JSON.stringify({ visible: true, dock: "top" }),
+      );
+      await renderWindow();
+
+      expect(mocks.resizeCalls[0]).toEqual([600, 16, false, true]);
+      const strip = document.querySelector<HTMLElement>(".fq-dock-strip")!;
+      await hoverIn(strip);
+      expect(mocks.resizeCalls.at(-1)).toEqual([646, 64, false, true]);
+      expect(
+        document.querySelector('[data-wallet-id="openrouter"]'),
+      ).not.toBeNull();
+      expect(document.querySelectorAll("[data-provider-id]")).toHaveLength(5);
+
+      await advance(DOCK_REVEAL_MS);
+      await hoverOut(document.querySelector(".fq-root")!);
+      await advance(150);
+      expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+    });
+  });
+
+  it("keeps the resting meters on their wallet-aware revealed positions", async () => {
+    mocks.wallets.push(WALLET);
+    mocks.extraProviders.push(
+      extraProvider(1),
+      extraProvider(2),
+      extraProvider(3),
+    );
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ visible: true, dock: "top" }),
+    );
+    await renderWindow();
+
+    const meters = Array.from(
+      document.querySelectorAll<HTMLElement>(".fq-dock-meter"),
+    );
+    const rects = dockMeterRects(5, true);
+    expect(meters).toHaveLength(rects.length);
+    meters.forEach((meter, index) => {
+      expect(meter.style.left).toBe(`${rects[index].left}px`);
+      expect(meter.style.width).toBe(`${rects[index].width}px`);
+    });
+    // A wallet is a revealed-bar slot only: the strip stays meters-only.
+    expect(
+      document.querySelector(
+        ".fq-dock-strip .fq-wallet, .fq-dock-strip .fq-percent, .fq-dock-strip .fq-mark",
+      ),
+    ).toBeNull();
+    expect(document.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
+  });
+
+  it(
+    "opens the wallet card on click and returns focus to the wallet on Escape",
+    withFakeTimers(async () => {
+      mocks.wallets.push(WALLET);
+      await renderWindow();
+      const wallet = document.querySelector<HTMLElement>(
+        '[data-wallet-id="openrouter"]',
+      )!;
+
+      await click(wallet);
+      const dialog = document.querySelector('[role="dialog"]');
+      expect(dialog).not.toBeNull();
+      expect(dialog!.getAttribute("data-wallet")).toBe("openrouter");
+      expect(dialog!.textContent).toContain("$12.50");
+      expect(document.activeElement).toBe(
+        dialog!.querySelector(".fq-wallet-refresh"),
+      );
+
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      expect(document.activeElement).toBe(wallet);
+      await advance(200);
+      expect(document.querySelector('[role="dialog"]')).toBeNull();
+    }),
+  );
+
+  it("does not show the empty state when only a wallet exists", async () => {
+    mocks.wallets.push(WALLET);
+    mocks.prefs.hidden = ["zai", "grok"];
+    await renderWindow();
+    expect(document.querySelector(".fq-empty")).toBeNull();
+    expect(document.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
   });
 });

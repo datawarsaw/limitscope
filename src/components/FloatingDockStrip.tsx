@@ -31,13 +31,16 @@ import {
  */
 export function FloatingDockStrip({
   items,
+  hasWallet = false,
   exiting,
 }: {
   items: FloatingQuotaItem[];
+  /** The revealed bar carries a wallet slot after the providers. */
+  hasWallet?: boolean;
   exiting: boolean;
 }) {
-  const rects = dockMeterRects(items.length);
-  const separators = dockSeparatorLefts(items.length);
+  const rects = dockMeterRects(items.length, hasWallet);
+  const separators = dockSeparatorLefts(items.length, hasWallet);
   return (
     <div
       className={"fq-dock-strip" + (exiting ? " is-exiting" : "")}

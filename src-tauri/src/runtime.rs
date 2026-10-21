@@ -95,6 +95,7 @@ use crate::opendesign::{self, OpenDesignRefresh, OpenDesignStatus};
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
+use crate::wallet::{self, WalletBalance};
 use crate::zai::{self, ZaiUsage};
 use crate::zcode_plans::{self, ZCodePlansObservation};
 use crate::zcode_reset::{self, ZCodeResetStatus};
@@ -177,6 +178,66 @@ impl Serialize for ProviderHealth {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
+}
+
+/// Normalized wallet health. A wallet is an absolute money balance, so the
+/// provider quota vocabulary only overlaps in part: there is no percentage
+/// and no reset window. `Unknown` is the pre-observation state (the slot is
+/// registered but no fetch has completed yet), never a fabricated balance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletHealth {
+    Live,
+    Stale,
+    Cooldown,
+    Error,
+    Unavailable,
+    Unknown,
+}
+
+impl WalletHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WalletHealth::Live => "live",
+            WalletHealth::Stale => "stale",
+            WalletHealth::Cooldown => "cooldown",
+            WalletHealth::Error => "error",
+            WalletHealth::Unavailable => "unavailable",
+            WalletHealth::Unknown => "unknown",
+        }
+    }
+}
+
+impl Serialize for WalletHealth {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+/// One prepaid wallet entry. Deliberately separate from
+/// [`ProviderUsageDto`]: no limits, no percentages, no reset clocks and no
+/// period. A missing balance is `None`, never `0.0`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiWalletDto {
+    pub id: String,
+    pub name: String,
+    pub health: WalletHealth,
+    /// Timestamp of the balance observation. Retained last-good keeps its
+    /// original stamp; an error without last-good carries no stamp.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checked_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remaining_usd: Option<f64>,
+    /// Masked credential identity (`key:1234`), used only to keep last-good
+    /// data bound to the account that produced it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_http_status: Option<u16>,
 }
 
 /// Keeps `status` and `health` in sync at the single write point.
@@ -298,6 +359,9 @@ pub struct ProviderUsageDto {
 pub struct RuntimeSnapshot {
     pub seq: u64,
     pub providers: Vec<ProviderUsageDto>,
+    /// Absolute prepaid balances, kept out of `providers` on purpose. A
+    /// wallet never enters history, prediction or notifications.
+    pub wallets: Vec<ApiWalletDto>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_updated_at: Option<String>,
     /// Whether the last completed cycle produced at least one usable source
@@ -526,6 +590,10 @@ impl ProviderKind {
 pub type FetchFuture = Pin<Box<dyn Future<Output = Result<ProviderUsageDto, ProviderFailure>> + Send>>;
 pub type FetchFn = Arc<dyn Fn() -> FetchFuture + Send + Sync>;
 
+pub type WalletFetchFuture =
+    Pin<Box<dyn Future<Output = Result<WalletBalance, ProviderFailure>> + Send>>;
+pub type WalletFetchFn = Arc<dyn Fn() -> WalletFetchFuture + Send + Sync>;
+
 /// One provider as the runtime sees it: its kind plus a fetch closure that
 /// invokes the existing backend fetch and normalizes the payload. Tests
 /// inject mock closures; production installs closures around the real
@@ -534,6 +602,15 @@ pub type FetchFn = Arc<dyn Fn() -> FetchFuture + Send + Sync>;
 pub struct ProviderSpec {
     pub kind: ProviderKind,
     pub fetch: FetchFn,
+}
+
+/// One prepaid wallet source. The id is stable across restarts because the
+/// persisted last-good entry is keyed by it.
+#[derive(Clone)]
+pub struct WalletSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub fetch: WalletFetchFn,
 }
 
 // ---------- runtime panic containment ----------
@@ -582,12 +659,12 @@ fn job_lost_failure() -> ProviderFailure {
 /// provider job becomes the ordinary structured failure instead of
 /// unwinding the whole job task. `FetchFuture` is `Pin<Box<..>>` (Unpin),
 /// so the wrapper needs no pin projection.
-struct FetchPanicBoundary {
-    inner: FetchFuture,
+struct FetchPanicBoundary<T> {
+    inner: Pin<Box<dyn Future<Output = Result<T, ProviderFailure>> + Send>>,
 }
 
-impl Future for FetchPanicBoundary {
-    type Output = Result<ProviderUsageDto, ProviderFailure>;
+impl<T> Future for FetchPanicBoundary<T> {
+    type Output = Result<T, ProviderFailure>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
@@ -604,6 +681,14 @@ impl Future for FetchPanicBoundary {
 /// panicking fetch is indistinguishable from any other failed refresh
 /// downstream.
 async fn fetch_contained(spec: &ProviderSpec) -> Result<ProviderUsageDto, ProviderFailure> {
+    let fetch = Arc::clone(&spec.fetch);
+    FetchPanicBoundary {
+        inner: Box::pin(async move { (fetch)().await }),
+    }
+    .await
+}
+
+async fn fetch_wallet_contained(spec: &WalletSpec) -> Result<WalletBalance, ProviderFailure> {
     let fetch = Arc::clone(&spec.fetch);
     FetchPanicBoundary {
         inner: Box::pin(async move { (fetch)().await }),
@@ -1285,6 +1370,22 @@ pub fn production_specs() -> Vec<ProviderSpec> {
     ]
 }
 
+/// The production wallet set. One entry for OpenRouter Phase 1; the registry
+/// shape lets a later wallet be added without touching the cycle machinery.
+pub fn production_wallets() -> Vec<WalletSpec> {
+    vec![WalletSpec {
+        id: "openrouter",
+        name: "OpenRouter",
+        fetch: Arc::new(|| {
+            Box::pin(async {
+                wallet::get_openrouter_credits()
+                    .await
+                    .map_err(failure_from_provider_error)
+            })
+        }),
+    }]
+}
+
 // ---------- retry, cadence, cooldown, and last-good constants ----------
 
 const RETRY_DELAY_MS: u64 = 750;
@@ -1293,6 +1394,10 @@ const RETRY_JITTER_MS: u64 = 250;
 /// undocumented CLI plane, so it is polled at most once per 15 minutes
 /// regardless of the global refresh interval.
 const GROK_MIN_POLL_INTERVAL_MS: i64 = 15 * 60_000;
+/// A prepaid balance moves slowly and costs a real authenticated request.
+/// The wallet is polled at most once per 15 minutes; manual refresh is the
+/// explicit way to force a fresher observation.
+const WALLET_MIN_POLL_INTERVAL_MS: i64 = 15 * 60_000;
 /// A manual OpenDesign UIA observation remains live for five minutes. Its
 /// original observed timestamp is retained afterwards; runtime cycles do
 /// not renew it.
@@ -1301,6 +1406,35 @@ const OPENDESIGN_FRESHNESS_MS: i64 = 5 * 60_000;
 /// re-auth takes effect on the next poll.
 const GROK_LOCAL_CREDENTIAL_CODES: [&str; 3] =
     ["credential_missing", "credential_expired", "credential_ambiguous"];
+
+/// Wallet failures that describe local credential state rather than an
+/// observation. They are never cached, so re-authentication takes effect on
+/// the next cycle instead of waiting out the 15-minute cadence.
+fn wallet_failure_is_local(failure: &ProviderFailure) -> bool {
+    failure.code.starts_with("auth_") || failure.code.starts_with("credential_")
+}
+
+/// Wallet failures that mean the source cannot be evaluated at all: the
+/// credential never resolved, so there is nothing to attempt. Every other
+/// failure — a key the server rejected, a transport error, a malformed
+/// response — happened after a credential existed and is a real refresh
+/// error. Provider health folds all auth codes into source-absent, which
+/// would present a rejected key as `unavailable`; a wallet keeps that split
+/// at the credential boundary instead.
+const WALLET_SOURCE_ABSENT_CODES: [&str; 4] = [
+    "auth_file_missing",
+    "auth_unreadable",
+    "credential_missing",
+    "credential_ambiguous",
+];
+
+fn wallet_failure_health(failure: &ProviderFailure) -> WalletHealth {
+    if WALLET_SOURCE_ABSENT_CODES.contains(&failure.code.as_str()) {
+        WalletHealth::Unavailable
+    } else {
+        WalletHealth::Error
+    }
+}
 
 /// A server-directed provider cooldown from a `Retry-After` hint. Ephemeral
 /// runtime state: never persisted, never spans an app restart, and its
@@ -1383,6 +1517,17 @@ struct PendingConfirmation {
 struct RuntimeInner {
     usages: Vec<ProviderUsageDto>,
     last_good: HashMap<&'static str, ProviderUsageDto>,
+    wallets: Vec<ApiWalletDto>,
+    wallet_last_good: HashMap<&'static str, ApiWalletDto>,
+    wallet_cooldowns: HashMap<&'static str, ProviderCooldown>,
+    wallet_last_result: HashMap<&'static str, ApiWalletDto>,
+    wallet_last_attempt_at: HashMap<&'static str, DateTime<Utc>>,
+    /// True for exactly one cycle: a manual wallet refresh bypasses the
+    /// 15-minute cadence cache. Cooldowns are still honored.
+    wallet_force: bool,
+    /// A wallet refresh landed while a cycle was in flight; the coalesced
+    /// follow-up cycle carries the force.
+    wallet_force_requested: bool,
     /// Active server-directed cooldowns by provider id (ephemeral).
     cooldowns: HashMap<&'static str, ProviderCooldown>,
     /// Last accepted automatic trigger per kind (burst dedupe).
@@ -1426,6 +1571,7 @@ pub enum RuntimeEvent {
 pub struct RuntimeCore {
     inner: Mutex<RuntimeInner>,
     specs: Vec<ProviderSpec>,
+    wallet_specs: Vec<WalletSpec>,
     retry_delay_ms: Box<dyn Fn() -> u64 + Send + Sync>,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     /// The Rust-owned quota history store, when one is attached (production
@@ -1478,9 +1624,15 @@ impl RuntimeCore {
     ) -> Self {
         if let Some(store) = &store {
             let (usages, last_good) = store.hydrate(&self.specs, (self.now)());
+            let (wallets, wallet_last_good) =
+                store.hydrate_wallets(&self.wallet_specs, (self.now)());
             let mut inner = self.inner.lock().unwrap();
             inner.usages = usages;
             inner.last_good = last_good;
+            if !wallets.is_empty() {
+                inner.wallets = wallets;
+            }
+            inner.wallet_last_good = wallet_last_good;
         }
         self.last_good_store = store;
         self
@@ -1488,6 +1640,41 @@ impl RuntimeCore {
 
     pub fn with_notification_lane(mut self, lane: Option<Arc<NotificationLane>>) -> Self {
         self.notifications = lane;
+        self
+    }
+
+    /// Registers the prepaid wallet sources. The slots are visible in every
+    /// snapshot from the start as `unknown` placeholders; hydrated last-good
+    /// entries replace them as `stale`.
+    pub fn with_wallets(mut self, specs: Vec<WalletSpec>) -> Self {
+        self.wallet_specs = specs;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.wallets = self
+                .wallet_specs
+                .iter()
+                .map(|spec| ApiWalletDto {
+                    id: spec.id.to_string(),
+                    name: spec.name.to_string(),
+                    health: WalletHealth::Unknown,
+                    checked_at: None,
+                    remaining_usd: None,
+                    identity: None,
+                    error: None,
+                    error_category: None,
+                    error_http_status: None,
+                })
+                .collect();
+        }
+        if let Some(store) = &self.last_good_store {
+            let (wallets, wallet_last_good) =
+                store.hydrate_wallets(&self.wallet_specs, (self.now)());
+            let mut inner = self.inner.lock().unwrap();
+            if !wallets.is_empty() {
+                inner.wallets = wallets;
+            }
+            inner.wallet_last_good = wallet_last_good;
+        }
         self
     }
 
@@ -1501,6 +1688,13 @@ impl RuntimeCore {
             inner: Mutex::new(RuntimeInner {
                 usages: Vec::new(),
                 last_good: HashMap::new(),
+                wallets: Vec::new(),
+                wallet_last_good: HashMap::new(),
+                wallet_cooldowns: HashMap::new(),
+                wallet_last_result: HashMap::new(),
+                wallet_last_attempt_at: HashMap::new(),
+                wallet_force: false,
+                wallet_force_requested: false,
                 cooldowns: HashMap::new(),
                 last_auto_trigger: HashMap::new(),
                 grok_last_result: None,
@@ -1521,6 +1715,7 @@ impl RuntimeCore {
                 opendesign_manual_revision: 0,
             }),
             specs,
+            wallet_specs: Vec::new(),
             retry_delay_ms,
             now,
             history: None,
@@ -1550,6 +1745,23 @@ impl RuntimeCore {
             return false;
         }
         inner.cycle_in_flight = true;
+        inner.wallet_force = false;
+        true
+    }
+
+    /// Manual wallet refresh entry. It shares the one-cycle machinery, so a
+    /// wallet refresh can never run beside a provider cycle; when a cycle is
+    /// already in flight the force travels to the single follow-up.
+    pub fn try_begin_wallet_cycle(&self) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.cycle_in_flight {
+            inner.rerun_pending = true;
+            inner.wallet_force_requested = true;
+            return false;
+        }
+        inner.cycle_in_flight = true;
+        inner.wallet_force = true;
+        inner.wallet_force_requested = false;
         true
     }
 
@@ -1590,10 +1802,14 @@ impl RuntimeCore {
             inner.rerun_pending = false;
             inner.grok_cache_bypass = inner.confirmation_follow_up_requested;
             inner.confirmation_follow_up_requested = false;
+            inner.wallet_force = inner.wallet_force_requested;
+            inner.wallet_force_requested = false;
             return true;
         }
         inner.cycle_in_flight = false;
         inner.grok_cache_bypass = false;
+        inner.wallet_force = false;
+        inner.wallet_force_requested = false;
         false
     }
 
@@ -1638,6 +1854,14 @@ impl RuntimeCore {
             let spec = spec.clone();
             jobs.spawn(async move { (index, core.run_provider_job(&spec).await) });
         }
+        // Wallets run as independent jobs in the same cycle: no daemon, no
+        // second scheduler, and the provider jobs keep running beside them.
+        let mut wallet_jobs = tokio::task::JoinSet::new();
+        for (index, spec) in self.wallet_specs.iter().enumerate() {
+            let core = self.clone();
+            let spec = spec.clone();
+            wallet_jobs.spawn(async move { (index, core.run_wallet_job(&spec).await) });
+        }
         let mut results: Vec<(usize, ProviderUsageDto)> = Vec::new();
         let mut lost_task_panics: usize = 0;
         while let Some(joined) = jobs.join_next().await {
@@ -1655,6 +1879,34 @@ impl RuntimeCore {
             }
         }
         results.sort_by_key(|(index, _)| *index);
+
+        let mut wallet_results: Vec<(usize, ApiWalletDto)> = Vec::new();
+        let mut lost_wallet_tasks: usize = 0;
+        while let Some(joined) = wallet_jobs.join_next().await {
+            match joined {
+                Ok(pair) => wallet_results.push(pair),
+                Err(error) => {
+                    if error.is_panic() {
+                        lost_wallet_tasks += 1;
+                    }
+                }
+            }
+        }
+        wallet_results.sort_by_key(|(index, _)| *index);
+        let completed_wallets: HashSet<usize> =
+            wallet_results.iter().map(|(index, _)| *index).collect();
+        for (index, spec) in self.wallet_specs.iter().enumerate() {
+            if completed_wallets.contains(&index) {
+                continue;
+            }
+            let failure = if lost_wallet_tasks == 1 {
+                failure_from_panic()
+            } else {
+                job_lost_failure()
+            };
+            wallet_results.push((index, self.apply_wallet_failure(spec, failure)));
+        }
+        wallet_results.sort_by_key(|(index, _)| *index);
 
         // Panic containment (belt over the fetch boundary's braces): every
         // registered provider must surface in the cycle. A spec whose job
@@ -1678,6 +1930,8 @@ impl RuntimeCore {
         results.sort_by_key(|(index, _)| *index);
 
         let mut usages: Vec<ProviderUsageDto> = results.into_iter().map(|(_, dto)| dto).collect();
+        let wallets: Vec<ApiWalletDto> =
+            wallet_results.into_iter().map(|(_, dto)| dto).collect();
         // History recording (phase 2): one batch per completed cycle, from
         // the same normalized snapshot that is about to be broadcast.
         // Recording before the snapshot state update means any snapshot
@@ -1765,12 +2019,16 @@ impl RuntimeCore {
         // frontend's refreshCycleSucceeded applied.
         inner.cycle_succeeded = usages
             .iter()
-            .any(|usage| matches!(usage.health, ProviderHealth::Live | ProviderHealth::Stale));
+            .any(|usage| matches!(usage.health, ProviderHealth::Live | ProviderHealth::Stale))
+            || wallets
+                .iter()
+                .any(|wallet| matches!(wallet.health, WalletHealth::Live | WalletHealth::Stale));
         if inner.cycle_succeeded {
             inner.last_updated_at = Some(completed_at);
         }
         inner.last_cycle_completed_at = Some(completed_at);
         inner.usages = usages;
+        inner.wallets = wallets;
         inner.seq += 1;
     }
 
@@ -1834,6 +2092,51 @@ impl RuntimeCore {
         dto
     }
 
+    async fn run_wallet_job(self: &Arc<Self>, spec: &WalletSpec) -> ApiWalletDto {
+        // A server-directed Retry-After cooldown wins over a manual force.
+        if let Some(cooldown) = self.active_wallet_cooldown(spec.id) {
+            return self.wallet_cooldown_dto(spec, cooldown);
+        }
+        let force = self.inner.lock().unwrap().wallet_force;
+        if !force {
+            if let Some(cached) = self.wallet_cached_result(spec.id) {
+                return cached;
+            }
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet_last_attempt_at
+            .insert(spec.id, self.now());
+
+        let outcome = self.fetch_wallet_with_retry(spec).await;
+        let (dto, failure) = match outcome {
+            Ok(balance) => {
+                self.inner.lock().unwrap().wallet_cooldowns.remove(spec.id);
+                (self.apply_wallet_success(spec, balance), None)
+            }
+            Err(failure) => {
+                self.maybe_apply_wallet_cooldown(spec.id, &failure);
+                let dto = self.apply_wallet_failure(spec, failure.clone());
+                (dto, Some(failure))
+            }
+        };
+        // Local credential failures are not cached: a re-authentication
+        // takes effect on the next cycle instead of waiting 15 minutes.
+        let local_failure = failure
+            .as_ref()
+            .map(wallet_failure_is_local)
+            .unwrap_or(false);
+        if !local_failure {
+            self.inner
+                .lock()
+                .unwrap()
+                .wallet_last_result
+                .insert(spec.id, dto.clone());
+        }
+        dto
+    }
+
     async fn fetch_with_retry(
         &self,
         spec: &ProviderSpec,
@@ -1849,11 +2152,31 @@ impl RuntimeCore {
         fetch_contained(spec).await
     }
 
+    async fn fetch_wallet_with_retry(
+        &self,
+        spec: &WalletSpec,
+    ) -> Result<WalletBalance, ProviderFailure> {
+        let first = fetch_wallet_contained(spec).await;
+        let Err(first_failure) = first else {
+            return first;
+        };
+        if !self.should_retry_failure(&first_failure) {
+            return Err(first_failure);
+        }
+        tokio::time::sleep(Duration::from_millis((self.retry_delay_ms)())).await;
+        fetch_wallet_contained(spec).await
+    }
+
     fn should_retry(&self, kind: ProviderKind, failure: &ProviderFailure) -> bool {
         // The passive Antigravity backend has no retry wrapper today.
         if kind == ProviderKind::Antigravity {
             return false;
         }
+        self.should_retry_failure(failure)
+    }
+
+    /// The provider-independent retry rule, shared with wallets.
+    fn should_retry_failure(&self, failure: &ProviderFailure) -> bool {
         if !failure.is_transient() {
             return false;
         }
@@ -2059,6 +2382,126 @@ impl RuntimeCore {
         let mut dto = self.apply_failure_at(kind, cooldown.failure, cooldown.failure_at);
         set_health(&mut dto, ProviderHealth::Cooldown);
         dto
+    }
+
+    // ---- wallet transitions ----
+
+    fn active_wallet_cooldown(&self, id: &'static str) -> Option<ProviderCooldown> {
+        let inner = self.inner.lock().unwrap();
+        let cooldown = inner.wallet_cooldowns.get(id)?;
+        (self.now() < cooldown.until).then(|| cooldown.clone())
+    }
+
+    fn maybe_apply_wallet_cooldown(&self, id: &'static str, failure: &ProviderFailure) {
+        let wait_ms = failure.retry_after_ms.unwrap_or(0);
+        if wait_ms == 0 {
+            return;
+        }
+        let now = self.now();
+        let until = now + chrono::Duration::milliseconds(wait_ms.min(MAX_COOLDOWN_MS) as i64);
+        self.inner.lock().unwrap().wallet_cooldowns.insert(
+            id,
+            ProviderCooldown {
+                until,
+                failure: failure.clone(),
+                failure_at: now,
+            },
+        );
+    }
+
+    fn wallet_cached_result(&self, id: &'static str) -> Option<ApiWalletDto> {
+        let inner = self.inner.lock().unwrap();
+        let attempt = *inner.wallet_last_attempt_at.get(id)?;
+        let cached = inner.wallet_last_result.get(id)?.clone();
+        let age_ms = (self.now() - attempt).num_milliseconds();
+        (age_ms < WALLET_MIN_POLL_INTERVAL_MS).then_some(cached)
+    }
+
+    fn wallet_cooldown_dto(
+        &self,
+        spec: &WalletSpec,
+        cooldown: ProviderCooldown,
+    ) -> ApiWalletDto {
+        let mut dto = self.apply_wallet_failure_at(spec, cooldown.failure, cooldown.failure_at);
+        dto.health = WalletHealth::Cooldown;
+        dto
+    }
+
+    fn apply_wallet_success(&self, spec: &WalletSpec, balance: WalletBalance) -> ApiWalletDto {
+        let dto = ApiWalletDto {
+            id: spec.id.to_string(),
+            name: spec.name.to_string(),
+            health: WalletHealth::Live,
+            checked_at: Some(self.now_iso()),
+            remaining_usd: Some(balance.remaining_usd),
+            identity: balance.identity,
+            error: None,
+            error_category: None,
+            error_http_status: None,
+        };
+        self.inner
+            .lock()
+            .unwrap()
+            .wallet_last_good
+            .insert(spec.id, dto.clone());
+        if let Some(store) = &self.last_good_store {
+            store.record_wallet_success(&dto);
+        }
+        dto
+    }
+
+    fn apply_wallet_failure(
+        &self,
+        spec: &WalletSpec,
+        failure: ProviderFailure,
+    ) -> ApiWalletDto {
+        self.apply_wallet_failure_at(spec, failure, self.now())
+    }
+
+    fn apply_wallet_failure_at(
+        &self,
+        spec: &WalletSpec,
+        failure: ProviderFailure,
+        _failure_at: DateTime<Utc>,
+    ) -> ApiWalletDto {
+        let message = failure.describe("OpenRouter balance could not be fetched.");
+        let error_category = if failure.code.is_empty() {
+            None
+        } else {
+            Some(failure.code.clone())
+        };
+        let error_http_status = failure.http_status;
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(last_good) = inner.wallet_last_good.get(spec.id).cloned() {
+            // Money from account A must never stand in for account B.
+            let same_account = match (failure.identity.as_deref(), last_good.identity.as_deref()) {
+                (Some(attempted), Some(retained)) => attempted == retained,
+                _ => true,
+            };
+            if same_account {
+                let mut retained = last_good;
+                retained.health = WalletHealth::Error;
+                retained.error = Some(format!("Refresh failed: {message}"));
+                retained.error_category = error_category;
+                retained.error_http_status = error_http_status;
+                return retained;
+            }
+            // Drop the stale other-account balance from this process so a
+            // later identity-less failure cannot resurrect it.
+            inner.wallet_last_good.remove(spec.id);
+        }
+        let health = wallet_failure_health(&failure);
+        ApiWalletDto {
+            id: spec.id.to_string(),
+            name: spec.name.to_string(),
+            health,
+            checked_at: None,
+            remaining_usd: None,
+            identity: failure.identity,
+            error: Some(message),
+            error_category,
+            error_http_status,
+        }
     }
 
     // ---- success / failure state transitions ----
@@ -2292,6 +2735,7 @@ impl RuntimeCore {
         RuntimeSnapshot {
             seq: inner.seq,
             providers: inner.usages.clone(),
+            wallets: inner.wallets.clone(),
             last_updated_at: inner
                 .last_updated_at
                 .map(|at| at.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -2536,6 +2980,13 @@ impl RuntimeHandle {
     /// otherwise coalesces into the single pending follow-up.
     pub fn request_refresh(&self) {
         self.spawn_chain_if(self.core.try_begin_cycle());
+    }
+
+    /// Manual wallet refresh from the wallet popover. It forces one fresh
+    /// balance observation (bypassing the 15-minute cadence cache) while
+    /// still honoring an active server `Retry-After` cooldown.
+    pub fn request_wallet_refresh(&self) {
+        self.spawn_chain_if(self.core.try_begin_wallet_cycle());
     }
 
     /// Emits the immediately updated shared snapshot for an explicit
@@ -2792,6 +3243,7 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
     let handle = RuntimeHandle {
         core: Arc::new(
             RuntimeCore::new(production_specs(), DEFAULT_INTERVAL_MINUTES)
+                .with_wallets(production_wallets())
                 .with_last_good_store(last_good.clone())
                 .with_history_store(history.clone())
                 .with_usage_intelligence_store(usage_intelligence.clone())
@@ -2887,6 +3339,13 @@ pub fn request_refresh(handle: tauri::State<RuntimeHandle>) {
     handle.request_refresh();
 }
 
+/// The wallet popover's Refresh action: one coalesced cycle with the wallet
+/// cadence cache bypassed. Provider refreshes keep their own gates.
+#[tauri::command]
+pub fn request_wallet_refresh(handle: tauri::State<RuntimeHandle>) {
+    handle.request_wallet_refresh();
+}
+
 /// The webview `online` hook: JS is only a trigger; the shared runtime
 /// owns the fetch. Reconnect bursts coalesce per-kind (see
 /// [`AutoTrigger`]).
@@ -2956,6 +3415,49 @@ mod tests {
 
     fn advance(clock: &Mutex<DateTime<Utc>>, ms: i64) {
         *clock.lock().unwrap() += chrono::Duration::milliseconds(ms);
+    }
+
+    /// A manual-clock core with prepaid wallets registered. Wallet hydration
+    /// has no store here, so every slot starts as `unknown`.
+    fn manual_clock_core_with_wallets(
+        specs: Vec<ProviderSpec>,
+        wallets: Vec<WalletSpec>,
+    ) -> (Arc<RuntimeCore>, Arc<Mutex<DateTime<Utc>>>) {
+        let clock = Arc::new(Mutex::new(fixed_now()));
+        let getter_clock = clock.clone();
+        let core = RuntimeCore::with_injections(
+            specs,
+            5,
+            Box::new(|| 0),
+            Box::new(move || *getter_clock.lock().unwrap()),
+        )
+        .with_wallets(wallets);
+        (Arc::new(core), clock)
+    }
+
+    fn counting_wallet(
+        id: &'static str,
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+        outcome: impl Fn(usize) -> Result<WalletBalance, ProviderFailure> + Send + Sync + 'static,
+    ) -> WalletSpec {
+        WalletSpec {
+            id,
+            name,
+            fetch: Arc::new(move || {
+                let calls = calls.clone();
+                let nth = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                let result = outcome(nth);
+                Box::pin(async move { result }) as WalletFetchFuture
+            }),
+        }
+    }
+
+    fn wallet_balance(remaining_usd: f64, identity: Option<&str>) -> WalletBalance {
+        WalletBalance {
+            remaining_usd,
+            identity: identity.map(str::to_string),
+        }
     }
 
     fn ok_usage(id: &str, name: &str, percent: f64) -> ProviderUsageDto {
@@ -8066,5 +8568,408 @@ mod tests {
         assert_eq!(core.snapshot().providers[0].health, ProviderHealth::Live);
         assert_eq!(core.snapshot().seq, 2);
         let _ = std::fs::remove_file(&lane_path);
+    }
+
+    // ---- prepaid wallets (API wallets phase 1) ----
+    //
+    // A wallet is money, not a quota: no percentage, no limit, no reset
+    // window, and a missing observation is never `$0.00`. The invariants
+    // below pin cadence, manual refresh, cooldown, last-good retention, the
+    // account guard, and isolation from history and notifications.
+
+    #[tokio::test]
+    async fn wallet_is_polled_at_most_once_per_fifteen_minutes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
+            Ok(wallet_balance(nth as f64, None))
+        });
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        let first = core.snapshot().wallets[0].clone();
+        assert_eq!(first.id, "openrouter");
+        assert_eq!(first.name, "OpenRouter");
+        assert_eq!(first.health, WalletHealth::Live);
+        assert_eq!(first.remaining_usd, Some(1.0));
+        assert!(first.checked_at.is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Inside the window the observation is served from cache, stamp and
+        // all — a cached balance is not a new observation.
+        advance(&clock, 5 * 60_000);
+        core.run_cycle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no fetch inside 15 min");
+        let cached = core.snapshot().wallets[0].clone();
+        assert_eq!(cached.remaining_usd, Some(1.0));
+        assert_eq!(cached.checked_at, first.checked_at);
+
+        advance(&clock, 10 * 60_000);
+        core.run_cycle().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the window has elapsed, so the wallet is polled again"
+        );
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(2.0));
+    }
+
+    #[tokio::test]
+    async fn a_manual_wallet_refresh_bypasses_the_cadence_cache_but_not_a_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
+            match nth {
+                1 => Ok(wallet_balance(10.0, None)),
+                2 => Ok(wallet_balance(9.0, None)),
+                3 => Err(rate_limited_failure(Some(120_000))),
+                _ => Ok(wallet_balance(8.0, None)),
+            }
+        });
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // A manual refresh inside the window forces a real fetch.
+        assert!(core.try_begin_wallet_cycle(), "nothing else owns the cycle");
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "the force bypasses the cache");
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(9.0));
+
+        // The next forced refresh fails with Retry-After, which installs a
+        // cooldown instead of an in-cycle retry.
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        let rejected = &core.snapshot().wallets[0];
+        assert_eq!(rejected.health, WalletHealth::Error);
+        assert_eq!(rejected.error_http_status, Some(429));
+
+        // A forced refresh during the cooldown must not touch the network.
+        advance(&clock, 30_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "Retry-After wins over the manual force"
+        );
+        assert_eq!(core.snapshot().wallets[0].health, WalletHealth::Cooldown);
+
+        // Once the cooldown expires, the forced refresh fetches again.
+        advance(&clock, 100_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let recovered = &core.snapshot().wallets[0];
+        assert_eq!(recovered.health, WalletHealth::Live);
+        assert_eq!(recovered.remaining_usd, Some(8.0));
+        assert_eq!(recovered.error_http_status, None);
+    }
+
+    #[tokio::test]
+    async fn a_transient_wallet_failure_is_retried_once_and_a_rate_limit_becomes_a_cooldown() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
+            match nth {
+                1 | 2 => Err(transient_failure("network")),
+                _ => Err(rate_limited_failure(Some(60_000))),
+            }
+        });
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one in-cycle retry");
+        let failed = &core.snapshot().wallets[0];
+        assert_eq!(failed.health, WalletHealth::Error);
+        assert_eq!(failed.error_category.as_deref(), Some("network"));
+        assert_eq!(failed.remaining_usd, None, "no balance is invented");
+        assert_eq!(failed.checked_at, None);
+
+        advance(&clock, 16 * 60_000);
+        core.run_cycle().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "a Retry-After is never retried inside the same cycle"
+        );
+        let rejected = &core.snapshot().wallets[0];
+        assert_eq!(
+            rejected.health,
+            WalletHealth::Error,
+            "the cycle that observed the 429 reports the failure"
+        );
+        assert_eq!(rejected.error_http_status, Some(429));
+        assert!(
+            rejected.error.is_some(),
+            "the rate-limit error stays honest"
+        );
+
+        advance(&clock, 30_000);
+        core.run_cycle().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "the cooldown is served without a fetch"
+        );
+        assert_eq!(
+            core.snapshot().wallets[0].health,
+            WalletHealth::Cooldown,
+            "the next cycle is skipped inside the Retry-After window"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_keeps_the_last_good_balance_and_its_original_stamp() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
+            match nth {
+                1 => Ok(wallet_balance(12.34, Some("key:A1"))),
+                _ => Err({
+                    let mut failure = transient_failure("network");
+                    failure.identity = Some("key:A1".to_string());
+                    failure
+                }),
+            }
+        });
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        let good = core.snapshot().wallets[0].clone();
+        assert_eq!(good.remaining_usd, Some(12.34));
+
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+
+        let retained = &core.snapshot().wallets[0];
+        assert_eq!(retained.health, WalletHealth::Error);
+        assert_eq!(
+            retained.remaining_usd,
+            Some(12.34),
+            "same-account money survives a failed refresh"
+        );
+        assert_eq!(
+            retained.checked_at, good.checked_at,
+            "the stamp describes the observation, so it is not renewed"
+        );
+        assert_eq!(retained.error_category.as_deref(), Some("network"));
+        assert!(retained
+            .error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("Refresh failed:")));
+    }
+
+    #[tokio::test]
+    async fn a_balance_from_another_account_is_never_retained() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", calls.clone(), |nth| {
+            match nth {
+                1 => Ok(wallet_balance(40.0, Some("key:A1"))),
+                2 => Err({
+                    let mut failure = permanent_failure();
+                    failure.identity = Some("key:B2".to_string());
+                    failure
+                }),
+                _ => Err(permanent_failure()),
+            }
+        });
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(40.0));
+
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        let other = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(other.health, WalletHealth::Error);
+        assert_eq!(
+            other.remaining_usd, None,
+            "account A's money must not stand in for account B"
+        );
+        assert_eq!(other.identity.as_deref(), Some("key:B2"));
+
+        // The dropped balance cannot resurface through an identity-less
+        // failure either.
+        advance(&clock, 60_000);
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        core.finish_cycle();
+        let anonymous = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(anonymous.remaining_usd, None);
+        assert_eq!(anonymous.identity, None);
+    }
+
+    #[tokio::test]
+    async fn a_wallet_balance_never_enters_history_or_notifications() {
+        let provider_calls = Arc::new(AtomicUsize::new(0));
+        let provider = counting_spec(ProviderKind::Codex, provider_calls, |_| {
+            Err(transient_failure("network"))
+        });
+        let wallet_calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet("openrouter", "OpenRouter", wallet_calls, |_| {
+            Ok(wallet_balance(3.5, Some("key:A1")))
+        });
+
+        let delivered: Arc<Mutex<Vec<crate::notifications::QuotaNotification>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let sink = delivered.clone();
+        let lane_path = std::env::temp_dir().join(format!(
+            "runtime-wallet-notifications-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let _ = std::fs::remove_file(&lane_path);
+        let lane = Arc::new(crate::notifications::NotificationLane::open(
+            lane_path.clone(),
+            Box::new(move |notes| sink.lock().unwrap().extend_from_slice(notes)),
+        ));
+        lane.set_enabled(true);
+
+        let history_path = std::env::temp_dir().join(format!(
+            "runtime-wallet-history-{}-{}.json",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        ));
+        let _ = std::fs::remove_file(&history_path);
+        let store = Arc::new(QuotaHistoryStore::open_with_clock(
+            history_path.clone(),
+            Box::new(|| Utc::now().timestamp_millis()),
+        ));
+
+        let clock = Arc::new(Mutex::new(fixed_now()));
+        let getter_clock = clock.clone();
+        let core = Arc::new(
+            RuntimeCore::with_injections(
+                vec![provider],
+                5,
+                Box::new(|| 0),
+                Box::new(move || *getter_clock.lock().unwrap()),
+            )
+            .with_history_store(Some(store.clone()))
+            .with_notification_lane(Some(lane))
+            .with_wallets(vec![wallet]),
+        );
+
+        core.run_cycle().await;
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.providers[0].health, ProviderHealth::Error);
+        assert_eq!(snapshot.wallets[0].health, WalletHealth::Live);
+        assert!(
+            snapshot.cycle_succeeded,
+            "a live wallet observation is a real source for the cycle verdict"
+        );
+        assert!(snapshot.last_updated_at.is_some());
+        assert_eq!(store.history().len(), 0, "a balance is not a quota sample");
+        assert!(
+            delivered.lock().unwrap().is_empty(),
+            "a balance never crosses a quota threshold"
+        );
+
+        let _ = std::fs::remove_file(history_path);
+        let _ = std::fs::remove_file(lane_path);
+    }
+
+    #[tokio::test]
+    async fn a_real_zero_balance_is_not_confused_with_no_balance() {
+        let zero_calls = Arc::new(AtomicUsize::new(0));
+        let zero_wallet = counting_wallet("openrouter", "OpenRouter", zero_calls, |_| {
+            Ok(wallet_balance(0.0, None))
+        });
+        let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![zero_wallet]);
+        core.run_cycle().await;
+        let zero = &core.snapshot().wallets[0];
+        assert_eq!(zero.health, WalletHealth::Live);
+        assert_eq!(
+            zero.remaining_usd,
+            Some(0.0),
+            "a real zero is an observation, not missing data"
+        );
+        assert!(zero.checked_at.is_some());
+
+        let missing_calls = Arc::new(AtomicUsize::new(0));
+        let missing_wallet = counting_wallet("openrouter", "OpenRouter", missing_calls, |_| {
+            Err(permanent_failure())
+        });
+        let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![missing_wallet]);
+        core.run_cycle().await;
+        let missing = &core.snapshot().wallets[0];
+        assert_eq!(missing.health, WalletHealth::Error);
+        assert_eq!(
+            missing.remaining_usd, None,
+            "a failed read must never project as $0.00"
+        );
+        assert_eq!(missing.checked_at, None);
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_credential_is_unavailable_while_a_rejected_key_is_an_error() {
+        for (code, expected) in [
+            ("credential_missing", WalletHealth::Unavailable),
+            ("auth_file_missing", WalletHealth::Unavailable),
+            ("auth_invalid", WalletHealth::Error),
+            ("unexpected_response", WalletHealth::Error),
+        ] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let error_code = code.to_string();
+            let wallet = counting_wallet("openrouter", "OpenRouter", calls, move |_| {
+                Err(ProviderFailure {
+                    code: error_code.clone(),
+                    message: "openrouter refused".to_string(),
+                    http_status: None,
+                    transient: Some(false),
+                    retry_after_ms: None,
+                    identity: None,
+                    transport_timeout: false,
+                })
+            });
+            let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+            core.run_cycle().await;
+
+            let dto = &core.snapshot().wallets[0];
+            assert_eq!(dto.health, expected, "code {code}");
+            assert_eq!(dto.error_category.as_deref(), Some(code));
+            assert_eq!(dto.remaining_usd, None, "code {code}");
+            assert_eq!(dto.checked_at, None, "code {code}");
+            assert!(dto.error.is_some(), "code {code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_wallet_fetch_is_contained_and_the_cycle_still_completes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let panic_calls = calls.clone();
+        let wallet = WalletSpec {
+            id: "openrouter",
+            name: "OpenRouter",
+            fetch: Arc::new(move || {
+                let calls = panic_calls.clone();
+                Box::pin(async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if calls.load(Ordering::SeqCst) > 0 {
+                        panic!("wallet fetch exploded")
+                    }
+                    Ok::<WalletBalance, ProviderFailure>(wallet_balance(1.0, None))
+                }) as WalletFetchFuture
+            }),
+        };
+        let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+        core.run_cycle().await;
+
+        let failed = &core.snapshot().wallets[0];
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(failed.health, WalletHealth::Error);
+        assert_eq!(failed.error_category.as_deref(), Some("unexpected"));
+        assert_eq!(failed.remaining_usd, None);
+        assert!(!core.snapshot().cycle_in_flight, "the panic wedges nothing");
     }
 }
