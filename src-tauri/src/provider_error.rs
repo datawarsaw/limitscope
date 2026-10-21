@@ -67,6 +67,14 @@ pub struct ProviderError {
     /// `account` field.
     #[serde(skip)]
     pub identity_hint: Option<String>,
+    /// Internal credential binding for the runtime's fail-closed last-good
+    /// guard: a deterministic fingerprint of the full credential this
+    /// refresh attempted. Never serialized to the WebView, and a digest
+    /// rather than recoverable key material if it is ever debug-formatted.
+    /// Providers whose identity is not credential-based leave it `None`;
+    /// wallet retention treats a missing binding as a mismatch.
+    #[serde(skip)]
+    pub credential_binding: Option<String>,
     /// Internal: the transport failure was a timeout — the request budget
     /// expired during connect, TLS, response, or body read. Never serialized;
     /// consumed only by the runtime's bounded-retry rule, which treats a
@@ -86,6 +94,7 @@ impl ProviderError {
             transient: Some(false),
             retry_after_ms: None,
             identity_hint: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -99,6 +108,7 @@ impl ProviderError {
             transient: Some(true),
             retry_after_ms: None,
             identity_hint: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -116,6 +126,7 @@ impl ProviderError {
             ),
             retry_after_ms: None,
             identity_hint: None,
+            credential_binding: None,
             transport_timeout: false,
         }
     }
@@ -132,6 +143,13 @@ impl ProviderError {
     /// a failure that arrived while account B's credential is stored.
     pub fn with_identity_hint(mut self, identity_hint: Option<String>) -> Self {
         self.identity_hint = identity_hint;
+        self
+    }
+
+    /// Attaches the deterministic full-credential fingerprint the runtime
+    /// uses for fail-closed wallet last-good retention.
+    pub fn with_credential_binding(mut self, credential_binding: Option<String>) -> Self {
+        self.credential_binding = credential_binding;
         self
     }
 
@@ -558,5 +576,16 @@ mod tests {
         // marker.
         assert!(!ProviderError::new("auth_invalid", "rejected").transport_timeout);
         assert!(!ProviderError::transient("network", "offline").transport_timeout);
+    }
+
+    #[test]
+    fn the_credential_binding_never_reaches_the_wire() {
+        let bound = ProviderError::transient("network", "offline")
+            .with_identity_hint(Some("key:A1".to_string()))
+            .with_credential_binding(Some("key:sha256:deadbeef".to_string()));
+        assert_eq!(wire_keys(&bound), ["code", "message", "transient"]);
+        let wire = serde_json::to_string(&bound).unwrap();
+        assert!(!wire.contains("deadbeef"));
+        assert!(!wire.contains("sha256"));
     }
 }

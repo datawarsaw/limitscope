@@ -29,8 +29,8 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
-    AccountAttributionDto, ProviderHealth, ProviderKind, ProviderSpec, ProviderUsageDto,
-    UsageLimitDto,
+    AccountAttributionDto, ApiWalletDto, ProviderHealth, ProviderKind, ProviderSpec,
+    ProviderUsageDto, UsageLimitDto, WalletHealth, WalletSpec,
 };
 
 pub const LAST_GOOD_FILE_NAME: &str = "provider-last-good-v1.json";
@@ -72,17 +72,42 @@ pub struct PersistedProviderState {
     pub source_updated_at: Option<String>,
 }
 
+/// One persisted prepaid balance. Kept in its own list: no limits, no
+/// percentages, and a malformed wallet entry never invalidates providers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedWalletState {
+    pub wallet_id: String,
+    pub wallet_name: String,
+    pub remaining_usd: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+    /// Deterministic full-credential fingerprint that produced the balance.
+    /// Absent on entries written before the P1 isolation fix, and therefore
+    /// unverifiable: hydration drops them rather than presenting another
+    /// account's money.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_binding: Option<String>,
+    pub last_successful_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedLastGoodEnvelope {
     pub version: u32,
     pub providers: Vec<PersistedProviderState>,
+    /// Optional for schema v1 compatibility: an envelope written before
+    /// wallets existed loads with an empty wallet list. The schema version
+    /// stays 1 because the provider payload is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wallets: Vec<PersistedWalletState>,
 }
 
 pub struct ProviderLastGoodStore {
     path: PathBuf,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     state: Mutex<HashMap<String, PersistedProviderState>>,
+    wallets: Mutex<HashMap<String, PersistedWalletState>>,
 }
 
 impl ProviderLastGoodStore {
@@ -98,6 +123,7 @@ impl ProviderLastGoodStore {
             path,
             now,
             state: Mutex::new(HashMap::new()),
+            wallets: Mutex::new(HashMap::new()),
         };
         store.load_from_disk();
         store
@@ -112,29 +138,36 @@ impl ProviderLastGoodStore {
         let Ok(raw) = fs::read_to_string(&self.path) else {
             return;
         };
-        let (providers, healthy) = parse_envelope(&raw);
+        let (providers, wallets, healthy) = parse_envelope(&raw);
         let mut state = self.state.lock().unwrap();
         *state = providers;
+        let mut wallet_state = self.wallets.lock().unwrap();
+        *wallet_state = wallets;
         if !healthy {
-            let _ = self.persist_locked(&state);
+            let _ = self.persist_locked(&state, &wallet_state);
         }
     }
 
     #[allow(dead_code)]
     pub fn persist(&self) -> Result<(), std::io::Error> {
         let state = self.state.lock().unwrap();
-        self.persist_locked(&state)
+        let wallets = self.wallets.lock().unwrap();
+        self.persist_locked(&state, &wallets)
     }
 
     fn persist_locked(
         &self,
         state: &HashMap<String, PersistedProviderState>,
+        wallets: &HashMap<String, PersistedWalletState>,
     ) -> Result<(), std::io::Error> {
         let mut providers: Vec<PersistedProviderState> = state.values().cloned().collect();
         providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        let mut wallet_entries: Vec<PersistedWalletState> = wallets.values().cloned().collect();
+        wallet_entries.sort_by(|a, b| a.wallet_id.cmp(&b.wallet_id));
         let envelope = PersistedLastGoodEnvelope {
             version: SCHEMA_VERSION,
             providers,
+            wallets: wallet_entries,
         };
         let json = serde_json::to_string_pretty(&envelope)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -162,8 +195,11 @@ impl ProviderLastGoodStore {
     /// repopulates the cache normally instead of resurrecting old entries.
     pub fn clear(&self) -> bool {
         let mut state = self.state.lock().unwrap();
+        let mut wallets = self.wallets.lock().unwrap();
         let had_entries = !state.is_empty();
         state.clear();
+        let had_wallets = !wallets.is_empty();
+        wallets.clear();
         let had_file = self.path.exists();
         let _ = fs::remove_file(&self.path);
         let temp_path = self.path.with_extension("json.tmp");
@@ -171,7 +207,7 @@ impl ProviderLastGoodStore {
         if had_temp {
             let _ = fs::remove_file(&temp_path);
         }
-        had_entries || had_file || had_temp
+        had_entries || had_wallets || had_file || had_temp
     }
 
     /// Hydrates safe cached ProviderUsageDto entries for known registered providers.
@@ -292,6 +328,83 @@ impl ProviderLastGoodStore {
         (usages, last_good)
     }
 
+    /// Hydrates persisted wallet balances for registered wallet specs. A
+    /// hydrated balance is always `stale`: it was observed before this
+    /// process started and cannot be presented as live. Unknown wallet ids,
+    /// expired entries, and malformed amounts are dropped independently of
+    /// provider hydration.
+    ///
+    /// Identity is a hard gate: a persisted entry is surfaced only when both
+    /// the entry and the currently stored credential carry a binding and the
+    /// two are exactly equal. Missing, blank, or mismatched bindings are
+    /// rejected and removed from the in-memory wallet map. Eviction from the
+    /// file is best effort, but it is not the security guarantee: every
+    /// hydration revalidates, so an entry that survives a failed rewrite is
+    /// still rejected on the next restart.
+    pub fn hydrate_wallets(
+        &self,
+        specs: &[WalletSpec],
+        now: DateTime<Utc>,
+    ) -> (Vec<ApiWalletDto>, HashMap<&'static str, ApiWalletDto>) {
+        let mut state = self.wallets.lock().unwrap();
+        let mut wallets = Vec::new();
+        let mut last_good = HashMap::new();
+        let mut rejected = false;
+        for spec in specs {
+            let Some(persisted) = state.get(spec.id).cloned() else {
+                continue;
+            };
+            let Ok(success_time) = DateTime::parse_from_rfc3339(&persisted.last_successful_at)
+            else {
+                continue;
+            };
+            let age_secs = (now - success_time.with_timezone(&Utc)).num_seconds();
+            if age_secs > MAX_CACHE_AGE_SECS || age_secs < -FUTURE_TOLERANCE_SECS {
+                continue;
+            }
+            if !persisted.remaining_usd.is_finite() || persisted.remaining_usd < 0.0 {
+                continue;
+            }
+            // Fail closed: the balance belongs to a credential, and only an
+            // exact match with the credential currently on disk proves that
+            // it is still the same source.
+            let current = (spec.current_credential_binding)();
+            if !crate::wallet::credential_bindings_match(
+                persisted.credential_binding.as_deref(),
+                current.as_deref(),
+            ) {
+                state.remove(spec.id);
+                rejected = true;
+                continue;
+            }
+            let dto = ApiWalletDto {
+                id: spec.id.to_string(),
+                name: if persisted.wallet_name.trim().is_empty() {
+                    spec.name.to_string()
+                } else {
+                    persisted.wallet_name.clone()
+                },
+                health: WalletHealth::Stale,
+                checked_at: Some(persisted.last_successful_at.clone()),
+                remaining_usd: Some(persisted.remaining_usd),
+                identity: persisted.identity.clone(),
+                credential_binding: persisted.credential_binding.clone(),
+                error: None,
+                error_category: None,
+                error_http_status: None,
+            };
+            wallets.push(dto.clone());
+            last_good.insert(spec.id, dto);
+        }
+        drop(state);
+        if rejected {
+            let providers = self.state.lock().unwrap();
+            let wallets = self.wallets.lock().unwrap();
+            let _ = self.persist_locked(&providers, &wallets);
+        }
+        (wallets, last_good)
+    }
+
     /// Records genuine successful provider data into the persisted cache.
     ///
     /// Write policy (canonical health, v0.6 runtime status contract):
@@ -334,28 +447,92 @@ impl ProviderLastGoodStore {
         };
 
         let mut lock = self.state.lock().unwrap();
+        let wallets = self.wallets.lock().unwrap();
         lock.insert(kind.id().to_string(), state);
-        let _ = self.persist_locked(&lock);
+        let _ = self.persist_locked(&lock, &wallets);
+    }
+
+    /// Records a genuine live wallet observation. An error, a cooldown skip,
+    /// or a hydrated stale entry never overwrites the cached balance.
+    pub fn record_wallet_success(&self, dto: &ApiWalletDto) {
+        if dto.health != WalletHealth::Live {
+            return;
+        }
+        let Some(balance) = dto.remaining_usd else {
+            return;
+        };
+        if !balance.is_finite() || balance < 0.0 {
+            return;
+        }
+        // An observation without a credential binding cannot be proven to
+        // belong to any account. Refuse to persist it: the cache would be
+        // unverifiable at the next cold start.
+        let Some(credential_binding) = dto.credential_binding.clone() else {
+            return;
+        };
+        if credential_binding.trim().is_empty() {
+            return;
+        }
+        let now_iso = (self.now)().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let state = PersistedWalletState {
+            wallet_id: dto.id.clone(),
+            wallet_name: dto.name.clone(),
+            remaining_usd: balance,
+            identity: dto.identity.clone(),
+            credential_binding: Some(credential_binding),
+            last_successful_at: now_iso,
+        };
+        let providers = self.state.lock().unwrap();
+        let mut wallets = self.wallets.lock().unwrap();
+        wallets.insert(dto.id.clone(), state);
+        let _ = self.persist_locked(&providers, &wallets);
+    }
+
+    /// Removes one wallet's persisted last-good balance and rewrites the
+    /// envelope. Used when the runtime observes a credential change.
+    ///
+    /// Best effort by design: if the rewrite fails, the old entry can stay on
+    /// disk, but hydration compares it with the then-current credential and
+    /// rejects it, so it still cannot surface after a restart.
+    pub fn discard_wallet(&self, wallet_id: &str) {
+        let providers = self.state.lock().unwrap();
+        let mut wallets = self.wallets.lock().unwrap();
+        wallets.remove(wallet_id);
+        // Rewrite even when the in-memory map no longer holds the entry: the
+        // disk copy is the one that can come back after a restart, and a
+        // previous write may have failed. This is a rare, rejection-only path.
+        let _ = self.persist_locked(&providers, &wallets);
     }
 
     #[cfg(test)]
     pub fn get_persisted(&self, provider_id: &str) -> Option<PersistedProviderState> {
         self.state.lock().unwrap().get(provider_id).cloned()
     }
+
+    #[cfg(test)]
+    pub fn get_persisted_wallet(&self, wallet_id: &str) -> Option<PersistedWalletState> {
+        self.wallets.lock().unwrap().get(wallet_id).cloned()
+    }
 }
 
-fn parse_envelope(raw: &str) -> (HashMap<String, PersistedProviderState>, bool) {
+fn parse_envelope(
+    raw: &str,
+) -> (
+    HashMap<String, PersistedProviderState>,
+    HashMap<String, PersistedWalletState>,
+    bool,
+) {
     let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return (HashMap::new(), false);
+        return (HashMap::new(), HashMap::new(), false);
     };
     let Some(object) = parsed.as_object() else {
-        return (HashMap::new(), false);
+        return (HashMap::new(), HashMap::new(), false);
     };
     if object.get("version").and_then(serde_json::Value::as_u64) != Some(SCHEMA_VERSION as u64) {
-        return (HashMap::new(), false);
+        return (HashMap::new(), HashMap::new(), false);
     }
     let Some(providers_val) = object.get("providers").and_then(serde_json::Value::as_array) else {
-        return (HashMap::new(), false);
+        return (HashMap::new(), HashMap::new(), false);
     };
     let mut map = HashMap::new();
     let mut healthy = true;
@@ -373,7 +550,35 @@ fn parse_envelope(raw: &str) -> (HashMap<String, PersistedProviderState>, bool) 
             healthy = false;
         }
     }
-    (map, healthy)
+    // Wallet entries are parsed independently: an absent `wallets` key is an
+    // old (valid) envelope, and one bad wallet entry is dropped without
+    // touching any provider entry.
+    let mut wallets = HashMap::new();
+    if let Some(wallets_val) = object.get("wallets") {
+        if let Some(entries) = wallets_val.as_array() {
+            for entry in entries {
+                match serde_json::from_value::<PersistedWalletState>(entry.clone()) {
+                    Ok(state) if is_valid_persisted_wallet(&state) => {
+                        wallets.insert(state.wallet_id.clone(), state);
+                    }
+                    _ => healthy = false,
+                }
+            }
+        } else {
+            healthy = false;
+        }
+    }
+    (map, wallets, healthy)
+}
+
+fn is_valid_persisted_wallet(state: &PersistedWalletState) -> bool {
+    if state.wallet_id.trim().is_empty() || state.wallet_name.trim().is_empty() {
+        return false;
+    }
+    if !state.remaining_usd.is_finite() || state.remaining_usd < 0.0 {
+        return false;
+    }
+    DateTime::parse_from_rfc3339(&state.last_successful_at).is_ok()
 }
 
 fn is_valid_persisted_state(state: &PersistedProviderState) -> bool {
@@ -942,6 +1147,7 @@ mod tests {
             transient: Some(false),
             retry_after_ms: None,
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         };
         let specs = vec![mock_spec(ProviderKind::Codex, Err(failure))];
@@ -983,6 +1189,7 @@ mod tests {
             transient: Some(false),
             retry_after_ms: Some(60_000),
             identity: None,
+            credential_binding: None,
             transport_timeout: false,
         };
         let specs = vec![mock_spec(ProviderKind::Codex, Err(failure))];
@@ -1312,6 +1519,7 @@ mod tests {
                 last_successful_at: "2026-09-29T12:00:00.000Z".to_string(),
                 source_updated_at: None,
             }],
+            wallets: Vec::new(),
         };
 
         let json = serde_json::to_string_pretty(&envelope).unwrap();
@@ -1380,6 +1588,450 @@ mod tests {
         );
         assert_eq!(snapshot.providers[0].id, "zai", "only the plausible sibling hydrates");
         assert_eq!(snapshot.providers[0].health, ProviderHealth::Stale);
+    }
+
+    // ---- persisted prepaid wallets (API wallets phase 1) ----
+
+    const TEST_WALLET_BINDING: &str = "key:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OTHER_WALLET_BINDING: &str =
+        "key:sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn mock_wallet_spec(id: &'static str, name: &'static str) -> WalletSpec {
+        mock_wallet_spec_with_binding(id, name, Some(TEST_WALLET_BINDING))
+    }
+
+    fn mock_wallet_spec_with_binding(
+        id: &'static str,
+        name: &'static str,
+        binding: Option<&'static str>,
+    ) -> WalletSpec {
+        WalletSpec {
+            id,
+            name,
+            current_credential_binding: Arc::new(move || binding.map(str::to_string)),
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    Ok(crate::wallet::WalletBalance {
+                        remaining_usd: 0.0,
+                        identity: None,
+                        credential_binding: None,
+                    })
+                }) as crate::runtime::WalletFetchFuture
+            }),
+        }
+    }
+
+    fn wallet_dto(
+        health: WalletHealth,
+        remaining_usd: Option<f64>,
+        identity: Option<&str>,
+    ) -> ApiWalletDto {
+        wallet_dto_with_binding(health, remaining_usd, identity, Some(TEST_WALLET_BINDING))
+    }
+
+    fn wallet_dto_with_binding(
+        health: WalletHealth,
+        remaining_usd: Option<f64>,
+        identity: Option<&str>,
+        binding: Option<&str>,
+    ) -> ApiWalletDto {
+        ApiWalletDto {
+            id: "openrouter".to_string(),
+            name: "OpenRouter".to_string(),
+            health,
+            checked_at: (health == WalletHealth::Live)
+                .then(|| "2026-09-29T12:00:00.000Z".to_string()),
+            remaining_usd,
+            identity: identity.map(str::to_string),
+            credential_binding: binding.map(str::to_string),
+            error: None,
+            error_category: None,
+            error_http_status: None,
+        }
+    }
+
+    // 21. an envelope written before wallets existed still loads
+    #[test]
+    fn an_envelope_without_wallets_loads_with_an_empty_wallet_list() {
+        let dir = tempdir::temp_dir("wallet-old-envelope");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [{
+                "providerId": "zai",
+                "providerName": "Z.ai",
+                "limits": [{
+                    "label": "Daily",
+                    "usedPercent": 20.0,
+                    "resetAt": "2026-09-29T16:00:00Z"
+                }],
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        let specs = vec![mock_spec(
+            ProviderKind::Zai,
+            Ok(sample_usage(ProviderKind::Zai, 20.0, None)),
+        )];
+        let (usages, _) = store.hydrate(&specs, fixed_now());
+        assert_eq!(usages.len(), 1, "provider hydration is untouched");
+
+        let wallet_specs = vec![mock_wallet_spec("openrouter", "OpenRouter")];
+        let (wallets, last_good) = store.hydrate_wallets(&wallet_specs, fixed_now());
+        assert!(wallets.is_empty(), "an old envelope has no wallet entries");
+        assert!(last_good.is_empty());
+    }
+
+    // 22. one malformed wallet entry never invalidates providers
+    #[test]
+    fn a_malformed_wallet_entry_never_invalidates_providers() {
+        let dir = tempdir::temp_dir("wallet-malformed");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [{
+                "providerId": "zai",
+                "providerName": "Z.ai",
+                "limits": [{
+                    "label": "Daily",
+                    "usedPercent": 35.0,
+                    "resetAt": "2026-09-29T16:00:00Z"
+                }],
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }],
+            "wallets": [{
+                "walletId": "openrouter",
+                "walletName": "OpenRouter",
+                "remainingUsd": "not-a-number",
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+        assert!(
+            store.get_persisted("zai").is_some(),
+            "the sibling provider entry survives"
+        );
+        let specs = vec![mock_spec(
+            ProviderKind::Zai,
+            Ok(sample_usage(ProviderKind::Zai, 35.0, None)),
+        )];
+        let (usages, _) = store.hydrate(&specs, fixed_now());
+        assert_eq!(usages.len(), 1);
+    }
+
+    // 23. a persisted balance hydrates as stale and expires after a week
+    #[test]
+    fn a_persisted_balance_hydrates_as_stale_and_expires_after_seven_days() {
+        let dir = tempdir::temp_dir("wallet-hydrate-stale");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        store.record_wallet_success(&wallet_dto(
+            WalletHealth::Live,
+            Some(4.25),
+            Some("key:A1"),
+        ));
+        let persisted = store
+            .get_persisted_wallet("openrouter")
+            .expect("the live observation is cached");
+        assert_eq!(persisted.remaining_usd, 4.25);
+
+        let specs = vec![mock_wallet_spec("openrouter", "OpenRouter")];
+        let (wallets, last_good) = store.hydrate_wallets(&specs, fixed_now());
+        assert_eq!(wallets.len(), 1);
+        assert_eq!(wallets[0].health, WalletHealth::Stale);
+        assert_eq!(wallets[0].remaining_usd, Some(4.25));
+        assert_eq!(
+            wallets[0].checked_at.as_deref(),
+            Some("2026-09-29T12:00:00.000Z"),
+            "hydration keeps the original observation stamp"
+        );
+        assert_eq!(
+            last_good.get("openrouter").and_then(|dto| dto.remaining_usd),
+            Some(4.25)
+        );
+
+        let eight_days = fixed_now() + chrono::Duration::days(8);
+        let (expired, expired_last_good) = store.hydrate_wallets(&specs, eight_days);
+        assert!(expired.is_empty(), "a week-old balance is not last-good");
+        assert!(expired_last_good.is_empty());
+
+        // A cold start through the runtime exposes the entry as stale.
+        let reopened = Arc::new(ProviderLastGoodStore::open_with_clock(
+            path,
+            Box::new(fixed_now),
+        ));
+        let core = RuntimeCore::with_injections(vec![], 5, Box::new(|| 0), Box::new(fixed_now))
+            .with_last_good_store(Some(reopened))
+            .with_wallets(specs);
+        let snapshot = core.snapshot();
+        assert_eq!(snapshot.wallets.len(), 1);
+        assert_eq!(snapshot.wallets[0].health, WalletHealth::Stale);
+        assert_eq!(snapshot.wallets[0].remaining_usd, Some(4.25));
+    }
+
+    // 24. only genuine live observations are written
+    #[test]
+    fn only_live_wallet_observations_are_persisted() {
+        let dir = tempdir::temp_dir("wallet-write-policy");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+
+        store.record_wallet_success(&wallet_dto(WalletHealth::Error, Some(9.0), None));
+        store.record_wallet_success(&wallet_dto(WalletHealth::Stale, Some(9.0), None));
+        store.record_wallet_success(&wallet_dto(WalletHealth::Cooldown, Some(9.0), None));
+        store.record_wallet_success(&wallet_dto(WalletHealth::Live, None, None));
+        assert!(
+            store.get_persisted_wallet("openrouter").is_none(),
+            "errors, stale projections, and balance-less states never write"
+        );
+
+        store.record_wallet_success(&wallet_dto(WalletHealth::Live, Some(0.0), Some("key:A1")));
+        let persisted = store
+            .get_persisted_wallet("openrouter")
+            .expect("a live zero is a real observation");
+        assert_eq!(persisted.remaining_usd, 0.0);
+        assert_eq!(persisted.identity.as_deref(), Some("key:A1"));
+
+        assert!(store.clear(), "the cache had entries to clear");
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+    }
+
+    // 25. a persisted balance from another credential is removed before it
+    // can be served, and a second restart cannot resurrect it.
+    #[test]
+    fn a_persisted_balance_for_another_credential_is_removed_for_good() {
+        let dir = tempdir::temp_dir("wallet-credential-mismatch");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+
+        let writer = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        writer.record_wallet_success(&wallet_dto(
+            WalletHealth::Live,
+            Some(4.25),
+            Some("key:A1"),
+        ));
+        assert!(writer.get_persisted_wallet("openrouter").is_some());
+
+        let first_restart = ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        );
+        let other = vec![mock_wallet_spec_with_binding(
+            "openrouter",
+            "OpenRouter",
+            Some(OTHER_WALLET_BINDING),
+        )];
+        let (wallets, last_good) = first_restart.hydrate_wallets(&other, fixed_now());
+        assert!(
+            wallets.is_empty(),
+            "credential B must not inherit credential A's balance"
+        );
+        assert!(last_good.is_empty());
+        assert!(
+            first_restart.get_persisted_wallet("openrouter").is_none(),
+            "the rejected entry is removed from disk, not merely hidden"
+        );
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("openrouter"),
+            "the rewritten envelope no longer carries the rejected entry: {contents}"
+        );
+
+        let second_restart = ProviderLastGoodStore::open_with_clock(
+            path,
+            Box::new(fixed_now),
+        );
+        let (wallets, last_good) = second_restart.hydrate_wallets(&other, fixed_now());
+        assert!(wallets.is_empty(), "a later restart cannot resurrect it");
+        assert!(last_good.is_empty());
+    }
+
+    // 25b. Eviction is a best-effort rewrite. When the old envelope survives
+    // on disk, hydration itself must still refuse it: the restart guarantee
+    // is revalidation, not the success of the rewrite.
+    #[test]
+    fn a_stale_envelope_that_survives_eviction_is_rejected_after_restart() {
+        let dir = tempdir::temp_dir("wallet-stale-envelope");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+
+        let writer = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        writer.record_wallet_success(&wallet_dto(
+            WalletHealth::Live,
+            Some(9.75),
+            Some("key:A1"),
+        ));
+        let stale_bytes = fs::read(&path).unwrap();
+
+        let other = vec![mock_wallet_spec_with_binding(
+            "openrouter",
+            "OpenRouter",
+            Some(OTHER_WALLET_BINDING),
+        )];
+        let first_restart =
+            ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        let (wallets, _) = first_restart.hydrate_wallets(&other, fixed_now());
+        assert!(wallets.is_empty());
+
+        // Simulate a failed eviction rewrite: the rejected envelope is still
+        // exactly what a restart would load.
+        fs::write(&path, stale_bytes).unwrap();
+
+        let second_restart =
+            ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        let (wallets, last_good) = second_restart.hydrate_wallets(&other, fixed_now());
+        assert!(
+            wallets.is_empty(),
+            "revalidation, not the rewrite, is the restart guarantee"
+        );
+        assert!(last_good.is_empty());
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("openrouter"),
+            "the successful hydration rewrite clears the stale entry: {contents}"
+        );
+    }
+
+    // 25c. The same guarantee under a real failed rewrite: the temp sibling
+    // a successful persist writes through is occupied by a directory, so
+    // persist_locked cannot write. The old envelope survives untouched, and
+    // hydration must still reject it.
+    #[test]
+    fn a_failed_eviction_rewrite_is_still_rejected_after_restart() {
+        let dir = tempdir::temp_dir("wallet-failed-eviction");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+
+        let writer = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        writer.record_wallet_success(&wallet_dto(
+            WalletHealth::Live,
+            Some(6.5),
+            Some("key:A1"),
+        ));
+        let stale_bytes = fs::read(&path).unwrap();
+
+        // Block the envelope rewrite exactly where persist_locked writes.
+        let temp_path = path.with_extension("json.tmp");
+        fs::create_dir(&temp_path).unwrap();
+
+        let other = vec![mock_wallet_spec_with_binding(
+            "openrouter",
+            "OpenRouter",
+            Some(OTHER_WALLET_BINDING),
+        )];
+        let first_restart =
+            ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        let (wallets, last_good) = first_restart.hydrate_wallets(&other, fixed_now());
+        assert!(wallets.is_empty());
+        assert!(last_good.is_empty());
+        assert!(
+            first_restart.get_persisted_wallet("openrouter").is_none(),
+            "the in-memory entry is dropped even when the rewrite fails"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            stale_bytes,
+            "the rewrite really failed: the old envelope is untouched"
+        );
+
+        fs::remove_dir(&temp_path).unwrap();
+        let second_restart =
+            ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        let (wallets, last_good) = second_restart.hydrate_wallets(&other, fixed_now());
+        assert!(
+            wallets.is_empty(),
+            "a later restart rejects the surviving stale envelope"
+        );
+        assert!(last_good.is_empty());
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(
+            !contents.contains("openrouter"),
+            "the next healthy rewrite clears the rejected entry: {contents}"
+        );
+    }
+
+    // 26. entries written before the isolation fix carry no binding. They
+    // are unverifiable by construction and must be rejected.
+    #[test]
+    fn a_legacy_wallet_entry_without_a_binding_is_rejected_and_removed() {
+        let dir = tempdir::temp_dir("wallet-legacy-binding");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [],
+            "wallets": [{
+                "walletId": "openrouter",
+                "walletName": "OpenRouter",
+                "remainingUsd": 7.5,
+                "identity": "key:A1",
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(
+            path.clone(),
+            Box::new(fixed_now),
+        );
+        let specs = vec![mock_wallet_spec("openrouter", "OpenRouter")];
+        let (wallets, last_good) = store.hydrate_wallets(&specs, fixed_now());
+        assert!(wallets.is_empty(), "a missing binding is never a match");
+        assert!(last_good.is_empty());
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+
+        let reopened = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert!(reopened.get_persisted_wallet("openrouter").is_none());
+    }
+
+    // 27. an unreadable or ambiguous current credential cannot prove that a
+    // persisted balance belongs to it, so it is rejected and removed.
+    #[test]
+    fn a_persisted_balance_is_rejected_when_the_current_credential_is_unavailable() {
+        let dir = tempdir::temp_dir("wallet-current-binding-missing");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        store.record_wallet_success(&wallet_dto(WalletHealth::Live, Some(3.0), None));
+
+        let specs = vec![mock_wallet_spec_with_binding(
+            "openrouter",
+            "OpenRouter",
+            None,
+        )];
+        let (wallets, last_good) = store.hydrate_wallets(&specs, fixed_now());
+        assert!(wallets.is_empty());
+        assert!(last_good.is_empty());
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+
+        let reopened = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert!(reopened.get_persisted_wallet("openrouter").is_none());
+    }
+
+    // 28. a live observation that cannot be bound to a credential is not
+    // written at all: otherwise it would become unverifiable after restart.
+    #[test]
+    fn an_unbound_live_observation_is_never_persisted() {
+        let dir = tempdir::temp_dir("wallet-unbound-write");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+
+        store.record_wallet_success(&wallet_dto_with_binding(
+            WalletHealth::Live,
+            Some(5.0),
+            Some("key:A1"),
+            None,
+        ));
+        assert!(store.get_persisted_wallet("openrouter").is_none());
+
+        store.record_wallet_success(&wallet_dto_with_binding(
+            WalletHealth::Live,
+            Some(5.0),
+            Some("key:A1"),
+            Some("   "),
+        ));
+        assert!(store.get_persisted_wallet("openrouter").is_none());
     }
 }
 

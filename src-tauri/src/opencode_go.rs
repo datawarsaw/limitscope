@@ -262,7 +262,7 @@ impl std::fmt::Debug for OpenCodeGoKey {
 /// OpenCode resolves its auth file XDG-style: `$XDG_DATA_HOME/opencode`
 /// when that directory exists, else `~/.local/share/opencode` (also the
 /// layout OpenCode uses on Windows).
-fn opencode_data_dir(home: &Path) -> PathBuf {
+pub(crate) fn opencode_data_dir(home: &Path) -> PathBuf {
     if let Ok(xdg_data_home) = std::env::var("XDG_DATA_HOME") {
         let xdg_data_home = xdg_data_home.trim();
         if !xdg_data_home.is_empty() {
@@ -355,29 +355,50 @@ fn resolve_active_credential() -> Result<OpenCodeGoKey, ProviderError> {
     resolve_credential(&home)
 }
 
-fn parse_auth(raw: &str) -> Result<String, ProviderError> {
-    let value: Value = serde_json::from_str(raw).map_err(|_| {
-        ProviderError::new(
-            "auth_unreadable",
-            "OpenCode auth state (auth.json) is not valid JSON.",
-        )
-    })?;
-    let entry = value.get("opencode-go").filter(|entry| entry.is_object());
-    let Some(entry) = entry else {
-        return Err(credential_missing());
-    };
+/// Why a single auth-file entry could not be turned into one credential.
+/// The parsed shape is shared with every OpenCode-backed adapter; each
+/// adapter keeps its own user-facing wording for the three cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthEntryError {
+    Unreadable,
+    Missing,
+    Ambiguous,
+}
+
+/// Reads one auth-file entry of the shape
+/// { "entryId": { "type": ..., "key": "..." } }. Shared by every adapter
+/// that consumes that file so the precedence and ambiguity rules cannot
+/// drift between providers: a blank or absent key is "nothing stored", and
+/// a non-string key is refused rather than guessed at.
+pub(crate) fn parse_auth_entry(raw: &str, entry_id: &str) -> Result<String, AuthEntryError> {
+    let value: Value = serde_json::from_str(raw).map_err(|_| AuthEntryError::Unreadable)?;
+    let entry = value
+        .get(entry_id)
+        .filter(|entry| entry.is_object())
+        .ok_or(AuthEntryError::Missing)?;
     let key = match entry.get("key") {
         // Absent or blank: nothing stored, same as no entry.
-        None => return Err(credential_missing()),
+        None => return Err(AuthEntryError::Missing),
         Some(Value::String(key)) => key.trim().to_string(),
         // A non-string value cannot be resolved to one credential. Never
         // fall back to "the first thing that looks like a key".
-        Some(_) => return Err(credential_ambiguous()),
+        Some(_) => return Err(AuthEntryError::Ambiguous),
     };
     if key.is_empty() {
-        return Err(credential_missing());
+        return Err(AuthEntryError::Missing);
     }
     Ok(key)
+}
+
+fn parse_auth(raw: &str) -> Result<String, ProviderError> {
+    parse_auth_entry(raw, "opencode-go").map_err(|error| match error {
+        AuthEntryError::Unreadable => ProviderError::new(
+            "auth_unreadable",
+            "OpenCode auth state (auth.json) is not valid JSON.",
+        ),
+        AuthEntryError::Missing => credential_missing(),
+        AuthEntryError::Ambiguous => credential_ambiguous(),
+    })
 }
 
 /// Last four characters of the stored key — the tail the OpenCode console
@@ -386,7 +407,7 @@ fn parse_auth(raw: &str) -> Result<String, ProviderError> {
 /// card to an account without any usable secret crossing the boundary.
 /// `None` when the key is too short to mask meaningfully or the tail is not
 /// printable key material.
-fn account_hint(key: &str) -> Option<OpenCodeGoAccount> {
+pub(crate) fn key_tail(key: &str) -> Option<String> {
     let tail = key.chars().rev().take(4).collect::<Vec<_>>();
     // Real Go keys are ~67 chars; anything shorter than 12 would leak too
     // much of the key through the hint, so it gets no attribution at all.
@@ -399,8 +420,11 @@ fn account_hint(key: &str) -> Option<OpenCodeGoAccount> {
     {
         return None;
     }
-    let tail: String = tail.into_iter().rev().collect();
-    Some(OpenCodeGoAccount { key_hint: tail })
+    Some(tail.into_iter().rev().collect())
+}
+
+fn account_hint(key: &str) -> Option<OpenCodeGoAccount> {
+    key_tail(key).map(|key_hint| OpenCodeGoAccount { key_hint })
 }
 
 // ---------- HTTP ----------

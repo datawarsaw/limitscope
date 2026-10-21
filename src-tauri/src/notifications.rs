@@ -1242,6 +1242,7 @@ mod tests {
                         transient: Some(true),
                         retry_after_ms: Some(60_000),
                         identity: None,
+                        credential_binding: None,
                         transport_timeout: false,
                     }),
                 };

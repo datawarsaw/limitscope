@@ -27,6 +27,7 @@ mod usage_intelligence;
 mod usage_source_codex;
 mod usage_source_opencode;
 mod usage_source_zcode;
+mod wallet;
 mod zai;
 mod zcode_plans;
 mod zcode_reset;
@@ -138,6 +139,7 @@ fn main() {
             floating_drag::restore_floating_drag_origin,
             runtime::get_runtime_snapshot,
             runtime::request_refresh,
+            runtime::request_wallet_refresh,
             runtime::request_refresh_on_reconnect,
             runtime::set_refresh_interval,
             runtime::set_quota_notifications_enabled,

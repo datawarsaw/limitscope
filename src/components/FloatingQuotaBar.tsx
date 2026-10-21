@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import type { FloatingQuotaItem } from "../lib/floatingQuota";
+import type { FloatingQuotaItem, FloatingWalletItem } from "../lib/floatingQuota";
 import type { SmartDockGesture } from "../lib/smartDocking";
 import { clampPopoverAlign, floatingClickAction } from "../lib/floatingQuota";
 import { FloatingProviderItem } from "./FloatingProviderItem";
 import { FloatingProviderPopover } from "./FloatingProviderPopover";
+import { FloatingWalletPopover } from "./FloatingWalletPopover";
+import { FloatingWalletSlot } from "./FloatingWalletSlot";
 
 /** One card width for hover previews and pinned clicks alike. */
 const POPOVER_WIDTH = 300;
@@ -22,6 +24,7 @@ export type FloatingDockState = "none" | "resting" | "revealing" | "revealed";
 
 export function FloatingQuotaBar({
   items,
+  wallets = [],
   loading,
   now,
   detailId,
@@ -38,6 +41,8 @@ export function FloatingQuotaBar({
   onDismiss,
   onOpenMain,
   onRefresh,
+  walletBusy = false,
+  onRefreshWallet,
   onTogglePin,
   onHide,
   onDetailCardHeight,
@@ -50,6 +55,8 @@ export function FloatingQuotaBar({
   dockGesture = null,
 }: {
   items: FloatingQuotaItem[];
+  /** Prepaid API wallets rendered as fixed slots after the providers. */
+  wallets?: FloatingWalletItem[];
   loading: boolean;
   now: Date;
   detailId: string | null;
@@ -66,6 +73,9 @@ export function FloatingQuotaBar({
   onDismiss: () => void;
   onOpenMain: () => void;
   onRefresh: () => void;
+  /** Manual wallet refresh in flight; only the wallet action is busy. */
+  walletBusy?: boolean;
+  onRefreshWallet?: () => void;
   onTogglePin: () => void;
   onHide: () => void;
   onDetailCardHeight: (height: number | null) => void;
@@ -95,7 +105,11 @@ export function FloatingQuotaBar({
   selectorRef.current = selector;
   const placeTimer = useRef<number | null>(null);
   const active = items.find((item) => item.providerId === detailId) ?? null;
-  const activeId = active?.providerId ?? null;
+  const activeWallet =
+    active === null
+      ? wallets.find((wallet) => wallet.id === detailId) ?? null
+      : null;
+  const activeId = active?.providerId ?? activeWallet?.id ?? null;
 
   useLayoutEffect(() => {
     const shell = shellRef.current;
@@ -112,7 +126,7 @@ export function FloatingQuotaBar({
       return;
     }
     const item = shell.querySelector<HTMLElement>(
-      '[data-provider-id="' + activeId + '"]',
+      '[data-provider-id="' + activeId + '"], [data-wallet-id="' + activeId + '"]',
     );
     if (!item) return;
     // The selector is absolutely positioned inside the shell's padding box
@@ -137,7 +151,7 @@ export function FloatingQuotaBar({
     } else if (current.left !== left || current.width !== width) {
       setSelector({ left, width, shown: true });
     }
-  }, [activeId, items.length]);
+  }, [activeId, items.length, wallets.length]);
 
   useEffect(
     () => () => {
@@ -225,27 +239,41 @@ export function FloatingQuotaBar({
         <span
           className="fq-active"
           aria-hidden="true"
-          data-on={active && selector.shown ? "true" : "false"}
+          data-on={activeId && selector.shown ? "true" : "false"}
           style={{
             transform: `translateX(${selector.left}px)`,
             width: `${selector.width}px`,
           }}
         />
         <span className="fq-grip" data-tauri-drag-region aria-hidden="true" />
-        {items.length === 0 ? (
+        {items.length === 0 && wallets.length === 0 ? (
           <p className="fq-empty">{loading ? "Checking quotas" : "No providers"}</p>
         ) : (
-          items.map((item) => (
-            <FloatingProviderItem
-              key={item.providerId}
-              item={item}
-              expanded={detailId === item.providerId}
-              onHover={onHover}
-              onHoverEnd={onHoverEnd}
-              onOpen={() => onOpen(floatingClickAction(item).providerId)}
-              onContextMenu={onContextMenu}
-            />
-          ))
+          <>
+            {items.map((item) => (
+              <FloatingProviderItem
+                key={item.providerId}
+                item={item}
+                expanded={detailId === item.providerId}
+                onHover={onHover}
+                onHoverEnd={onHoverEnd}
+                onOpen={() => onOpen(floatingClickAction(item).providerId)}
+                onContextMenu={onContextMenu}
+              />
+            ))}
+            {wallets.map((wallet) => (
+              <FloatingWalletSlot
+                key={wallet.id}
+                item={wallet}
+                expanded={detailId === wallet.id}
+                busy={walletBusy}
+                onHover={onHover}
+                onHoverEnd={onHoverEnd}
+                onOpen={onOpen}
+                onContextMenu={onContextMenu}
+              />
+            ))}
+          </>
         )}
       </div>
       {active ? (
@@ -280,6 +308,36 @@ export function FloatingQuotaBar({
             onHoverEnd();
           }}
           onOpenMain={onOpenMain}
+        />
+      ) : activeWallet ? (
+        <FloatingWalletPopover
+          item={activeWallet}
+          pinned={pinned}
+          now={now}
+          align={align}
+          exiting={exiting}
+          busy={walletBusy}
+          onMouseEnter={onHoverCancel}
+          onMouseLeave={onHoverEnd}
+          onFocus={(event) => {
+            if (
+              event.relatedTarget instanceof Node &&
+              event.currentTarget.contains(event.relatedTarget)
+            ) {
+              return;
+            }
+            onHoverCancel();
+          }}
+          onBlur={(event) => {
+            if (
+              event.relatedTarget instanceof Node &&
+              event.currentTarget.contains(event.relatedTarget)
+            ) {
+              return;
+            }
+            onHoverEnd();
+          }}
+          onRefresh={onRefreshWallet ?? (() => {})}
         />
       ) : null}
       {menuOpen ? (

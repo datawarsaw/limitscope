@@ -7,6 +7,7 @@ import {
   DOCK_WIDTH,
   floatingBarWidth,
   floatingQuotaItems,
+  floatingWalletItems,
   floatingWindowHeight,
   type FloatingOverlay,
 } from "../lib/floatingQuota";
@@ -67,10 +68,19 @@ export function FloatingQuotaWindow() {
       ? readDevFixture(window.location.search)
       : null;
   const { settings } = useSettings();
-  const { usages: runtimeUsages, loading, refresh } = useProviderUsage(
-    settings.refreshIntervalMinutes,
-  );
+  const {
+    usages: runtimeUsages,
+    wallets: runtimeWallets,
+    loading,
+    refresh,
+    refreshWallet,
+    walletRefreshing = false,
+  } = useProviderUsage(settings.refreshIntervalMinutes);
   const usages = devFixture?.usages ?? runtimeUsages;
+  // Wallets are an independent snapshot collection: hidden-provider
+  // preferences never filter them, and an older runtime without the field
+  // simply yields an empty list.
+  const walletItems = floatingWalletItems(runtimeWallets ?? []);
   const now = new Date(useNow());
   // Presentation only: hidden providers leave the glanceable bar, but the
   // runtime snapshot above stays complete (history, notifications).
@@ -125,7 +135,7 @@ export function FloatingQuotaWindow() {
   const exiting = detail === null && cardDetail !== null;
   const overlay: FloatingOverlay = menuOpen ? "menu" : cardDetail ? "detail" : "none";
   overlayOpen.current = overlay !== "none";
-  const width = floatingBarWidth(items.length);
+  const width = floatingBarWidth(items.length, walletItems.length > 0);
   const height = floatingWindowHeight(overlay, detailCardHeight);
 
   useEffect(() => {
@@ -344,7 +354,7 @@ export function FloatingQuotaWindow() {
       closeDetail(false);
       if (!returnTo) return;
       const button = document.querySelector<HTMLButtonElement>(
-        '[data-provider-id="' + CSS.escape(returnTo) + '"]',
+        '[data-provider-id="' + CSS.escape(returnTo) + '"], [data-wallet-id="' + CSS.escape(returnTo) + '"]',
       );
       button?.focus();
     };
@@ -374,6 +384,9 @@ export function FloatingQuotaWindow() {
   return (
     <FloatingQuotaBar
       items={items}
+      wallets={walletItems}
+      walletBusy={walletRefreshing}
+      onRefreshWallet={refreshWallet}
       loading={loading}
       now={now}
       detailId={cardDetail?.id ?? null}
@@ -417,7 +430,11 @@ export function FloatingQuotaWindow() {
       }
       dockSlot={
         docked && (resting || stripExiting) ? (
-          <FloatingDockStrip items={items} exiting={stripExiting} />
+          <FloatingDockStrip
+            items={items}
+            hasWallet={walletItems.length > 0}
+            exiting={stripExiting}
+          />
         ) : null
       }
       onPointerEnterWindow={onPointerEnterWindow}

@@ -1,4 +1,4 @@
-import type { LimitWindow, ProviderUsage } from "../types";
+import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import {
   providerStatusPresentation,
@@ -75,12 +75,63 @@ export type FloatingClickAction = {
 };
 
 /**
- * Logical width of the floating bar. Four providers land at 520px and five
- * cap at 600px, without a layout that only fits the current registry.
+ * Wallet presentation state. It deliberately names its own set rather than
+ * reusing `FloatingQuotaState`: a wallet can be in an upstream cooldown with
+ * a perfectly good last-good balance, which no quota state expresses.
  */
-export function floatingBarWidth(providerCount: number): number {
+export type FloatingWalletState =
+  | "healthy"
+  | "stale"
+  | "cooldown"
+  | "error"
+  | "unavailable";
+
+/** One prepaid API wallet as the floating slot and its card show it. */
+export type FloatingWalletItem = {
+  id: string;
+  name: string;
+  state: FloatingWalletState;
+  /** Confirmed or last-good balance in USD, or null when no trustworthy
+   * reading exists. Never defaulted to zero. */
+  remainingUsd: number | null;
+  checkedAt: string | null;
+  identity?: string;
+  error?: string;
+  errorCategory?: string;
+  errorHttpStatus?: number;
+  statusLabel: string;
+};
+
+// The production Halo bar's layout constants that meter geometry depends on.
+// They mirror floating.css and are pinned there by floating.css.test.ts, so
+// the resting dock's computed meter positions can never silently drift from
+// the revealed bar's real ones.
+const ROOT_PAD = 4; // .fq-root padding
+const SHELL_BORDER = 1; // .fq-shell border
+const SHELL_PAD = 4; // .fq-shell padding
+const SHELL_GAP = 2; // .fq-shell gap between grip, items and the wallet slot
+const GRIP_WIDTH = 12; // .fq-grip
+const ITEM_PAD_X = 10; // .fq-item horizontal padding
+const MARK_COL = 22; // .fq-item mark column
+const ITEM_COL_GAP = 8; // .fq-item column-gap between mark and meter column
+
+/** The compact wallet slot's own width, in logical px (Variant B). */
+export const WALLET_SLOT_WIDTH = 44;
+
+/**
+ * Logical width of the floating bar. Four providers land at 520px and five
+ * cap at 600px, without a layout that only fits the current registry. A
+ * wallet adds its own fixed slot plus one shell gap to the right of the
+ * providers, so five providers plus OpenRouter reveal at 646px while every
+ * provider segment keeps the exact geometry it had at 600px.
+ */
+export function floatingBarWidth(
+  providerCount: number,
+  hasWallet = false,
+): number {
   const count = Math.max(providerCount, 1);
-  return Math.min(600, Math.max(300, 40 + count * 120));
+  const width = Math.min(600, Math.max(300, 40 + count * 120));
+  return width + (hasWallet ? WALLET_SLOT_WIDTH + SHELL_GAP : 0);
 }
 
 // ---------- Resting dock (top edge) ----------
@@ -94,19 +145,6 @@ export const DOCK_METER_HEIGHT = 3;
 /** One meter's horizontal extent, in logical px from the window's left edge. */
 export type MeterRect = { left: number; width: number };
 
-// The production Halo bar's layout constants that meter geometry depends on.
-// They mirror floating.css and are pinned there by floating.css.test.ts, so
-// the resting dock's computed meter positions can never silently drift from
-// the revealed bar's real ones.
-const ROOT_PAD = 4; // .fq-root padding
-const SHELL_BORDER = 1; // .fq-shell border
-const SHELL_PAD = 4; // .fq-shell padding
-const SHELL_GAP = 2; // .fq-shell gap between grip and items
-const GRIP_WIDTH = 12; // .fq-grip
-const ITEM_PAD_X = 10; // .fq-item horizontal padding
-const MARK_COL = 22; // .fq-item mark column
-const ITEM_COL_GAP = 8; // .fq-item column-gap between mark and meter column
-
 /** Horizontal distance from an item's left edge to its meter's left edge. */
 const METER_INSET = ITEM_PAD_X + MARK_COL + ITEM_COL_GAP;
 
@@ -115,30 +153,76 @@ function meterInset(providerCount: number): number {
 }
 
 /**
+ * Shared flex layout of the revealed shell: the width every provider
+ * segment gets and where the first one starts. When a wallet occupies the
+ * rightmost slot, its own fixed width and gap come out of the shell content
+ * before the providers divide the rest — which is why five providers keep
+ * their 112px segments and identical positions at 646px.
+ */
+function shellLayout(
+  windowWidth: number,
+  providerCount: number,
+  hasWallet: boolean,
+): { count: number; itemWidth: number; firstItemLeft: number; shellContent: number } {
+  const count = Math.max(1, Math.floor(providerCount));
+  const shellContent =
+    windowWidth - ROOT_PAD * 2 - SHELL_BORDER * 2 - SHELL_PAD * 2;
+  const walletExtra = hasWallet ? WALLET_SLOT_WIDTH + SHELL_GAP : 0;
+  const itemWidth =
+    (shellContent - GRIP_WIDTH - count * SHELL_GAP - walletExtra) / count;
+  const firstItemLeft =
+    ROOT_PAD + SHELL_BORDER + SHELL_PAD + GRIP_WIDTH + SHELL_GAP;
+  return { count, itemWidth, firstItemLeft, shellContent };
+}
+
+/**
  * Meter x-geometry of the production Halo bar for a window of `windowWidth`
  * logical px hosting `providerCount` segments: one rect per provider, in
  * provider order. Pure math over the same constants floating.css lays the
  * real bar out with — the resting dock uses it to sit exactly on the meters
- * the revealed bar will show.
+ * the revealed bar will show. A wallet has no quota meter, so `hasWallet`
+ * only affects the segment widths; the returned array stays one rect per
+ * provider.
  */
 export function haloMeterRects(
   windowWidth: number,
   providerCount: number,
+  hasWallet = false,
 ): MeterRect[] {
-  const count = Math.max(1, Math.floor(providerCount));
-  const shellContent =
-    windowWidth - ROOT_PAD * 2 - SHELL_BORDER * 2 - SHELL_PAD * 2;
-  const itemWidth = (shellContent - GRIP_WIDTH - count * SHELL_GAP) / count;
+  const { count, itemWidth, firstItemLeft } = shellLayout(
+    windowWidth,
+    providerCount,
+    hasWallet,
+  );
   // Seven providers use the compact item geometry in floating.css. Keep the
   // resting dock's meters aligned with that same rendered geometry.
   const inset = meterInset(count);
   const rightPad = count >= 7 ? 6 : ITEM_PAD_X;
-  const firstItemLeft =
-    ROOT_PAD + SHELL_BORDER + SHELL_PAD + GRIP_WIDTH + SHELL_GAP;
   return Array.from({ length: count }, (_, index) => ({
     left: firstItemLeft + index * (itemWidth + SHELL_GAP) + inset,
     width: itemWidth - inset - rightPad,
   }));
+}
+
+/**
+ * Where the wallet slot sits inside a revealed shell of `windowWidth` that
+ * hosts `providerCount` providers: immediately right of the last provider,
+ * one shell gap away, at its own fixed 44px. Pure geometry — the slot itself
+ * renders in normal flex flow and never carries a quota meter.
+ */
+export function haloWalletRect(
+  windowWidth: number,
+  providerCount: number,
+): MeterRect {
+  const { count, itemWidth, firstItemLeft } = shellLayout(
+    windowWidth,
+    providerCount,
+    true,
+  );
+  return {
+    left: firstItemLeft + count * (itemWidth + SHELL_GAP),
+    width: WALLET_SLOT_WIDTH,
+  };
 }
 
 /**
@@ -148,10 +232,13 @@ export function haloMeterRects(
  * the window, and with this offset every resting meter stays stationary on
  * screen while the bar fades in underneath it.
  */
-export function dockMeterRects(providerCount: number): MeterRect[] {
-  const revealedWidth = floatingBarWidth(providerCount);
+export function dockMeterRects(
+  providerCount: number,
+  hasWallet = false,
+): MeterRect[] {
+  const revealedWidth = floatingBarWidth(providerCount, hasWallet);
   const offset = (DOCK_WIDTH - revealedWidth) / 2;
-  return haloMeterRects(revealedWidth, providerCount).map((rect) => ({
+  return haloMeterRects(revealedWidth, providerCount, hasWallet).map((rect) => ({
     left: offset + rect.left,
     width: rect.width,
   }));
@@ -163,8 +250,11 @@ export function dockMeterRects(providerCount: number): MeterRect[] {
  * left of the meter that follows it), so the strip reads as a compressed
  * continuation of the bar rather than an evenly ruled ruler.
  */
-export function dockSeparatorLefts(providerCount: number): number[] {
-  const rects = dockMeterRects(providerCount);
+export function dockSeparatorLefts(
+  providerCount: number,
+  hasWallet = false,
+): number[] {
+  const rects = dockMeterRects(providerCount, hasWallet);
   return rects.slice(1).map((rect) => rect.left - meterInset(providerCount));
 }
 
@@ -451,4 +541,126 @@ export function floatingQuotaItems(
     });
   }
   return items;
+}
+
+// ---------- API wallets ----------
+
+function walletStateFor(
+  health: ApiWallet["health"],
+  hasBalance: boolean,
+): FloatingWalletState {
+  switch (health) {
+    case "live":
+      // A "live" wallet without a balance states nothing: the only honest
+      // presentation is unavailable, never a fabricated $0.00.
+      return hasBalance ? "healthy" : "unavailable";
+    case "stale":
+      return "stale";
+    case "cooldown":
+      return "cooldown";
+    case "error":
+      return "error";
+    case "unavailable":
+    case "unknown":
+      return "unavailable";
+  }
+}
+
+function walletStatusLabel(
+  state: FloatingWalletState,
+  httpStatus: number | undefined,
+): string {
+  switch (state) {
+    case "healthy":
+      return "Live";
+    case "stale":
+      return "Stale";
+    case "cooldown":
+      return "Cooling down";
+    case "error":
+      return httpStatus === 429 ? "Rate limited" : "Refresh failed";
+    case "unavailable":
+      return "Unavailable";
+  }
+}
+
+/**
+ * Map one wire wallet entry to its floating presentation. The balance is
+ * carried only when it is a finite, non-negative upstream number; anything
+ * else becomes null and is shown as unavailable. A real $0.00 survives
+ * unchanged because zero is a valid balance, not missing data.
+ */
+export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
+  const balance =
+    typeof wallet.remainingUsd === "number" &&
+    Number.isFinite(wallet.remainingUsd) &&
+    wallet.remainingUsd >= 0
+      ? wallet.remainingUsd
+      : null;
+  const checkedAt =
+    wallet.checkedAt && !Number.isNaN(Date.parse(wallet.checkedAt))
+      ? wallet.checkedAt
+      : null;
+  const state = walletStateFor(wallet.health, balance !== null);
+  return {
+    id: wallet.id,
+    name: wallet.name,
+    state,
+    remainingUsd: balance,
+    checkedAt,
+    ...(wallet.identity ? { identity: wallet.identity } : {}),
+    ...(wallet.error ? { error: wallet.error } : {}),
+    ...(wallet.errorCategory ? { errorCategory: wallet.errorCategory } : {}),
+    ...(wallet.errorHttpStatus !== undefined
+      ? { errorHttpStatus: wallet.errorHttpStatus }
+      : {}),
+    statusLabel: walletStatusLabel(state, wallet.errorHttpStatus),
+  };
+}
+
+/** Wallet items in snapshot order, one per id. */
+export function floatingWalletItems(
+  wallets: readonly ApiWallet[],
+): FloatingWalletItem[] {
+  const items: FloatingWalletItem[] = [];
+  const seen = new Set<string>();
+  for (const wallet of wallets) {
+    const id = wallet.id?.trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    items.push(floatingWalletItem({ ...wallet, id }));
+  }
+  return items;
+}
+
+/**
+ * The money readout, always two decimals. Null means the slot and card must
+ * say "balance unavailable" — the one thing they never do is claim $0.00.
+ */
+export function floatingWalletBalanceText(
+  item: FloatingWalletItem,
+): string | null {
+  if (
+    item.remainingUsd === null ||
+    !Number.isFinite(item.remainingUsd) ||
+    item.remainingUsd < 0
+  ) {
+    return null;
+  }
+  return `$${item.remainingUsd.toFixed(2)}`;
+}
+
+/**
+ * Spoken label for the wallet slot: name, balance (or the unavailable
+ * phrase), and status. The slot itself never prints a dollar figure, so this
+ * is where assistive tech gets the number.
+ */
+export function floatingWalletLabel(item: FloatingWalletItem): string {
+  const balance = floatingWalletBalanceText(item);
+  const parts = [
+    `${item.name} API wallet`,
+    balance ? `${balance} remaining` : "balance unavailable",
+    item.statusLabel,
+  ];
+  return parts.join(", ");
 }

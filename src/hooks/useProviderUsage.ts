@@ -33,6 +33,10 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
   // Optimistic loading for a just-requested cycle; the runtime's
   // cycle-started/snapshot events take over from there.
   const [requested, setRequested] = useState(false);
+  // Wallet refreshes share the runtime cycle, but their own busy state is
+  // kept separate: a wallet request must not make the provider surfaces
+  // look like they are fetching.
+  const [walletRequested, setWalletRequested] = useState(false);
   // Reference point for the stale readout before any successful cycle.
   const [attachAt] = useState(() => Date.now());
   const [now, setNow] = useState(() => Date.now());
@@ -43,6 +47,9 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
     lastSeqRef.current = next.seq;
     setSnapshot(next);
     if (!next.cycleInFlight) setRequested(false);
+    // Every snapshot closes the optimistic wallet span: the wallet jobs run
+    // inside that cycle and publish their result with it.
+    setWalletRequested(false);
   }, []);
 
   useEffect(() => {
@@ -114,6 +121,17 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
     });
   }, []);
 
+  // Manual wallet refresh. The Rust runtime coalesces it with the one
+  // provider cycle; this hook only marks the wallet action busy.
+  const refreshWallet = useCallback(() => {
+    if (!isRunningInTauri()) return;
+    setWalletRequested(true);
+    void invoke("request_wallet_refresh").catch((error) => {
+      console.error("Failed to request a wallet refresh", error);
+      setWalletRequested(false);
+    });
+  }, []);
+
   // Wall clock for the relative "stale" age in the footer.
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
@@ -121,6 +139,7 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
   }, []);
 
   const usages = snapshot?.providers ?? [];
+  const wallets = snapshot?.wallets ?? [];
   // Loading spans a whole chain: from the request (or the runtime's
   // cycle-started event) until the closing snapshot of the chain.
   const loading = snapshot === null ? isRunningInTauri() : snapshot.cycleInFlight || requested;
@@ -145,9 +164,12 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
 
   return {
     usages,
+    wallets,
     loading,
     lastUpdatedAt,
     refresh,
+    refreshWallet,
+    walletRefreshing: walletRequested,
     refreshOverdue,
     stale,
     staleMinutes,
