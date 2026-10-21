@@ -12,6 +12,9 @@
   commit `d640f052762e409461746b6ee7e2538c641a3b77`, annotated tag `v0.8.14`,
   published in `datawarsaw/limitscope-releases`. See
   `docs/release-verification-v0.8.14.md`.
+- API Wallets Phase 1 (OpenRouter) candidate on
+  `codex/api-wallets-openrouter-phase1`: a real prepaid USD balance beside the
+  quota providers. Awaiting Human Acceptance; no release is claimed.
 - Technical baseline for the release: `67c2df3e6e37d48e4c329a06c9465116d5c0d460`.
 - Integrated branch: `codex/v0.8.14-opendesign`, merged as PR #16.
 - Historical dirty checkout `C:/AI/Token_Monitor` is outside the mutation scope.
@@ -28,6 +31,12 @@
   reset is invented. See `docs/opendesign-provider.md`.
 - Existing providers, ZCode Reset Cards, OpenCode Go and signing infrastructure
   retain their established behavior. Z.ai `unexpected_response` is out of scope.
+- Prepaid API wallets are a separate snapshot list (`wallets`), not providers:
+  no percentages, reset windows or period, and they never enter quota history,
+  prediction or notifications. OpenRouter reads the official credits endpoint
+  with the OpenCode auth entry; the key never leaves the process.
+- The compact wallet slot adds 44 px beside the unchanged provider meters
+  (revealed bar 646 px). The resting dock stays 600 px and shows meters only.
 
 ## Evidence and limits
 
@@ -37,6 +46,10 @@
   2026-10-18: 17 PASS / 0 FAIL.
 - Focused provider/component tests cover window selection, reset text,
   missing/stale/error states, explicit refresh and provider compatibility.
+- Wallet candidate verified on 2026-10-21 at `0e829c0`: frontend 1156 PASS;
+  Rust 875 PASS / 16 intentionally ignored live probes; `npm run build` PASS;
+  `npm run scan:secrets` PASS. Native Tauri visuals and a live authenticated
+  OpenRouter balance remain Human Acceptance checks.
 - Authenticated OpenDesign validation requires the user-owned Plan & balance
   page in Chrome. Agent validation is separate from Human Acceptance, which the
   operator recorded against the candidate SHA before the release.
