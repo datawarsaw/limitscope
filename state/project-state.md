@@ -38,9 +38,19 @@
   prediction or notifications. OpenRouter reads the official credits endpoint
   with the OpenCode auth entry; the key never leaves the process.
 - The compact wallet slot adds 44 px beside the unchanged provider meters
-  (revealed bar 646 px). The resting dock stays 600 px and shows meters only.
-  The floating window's declared native maximum is 646 px, matching that
-  widest layout; a regression test pins the two together.
+  (revealed bar 646 px). The floating window's declared native maximum is
+  646 px, matching that widest layout; a regression test pins the two
+  together.
+- The resting dock has no width of its own: it takes the active bar's width
+  for the same visible providers and the same wallet slot, so resting,
+  revealed and pinned share one footprint and the resting meters sit exactly
+  on the revealed bar's meters. The dock shows meters only, plus one wallet
+  status DOT in the revealed bar's own wallet slot — a wallet is an absolute
+  money balance, so it never gets a meter, a fill, or a percentage.
+- The floating bar's Grok detail card shows the runtime's passive Grok Bot
+  observation — the same one the main dashboard renders — so both surfaces
+  describe one pool from one source. The manual accessibility read stays the
+  explicit fallback and never displaces a live passive reading.
 
 ## Evidence and limits
 
