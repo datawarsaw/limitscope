@@ -8,6 +8,11 @@
 
 ## Current status
 
+- v0.8.16 released: the combined floating-experience, monitor-recovery,
+  DeepSeek-wallet and MiniMax-quota work is on `main`. Release commit
+  `c597bc1f318bc9227bc64b48087b61ecb89dd31b`, annotated tag `v0.8.16`, published
+  in `datawarsaw/limitscope-releases` as the live stable release. See
+  `docs/release-verification-v0.8.16.md`.
 - v0.8.15 released: API Wallets Phase 1 (OpenRouter prepaid balance) is on
   `main`. Release commit `c048d9ac0b1ec0c9e43ff44ec929ed08d8a9809c`, annotated
   tag `v0.8.15`, published in `datawarsaw/limitscope-releases` as the live
@@ -18,7 +23,10 @@
   `docs/release-verification-v0.8.14.md`.
 - API Wallets Phase 1 merged as PR #18, merge commit
   `feaff647f8f6fd6c3ad0115129c4a6a614464311`.
-- Technical baseline for the release: `feaff647f8f6fd6c3ad0115129c4a6a614464311`.
+- The combined v0.8.16 candidate merged as PR #19, merge commit
+  `0a984dced406933007b4074fad1529c4d60dd629`, carrying the identical tree of
+  the accepted candidate `404ad731847ab0c95c6518b8a36ce8012788d70a`.
+- Technical baseline for the release: `0a984dced406933007b4074fad1529c4d60dd629`.
 - Historical dirty checkout `C:/AI/Token_Monitor` is outside the mutation scope.
 
 ## Architecture and boundaries
@@ -79,6 +87,15 @@
   signature were re-downloaded after publication and re-hashed; both match
   the run manifest, and `minisign-verify 0.2.5` with `allow_legacy=false`
   passes against the published installer.
+- Release integrity verification on 2026-10-22 for v0.8.16: 18 PASS / 0 FAIL
+  (1 skipped: local worktree cleanliness). The published installer and
+  signature were re-downloaded after publication and re-hashed; both match
+  the run manifest, and `minisign-verify 0.2.5` with `allow_legacy=false`
+  passes against the published installer.
+- The MiniMax `AuthStore` derives `Debug` over the raw OAuth record. This is
+  a latent, non-blocking P2 finding tracked as Linear MIC-315; it was not
+  fixed in v0.8.16 because the release commit is version-only and no release
+  policy requires the remediation.
 - Authenticated OpenDesign validation requires the user-owned Plan & balance
   page in Chrome. Agent validation is separate from Human Acceptance, which the
   operator recorded against the candidate SHA before the release.
@@ -115,11 +132,9 @@
   live probes; frontend 1160 PASS; `cargo check --locked --all-targets` PASS;
   `npm run build` PASS; `npm run scan:secrets` PASS. See
   `docs/minimax-provider.md`.
-- Not yet done: Human Acceptance of the native Tauri surfaces, and the
-  release/integration step for the combined stable release. Phase D does not
-  merge, tag, publish, or deploy.
+- Merged and published as part of v0.8.16; see the release record below.
 
-## Combined v0.8.16 integration candidate
+## Combined v0.8.16 integration (released)
 
 - Branch `codex/v0.8.16-combined-integration`, worktree
   `C:/AI/limitscope-v0816-integration`, cut from the published v0.8.15
@@ -151,5 +166,8 @@
   phase); `npm run build` PASS; `npm run scan:secrets` PASS;
   `npm run tauri build` PASS; release integrity verifier 7 PASS / 0 FAIL /
   1 skipped.
-- Not yet done: native Windows Human Acceptance of the combined surfaces.
-  The candidate does not bump the version, tag, publish, or deploy.
+- Human Acceptance of the combined surfaces was recorded by the operator
+  (APPROVED); an independent fresh-context review of the exact candidate
+  returned PASS with no P0/P1 findings. The candidate was merged into `main`
+  as PR #19 and published as v0.8.16 — see
+  `docs/release-verification-v0.8.16.md`.
