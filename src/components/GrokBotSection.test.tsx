@@ -95,19 +95,15 @@ describe("GrokBotSection with the runtime's passive observation", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("keeps the passive observation when a manual refresh also succeeds", async () => {
-    invoke.mockResolvedValueOnce(OK_RESULT);
+  it("offers no manual read for a pool the runtime already observes", async () => {
     await renderSectionWithObservation(PASSIVE_OBSERVATION);
-    await clickRefresh();
-
-    // The runtime's current observation wins; the manual read never
-    // displaces it with a different acquisition's number.
-    const line = container.querySelector(".fq-grokbot-line")!;
-    expect(line.textContent).toContain("82% remaining");
-    expect(line.textContent).not.toContain("27% remaining");
+    // Fresh, automatically maintained data: the control would only duplicate
+    // what the card already shows.
+    expect(container.querySelector(".fq-grokbot-refresh")).toBeNull();
+    expect(invoke).not.toHaveBeenCalled();
   });
 
-  it("shows no value and no status when the observation's percentage is malformed", async () => {
+  it("shows no value and no status when the observation's percentage is malformed, keeping the manual fallback", async () => {
     await renderSectionWithObservation({
       ...PASSIVE_OBSERVATION,
       usedPercent: Number.NaN,
@@ -117,6 +113,8 @@ describe("GrokBotSection with the runtime's passive observation", () => {
     expect(container.querySelector(".fq-grokbot .fq-meter-row")).toBeNull();
     expect(container.textContent).not.toContain("0% remaining");
     expect(container.textContent).not.toContain("100% remaining");
+    // An unusable observation is exactly when the manual read can help.
+    expect(container.querySelector(".fq-grokbot-refresh")).not.toBeNull();
   });
 });
 

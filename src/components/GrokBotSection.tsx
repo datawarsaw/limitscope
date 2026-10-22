@@ -110,6 +110,12 @@ export function GrokBotSection({
       : null;
   const message = passive ? null : grokBotStatusMessage(result);
   const stale = reading !== null && effective.source !== "fresh";
+  // The manual read is the fallback for a pool the runtime could not observe.
+  // A usable passive observation is fresh by construction (the backend
+  // strips stale ones), so the explicit control would only duplicate data
+  // the card already shows. It stays mounted while its own read is in
+  // flight, so the control never vanishes under the keyboard focus.
+  const manualRefreshAvailable = passive === null || busy;
 
   return (
     <section className="fq-grokbot" aria-label="Grok Bot usage">
@@ -117,16 +123,18 @@ export function GrokBotSection({
         <span className="fq-grokbot-label">
           {passive ? grokBotLabel(passive) : "Grok Bot"}
         </span>
-        <button
-          type="button"
-          className="fq-grokbot-refresh"
-          onClick={refresh}
-          aria-disabled={busy ? true : undefined}
-          aria-busy={busy ? true : undefined}
-          aria-label="Refresh Grok Bot usage"
-        >
-          {busy ? "Refreshing…" : "Refresh"}
-        </button>
+        {manualRefreshAvailable ? (
+          <button
+            type="button"
+            className="fq-grokbot-refresh"
+            onClick={refresh}
+            aria-disabled={busy ? true : undefined}
+            aria-busy={busy ? true : undefined}
+            aria-label="Refresh Grok Bot usage"
+          >
+            {busy ? "Refreshing…" : "Refresh"}
+          </button>
+        ) : null}
       </div>
 
       {passive ? (

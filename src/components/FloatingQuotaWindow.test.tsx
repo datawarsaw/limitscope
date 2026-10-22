@@ -368,13 +368,13 @@ describe("FloatingQuotaWindow detail card interaction", () => {
   });
 
   it("pins the card without focus-scrolling the pill out of view", async () => {
-    const focusSpy = vi.spyOn(HTMLButtonElement.prototype, "focus");
+    const focusSpy = vi.spyOn(HTMLElement.prototype, "focus");
     try {
       await renderWindow();
       await click(document.querySelector('[data-provider-id="zai"]')!);
       expect(focusSpy).toHaveBeenCalledWith({ preventScroll: true });
       expect(document.activeElement).toBe(
-        document.querySelector('[role="dialog"] button'),
+        document.querySelector('[role="dialog"]'),
       );
     } finally {
       focusSpy.mockRestore();
@@ -382,7 +382,7 @@ describe("FloatingQuotaWindow detail card interaction", () => {
   });
 
   it(
-    "opens the pinned card on click, focuses Open, and Escape returns focus to the provider",
+    "opens the pinned card on click, focuses the card, and Escape returns focus to the provider",
     withFakeTimers(async () => {
       await renderWindow();
       const provider = document.querySelector<HTMLElement>(
@@ -393,12 +393,9 @@ describe("FloatingQuotaWindow detail card interaction", () => {
       await click(provider!);
       const dialog = document.querySelector('[role="dialog"]');
       expect(dialog).not.toBeNull();
-      expect(document.querySelector('[role="dialog"] button')!.textContent).toBe(
-        "Open",
-      );
-      expect(document.activeElement).toBe(
-        dialog!.querySelector("button"),
-      );
+      // The provider card has no bottom action; pinning focuses the dialog.
+      expect(dialog!.querySelector("button")).toBeNull();
+      expect(document.activeElement).toBe(dialog);
 
       await act(async () => {
         window.dispatchEvent(
@@ -918,9 +915,10 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       expect(dialog).not.toBeNull();
       expect(dialog!.getAttribute("data-wallet")).toBe("api-wallets");
       expect(dialog!.textContent).toContain("USD 12.50");
-      expect(document.activeElement).toBe(
-        dialog!.querySelector(".fq-wallet-refresh"),
-      );
+      // A live wallet is maintained by the runtime, so the card has no
+      // manual action and the dialog itself takes the pin's focus.
+      expect(dialog!.querySelector(".fq-wallet-refresh")).toBeNull();
+      expect(document.activeElement).toBe(dialog);
 
       await act(async () => {
         window.dispatchEvent(

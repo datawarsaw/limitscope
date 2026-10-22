@@ -116,7 +116,6 @@ export function FloatingProviderPopover({
   onMouseLeave,
   onFocus,
   onBlur,
-  onOpenMain,
 }: {
   item: FloatingQuotaItem;
   pinned: boolean;
@@ -128,18 +127,14 @@ export function FloatingProviderPopover({
   onMouseLeave: () => void;
   onFocus: (event: FocusEvent<HTMLDivElement>) => void;
   onBlur: (event: FocusEvent<HTMLDivElement>) => void;
-  onOpenMain: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!pinned) return;
-    // Target the footer action specifically: the Grok Bot section adds its
-    // own Refresh control above, and pinning must still land focus on Open.
-    const button = ref.current?.querySelector(".fq-actions button");
     // preventScroll: the window is sized to the card, but until that resize
     // lands a focus-driven scroll would push the pill out of the viewport —
     // the bar must stay visible no matter how tall the card is.
-    if (button instanceof HTMLButtonElement) button.focus({ preventScroll: true });
+    ref.current?.focus({ preventScroll: true });
   }, [pinned, item.providerId]);
 
   const presentation = floatingQuotaPresentation(
@@ -154,9 +149,9 @@ export function FloatingProviderPopover({
       className={"fq-popover" + (exiting ? " is-exiting" : "")}
       data-tauri-drag-region="false"
       data-provider={item.providerId}
-      data-quota={quotaColorLevel(presentation)}
       role="dialog"
       aria-label={item.name}
+      tabIndex={-1}
       style={{ "--fq-align": `${align}px` } as CSSProperties}
       onMouseEnter={onMouseEnter}
       onMouseLeave={onMouseLeave}
@@ -164,8 +159,15 @@ export function FloatingProviderPopover({
       onBlur={onBlur}
     >
       {/* Re-keyed per provider: switching segments remounts this body so the
-          swap crossfades while the card itself glides to its new anchor. */}
-      <div className="fq-card" key={item.providerId}>
+          swap crossfades while the card itself glides to its new anchor. It
+          also owns the semantic quota color: a remounted card starts at the
+          new provider's band, while a quota update inside one provider keeps
+          the same card and eases between bands. */}
+      <div
+        className="fq-card"
+        key={item.providerId}
+        data-quota={quotaColorLevel(presentation)}
+      >
         <header className="fq-popover-head">
           {/* The muted mark ties the card back to its collapsed segment; like
              on the bar, it carries identity only, never quota state. */}
@@ -261,13 +263,6 @@ export function FloatingProviderPopover({
           </footer>
         ) : null}
 
-        {/* Open is the footer action; manual sources own their explicit
-            Refresh controls above. Pin/hide stay in the context menu. */}
-        <div className="fq-actions">
-          <button type="button" onClick={onOpenMain}>
-            Open
-          </button>
-        </div>
       </div>
     </div>
   );

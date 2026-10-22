@@ -99,19 +99,15 @@ describe("FloatingWalletsPopover", () => {
     expect(dialog().textContent).toContain("Stale");
   });
 
-  it("explains a rate-limit cooldown and disables the wallet action", async () => {
-    const props = await renderPopover({
+  it("explains a rate-limit cooldown and offers no action that would fail", async () => {
+    await renderPopover({
       items: [item({ state: "cooldown", statusLabel: "Cooling down" })],
     });
     expect(dialog().textContent).toContain("Cooling down");
     expect(dialog().textContent).toContain("Cooling down: the last check hit");
     expect(dialog().textContent).toContain("OpenRouter");
-    expect(refreshButton().disabled).toBe(true);
-    expect(
-      refreshButton().getAttribute("aria-describedby"),
-    ).toBeTruthy();
-    await click(refreshButton());
-    expect(props.onRefresh).not.toHaveBeenCalled();
+    // No supported read exists until the rate limit clears.
+    expect(dialog().querySelector(".fq-wallet-refresh")).toBeNull();
   });
 
   it("shows a 429 as rate limited and never retries the action", async () => {
@@ -188,8 +184,8 @@ describe("FloatingWalletsPopover", () => {
     expect(text).toContain("USD 12.50");
     expect(text).toContain("DeepSeek");
     expect(text).toContain("CNY 110.00");
-    // The card has exactly one shared refresh action.
-    expect(dialog().querySelectorAll(".fq-wallet-refresh")).toHaveLength(1);
+    // Both wallets are fresh, so the card offers no manual action at all.
+    expect(dialog().querySelectorAll(".fq-wallet-refresh")).toHaveLength(0);
     expect(dialog().querySelectorAll(".fq-wallet-section")).toHaveLength(2);
   });
 
@@ -233,16 +229,48 @@ describe("FloatingWalletsPopover", () => {
   });
 
   it("refreshes only through its own action and shows the in-flight state", async () => {
-    const props = await renderPopover();
+    const stale = { state: "stale" as const, statusLabel: "Stale" };
+    const props = await renderPopover({ items: [item(stale)] });
     expect(refreshButton().textContent).toBe("Refresh");
     expect(refreshButton().disabled).toBe(false);
     await click(refreshButton());
     expect(props.onRefresh).toHaveBeenCalledTimes(1);
 
-    await renderPopover({ busy: true });
+    await renderPopover({ items: [item(stale)], busy: true });
     expect(refreshButton().textContent).toBe("Refreshing…");
     expect(refreshButton().disabled).toBe(true);
     expect(refreshButton().getAttribute("aria-busy")).toBe("true");
+  });
+
+  it("hides the shared Refresh while the runtime's data is fresh", async () => {
+    await renderPopover();
+    expect(dialog().querySelector(".fq-wallet-refresh")).toBeNull();
+    // The freshness stamp stays: only the redundant action is gone.
+    expect(dialog().textContent).toContain("Checked ");
+  });
+
+  it("keeps the Refresh for a wallet the runtime could not read", async () => {
+    const props = await renderPopover({
+      items: [
+        item({
+          state: "unavailable",
+          balances: [],
+          checkedAt: null,
+          statusLabel: "Unavailable",
+        }),
+      ],
+    });
+    expect(refreshButton().disabled).toBe(false);
+    await click(refreshButton());
+    expect(props.onRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders no Refresh when the surface has no acquisition handler", async () => {
+    await renderPopover({
+      items: [item({ state: "stale", statusLabel: "Stale" })],
+      onRefresh: undefined,
+    });
+    expect(dialog().querySelector(".fq-wallet-refresh")).toBeNull();
   });
 
   it("keeps the masked credential identity muted in the footer", async () => {
@@ -252,8 +280,11 @@ describe("FloatingWalletsPopover", () => {
     expect(footer!.textContent).toContain("credential: key:1234");
   });
 
-  it("moves focus to Refresh when pinned and to the card when it is disabled", async () => {
-    await renderPopover({ pinned: true });
+  it("moves focus to Refresh when the card has an action and to the card otherwise", async () => {
+    await renderPopover({
+      pinned: true,
+      items: [item({ state: "stale", statusLabel: "Stale" })],
+    });
     expect(document.activeElement).toBe(refreshButton());
 
     await renderPopover({

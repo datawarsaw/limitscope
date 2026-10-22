@@ -71,7 +71,7 @@ describe("first-class OpenDesign presentation", () => {
     expect(invoke).not.toHaveBeenCalled();
   });
   it("renders the same long-term window and both reset strings in the floating detail", async () => {
-    await render(<FloatingProviderPopover item={floatingQuotaItems([usage])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} onOpenMain={() => {}} />);
+    await render(<FloatingProviderPopover item={floatingQuotaItems([usage])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.querySelector(".fq-value-num")?.textContent).toBe("91%");
     expect(container.querySelector(".fq-primary-reset")?.textContent).toContain("7-day · At observation: Resets in 6 days 14 hr");
     expect(container.textContent).toContain("At observation: Resets in 39 min");
