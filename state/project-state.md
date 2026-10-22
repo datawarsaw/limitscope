@@ -118,3 +118,38 @@
 - Not yet done: Human Acceptance of the native Tauri surfaces, and the
   release/integration step for the combined stable release. Phase D does not
   merge, tag, publish, or deploy.
+
+## Combined v0.8.16 integration candidate
+
+- Branch `codex/v0.8.16-combined-integration`, worktree
+  `C:/AI/limitscope-v0816-integration`, cut from the published v0.8.15
+  baseline `9ac6fe7fb6fb7ccebd081d79106d8e175e9a2110` (= `origin/main`).
+  All four phases share that baseline as their merge base.
+- Four `--no-ff` merges preserve each phase's provenance as a second parent:
+  Phase A `a3bb6a6` (`codex/floating-dock-phase-a`), Phase B `50ac9bf`
+  (`codex/monitor-recovery`), Phase C `0d01380`
+  (`codex/deepseek-api-wallet`), Phase D `919f41e`
+  (`codex/minimax-quota-phase-d`). All four commits are ancestors of the
+  integration head.
+- Three real conflicts, all resolved by preserving both phases' behavior:
+  `src/lib/floatingQuota.ts` (import union — Phase A's `GrokBotUsage` /
+  `grokBotFor` with Phase C's wallet model),
+  `src/components/FloatingQuotaWindow.test.tsx` (Phase A's dock-dot
+  assertions rewritten onto Phase C's shared-wallet vocabulary), and
+  `src-tauri/src/runtime.rs` (import union — Phase C's `WalletAmount` with
+  Phase D's `minimax_token_plan`).
+- One integration defect fixed beyond the textual conflicts: the resting
+  dock's wallet dot read `wallets[0]`, which is Phase A's single-wallet
+  model. Phase C replaced it with ONE shared wallet slot covering every
+  wallet, so the dot now uses `floatingWalletSlotState` /
+  `floatingWalletSlotLabel` — the same aggregate state and spoken label the
+  revealed slot uses. The two placements can no longer disagree.
+- Verified on 2026-10-22 at `030dde91e10b7a22c9f57e92240520bd70297804`:
+  frontend 1257 PASS (71 files); Rust 966 PASS / 18 intentionally ignored
+  live probes; `cargo check --locked --all-targets` PASS (3 pre-existing
+  dead-code warnings in `zcode_reset` / `zcode_plans`, untouched by every
+  phase); `npm run build` PASS; `npm run scan:secrets` PASS;
+  `npm run tauri build` PASS; release integrity verifier 7 PASS / 0 FAIL /
+  1 skipped.
+- Not yet done: native Windows Human Acceptance of the combined surfaces.
+  The candidate does not bump the version, tag, publish, or deploy.
