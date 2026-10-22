@@ -68,6 +68,25 @@ repository secrets configured under GitHub Actions:
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Decryption password for the minisign private key. |
 | `RELEASES_PAT` | Fine-grained GitHub Personal Access Token scoped strictly to **Contents: Read and write** on `datawarsaw/limitscope-releases` only. It does not need access to the source repository. |
 
+## Workflow Supply-Chain Controls
+
+The release workflow treats third-party actions as executable code:
+
+- Every `uses:` reference is pinned to a full commit SHA, with the upstream
+  release tag recorded in a trailing comment. The Rust toolchain action is
+  pinned to the commit behind its `stable` branch and explicitly installs
+  Rust 1.98.1, matching the version used for local development.
+- The workflow and its single job set `permissions: contents: read`. The
+  workflow `GITHUB_TOKEN` cannot write repository contents or create releases.
+- Publication to `datawarsaw/limitscope-releases` uses `RELEASES_PAT`, which
+  is scoped to `contents:write` on that companion repository only.
+- Secrets are injected only into the steps that consume them. The signing key
+  and password are present only in the Tauri build step; the PAT is present in
+  the early configuration check and the publication and post-publication
+  verification steps. Values are never printed.
+- Checkout does not persist the workflow token in `.git/config`, so build and
+  test steps cannot reuse it for later Git operations.
+
 ## Atomic Release Publication Ordering
 
 To prevent installed clients from fetching an update feed that points to
