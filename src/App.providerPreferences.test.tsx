@@ -72,6 +72,14 @@ function standardUsages(): ProviderUsage[] {
       name: 'Grok (xAI)',
       limits: [{ label: 'Weekly', usedPercent: 96 }],
     }),
+    usage({
+      id: 'minimax-token-plan',
+      name: 'MiniMax Token Plan',
+      limits: [
+        { label: '5-hour', usedPercent: 62 },
+        { label: 'Weekly', usedPercent: 18 },
+      ],
+    }),
   ];
 }
 
@@ -108,7 +116,21 @@ describe('provider presentation preferences', () => {
       'Show OpenCode Go in the dashboard',
       'Show Google Antigravity in the dashboard',
       'Show Grok (xAI) in the dashboard',
+      'Show MiniMax Token Plan in the dashboard',
     ]);
+  });
+
+  it('hides the MiniMax Token Plan after the subscription expires', () => {
+    // The one-month subscription is a temporary arrangement: hiding the
+    // provider must be a single switch, and hiding it must not stop the
+    // runtime from refreshing it (history and notifications continue).
+    render(<App />);
+    expandDrawer();
+    fireEvent.click(
+      screen.getByRole('switch', { name: 'Show MiniMax Token Plan in the dashboard' }),
+    );
+    expect(screen.queryByRole('tab', { name: /MiniMax/ })).toBeNull();
+    expect(storedPrefs().hidden).toEqual(['minimax-token-plan']);
   });
 
   it('hides a provider from the main navigation and persists the choice', () => {
@@ -116,14 +138,20 @@ describe('provider presentation preferences', () => {
     expandDrawer();
     fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the dashboard' }));
     expect(screen.queryByRole('tab', { name: /Grok/ })).toBeNull();
-    expect(railNames()).toHaveLength(4);
+    expect(railNames()).toHaveLength(5);
     expect(storedPrefs().hidden).toEqual(['grok']);
   });
 
   it('refuses to hide the final visible provider with feedback', () => {
     render(<App />);
     expandDrawer();
-    const names = ['OpenAI / Codex', 'Z.ai', 'OpenCode Go', 'Google Antigravity'];
+    const names = [
+      'OpenAI / Codex',
+      'Z.ai',
+      'OpenCode Go',
+      'Google Antigravity',
+      'MiniMax Token Plan',
+    ];
     for (const name of names) {
       fireEvent.click(screen.getByRole('switch', { name: 'Show ' + name + ' in the dashboard' }));
     }
@@ -148,7 +176,9 @@ describe('provider presentation preferences', () => {
     render(<App />);
     expandDrawer();
     const moveFirstUp = screen.getByRole('button', { name: 'Move Codex up' }) as HTMLButtonElement;
-    const moveLastDown = screen.getByRole('button', { name: 'Move Grok down' }) as HTMLButtonElement;
+    const moveLastDown = screen.getByRole('button', {
+      name: 'Move MiniMax down',
+    }) as HTMLButtonElement;
     expect(moveFirstUp.disabled).toBe(true);
     expect(moveLastDown.disabled).toBe(true);
   });

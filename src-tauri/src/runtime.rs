@@ -95,6 +95,7 @@ use crate::opendesign::{self, OpenDesignRefresh, OpenDesignStatus};
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
+use crate::minimax_token_plan::{self, MiniMaxUsage};
 use crate::wallet::{self, WalletBalance};
 use crate::zai::{self, ZaiUsage};
 use crate::zcode_plans::{self, ZCodePlansObservation};
@@ -540,6 +541,7 @@ pub enum ProviderKind {
     Antigravity,
     Grok,
     QwenTokenPlan,
+    MiniMaxTokenPlan,
     OpenDesign,
 }
 
@@ -552,6 +554,7 @@ impl ProviderKind {
             ProviderKind::Antigravity => "antigravity",
             ProviderKind::Grok => "grok",
             ProviderKind::QwenTokenPlan => "qwen-token-plan",
+            ProviderKind::MiniMaxTokenPlan => "minimax-token-plan",
             ProviderKind::OpenDesign => "opendesign",
         }
     }
@@ -564,6 +567,7 @@ impl ProviderKind {
             ProviderKind::Antigravity => "Google Antigravity",
             ProviderKind::Grok => "Grok (xAI)",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan",
+            ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan",
             ProviderKind::OpenDesign => "OpenDesign",
         }
     }
@@ -576,6 +580,7 @@ impl ProviderKind {
             "antigravity" => Some(ProviderKind::Antigravity),
             "grok" => Some(ProviderKind::Grok),
             "qwen-token-plan" => Some(ProviderKind::QwenTokenPlan),
+            "minimax-token-plan" => Some(ProviderKind::MiniMaxTokenPlan),
             "opendesign" => Some(ProviderKind::OpenDesign),
             _ => None,
         }
@@ -589,6 +594,7 @@ impl ProviderKind {
             ProviderKind::Antigravity => "Google Antigravity usage could not be fetched.",
             ProviderKind::Grok => "Grok usage could not be fetched.",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan usage could not be fetched.",
+            ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan usage could not be fetched.",
             ProviderKind::OpenDesign => "OpenDesign usage could not be read.",
         }
     }
@@ -1161,6 +1167,55 @@ fn normalize_qwen_token_plan(
     }
 }
 
+/// The MiniMax collector reports the subscription's own windows: the
+/// five-hour pool and the weekly pool, both converted to used percent by the
+/// adapter. The account attribution names the shared plan and carries the
+/// masked key hint, so the card can prove which subscription the numbers
+/// belong to without any secret material crossing the boundary.
+fn normalize_minimax_token_plan(
+    result: Result<MiniMaxUsage, ProviderError>,
+    now_ms: i64,
+) -> Result<ProviderUsageDto, ProviderFailure> {
+    match result {
+        Ok(usage) => {
+            let limits = limits_from(
+                &usage
+                    .limits
+                    .iter()
+                    .map(|limit| {
+                        (
+                            limit.label.clone(),
+                            limit.used_percent,
+                            limit.reset_at.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                now_ms,
+            );
+            let health = if limits.is_empty() {
+                ProviderHealth::Unknown
+            } else {
+                ProviderHealth::Live
+            };
+            let mut dto = base_usage(ProviderKind::MiniMaxTokenPlan, health, limits);
+            dto.plan_type = Some("token-plan".to_string());
+            dto.account = Some(AccountAttributionDto {
+                label: "MiniMax Token Plan".to_string(),
+                note: Some(
+                    "Subscription quota from the official MiniMax endpoint. Five-hour and weekly windows."
+                        .to_string(),
+                ),
+                identity: usage
+                    .account
+                    .as_ref()
+                    .map(|account| format!("minimax-token-plan:key:{}", account.key_hint)),
+            });
+            Ok(dto)
+        }
+        Err(error) => Err(failure_from_provider_error(error)),
+    }
+}
+
 /// OpenDesign's collector owns the only UIA scan. The runtime merely maps
 /// its latest in-memory manual result into the common provider contract.
 /// `checked_at` and `source_updated_at` stay at the collector's observation
@@ -1373,6 +1428,18 @@ pub fn production_specs() -> Vec<ProviderSpec> {
                     let now_ms = Utc::now().timestamp_millis();
                     normalize_qwen_token_plan(
                         qwen_token_plan::get_qwen_token_plan_usage().await,
+                        now_ms,
+                    )
+                })
+            }),
+        },
+        ProviderSpec {
+            kind: ProviderKind::MiniMaxTokenPlan,
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    let now_ms = Utc::now().timestamp_millis();
+                    normalize_minimax_token_plan(
+                        minimax_token_plan::get_minimax_usage().await,
                         now_ms,
                     )
                 })
@@ -2848,7 +2915,8 @@ impl RuntimeCore {
             // success produced).
             ProviderKind::Codex | ProviderKind::Zai | ProviderKind::OpenCodeGo
             | ProviderKind::Antigravity
-            | ProviderKind::QwenTokenPlan => {
+            | ProviderKind::QwenTokenPlan
+            | ProviderKind::MiniMaxTokenPlan => {
                 self.inner
                     .lock()
                     .unwrap()
@@ -4747,13 +4815,14 @@ mod tests {
                 ProviderKind::Antigravity,
                 ProviderKind::Grok,
                 ProviderKind::QwenTokenPlan,
+                ProviderKind::MiniMaxTokenPlan,
                 ProviderKind::OpenDesign,
             ]
         );
         let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
         );
         assert!(ids.contains(&"grok"), "Grok must remain production");
         // No simulated providers: the production runtime never carries the
@@ -7036,7 +7105,7 @@ mod tests {
         let ids: Vec<&str> = production_specs().iter().map(|s| s.kind.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
         );
     }
 
@@ -7194,6 +7263,102 @@ mod tests {
     fn week_ahead_reset() -> String {
         (fixed_now() + chrono::Duration::days(7))
             .to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    // ---- MiniMax Token Plan: the runtime's view of the collector ----
+
+    fn minimax_usage(
+        limits: Vec<crate::minimax_token_plan::MiniMaxLimitWindow>,
+    ) -> crate::minimax_token_plan::MiniMaxUsage {
+        crate::minimax_token_plan::MiniMaxUsage {
+            limits,
+            account: Some(crate::minimax_token_plan::MiniMaxAccount {
+                key_hint: "mnop".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn the_minimax_normalizer_surfaces_both_windows_as_live() {
+        let usage = minimax_usage(vec![
+            crate::minimax_token_plan::MiniMaxLimitWindow {
+                label: "5-hour".to_string(),
+                used_percent: 62.0,
+                reset_at: Some(week_ahead_reset()),
+            },
+            crate::minimax_token_plan::MiniMaxLimitWindow {
+                label: "Weekly".to_string(),
+                used_percent: 18.0,
+                reset_at: Some(week_ahead_reset()),
+            },
+        ]);
+        let dto = normalize_minimax_token_plan(Ok(usage), fixed_now().timestamp_millis())
+            .expect("normalized");
+        assert_eq!(dto.id, "minimax-token-plan");
+        assert_eq!(dto.name, "MiniMax Token Plan");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.status, "ok");
+        assert_eq!(dto.limits.len(), 2);
+        assert_eq!(dto.limits[0].label, "5-hour");
+        assert!((dto.limits[0].used_percent - 62.0).abs() < 1e-9);
+        assert_eq!(dto.limits[1].label, "Weekly");
+        assert!((dto.limits[1].used_percent - 18.0).abs() < 1e-9);
+        assert_eq!(dto.plan_type.as_deref(), Some("token-plan"));
+        // The attribution names the plan and the masked key hint - never the
+        // key itself.
+        let account = dto.account.expect("account");
+        assert_eq!(account.label, "MiniMax Token Plan");
+        assert_eq!(
+            account.identity.as_deref(),
+            Some("minimax-token-plan:key:mnop")
+        );
+    }
+
+    #[test]
+    fn the_minimax_normalizer_drops_an_implausible_reset_without_touching_siblings() {
+        let usage = minimax_usage(vec![
+            crate::minimax_token_plan::MiniMaxLimitWindow {
+                label: "5-hour".to_string(),
+                used_percent: 62.0,
+                // A five-hour window cannot reset 30 days out.
+                reset_at: Some(
+                    (fixed_now() + chrono::Duration::days(30))
+                        .to_rfc3339_opts(SecondsFormat::Millis, true),
+                ),
+            },
+            crate::minimax_token_plan::MiniMaxLimitWindow {
+                label: "Weekly".to_string(),
+                used_percent: 18.0,
+                reset_at: Some(week_ahead_reset()),
+            },
+        ]);
+        let dto = normalize_minimax_token_plan(Ok(usage), fixed_now().timestamp_millis())
+            .expect("normalized");
+        assert!(dto.limits[0].reset_at.is_none());
+        assert!(dto.limits[0].reset_text.is_none());
+        assert_eq!(dto.limits[1].reset_at.as_deref(), Some(week_ahead_reset().as_str()));
+    }
+
+    #[test]
+    fn a_failed_minimax_refresh_keeps_the_structured_error_category() {
+        let error = ProviderError::new("not_entitled", "No active subscription.");
+        let failure = normalize_minimax_token_plan(Err(error), fixed_now().timestamp_millis())
+            .expect_err("failure");
+        assert_eq!(failure.code, "not_entitled");
+        assert_eq!(failure.transient, Some(false));
+    }
+
+    #[test]
+    fn the_minimax_provider_is_registered_in_the_production_registry() {
+        let ids: Vec<&str> = production_specs().iter().map(|spec| spec.kind.id()).collect();
+        assert!(ids.contains(&"minimax-token-plan"));
+        // It sits after Qwen and before OpenDesign, so the provider rail and
+        // the floating bar keep one deterministic order.
+        let position = ids.iter().position(|id| *id == "minimax-token-plan").unwrap();
+        let qwen = ids.iter().position(|id| *id == "qwen-token-plan").unwrap();
+        let opendesign = ids.iter().position(|id| *id == "opendesign").unwrap();
+        assert!(qwen < position);
+        assert!(position < opendesign);
     }
 
     // ---- reset plausibility gate: integration consequences ----

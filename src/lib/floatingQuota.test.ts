@@ -476,6 +476,51 @@ describe("floating primary quota selection", () => {
     });
   });
 
+  it("designates the MiniMax Token Plan weekly window over its 5-hour window", () => {
+    // The MiniMax subscription reports both a five-hour and a weekly pool.
+    // The weekly pool is the plan-level budget the floating bar answers
+    // "how much long-term quota do I have left?" with - never whichever
+    // window happens to be most depleted right now.
+    const items = floatingQuotaItems([
+      usage(
+        "minimax-token-plan",
+        [
+          limit("5-hour", 62, "2026-10-22T07:01:06.447Z"),
+          limit("Weekly", 18, "2026-10-29T02:01:06.447Z"),
+        ],
+        { name: "MiniMax Token Plan" },
+      ),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 18,
+      usedPercent: 18,
+      windowLabel: "Weekly",
+    });
+  });
+
+  it("keeps the MiniMax 5-hour window in the popover inventory", () => {
+    const items = floatingQuotaItems([
+      usage(
+        "minimax-token-plan",
+        [
+          limit("5-hour", 62, "2026-10-22T07:01:06.447Z"),
+          limit("Weekly", 18, "2026-10-29T02:01:06.447Z"),
+        ],
+        { name: "MiniMax Token Plan" },
+      ),
+    ]);
+
+    expect(items[0].windows.map((row) => row.label)).toEqual([
+      "5-hour",
+      "Weekly",
+    ]);
+    expect(items[0].primaryReset).toEqual({
+      label: "Weekly",
+      resetAt: "2026-10-29T02:01:06.447Z",
+    });
+  });
+
   it("keeps Antigravity's families separate: Gemini Weekly over a depleted Claude Weekly", () => {
     // The task's example shape: the Claude family is nearly exhausted while
     // the Gemini weekly pool still has 70% left. The collapsed segment speaks

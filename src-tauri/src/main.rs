@@ -13,6 +13,7 @@ mod grok_bot;
 mod history;
 mod last_good;
 mod local_data;
+mod minimax_token_plan;
 mod notifications;
 mod opencode_go;
 mod opendesign;
