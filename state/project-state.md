@@ -37,6 +37,14 @@
   no percentages, reset windows or period, and they never enter quota history,
   prediction or notifications. OpenRouter reads the official credits endpoint
   with the OpenCode auth entry; the key never leaves the process.
+- API Wallets Phase C (candidate): DeepSeek's prepaid balance joins OpenRouter
+  in the same wallet list, read from the official balance endpoint
+  (`GET https://api.deepseek.com/user/balance`). The credential is resolved
+  read-only from the OpenCodex provider config, falling back to the OpenCode
+  auth file; no credential record is created or modified. Money is carried per
+  currency (USD, CNY): amounts are never summed, converted, or read as USD
+  when they are not, and the floating bar keeps exactly one shared 44 px
+  wallet slot whose card lists every wallet with its own currency.
 - The compact wallet slot adds 44 px beside the unchanged provider meters
   (revealed bar 646 px). The floating window's declared native maximum is
   646 px, matching that widest layout; a regression test pins the two

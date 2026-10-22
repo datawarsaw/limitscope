@@ -164,14 +164,15 @@ describe("useProviderUsage (shared runtime consumer)", () => {
             name: "OpenRouter",
             health: "live",
             checkedAt: "2026-09-29T12:00:00.000Z",
-            remainingUsd: 12.5,
+            balances: [{ currency: "USD", amount: 12.5 }],
           },
         ],
       }),
     );
     expect(result.current.walletRefreshing).toBe(false);
     expect(result.current.wallets).toHaveLength(1);
-    expect(result.current.wallets[0].remainingUsd).toBe(12.5);
+    const [wallet] = result.current.wallets;
+    expect(wallet.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
   });
 
   it("the reconnect trigger only asks the shared runtime for one cycle", async () => {

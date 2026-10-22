@@ -95,7 +95,7 @@ use crate::opendesign::{self, OpenDesignRefresh, OpenDesignStatus};
 use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
-use crate::wallet::{self, WalletBalance};
+use crate::wallet::{self, WalletAmount, WalletBalance};
 use crate::zai::{self, ZaiUsage};
 use crate::zcode_plans::{self, ZCodePlansObservation};
 use crate::zcode_reset::{self, ZCodeResetStatus};
@@ -207,15 +207,60 @@ impl WalletHealth {
     }
 }
 
+/// Projects one collector balance into its wire shape.
+///
+/// The currency travels with the amount: a CNY amount is never published as
+/// a bare number that a consumer could read as dollars.
+fn wallet_balance_dto(amount: &WalletAmount) -> WalletBalanceDto {
+    WalletBalanceDto {
+        currency: amount.currency.clone(),
+        amount: amount.amount,
+        granted: amount.granted,
+        topped_up: amount.topped_up,
+    }
+}
+
+/// The USD convenience amount of a balance set: the single amount, when the
+/// wallet holds exactly one balance and that balance is in USD.
+///
+/// A wallet in another currency, or one holding several currencies, has no
+/// single USD amount — so this is `None` and no consumer can mistake a CNY
+/// balance for dollars or read a cross-currency sum.
+fn wallet_remaining_usd(balances: &[WalletAmount]) -> Option<f64> {
+    wallet::single_amount(balances, "USD")
+}
+
 impl Serialize for WalletHealth {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(self.as_str())
     }
 }
 
+/// One currency's balance inside a wallet.
+///
+/// The currency travels with the amount: a CNY amount is never published as
+/// a bare number that a consumer could read as dollars.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletBalanceDto {
+    /// ISO currency code exactly as the source reported it (`"USD"`,
+    /// `"CNY"`). Never assumed and never defaulted to USD.
+    pub currency: String,
+    /// The remaining amount in `currency`. Always finite and non-negative.
+    pub amount: f64,
+    /// The source's own breakdown of `amount`, when it reports one
+    /// (DeepSeek: the not-expired granted part). Absent means the source
+    /// states no breakdown — never a zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub granted: Option<f64>,
+    /// The topped-up part of `amount`, when the source reports one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topped_up: Option<f64>,
+}
+
 /// One prepaid wallet entry. Deliberately separate from
 /// [`ProviderUsageDto`]: no limits, no percentages, no reset clocks and no
-/// period. A missing balance is `None`, never `0.0`.
+/// period. A missing balance is absent, never `0.0`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiWalletDto {
@@ -226,6 +271,25 @@ pub struct ApiWalletDto {
     /// original stamp; an error without last-good carries no stamp.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checked_at: Option<String>,
+    /// The wallet's balances, one entry per currency, in source order.
+    ///
+    /// Currencies are never merged: a wallet holding both USD and CNY carries
+    /// two entries, and no consumer may add, average or convert them. A
+    /// wallet with no amount to state carries an empty list, never a zero.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub balances: Vec<WalletBalanceDto>,
+    /// The source's own "balance sufficient for API calls" verdict, when it
+    /// reports one (DeepSeek's `is_available`). Absent means the source makes
+    /// no such claim — never `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    /// The wallet's single USD amount, when it holds exactly one balance and
+    /// that balance is in USD.
+    ///
+    /// This is the OpenRouter-shaped convenience field. It is `None` for a
+    /// wallet in another currency or a multi-currency wallet, so a consumer
+    /// that only understands USD can never read a CNY amount as if it were
+    /// dollars, and never sees a converted total.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_usd: Option<f64>,
     /// Display-safe masked credential identity (`key:1234`). Shown in the
@@ -1392,18 +1456,32 @@ pub fn production_specs() -> Vec<ProviderSpec> {
 /// The production wallet set. One entry for OpenRouter Phase 1; the registry
 /// shape lets a later wallet be added without touching the cycle machinery.
 pub fn production_wallets() -> Vec<WalletSpec> {
-    vec![WalletSpec {
-        id: "openrouter",
-        name: "OpenRouter",
-        current_credential_binding: Arc::new(wallet::current_credential_binding),
-        fetch: Arc::new(|| {
-            Box::pin(async {
-                wallet::get_openrouter_credits()
-                    .await
-                    .map_err(failure_from_provider_error)
-            })
-        }),
-    }]
+    vec![
+        WalletSpec {
+            id: "openrouter",
+            name: "OpenRouter",
+            current_credential_binding: Arc::new(wallet::current_credential_binding),
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    wallet::get_openrouter_credits()
+                        .await
+                        .map_err(failure_from_provider_error)
+                })
+            }),
+        },
+        WalletSpec {
+            id: "deepseek",
+            name: "DeepSeek",
+            current_credential_binding: Arc::new(crate::wallet_deepseek::current_credential_binding),
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    crate::wallet_deepseek::get_deepseek_balance()
+                        .await
+                        .map_err(failure_from_provider_error)
+                })
+            }),
+        },
+    ]
 }
 
 // ---------- retry, cadence, cooldown, and last-good constants ----------
@@ -1488,7 +1566,7 @@ fn neutralize_wallet_failure(
         && !wallet::credential_bindings_match(failure.credential_binding.as_deref(), current)
     {
         credential_changed_failure(
-            "The OpenRouter credential changed during the balance refresh; the previous observation was discarded.",
+            "The wallet credential changed during the balance refresh; the previous observation was discarded.",
         )
     } else {
         failure
@@ -1514,7 +1592,9 @@ fn project_wallet_for_current_credential(
     // status code of a replaced credential would be presented as the new
     // one's state. Entries without a binding (local resolution failures)
     // describe the source the user has now and stay visible.
-    let protected = wallet.remaining_usd.is_some() || wallet.credential_binding.is_some();
+    let protected = wallet.remaining_usd.is_some()
+        || !wallet.balances.is_empty()
+        || wallet.credential_binding.is_some();
     if !protected
         || wallet::credential_bindings_match(wallet.credential_binding.as_deref(), current)
     {
@@ -1525,6 +1605,8 @@ fn project_wallet_for_current_credential(
         name: wallet.name.clone(),
         health: WalletHealth::Unknown,
         checked_at: None,
+        balances: Vec::new(),
+        available: None,
         remaining_usd: None,
         identity: None,
         credential_binding: None,
@@ -1761,6 +1843,8 @@ impl RuntimeCore {
                     name: spec.name.to_string(),
                     health: WalletHealth::Unknown,
                     checked_at: None,
+                    balances: Vec::new(),
+                    available: None,
                     remaining_usd: None,
                     identity: None,
                     credential_binding: None,
@@ -2229,7 +2313,7 @@ impl RuntimeCore {
                 ) {
                     self.reconcile_wallet_credential(spec);
                     let failure = credential_changed_failure(
-                        "The OpenRouter credential changed during the balance refresh; the previous balance was discarded.",
+                        "The wallet credential changed during the balance refresh; the previous balance was discarded.",
                     );
                     (self.apply_wallet_failure(spec, failure.clone()), Some(failure))
                 } else {
@@ -2600,6 +2684,7 @@ impl RuntimeCore {
                 .get(spec.id)
                 .is_some_and(|cached| {
                     let protected = cached.remaining_usd.is_some()
+                        || !cached.balances.is_empty()
                         || cached.credential_binding.is_some();
                     protected
                         && !wallet::credential_bindings_match(
@@ -2615,8 +2700,9 @@ impl RuntimeCore {
             // maps alone would leave the old account's money in the snapshot
             // until the in-flight refresh finishes.
             let displayed_mismatch = inner.wallets.iter().any(|wallet| {
-                let protected =
-                    wallet.remaining_usd.is_some() || wallet.credential_binding.is_some();
+                let protected = wallet.remaining_usd.is_some()
+                    || !wallet.balances.is_empty()
+                    || wallet.credential_binding.is_some();
                 wallet.id == spec.id
                     && protected
                     && !wallet::credential_bindings_match(
@@ -2631,6 +2717,8 @@ impl RuntimeCore {
                         name: spec.name.to_string(),
                         health: WalletHealth::Unknown,
                         checked_at: None,
+                        balances: Vec::new(),
+                        available: None,
                         remaining_usd: None,
                         identity: None,
                         credential_binding: None,
@@ -2692,7 +2780,13 @@ impl RuntimeCore {
             name: spec.name.to_string(),
             health: WalletHealth::Live,
             checked_at: Some(self.now_iso()),
-            remaining_usd: Some(balance.remaining_usd),
+            balances: balance
+                .balances
+                .iter()
+                .map(wallet_balance_dto)
+                .collect(),
+            available: balance.available,
+            remaining_usd: wallet_remaining_usd(&balance.balances),
             identity: balance.identity,
             credential_binding: balance.credential_binding,
             error: None,
@@ -2730,7 +2824,7 @@ impl RuntimeCore {
         let current = (spec.current_credential_binding)();
         let failure = neutralize_wallet_failure(failure, current.as_deref());
         let current = (spec.current_credential_binding)();
-        let message = failure.describe("OpenRouter balance could not be fetched.");
+        let message = failure.describe("The API wallet balance could not be fetched.");
         let error_category = if failure.code.is_empty() {
             None
         } else {
@@ -2782,6 +2876,8 @@ impl RuntimeCore {
             name: spec.name.to_string(),
             health,
             checked_at: None,
+            balances: Vec::new(),
+            available: None,
             remaining_usd: None,
             identity: failure.identity,
             credential_binding: failure.credential_binding,
@@ -3835,7 +3931,13 @@ mod tests {
         binding: Option<&str>,
     ) -> WalletBalance {
         WalletBalance {
-            remaining_usd,
+            balances: vec![WalletAmount {
+                currency: "USD".to_string(),
+                amount: remaining_usd,
+                granted: None,
+                topped_up: None,
+            }],
+            available: None,
             identity: identity.map(str::to_string),
             credential_binding: binding.map(str::to_string),
         }
@@ -9837,6 +9939,13 @@ mod tests {
             name: "OpenRouter".to_string(),
             health: WalletHealth::Stale,
             checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+            balances: vec![WalletBalanceDto {
+                currency: "USD".to_string(),
+                amount: 1.25,
+                granted: None,
+                topped_up: None,
+            }],
+            available: None,
             remaining_usd: Some(1.25),
             identity: Some("key:A1".to_string()),
             credential_binding: Some(WALLET_BINDING_A.to_string()),
@@ -9854,6 +9963,52 @@ mod tests {
             wire.get("identity").and_then(|value| value.as_str()),
             Some("key:A1")
         );
+        assert!(!wire.to_string().contains("key:sha256:"));
+    }
+
+    #[test]
+    fn a_multi_currency_wallet_serializes_its_currencies_and_never_a_usd_total() {
+        let dto = ApiWalletDto {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            health: WalletHealth::Live,
+            checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+            balances: vec![
+                WalletBalanceDto {
+                    currency: "USD".to_string(),
+                    amount: 12.5,
+                    granted: None,
+                    topped_up: None,
+                },
+                WalletBalanceDto {
+                    currency: "CNY".to_string(),
+                    amount: 110.0,
+                    granted: Some(10.0),
+                    topped_up: Some(100.0),
+                },
+            ],
+            available: Some(true),
+            // A multi-currency wallet has no single USD amount, so the
+            // convenience field is absent rather than a cross-currency sum.
+            remaining_usd: None,
+            identity: Some("key:A1".to_string()),
+            credential_binding: Some(WALLET_BINDING_A.to_string()),
+            error: None,
+            error_category: None,
+            error_http_status: None,
+        };
+        let wire = serde_json::to_value(&dto).unwrap();
+        assert!(wire.get("remainingUsd").is_none(), "no combined total");
+        assert_eq!(wire["available"], serde_json::json!(true));
+        let balances = wire["balances"].as_array().expect("the balances");
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0]["currency"], "USD");
+        assert_eq!(balances[0]["amount"], 12.5);
+        assert_eq!(balances[1]["currency"], "CNY");
+        assert_eq!(balances[1]["amount"], 110.0);
+        assert_eq!(balances[1]["granted"], 10.0);
+        assert_eq!(balances[1]["toppedUp"], 100.0);
+        // The credential binding never reaches the wire.
         assert!(!wire.to_string().contains("key:sha256:"));
     }
 
@@ -10014,6 +10169,13 @@ mod tests {
                 name: "OpenRouter".to_string(),
                 health: WalletHealth::Live,
                 checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+                balances: vec![WalletBalanceDto {
+                    currency: "USD".to_string(),
+                    amount: 21.0,
+                    granted: None,
+                    topped_up: None,
+                }],
+                available: None,
                 remaining_usd: Some(21.0),
                 identity: Some("key:A1".to_string()),
                 credential_binding: Some(WALLET_BINDING_A.to_string()),
@@ -10056,5 +10218,161 @@ mod tests {
         drop(core);
         drop(store);
         remove_wallet_store(&path);
+    }
+
+    // ---- multi-currency wallets and cross-wallet isolation ----
+
+    /// A balance holding several currencies, as a per-currency source
+    /// reports it.
+    fn multi_currency_balance(
+        balances: &[(&str, f64)],
+        binding: Option<&str>,
+    ) -> WalletBalance {
+        WalletBalance {
+            balances: balances
+                .iter()
+                .map(|(currency, amount)| WalletAmount {
+                    currency: (*currency).to_string(),
+                    amount: *amount,
+                    granted: None,
+                    topped_up: None,
+                })
+                .collect(),
+            available: Some(true),
+            identity: Some("key:A1".to_string()),
+            credential_binding: binding.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_multi_currency_wallet_publishes_each_currency_separately() {
+        let (core, _clock) = manual_clock_core_with_wallets(
+            vec![],
+            vec![counting_wallet(
+                "deepseek",
+                "DeepSeek",
+                wallet_credential(Some(WALLET_BINDING_A)),
+                Arc::new(AtomicUsize::new(0)),
+                |_| Ok(multi_currency_balance(&[("USD", 12.5), ("CNY", 110.0)], Some(WALLET_BINDING_A))),
+            )],
+        );
+
+        core.run_cycle().await;
+        let wallet = &core.snapshot().wallets[0];
+        assert_eq!(wallet.health, WalletHealth::Live);
+        assert_eq!(wallet.balances.len(), 2);
+        assert_eq!(wallet.balances[0].currency, "USD");
+        assert_eq!(wallet.balances[0].amount, 12.5);
+        assert_eq!(wallet.balances[1].currency, "CNY");
+        assert_eq!(wallet.balances[1].amount, 110.0);
+        // A wallet with several currencies has no single USD amount: the
+        // convenience field must not become a cross-currency total.
+        assert_eq!(wallet.remaining_usd, None);
+        assert_eq!(wallet.available, Some(true));
+    }
+
+    #[tokio::test]
+    async fn a_cny_only_wallet_never_publishes_a_usd_amount() {
+        let (core, _clock) = manual_clock_core_with_wallets(
+            vec![],
+            vec![counting_wallet(
+                "deepseek",
+                "DeepSeek",
+                wallet_credential(Some(WALLET_BINDING_A)),
+                Arc::new(AtomicUsize::new(0)),
+                |_| Ok(multi_currency_balance(&[("CNY", 110.0)], Some(WALLET_BINDING_A))),
+            )],
+        );
+
+        core.run_cycle().await;
+        let wallet = &core.snapshot().wallets[0];
+        assert_eq!(wallet.balances.len(), 1);
+        assert_eq!(wallet.balances[0].currency, "CNY");
+        // No CNY amount is ever published as a USD amount.
+        assert_eq!(wallet.remaining_usd, None);
+    }
+
+    #[tokio::test]
+    async fn two_wallets_keep_their_own_balances_and_never_leak_into_each_other() {
+        let openrouter = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            Arc::new(AtomicUsize::new(0)),
+            |_| Ok(wallet_balance(40.0, Some("key:A1"), Some(WALLET_BINDING_A))),
+        );
+        let deepseek = counting_wallet(
+            "deepseek",
+            "DeepSeek",
+            wallet_credential(Some(WALLET_BINDING_B)),
+            Arc::new(AtomicUsize::new(0)),
+            |_| Ok(multi_currency_balance(&[("CNY", 110.0)], Some(WALLET_BINDING_B))),
+        );
+        let (core, _clock) =
+            manual_clock_core_with_wallets(vec![], vec![openrouter, deepseek]);
+
+        core.run_cycle().await;
+        let wallets = &core.snapshot().wallets;
+        assert_eq!(wallets.len(), 2);
+        let first = &wallets[0];
+        let second = &wallets[1];
+        assert_eq!(first.id, "openrouter");
+        assert_eq!(first.remaining_usd, Some(40.0));
+        assert_eq!(first.balances.len(), 1);
+        assert_eq!(first.balances[0].currency, "USD");
+        assert_eq!(second.id, "deepseek");
+        assert_eq!(second.remaining_usd, None);
+        assert_eq!(second.balances.len(), 1);
+        assert_eq!(second.balances[0].currency, "CNY");
+        assert_eq!(second.balances[0].amount, 110.0);
+        // No wallet carries the other wallet's money.
+        assert_ne!(first.balances[0].currency, "CNY");
+        assert_ne!(second.balances[0].currency, "USD");
+    }
+
+    #[tokio::test]
+    async fn a_credential_rotation_evicts_only_the_rotated_wallet() {
+        let openrouter_credential = wallet_credential(Some(WALLET_BINDING_A));
+        let openrouter = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            openrouter_credential.clone(),
+            Arc::new(AtomicUsize::new(0)),
+            |_| Ok(wallet_balance(40.0, Some("key:A1"), Some(WALLET_BINDING_A))),
+        );
+        let deepseek = counting_wallet(
+            "deepseek",
+            "DeepSeek",
+            wallet_credential(Some(WALLET_BINDING_B)),
+            Arc::new(AtomicUsize::new(0)),
+            |_| Ok(multi_currency_balance(&[("CNY", 110.0)], Some(WALLET_BINDING_B))),
+        );
+        let (core, _clock) =
+            manual_clock_core_with_wallets(vec![], vec![openrouter, deepseek]);
+
+        core.run_cycle().await;
+        assert_eq!(core.snapshot().wallets[0].remaining_usd, Some(40.0));
+
+        // Only the OpenRouter credential is replaced.
+        *openrouter_credential.lock().unwrap() = Some(WALLET_BINDING_B.to_string());
+        let wallets = &core.snapshot().wallets;
+        assert_eq!(
+            wallets[0].remaining_usd, None,
+            "the rotated wallet loses its balance"
+        );
+        assert_eq!(wallets[0].health, WalletHealth::Unknown);
+        assert_eq!(
+            wallets[1].balances[0].amount, 110.0,
+            "the untouched wallet keeps its own money"
+        );
+    }
+
+    #[test]
+    fn the_wallet_registration_carries_both_prepaid_sources() {
+        let specs = production_wallets();
+        let ids: Vec<&str> = specs.iter().map(|spec| spec.id).collect();
+        assert_eq!(ids, vec!["openrouter", "deepseek"]);
+        assert_eq!(specs[0].name, "OpenRouter");
+        assert_eq!(specs[1].name, "DeepSeek");
     }
 }

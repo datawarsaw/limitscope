@@ -4,7 +4,8 @@ import {
   dockSeparatorLefts,
   dockWalletDotRect,
   FLOATING_QUOTA_PERSPECTIVE,
-  floatingWalletLabel,
+  floatingWalletSlotLabel,
+  floatingWalletSlotState,
   type FloatingWalletItem,
   type FloatingQuotaItem,
 } from "../lib/floatingQuota";
@@ -53,6 +54,11 @@ export function FloatingDockStrip({
   const rects = dockMeterRects(items.length, hasWallet);
   const separators = dockSeparatorLefts(items.length, hasWallet);
   const walletDot = dockWalletDotRect(items.length, hasWallet);
+  // The bar carries ONE shared wallet slot, whatever the number of wallets
+  // the runtime reports. The resting dot is that same slot, so it states the
+  // most consequential state among the wallets it covers and speaks the same
+  // label as the revealed slot — the two never disagree.
+  const walletState = floatingWalletSlotState(wallets);
   return (
     <div
       className={"fq-dock-strip" + (exiting ? " is-exiting" : "")}
@@ -94,15 +100,16 @@ export function FloatingDockStrip({
           </span>
         );
       })}
-      {walletDot && wallets[0] ? (
+      {walletDot && walletState ? (
         <span
           className="fq-dock-wallet-dot"
-          data-state={wallets[0].state}
-          // The same spoken contract the revealed wallet slot uses: name,
-          // balance, and status. The balance is named as a balance — never a
-          // quota percentage — and the dot itself carries no meter fill.
+          data-state={walletState}
+          // The same spoken contract the revealed wallet slot uses: every
+          // wallet's amount, each in its own currency, plus the status. The
+          // balance is named as a balance — never a quota percentage — and
+          // the dot itself carries no meter fill.
           role="img"
-          aria-label={floatingWalletLabel(wallets[0])}
+          aria-label={floatingWalletSlotLabel(wallets)}
           style={{ left: walletDot.left } as CSSProperties}
         />
       ) : null}

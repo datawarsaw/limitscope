@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
     AccountAttributionDto, ApiWalletDto, ProviderHealth, ProviderKind, ProviderSpec,
-    ProviderUsageDto, UsageLimitDto, WalletHealth, WalletSpec,
+    ProviderUsageDto, UsageLimitDto, WalletBalanceDto, WalletHealth, WalletSpec,
 };
 
 pub const LAST_GOOD_FILE_NAME: &str = "provider-last-good-v1.json";
@@ -79,7 +79,22 @@ pub struct PersistedProviderState {
 pub struct PersistedWalletState {
     pub wallet_id: String,
     pub wallet_name: String,
-    pub remaining_usd: f64,
+    /// The wallet's balances, one entry per currency, in source order.
+    /// Currencies are never merged, summed or converted.
+    ///
+    /// `None` means the entry predates the currency-aware schema and
+    /// carries only the legacy USD field; `Some(vec![])` is an explicit
+    /// statement that the wallet holds no balance. The two are different
+    /// facts and are never conflated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balances: Option<Vec<PersistedWalletBalance>>,
+    /// The source's own availability verdict, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available: Option<bool>,
+    /// The single USD amount, when the wallet holds exactly one USD balance.
+    /// Absent for a wallet in another currency or a multi-currency wallet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_usd: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
     /// Deterministic full-credential fingerprint that produced the balance.
@@ -89,6 +104,22 @@ pub struct PersistedWalletState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_binding: Option<String>,
     pub last_successful_at: String,
+}
+
+/// One persisted currency balance inside a wallet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedWalletBalance {
+    /// ISO currency code exactly as the source reported it.
+    pub currency: String,
+    /// The remaining amount in `currency`.
+    pub amount: f64,
+    /// The source's own breakdown of `amount`, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted: Option<f64>,
+    /// The topped-up part of `amount`, when the source reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topped_up: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -362,7 +393,7 @@ impl ProviderLastGoodStore {
             if age_secs > MAX_CACHE_AGE_SECS || age_secs < -FUTURE_TOLERANCE_SECS {
                 continue;
             }
-            if !persisted.remaining_usd.is_finite() || persisted.remaining_usd < 0.0 {
+            if !persisted_balances_are_valid(&persisted) {
                 continue;
             }
             // Fail closed: the balance belongs to a credential, and only an
@@ -386,7 +417,17 @@ impl ProviderLastGoodStore {
                 },
                 health: WalletHealth::Stale,
                 checked_at: Some(persisted.last_successful_at.clone()),
-                remaining_usd: Some(persisted.remaining_usd),
+                balances: effective_persisted_balances(&persisted)
+                    .iter()
+                    .map(|balance| WalletBalanceDto {
+                        currency: balance.currency.clone(),
+                        amount: balance.amount,
+                        granted: balance.granted,
+                        topped_up: balance.topped_up,
+                    })
+                    .collect(),
+                available: persisted.available,
+                remaining_usd: persisted.remaining_usd,
                 identity: persisted.identity.clone(),
                 credential_binding: persisted.credential_binding.clone(),
                 error: None,
@@ -458,10 +499,24 @@ impl ProviderLastGoodStore {
         if dto.health != WalletHealth::Live {
             return;
         }
-        let Some(balance) = dto.remaining_usd else {
+        if dto.balances.is_empty() {
             return;
+        }
+        if !dto.balances.iter().all(|balance| {
+            !balance.currency.trim().is_empty()
+                && balance.amount.is_finite()
+                && balance.amount >= 0.0
+        }) {
+            return;
+        }
+        // The USD convenience amount must agree with the persisted balances:
+        // it is derived from them, never an independent fact.
+        let derived_usd = if dto.balances.len() == 1 && dto.balances[0].currency == "USD" {
+            Some(dto.balances[0].amount)
+        } else {
+            None
         };
-        if !balance.is_finite() || balance < 0.0 {
+        if derived_usd != dto.remaining_usd {
             return;
         }
         // An observation without a credential binding cannot be proven to
@@ -477,7 +532,19 @@ impl ProviderLastGoodStore {
         let state = PersistedWalletState {
             wallet_id: dto.id.clone(),
             wallet_name: dto.name.clone(),
-            remaining_usd: balance,
+            balances: dto
+                .balances
+                .iter()
+                .map(|balance| PersistedWalletBalance {
+                    currency: balance.currency.clone(),
+                    amount: balance.amount,
+                    granted: balance.granted,
+                    topped_up: balance.topped_up,
+                })
+                .collect::<Vec<_>>()
+                .into(),
+            available: dto.available,
+            remaining_usd: dto.remaining_usd,
             identity: dto.identity.clone(),
             credential_binding: Some(credential_binding),
             last_successful_at: now_iso,
@@ -559,7 +626,7 @@ fn parse_envelope(
             for entry in entries {
                 match serde_json::from_value::<PersistedWalletState>(entry.clone()) {
                     Ok(state) if is_valid_persisted_wallet(&state) => {
-                        wallets.insert(state.wallet_id.clone(), state);
+                        wallets.insert(state.wallet_id.clone(), normalize_persisted_wallet(state));
                     }
                     _ => healthy = false,
                 }
@@ -575,10 +642,73 @@ fn is_valid_persisted_wallet(state: &PersistedWalletState) -> bool {
     if state.wallet_id.trim().is_empty() || state.wallet_name.trim().is_empty() {
         return false;
     }
-    if !state.remaining_usd.is_finite() || state.remaining_usd < 0.0 {
+    if !persisted_balances_are_valid(state) {
         return false;
     }
     DateTime::parse_from_rfc3339(&state.last_successful_at).is_ok()
+}
+
+/// Brings a persisted wallet into the canonical currency-aware shape.
+///
+/// An entry written before the schema carried only the single USD amount.
+/// It is migrated into one explicit USD balance, so the in-memory state
+/// always states its currency. The migration is a faithful restatement: the
+/// old field was explicitly USD, so it invents nothing.
+fn normalize_persisted_wallet(mut state: PersistedWalletState) -> PersistedWalletState {
+    if state.balances.is_none() {
+        state.balances = Some(effective_persisted_balances(&state));
+    }
+    state
+}
+
+/// Whether a persisted wallet carries at least one trustworthy amount.
+///
+/// Every persisted amount must be finite, non-negative and in a named
+/// currency, and the USD convenience amount must agree with the balances it
+/// was derived from. A wallet that claims a USD amount it cannot show in its
+/// balances is not verifiable and is refused.
+fn persisted_balances_are_valid(state: &PersistedWalletState) -> bool {
+    let balances = effective_persisted_balances(state);
+    if balances.is_empty() {
+        return false;
+    }
+    if !balances.iter().all(|balance| {
+        !balance.currency.trim().is_empty()
+            && balance.amount.is_finite()
+            && balance.amount >= 0.0
+    }) {
+        return false;
+    }
+    let derived_usd = if balances.len() == 1 && balances[0].currency == "USD" {
+        Some(balances[0].amount)
+    } else {
+        None
+    };
+    derived_usd == state.remaining_usd
+}
+
+/// The balances a persisted wallet actually carries.
+///
+/// An envelope written before the currency-aware schema has no `balances`
+/// list, only the single USD amount. That entry is migrated into one USD
+/// balance: the old field was explicitly USD, so the migration states
+/// nothing the file did not already say. A wallet that carries a `balances`
+/// list is never migrated — the list is authoritative, even when it is empty.
+fn effective_persisted_balances(state: &PersistedWalletState) -> Vec<PersistedWalletBalance> {
+    if let Some(balances) = &state.balances {
+        return balances.clone();
+    }
+    match state.remaining_usd {
+        Some(amount) if amount.is_finite() && amount >= 0.0 => {
+            vec![PersistedWalletBalance {
+                currency: "USD".to_string(),
+                amount,
+                granted: None,
+                topped_up: None,
+            }]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn is_valid_persisted_state(state: &PersistedProviderState) -> bool {
@@ -1611,11 +1741,7 @@ mod tests {
             current_credential_binding: Arc::new(move || binding.map(str::to_string)),
             fetch: Arc::new(|| {
                 Box::pin(async {
-                    Ok(crate::wallet::WalletBalance {
-                        remaining_usd: 0.0,
-                        identity: None,
-                        credential_binding: None,
-                    })
+                    Ok(crate::wallet::tests::usd_balance(0.0))
                 }) as crate::runtime::WalletFetchFuture
             }),
         }
@@ -1641,6 +1767,17 @@ mod tests {
             health,
             checked_at: (health == WalletHealth::Live)
                 .then(|| "2026-09-29T12:00:00.000Z".to_string()),
+            balances: remaining_usd
+                .map(|amount| {
+                    vec![WalletBalanceDto {
+                        currency: "USD".to_string(),
+                        amount,
+                        granted: None,
+                        topped_up: None,
+                    }]
+                })
+                .unwrap_or_default(),
+            available: None,
             remaining_usd,
             identity: identity.map(str::to_string),
             credential_binding: binding.map(str::to_string),
@@ -1704,6 +1841,7 @@ mod tests {
             "wallets": [{
                 "walletId": "openrouter",
                 "walletName": "OpenRouter",
+                "balances": [{ "currency": "USD", "amount": "not-a-number" }],
                 "remainingUsd": "not-a-number",
                 "lastSuccessfulAt": "2026-09-29T11:00:00Z"
             }]
@@ -1738,7 +1876,11 @@ mod tests {
         let persisted = store
             .get_persisted_wallet("openrouter")
             .expect("the live observation is cached");
-        assert_eq!(persisted.remaining_usd, 4.25);
+        assert_eq!(persisted.remaining_usd, Some(4.25));
+        let balances = persisted.balances.as_ref().expect("a written balance");
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].currency, "USD");
+        assert_eq!(balances[0].amount, 4.25);
 
         let specs = vec![mock_wallet_spec("openrouter", "OpenRouter")];
         let (wallets, last_good) = store.hydrate_wallets(&specs, fixed_now());
@@ -1794,11 +1936,72 @@ mod tests {
         let persisted = store
             .get_persisted_wallet("openrouter")
             .expect("a live zero is a real observation");
-        assert_eq!(persisted.remaining_usd, 0.0);
+        assert_eq!(persisted.remaining_usd, Some(0.0));
         assert_eq!(persisted.identity.as_deref(), Some("key:A1"));
 
         assert!(store.clear(), "the cache had entries to clear");
         assert!(store.get_persisted_wallet("openrouter").is_none());
+    }
+
+    // 24b. an envelope written before the currency-aware schema carries only
+    // the single USD amount. That entry is migrated into one USD balance
+    // rather than dropped: the old field was explicitly USD, so the
+    // migration states nothing the file did not already say.
+    #[test]
+    fn a_legacy_usd_only_wallet_entry_is_migrated_into_one_usd_balance() {
+        let dir = tempdir::temp_dir("wallet-legacy-usd");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [],
+            "wallets": [{
+                "walletId": "openrouter",
+                "walletName": "OpenRouter",
+                "remainingUsd": 7.5,
+                "identity": "key:A1",
+                "credentialBinding": TEST_WALLET_BINDING,
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        let persisted = store
+            .get_persisted_wallet("openrouter")
+            .expect("a legacy USD entry is migratable");
+        let balances = persisted.balances.as_ref().expect("a migrated balance");
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].currency, "USD");
+        assert_eq!(balances[0].amount, 7.5);
+        assert_eq!(persisted.remaining_usd, Some(7.5));
+    }
+
+    // 24c. a wallet that carries an explicit balances list is never
+    // migrated: the list is authoritative, even when it is empty.
+    #[test]
+    fn an_explicit_empty_balance_list_is_never_migrated_from_the_legacy_field() {
+        let dir = tempdir::temp_dir("wallet-empty-balances");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [],
+            "wallets": [{
+                "walletId": "openrouter",
+                "walletName": "OpenRouter",
+                "balances": [],
+                "remainingUsd": 7.5,
+                "identity": "key:A1",
+                "credentialBinding": TEST_WALLET_BINDING,
+                "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+            }]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert!(
+            store.get_persisted_wallet("openrouter").is_none(),
+            "an explicit empty balance list states no balance"
+        );
     }
 
     // 25. a persisted balance from another credential is removed before it
@@ -1965,6 +2168,7 @@ mod tests {
             "wallets": [{
                 "walletId": "openrouter",
                 "walletName": "OpenRouter",
+                "balances": [{ "currency": "USD", "amount": 7.5 }],
                 "remainingUsd": 7.5,
                 "identity": "key:A1",
                 "lastSuccessfulAt": "2026-09-29T11:00:00Z"

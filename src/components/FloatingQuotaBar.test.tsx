@@ -364,7 +364,7 @@ function wallet(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
     id: "openrouter",
     name: "OpenRouter",
     state: "healthy",
-    remainingUsd: 12.5,
+    balances: [{ currency: "USD", amount: 12.5 }],
     checkedAt: "2026-09-28T09:55:00.000Z",
     statusLabel: "Live",
     ...extra,
@@ -382,21 +382,35 @@ describe("FloatingQuotaBar wallet slot", () => {
         ? element.getAttribute("data-wallet-id")
         : element.getAttribute("data-provider-id"),
     );
-    expect(order).toEqual(["zai", "grok", "openrouter"]);
+    expect(order).toEqual(["zai", "grok", "api-wallets"]);
     const slot = container.querySelector<HTMLElement>(
-      '[data-wallet-id="openrouter"]',
+      '[data-wallet-id="api-wallets"]',
     )!;
     expect(slot.className).toContain("fq-wallet");
     expect(slot.textContent).toBe("");
   });
 
-  it("opens the wallet card through the shared detail slot", async () => {
-    await renderBar({ wallets: [wallet()], detailId: "openrouter" });
+  it("keeps one slot for several wallets, never one segment per wallet", async () => {
+    await renderBar({
+      wallets: [
+        wallet(),
+        wallet({
+          id: "deepseek",
+          name: "DeepSeek",
+          balances: [{ currency: "CNY", amount: 110 }],
+        }),
+      ],
+    });
+    expect(container.querySelectorAll("[data-wallet-id]")).toHaveLength(1);
+  });
+
+  it("opens the shared wallet card through the shared detail slot", async () => {
+    await renderBar({ wallets: [wallet()], detailId: "api-wallets" });
     const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
     expect(dialog).not.toBeNull();
-    expect(dialog!.getAttribute("data-wallet")).toBe("openrouter");
+    expect(dialog!.getAttribute("data-wallet")).toBe("api-wallets");
     expect(dialog!.textContent).toContain("OpenRouter");
-    expect(dialog!.textContent).toContain("$12.50");
+    expect(dialog!.textContent).toContain("USD 12.50");
   });
 
   it("keeps one detail card at a time when a provider is open", async () => {
@@ -413,18 +427,18 @@ describe("FloatingQuotaBar wallet slot", () => {
     await renderBar({
       items: [HEALTHY],
       wallets: [wallet()],
-      detailId: "openrouter",
+      detailId: "api-wallets",
     });
     const walletDialogs = container.querySelectorAll('[role="dialog"]');
     expect(walletDialogs).toHaveLength(1);
-    expect(walletDialogs[0].getAttribute("data-wallet")).toBe("openrouter");
+    expect(walletDialogs[0].getAttribute("data-wallet")).toBe("api-wallets");
     expect(container.querySelector(".fq-wallet-popover")).not.toBeNull();
   });
 
   it("routes the wallet card's Refresh to the wallet action only", async () => {
     const props = await renderBar({
       wallets: [wallet()],
-      detailId: "openrouter",
+      detailId: "api-wallets",
       onRefreshWallet: vi.fn(),
     });
     const refresh = container.querySelector<HTMLButtonElement>(
@@ -439,10 +453,10 @@ describe("FloatingQuotaBar wallet slot", () => {
   it("marks only the wallet slot busy while a wallet refresh runs", async () => {
     await renderBar({
       wallets: [wallet()],
-      detailId: "openrouter",
+      detailId: "api-wallets",
       walletBusy: true,
     });
-    const slot = container.querySelector('[data-wallet-id="openrouter"]')!;
+    const slot = container.querySelector('[data-wallet-id="api-wallets"]')!;
     expect(slot.getAttribute("aria-busy")).toBe("true");
     expect(slot.className).toContain("is-refreshing");
     expect(
@@ -454,7 +468,9 @@ describe("FloatingQuotaBar wallet slot", () => {
   it("renders a wallet-only bar without the empty state", async () => {
     await renderBar({ items: [], wallets: [wallet()] });
     expect(container.querySelector(".fq-empty")).toBeNull();
-    expect(container.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
+    expect(
+      container.querySelector('[data-wallet-id="api-wallets"]'),
+    ).not.toBeNull();
   });
 });
 

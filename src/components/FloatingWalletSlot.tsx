@@ -1,11 +1,15 @@
 import type { FloatingWalletItem } from "../lib/floatingQuota";
-import { floatingWalletLabel } from "../lib/floatingQuota";
+import {
+  API_WALLETS_DETAIL_ID,
+  floatingWalletSlotLabel,
+  floatingWalletSlotState,
+} from "../lib/floatingQuota";
 
 /**
  * The wallet glyph. A wallet has identity but no quota window, so the mark
  * is the same kind of muted, single-color silhouette the provider segments
  * use — never a status color. The status dot below is the only state signal
- * in the slot; the dollar figure belongs to the card, not the collapsed bar.
+ * in the slot; the money figures belong to the card, not the collapsed bar.
  */
 export function WalletMark() {
   return (
@@ -32,10 +36,15 @@ export function WalletMark() {
  * The compact API wallet slot (Variant B): a fixed 44px segment after the
  * providers. It opens the same shared detail card as a provider segment and
  * carries no text beyond its mark and status dot — assistive tech gets the
- * balance and state from the spoken label.
+ * balances and states from the spoken label.
+ *
+ * There is exactly one wallet slot, whatever the number of wallets the
+ * runtime reports: it is the shared entry point into the API Wallets card,
+ * never one segment per wallet. The slot's dot states the most
+ * consequential state among the wallets it covers.
  */
 export function FloatingWalletSlot({
-  item,
+  items,
   expanded,
   busy,
   onHover,
@@ -43,7 +52,7 @@ export function FloatingWalletSlot({
   onOpen,
   onContextMenu,
 }: {
-  item: FloatingWalletItem;
+  items: FloatingWalletItem[];
   expanded: boolean;
   busy: boolean;
   onHover: (id: string) => void;
@@ -51,26 +60,25 @@ export function FloatingWalletSlot({
   onOpen: (id: string) => void;
   onContextMenu: () => void;
 }) {
+  const state = floatingWalletSlotState(items) ?? "unavailable";
   return (
     <button
       type="button"
       className={
-        "fq-wallet is-" +
-        item.state +
-        (busy ? " is-refreshing" : "")
+        "fq-wallet is-" + state + (busy ? " is-refreshing" : "")
       }
-      data-wallet={item.id}
-      data-wallet-id={item.id}
-      data-state={item.state}
-      aria-label={floatingWalletLabel(item)}
+      data-wallet="api-wallets"
+      data-wallet-id={API_WALLETS_DETAIL_ID}
+      data-state={state}
+      aria-label={floatingWalletSlotLabel(items)}
       aria-haspopup="dialog"
       aria-expanded={expanded}
       aria-busy={busy || undefined}
-      onMouseEnter={() => onHover(item.id)}
+      onMouseEnter={() => onHover(API_WALLETS_DETAIL_ID)}
       onMouseLeave={onHoverEnd}
-      onFocus={() => onHover(item.id)}
+      onFocus={() => onHover(API_WALLETS_DETAIL_ID)}
       onBlur={onHoverEnd}
-      onClick={() => onOpen(item.id)}
+      onClick={() => onOpen(API_WALLETS_DETAIL_ID)}
       onContextMenu={(event) => {
         event.preventDefault();
         event.stopPropagation();
