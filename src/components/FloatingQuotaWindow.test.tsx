@@ -58,13 +58,21 @@ vi.mock("../lib/floatingWindowChrome", () => ({
     onBlur?: () => void,
     _signal?: AbortSignal,
     onGesturePreview?: (gesture: "snap" | "snap-ready" | "unsnap" | null) => void,
+    onLocate?: () => void,
   ) => {
     mocks.onDockChange = onDockChange;
     mocks.onBlur = onBlur;
     mocks.onGesturePreview = onGesturePreview;
+    mocks.onLocate = onLocate;
     return Promise.resolve(() => {});
   },
   attachDockReanchor: (_onReanchor: () => void) => () => {},
+  attachMonitorRecovery: (
+    onReconciled?: (action: { kind: string }) => void,
+  ) => {
+    mocks.onReconciled = onReconciled;
+    return () => {};
+  },
   resizeFloatingWindow: (
     width: number,
     height: number,
@@ -101,6 +109,10 @@ const mocks = vi.hoisted(() => ({
   onGesturePreview: undefined as
     | undefined
     | ((gesture: "snap" | "snap-ready" | "unsnap" | null) => void),
+  onLocate: undefined as undefined | (() => void),
+  onReconciled: undefined as
+    | undefined
+    | ((action: { kind: string }) => void),
 }));
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;

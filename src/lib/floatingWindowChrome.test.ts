@@ -211,6 +211,7 @@ describe("setFloatingBarEnabled", () => {
       dockAnchor: null,
       x: 320,
       y: 180,
+      monitor: { id: null, x: null, y: null, width: null, height: null },
     });
   });
 
@@ -236,6 +237,7 @@ describe("setFloatingBarEnabled", () => {
       dockAnchor: null,
       x: 320,
       y: 180,
+      monitor: { id: null, x: null, y: null, width: null, height: null },
     });
   });
 });

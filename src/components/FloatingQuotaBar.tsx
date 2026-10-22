@@ -53,6 +53,7 @@ export function FloatingQuotaBar({
   onDockToggle,
   docked = false,
   dockGesture = null,
+  locatePulse = false,
 }: {
   items: FloatingQuotaItem[];
   /** Prepaid API wallets rendered as fixed slots after the providers. */
@@ -91,6 +92,11 @@ export function FloatingQuotaBar({
   docked?: boolean;
   /** Transient snap/unsnap cue. It does not change the persisted dock mode. */
   dockGesture?: SmartDockGesture | null;
+  /**
+   * The tray's locate pulse: a brief highlight that marks the bar as
+   * "this is the one" after it was recovered.
+   */
+  locatePulse?: boolean;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
   const shellRef = useRef<HTMLDivElement>(null);
@@ -218,6 +224,7 @@ export function FloatingQuotaBar({
       data-tauri-drag-region="deep"
       data-dock-state={dockState}
       data-dock-gesture={dockGesture ?? undefined}
+      data-locate-pulse={locatePulse ? "true" : undefined}
       onMouseEnter={onPointerEnterWindow}
       onMouseLeave={onPointerLeaveWindow}
       onMouseDown={(event) => {
