@@ -751,7 +751,12 @@ pub(crate) async fn get_minimax_usage() -> Result<MiniMaxUsage, ProviderError> {
     let client = http_client()?;
     let limits = fetch_quota(client, &key, region)
         .await
-        .map_err(|error| scrub_failure(error, &key))?;
+        // The failure is attributed to the credential that was actually
+        // attempted, so the runtime's last-good guard can tell a failure of
+        // this account apart from one that arrived while another account's
+        // key was stored. The masked hint is display-safe; the key itself
+        // never reaches the wire.
+        .map_err(|error| scrub_failure(error, &key).with_identity_hint(identity(&key.0)))?;
     Ok(MiniMaxUsage {
         limits,
         account: account_hint(&key.0).map(|key_hint| MiniMaxAccount { key_hint }),
@@ -1061,6 +1066,19 @@ mod tests {
     #[test]
     fn a_short_key_gets_no_attribution() {
         assert!(account_hint("sk-short").is_none());
+    }
+
+    #[test]
+    fn a_failed_refresh_is_attributed_to_the_attempted_credential() {
+        // The runtime's last-good guard compares the identity of the
+        // credential a failure was raised against. The hint is masked, and
+        // the key itself is scrubbed out of the message.
+        let key = SubscriptionKey("sk-cp-abcdefghijklmnop".to_string());
+        let failure = ProviderError::new("network", "upstream echoed sk-cp-abcdefghijklmnop");
+        let scrubbed = scrub_failure(failure, &key).with_identity_hint(identity(&key.0));
+        assert_eq!(scrubbed.identity_hint.as_deref(), Some("key:mnop"));
+        assert!(!scrubbed.message.contains("sk-cp-abcdefghijklmnop"));
+        assert!(scrubbed.message.contains("[REDACTED]"));
     }
 
     #[test]
