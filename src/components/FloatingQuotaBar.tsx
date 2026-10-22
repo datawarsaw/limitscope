@@ -319,7 +319,6 @@ export function FloatingQuotaBar({
             }
             onHoverEnd();
           }}
-          onOpenMain={onOpenMain}
         />
       ) : activeWallets !== null ? (
         <FloatingWalletsPopover
@@ -349,7 +348,7 @@ export function FloatingQuotaBar({
             }
             onHoverEnd();
           }}
-          onRefresh={onRefreshWallet ?? (() => {})}
+          onRefresh={onRefreshWallet}
         />
       ) : null}
       {menuOpen ? (

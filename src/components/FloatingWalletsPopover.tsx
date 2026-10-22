@@ -63,6 +63,20 @@ function walletHint(item: FloatingWalletItem): string | null {
 }
 
 /**
+ * A manual read can only help where the runtime did not settle a fresh
+ * balance. A healthy wallet is maintained by the runtime's own polling, and
+ * a cooling wallet has no supported read until its rate limit clears, so
+ * neither gets an action that would either duplicate or fail.
+ */
+function walletNeedsManualRefresh(item: FloatingWalletItem): boolean {
+  return (
+    item.state === "stale" ||
+    item.state === "error" ||
+    item.state === "unavailable"
+  );
+}
+
+/**
  * The shared API Wallets card: every prepaid wallet the runtime knows
  * about, one section each.
  *
@@ -95,20 +109,28 @@ export function FloatingWalletsPopover({
   onMouseLeave: () => void;
   onFocus: (event: FocusEvent<HTMLDivElement>) => void;
   onBlur: (event: FocusEvent<HTMLDivElement>) => void;
-  onRefresh: () => void;
+  /**
+   * The runtime's manual wallet read. Absent means this surface cannot
+   * acquire data, so no action is rendered at all.
+   */
+  onRefresh?: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const hintId = useId();
   const cooling = items.some((item) => item.state === "cooldown");
-  const disabled = busy || cooling;
+  const actionable = items.some(walletNeedsManualRefresh);
+  // Hidden when every wallet is fresh or cooling; still shown while its own
+  // read is in flight, so the in-flight state is not replaced by a vanish.
+  const showRefresh = onRefresh !== undefined && (actionable || busy);
+  const disabled = busy;
 
   useEffect(() => {
     if (!pinned) return;
     const card = ref.current;
     if (!card) return;
-    // Pinning lands focus on the card's action, like the provider card's
-    // Open button. During a cooldown the action is disabled, so the dialog
-    // itself becomes the focus target instead.
+    // Pinning lands focus on the card's action when it has one; a card with
+    // no actionable read (fresh or cooling wallets) focuses the dialog
+    // itself, so the pin still has a keyboard target.
     const button = card.querySelector<HTMLButtonElement>(".fq-wallet-refresh");
     if (button && !button.disabled) {
       button.focus({ preventScroll: true });
@@ -144,18 +166,20 @@ export function FloatingWalletsPopover({
           <WalletSection key={item.id} item={item} now={now} hintId={hintId} />
         ))}
 
-        <div className="fq-actions fq-wallet-actions">
-          <button
-            type="button"
-            className="fq-wallet-refresh"
-            disabled={disabled}
-            aria-busy={busy || undefined}
-            aria-describedby={disabled && cooling ? hintId : undefined}
-            onClick={onRefresh}
-          >
-            {busy ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
+        {showRefresh ? (
+          <div className="fq-actions fq-wallet-actions">
+            <button
+              type="button"
+              className="fq-wallet-refresh"
+              disabled={disabled}
+              aria-busy={busy || undefined}
+              aria-describedby={cooling ? hintId : undefined}
+              onClick={onRefresh}
+            >
+              {busy ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

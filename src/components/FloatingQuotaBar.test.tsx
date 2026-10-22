@@ -233,8 +233,8 @@ describe("FloatingQuotaBar shared detail card", () => {
     expect(account).not.toBeNull();
     expect(account.textContent).toBe("account: key ··3456");
     const dialog = container.querySelector('[role="dialog"]')!;
-    // Muted and last: nothing renders below the footer except actions.
-    expect(footer.nextElementSibling?.className).toBe("fq-actions");
+    // Muted and last: the card closes on the account line.
+    expect(footer.nextElementSibling).toBeNull();
     expect(dialog.textContent).not.toContain("· account");
   });
 
@@ -258,17 +258,53 @@ describe("FloatingQuotaBar shared detail card", () => {
     // account footer — no separate quick-view variant.
     expect(hoverCard).toBe(pinnedCard);
     expect(hoverCard).toContain('role="dialog"');
-    expect(hoverCard).toContain(">Open</button>");
+    expect(hoverCard).not.toContain(">Open</button>");
     expect(hoverCard).toContain("account: key ··3456");
     expect(hoverCard).toContain("Weekly reset in <strong>6d 8h</strong>");
     expect(hoverCard).toContain("Showing last good data");
   });
 
-  it("keeps exactly one command action, Open, on the hover preview too", async () => {
+  it("renders no Open action on the hover preview", async () => {
     await renderBar({ detailId: "zai", pinned: false });
+    const dialog = container.querySelector('[role="dialog"]')!;
     const buttons = container.querySelectorAll('[role="dialog"] button');
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0].textContent).toBe("Open");
+    expect(buttons).toHaveLength(0);
+    expect(dialog.textContent).not.toContain("Open");
+  });
+
+  it("removes the Open shortcut from every provider popover", async () => {
+    const providers = [
+      HEALTHY,
+      item({ providerId: "grok", name: "Grok" }),
+      item({ providerId: "opendesign", name: "OpenDesign" }),
+    ];
+    for (const provider of providers) {
+      await renderBar({
+        items: [provider],
+        detailId: provider.providerId,
+        pinned: true,
+      });
+      const dialog = container.querySelector('[role="dialog"]')!;
+      const labels = Array.from(dialog.querySelectorAll("button")).map(
+        (button) => button.textContent,
+      );
+      expect(labels).not.toContain("Open");
+      expect(dialog.querySelector(".fq-actions")).toBeNull();
+    }
+  });
+
+  it("keeps OpenDesign's manual refresh control in its popover", async () => {
+    const openDesign = item({ providerId: "opendesign", name: "OpenDesign" });
+    await renderBar({
+      items: [openDesign],
+      detailId: "opendesign",
+      pinned: true,
+    });
+    const refresh = container.querySelector<HTMLButtonElement>(
+      '[role="dialog"] .opendesign-refresh',
+    );
+    expect(refresh).not.toBeNull();
+    expect(refresh!.getAttribute("aria-label")).toBe("Refresh OpenDesign usage");
   });
 
   it("no longer duplicates the menu commands in the detail card", async () => {
@@ -359,6 +395,65 @@ describe("FloatingQuotaBar shared detail card", () => {
   });
 });
 
+describe("FloatingQuotaBar provider switch color", () => {
+  const CRITICAL = item({
+    providerId: "antigravity",
+    name: "Google Antigravity",
+    percent: 100,
+    usedPercent: 100,
+    windows: [{ label: "Weekly", usedPercent: 100, resetAt: RESET_AT }],
+  });
+
+  it("paints the incoming provider's band on the first render of a rapid switch", async () => {
+    const props = await renderBar({
+      items: [HEALTHY, CRITICAL],
+      detailId: "zai",
+    });
+    const popover = container.querySelector(".fq-popover")!;
+    const firstCard = container.querySelector(".fq-card")!;
+    expect(firstCard.getAttribute("data-quota")).toBe("good");
+
+    await renderBar({ ...props, detailId: "antigravity" });
+
+    const switchedPopover = container.querySelector(".fq-popover")!;
+    const switchedCard = container.querySelector(".fq-card")!;
+    // The popover root survives the switch; a color transition on it would
+    // still be easing the outgoing provider's band while the new card paints.
+    expect(switchedPopover).toBe(popover);
+    expect(switchedPopover.hasAttribute("data-quota")).toBe(false);
+    // The re-keyed card carries the new level, so its first rendered frame
+    // is already the incoming provider's color.
+    expect(switchedCard).not.toBe(firstCard);
+    expect(switchedCard.getAttribute("data-quota")).toBe("critical");
+    expect(
+      switchedCard
+        .querySelector(".fq-meter-primary .fq-meter-fill")!
+        .getAttribute("style"),
+    ).toContain("width: 0%");
+  });
+
+  it("keeps the same card, and so its color transition, when one provider's quota changes", async () => {
+    const props = await renderBar({
+      items: [HEALTHY],
+      detailId: "zai",
+      pinned: true,
+    });
+    const card = container.querySelector(".fq-card")!;
+    expect(card.getAttribute("data-quota")).toBe("good");
+
+    await renderBar({
+      ...props,
+      items: [item({ percent: 95, usedPercent: 95 })],
+    });
+
+    const updated = container.querySelector(".fq-card")!;
+    // Same element: the card's own registered --fq-quota transition eases
+    // this band change. A remount here would break that smooth update.
+    expect(updated).toBe(card);
+    expect(updated.getAttribute("data-quota")).toBe("critical");
+  });
+});
+
 function wallet(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
   return {
     id: "openrouter",
@@ -437,7 +532,8 @@ describe("FloatingQuotaBar wallet slot", () => {
 
   it("routes the wallet card's Refresh to the wallet action only", async () => {
     const props = await renderBar({
-      wallets: [wallet()],
+      // A stale wallet is the state a manual read can actually help.
+      wallets: [wallet({ state: "stale", statusLabel: "Stale" })],
       detailId: "api-wallets",
       onRefreshWallet: vi.fn(),
     });
@@ -450,11 +546,31 @@ describe("FloatingQuotaBar wallet slot", () => {
     expect(props.onRefresh).not.toHaveBeenCalled();
   });
 
+  it("hides the wallet Refresh while the runtime's data is fresh", async () => {
+    await renderBar({
+      wallets: [wallet()],
+      detailId: "api-wallets",
+      onRefreshWallet: vi.fn(),
+    });
+    expect(container.querySelector(".fq-wallet-refresh")).toBeNull();
+  });
+
+  it("hides the wallet Refresh when no handler can acquire data", async () => {
+    await renderBar({
+      wallets: [wallet({ state: "stale", statusLabel: "Stale" })],
+      detailId: "api-wallets",
+    });
+    expect(container.querySelector(".fq-wallet-refresh")).toBeNull();
+  });
+
   it("marks only the wallet slot busy while a wallet refresh runs", async () => {
     await renderBar({
       wallets: [wallet()],
       detailId: "api-wallets",
       walletBusy: true,
+      // An in-flight read implies a live handler: the control stays mounted
+      // for the duration of that read.
+      onRefreshWallet: vi.fn(),
     });
     const slot = container.querySelector('[data-wallet-id="api-wallets"]')!;
     expect(slot.getAttribute("aria-busy")).toBe("true");
@@ -514,21 +630,23 @@ describe("Grok detail card Grok Bot section", () => {
     // No manual read was needed, so the guidance is absent.
     expect(dialog.querySelector(".fq-grokbot-status")).toBeNull();
     expect(dialog.textContent).not.toContain("No Grok Bot data yet");
+    // The automatically maintained pool needs no explicit manual read.
+    expect(dialog.querySelector(".fq-grokbot-refresh")).toBeNull();
   });
 
-  it("adds a Grok Bot section below the quota windows, before the actions", async () => {
+  it("adds a Grok Bot section below the quota windows, with no Open action", async () => {
     await renderBar({ items: [GROK], detailId: "grok", pinned: true });
     const dialog = container.querySelector('[role="dialog"]')!;
     const windows = dialog.querySelector(".fq-windows")!;
     const grokbot = dialog.querySelector(".fq-grokbot")!;
-    const actions = dialog.querySelector(".fq-actions")!;
     expect(grokbot).not.toBeNull();
     expect(
       grokbot.compareDocumentPosition(windows) & Node.DOCUMENT_POSITION_PRECEDING,
     ).toBeTruthy();
-    expect(
-      actions.compareDocumentPosition(grokbot) & Node.DOCUMENT_POSITION_PRECEDING,
-    ).toBeTruthy();
+    // The manual Refresh above is the section's only action; the card no
+    // longer ends with a command footer.
+    expect(dialog.querySelector(".fq-actions")).toBeNull();
+    expect(dialog.textContent).not.toContain("Open");
   });
 
   it("keeps Grok Weekly credits as the untouched primary quota", async () => {
@@ -549,10 +667,10 @@ describe("Grok detail card Grok Bot section", () => {
     await renderBar({ items: [HEALTHY, UNAVAILABLE], detailId: "zai", pinned: true });
     const dialog = container.querySelector('[role="dialog"]')!;
     expect(dialog.querySelector(".fq-grokbot")).toBeNull();
-    // The non-Grok card keeps exactly its one Open action.
+    // The non-Grok card carries no command action at all.
     const buttons = dialog.querySelectorAll("button");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0].textContent).toBe("Open");
+    expect(buttons).toHaveLength(0);
+    expect(dialog.textContent).not.toContain("Open");
     expect(dialog.textContent).not.toContain("Grok Bot");
   });
 
@@ -964,7 +1082,7 @@ describe("FloatingQuotaBar persistent bar", () => {
       pinned: true,
     });
     expect(
-      container.querySelector('[role="dialog"]')!.getAttribute("data-quota"),
+      container.querySelector('[role="dialog"] .fq-card')!.getAttribute("data-quota"),
     ).toBe("critical"); // 5% remaining
   });
 });

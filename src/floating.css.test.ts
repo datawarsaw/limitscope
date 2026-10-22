@@ -91,6 +91,21 @@ describe("floating quota bar motion guards", () => {
     expect(css).toContain("transition: --fq-quota 240ms ease");
   });
 
+  it("eases the quota color inside a card and never across a provider switch", () => {
+    // The card is re-keyed per provider, so it is the only element that can
+    // own the color transition: a new provider mounts at its own band.
+    const cardBlock = css.match(/\.fq-card \{[^}]*\}/)?.[0] ?? "";
+    expect(cardBlock).toContain("transition: --fq-quota 240ms ease");
+    // The popover root survives a switch; easing the color there painted the
+    // incoming card in the outgoing provider's color for 240ms.
+    const popoverBlock = css.match(/\.fq-popover \{[^}]*\}/)?.[0] ?? "";
+    expect(popoverBlock).not.toContain("--fq-quota");
+    expect(popoverBlock).toContain("translate 180ms ease-out");
+    // Same-provider quota updates still ease on the meter that carries them.
+    const meterBlock = css.match(/\.fq-meter \{[^}]*\}/)?.[0] ?? "";
+    expect(meterBlock).toContain("transition: --fq-quota 240ms ease");
+  });
+
   it("glides the card between segments and crossfades its content per provider", () => {
     const popover = css.match(/\.fq-popover \{[^}]*\}/)?.[0] ?? "";
     expect(popover).toContain("translate: var(--fq-align, 0px) 0");
@@ -151,12 +166,16 @@ describe("floating quota bar semantic color guards", () => {
   ];
 
   it.each(QUOTA_LEVELS)(
-    "maps the %s quota level for both the segment and its popover",
+    "maps the %s quota level for both the segment and its card",
     (level) => {
       expect(css).toContain(`.fq-item[data-quota="${level}"]`);
-      expect(css).toContain(`.fq-popover[data-quota="${level}"]`);
+      expect(css).toContain(`.fq-card[data-quota="${level}"]`);
     },
   );
+
+  it("scopes the card's quota bands to the re-keyed card, not the popover root", () => {
+    expect(css).not.toContain(".fq-popover[data-quota=");
+  });
 
   it("paints the six Halo bands with the approved hex values; unavailable stays muted", () => {
     for (const band of HALO_REMAINING_QUOTA_SCALE) {

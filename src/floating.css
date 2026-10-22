@@ -193,49 +193,49 @@ html[data-window="floating"] body {
   outline-offset: 1px;
 }
 
-/* Halo semantic remaining-quota scale, shared by the collapsed segment, its
-   popover, and every meter row inside the card. The hex values mirror
+/* Halo semantic remaining-quota scale, shared by the collapsed segment, the
+   re-keyed card, and every meter row inside the card. The hex values mirror
    HALO_REMAINING_QUOTA_SCALE in quotaPresentation.ts, with
    floating.css.test.ts guarding the mirror; unavailable keeps a theme
    token, the six Halo colors have none. */
 .fq-item[data-quota="healthy"],
-.fq-popover[data-quota="healthy"],
+.fq-card[data-quota="healthy"],
 .fq-meter[data-quota="healthy"] {
   --fq-quota: #2ee6d0;
 }
 
 .fq-item[data-quota="good"],
-.fq-popover[data-quota="good"],
+.fq-card[data-quota="good"],
 .fq-meter[data-quota="good"] {
   --fq-quota: #3fdc7e;
 }
 
 .fq-item[data-quota="fair"],
-.fq-popover[data-quota="fair"],
+.fq-card[data-quota="fair"],
 .fq-meter[data-quota="fair"] {
   --fq-quota: #b5e04a;
 }
 
 .fq-item[data-quota="medium"],
-.fq-popover[data-quota="medium"],
+.fq-card[data-quota="medium"],
 .fq-meter[data-quota="medium"] {
   --fq-quota: #f5b942;
 }
 
 .fq-item[data-quota="low"],
-.fq-popover[data-quota="low"],
+.fq-card[data-quota="low"],
 .fq-meter[data-quota="low"] {
   --fq-quota: #fb8a3c;
 }
 
 .fq-item[data-quota="critical"],
-.fq-popover[data-quota="critical"],
+.fq-card[data-quota="critical"],
 .fq-meter[data-quota="critical"] {
   --fq-quota: #ff5d5d;
 }
 
 .fq-item[data-quota="unavailable"],
-.fq-popover[data-quota="unavailable"],
+.fq-card[data-quota="unavailable"],
 .fq-meter[data-quota="unavailable"] {
   --fq-quota: var(--text-faint);
 }
@@ -458,11 +458,11 @@ html[data-window="floating"] body {
   /* The card glides to its provider's segment on a switch. The separate
      translate property composes with the entrance keyframes' transform, and
      the first placement lands before paint so opening never slides across
-     the bar. */
+     the bar. The quota color is deliberately NOT transitioned here: this
+     root survives a provider switch, so easing it would paint the incoming
+     card in the outgoing provider's color for 240ms. */
   translate: var(--fq-align, 0px) 0;
-  transition:
-    translate 180ms ease-out,
-    --fq-quota 240ms ease;
+  transition: translate 180ms ease-out;
   animation: fq-in 120ms ease;
 }
 
@@ -474,9 +474,13 @@ html[data-window="floating"] body {
 }
 
 /* Card content re-keys per provider: a switch crossfades the readouts while
-   the card itself glides to the next segment — continuity without springs. */
+   the card itself glides to the next segment — continuity without springs.
+   The re-keyed card is also the semantic color's owner: a new provider
+   mounts at its own band on the first frame, while a quota update within
+   the same provider keeps this element and eases between bands. */
 .fq-card {
   animation: fq-swap 140ms ease;
+  transition: --fq-quota 240ms ease;
 }
 
 .fq-popover-head,
