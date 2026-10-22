@@ -1186,7 +1186,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "opendesign"]
+            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
         );
         let serialized = serde_json::to_string(&ids).unwrap();
         assert!(!serialized.contains("mock"), "no mock adapters in the notification path");

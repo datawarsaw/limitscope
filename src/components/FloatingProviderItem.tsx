@@ -15,6 +15,12 @@ import {
  */
 export function ProviderMark({ id }: { id: string }) {
   if (id === "opendesign") return <span className="fq-mark-fallback">OD</span>;
+  if (id === "minimax-token-plan") {
+    // The MiniMax mark reduced to a two-letter monogram: the brand's own
+    // wordmark is not licensed into the app, and the single-letter fallback
+    // would be indistinguishable from other providers at 16px.
+    return <span className="fq-mark-fallback">MM</span>;
+  }
   if (id === "openai-codex") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">

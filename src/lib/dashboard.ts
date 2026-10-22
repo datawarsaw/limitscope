@@ -26,6 +26,7 @@ const SHORT_NAMES: Readonly<Record<string, string>> = {
   antigravity: "Antigravity",
   grok: "Grok",
   "qwen-token-plan": "Qwen",
+  "minimax-token-plan": "MiniMax",
   opendesign: "OpenDesign",
 };
 

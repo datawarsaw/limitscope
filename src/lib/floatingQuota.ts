@@ -438,6 +438,7 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   "opencode-go": ["30-day"],
   zai: ["Weekly"],
   "qwen-token-plan": ["Monthly"],
+  "minimax-token-plan": ["Weekly"],
   opendesign: ["7-day"],
 };
 

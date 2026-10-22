@@ -92,3 +92,29 @@
   the existing signed workflow and integrity verifier. Required gates remain.
 - Execution/release status is tracked in Linear `MIC-311`; this file records
   technical state and does not replace that backlog.
+
+## Phase D — MiniMax subscription quota (in progress)
+
+- Branch `codex/minimax-quota-phase-d`, cut from the published v0.8.15
+  baseline `9ac6fe7fb6fb7ccebd081d79106d8e175e9a2110` in the isolated
+  worktree `C:/AI/limitscope-minimax-phase-d`.
+- `minimax-token-plan` is a standard provider: official read-only endpoint
+  `GET https://www.minimax.io/v1/token_plan/remains`, Bearer subscription key
+  (`sk-cp-…`). The credential is resolved read-only from the MiniMax Code
+  CLI's managed-login store through the account route; the CLI's OAuth
+  refresh token is never used, because MiniMax rotates it on use and doing
+  so would sign the user out of their own desktop app.
+- Two windows: `5-hour` and `Weekly`. MiniMax reports REMAINING percent, so
+  the adapter converts to used percent explicitly; `end_time` /
+  `weekly_end_time` are absolute epoch milliseconds, while `remains_time` /
+  `weekly_remains_time` are relative seconds and are ignored. The shared
+  `general` pool is reported alone, so model-specific and media pools are
+  never double-counted.
+- Verified on 2026-10-22 against the user's own one-month plan: live quota
+  read succeeded (both windows, correct resets); Rust 921 PASS / 16 ignored
+  live probes; frontend 1160 PASS; `cargo check --locked --all-targets` PASS;
+  `npm run build` PASS; `npm run scan:secrets` PASS. See
+  `docs/minimax-provider.md`.
+- Not yet done: Human Acceptance of the native Tauri surfaces, and the
+  release/integration step for the combined stable release. Phase D does not
+  merge, tag, publish, or deploy.
