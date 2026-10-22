@@ -17,7 +17,6 @@ import {
 } from "./floatingDragLifecycle";
 import {
   DOCK_HEIGHT,
-  DOCK_WIDTH,
   FLOATING_WINDOW_HEIGHT,
 } from "./floatingQuota";
 import {
@@ -321,10 +320,9 @@ export function dockAnchorFromCenter(
  * The docked window's shared horizontal center for an anchor fraction. Both
  * the resting strip and the revealed bar center on this x, so the reveal
  * never slides the meters horizontally. The center is confined to the range
- * where the widest docked placement — the 600px resting strip — still fits
- * the work area, so near an edge both placements clamp identically; a work
- * area narrower than that falls back to the middle and the per-placement
- * clamp owns the edges.
+ * where the current docked width still fits the work area, so near an edge
+ * both placements clamp identically; a work area narrower than that falls
+ * back to the middle and the per-placement clamp owns the edges.
  */
 export function dockCenterForAnchor(
   anchor: number,
@@ -1073,10 +1071,10 @@ export async function attachFloatingChrome(
  *
  * While docked the vertical position is not the user's: the window is
  * anchored to the top edge of its monitor's work area on every resize —
- * resting 600×16 or the full revealed bar — while the horizontal center
- * follows the persisted work-area-relative anchor (centered when unset) and
- * the whole window is clamped into the work area as one unit when the
- * monitor cannot host it.
+ * resting 16px or the full revealed bar, both at the same width — while the
+ * horizontal center follows the persisted work-area-relative anchor
+ * (centered when unset) and the whole window is clamped into the work area
+ * as one unit when the monitor cannot host it.
  * The native size change is a single call, never animated; the reveal motion
  * is content-level (floating.css).
  */
@@ -1144,11 +1142,11 @@ async function applyFloatingWindowSize(width: number, height: number, overlay: b
       // The persisted anchor (work-area-relative fraction; null = centered)
       // places the resting strip and the revealed bar on one shared center so
       // the reveal never slides horizontally. widestHalf comes from the
-      // resting width — the widest docked placement — so the clamp range
-      // keeps every docked size inside the work area before the
-      // per-placement clamp runs.
+      // docked width, shared by the resting and revealed sizes, so the clamp
+      // range keeps that size inside the work area before the per-placement
+      // clamp runs.
       const anchor = loadFloatingQuotaPrefs().dockAnchor ?? 0;
-      const widestHalf = (Math.max(DOCK_WIDTH, width) * scale) / 2;
+      const widestHalf = (width * scale) / 2;
       const center = dockCenterForAnchor(anchor, workArea, widestHalf);
       const clamped = clampWindowBoundsToWorkArea(
         {

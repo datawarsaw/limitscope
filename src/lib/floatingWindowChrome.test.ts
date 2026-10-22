@@ -438,6 +438,52 @@ describe("resizeFloatingWindow docked (resting dock)", () => {
     );
   });
 
+  it.each([300, 400, 520, 600])(
+    "centers a %ipx resting dock on the work area",
+    async (width) => {
+      // The resting dock's width is the active bar's width, so every
+      // visible-provider count gets its own centered footprint.
+      mocks.state.monitor = ULTRAWIDE;
+
+      await resizeFloatingWindow(width, 16, false, true);
+
+      expect(mocks.winFns.setSize).toHaveBeenLastCalledWith(
+        expect.objectContaining({ width, height: 16 }),
+      );
+      expect(mocks.winFns.setPosition).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          x: 3520 + (3440 - width) / 2,
+          y: 0,
+        }),
+      );
+    },
+  );
+
+  it("keeps one center and top edge for a three-provider rest and reveal", async () => {
+    mocks.state.monitor = ULTRAWIDE;
+
+    await resizeFloatingWindow(400, 16, false, true);
+    await resizeFloatingWindow(400, 64, false, true);
+
+    expect(mocks.winFns.setSize).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ width: 400, height: 16 }),
+    );
+    expect(mocks.winFns.setSize).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ width: 400, height: 64 }),
+    );
+    const center = 3520 + 3440 / 2;
+    expect(mocks.winFns.setPosition).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ x: center - 200, y: 0 }),
+    );
+    expect(mocks.winFns.setPosition).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ x: center - 200, y: 0 }),
+    );
+  });
+
   it("centers a narrower revealed bar so docked meters keep their screen x", async () => {
     // Two visible providers reveal at 300 wide; the reveal re-centers.
     mocks.state.monitor = ULTRAWIDE;
@@ -582,6 +628,50 @@ describe("resizeFloatingWindow docked (resting dock)", () => {
         x: 3520 + Math.round(0.75 * 5160) - 450,
         y: 0,
       }),
+    );
+  });
+
+  it("keeps an edge-anchored dock flush when the visible set widens", async () => {
+    mocks.state.monitor = ULTRAWIDE;
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ visible: true, dock: "top", dockAnchor: 0.5 }),
+    );
+
+    // The dock's width follows the visible set, and the anchored edge stays
+    // flush as it grows — the window never jumps to the opposite side.
+    await resizeFloatingWindow(400, 16, false, true);
+    expect(mocks.winFns.setPosition).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 3520 + 3440 - 400, y: 0 }),
+    );
+
+    await resizeFloatingWindow(600, 16, false, true);
+    expect(mocks.winFns.setPosition).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 3520 + 3440 - 600, y: 0 }),
+    );
+  });
+
+  it("scales an edge-anchored width change at 150%", async () => {
+    mocks.state.monitor = ULTRAWIDE_150;
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ visible: true, dock: "top", dockAnchor: 0.5 }),
+    );
+
+    await resizeFloatingWindow(400, 16, false, true);
+    expect(mocks.winFns.setSize).toHaveBeenLastCalledWith(
+      expect.objectContaining({ width: 600, height: 24 }),
+    );
+    expect(mocks.winFns.setPosition).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 3520 + 5160 - 600, y: 0 }),
+    );
+
+    await resizeFloatingWindow(600, 16, false, true);
+    expect(mocks.winFns.setSize).toHaveBeenLastCalledWith(
+      expect.objectContaining({ width: 900, height: 24 }),
+    );
+    expect(mocks.winFns.setPosition).toHaveBeenLastCalledWith(
+      expect.objectContaining({ x: 3520 + 5160 - 900, y: 0 }),
     );
   });
 

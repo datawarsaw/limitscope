@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { DOCK_HEIGHT, DOCK_WIDTH } from "./lib/floatingQuota";
+import { DOCK_HEIGHT } from "./lib/floatingQuota";
 import { HALO_REMAINING_QUOTA_SCALE } from "./lib/quotaPresentation";
 
 const css = readFileSync(new URL("./floating.css", import.meta.url), "utf8");
@@ -220,17 +220,24 @@ describe("resting dock guards", () => {
     expect(itemBlock).toContain("column-gap: 8px");
   });
 
-  it("paints a faint resting surface across the exact dock footprint", () => {
+  it("paints a faint resting surface across the window's dock footprint", () => {
     const stripBlock = css.match(/\.fq-dock-strip \{[^}]*\}/)?.[0] ?? "";
     expect(stripBlock).toContain("position: absolute");
-    // The strip holds the resting footprint while the reveal plays — the
-    // native window has already grown to the bar while it fades out.
-    expect(stripBlock).toContain(`width: ${DOCK_WIDTH}px`);
+    // The strip takes the window's width, which is the active bar's width
+    // for the same visible providers; only the height is a resting constant.
+    expect(stripBlock).toContain("box-sizing: border-box");
+    expect(stripBlock).toContain("width: 100%");
+    expect(stripBlock).not.toContain("width: 600px");
     expect(stripBlock).toContain(`height: ${DOCK_HEIGHT}px`);
     // Perceptible on a black desktop, still minimal: a barely-there fill and
     // one hairline round the footprint.
     expect(stripBlock).toContain("background: rgba(255, 255, 255, 0.04)");
-    expect(stripBlock).toContain("border: 1px solid rgba(255, 255, 255, 0.08)");
+    // The hairline is an outline, not a border: a border would inset the
+    // padding box and shift every resting meter 1px off the revealed bar's
+    // meter it must land on.
+    expect(stripBlock).toContain("outline: 1px solid rgba(255, 255, 255, 0.08)");
+    expect(stripBlock).toContain("outline-offset: -1px");
+    expect(stripBlock).not.toContain("border: 1px solid");
     // No glow on the resting surface — the primary card meter keeps the only
     // shadow on the floating surface.
     expect(stripBlock).not.toContain("box-shadow");
@@ -257,6 +264,33 @@ describe("resting dock guards", () => {
     expect(css).not.toMatch(/\.fq-dock-strip[^{]*\.fq-percent/);
     expect(css).not.toMatch(/\.fq-dock-strip[^{]*\.fq-mark/);
     expect(css).not.toMatch(/\.fq-dock-strip[^{]*\.fq-readout/);
+  });
+
+  it("paints the wallet status dot with the revealed bar's own health colors", () => {
+    // The dot is a state signal only: it mirrors the revealed wallet slot's
+    // dot colors exactly, so the two read as one element across the reveal.
+    const dotBlock = css.match(/\.fq-dock-wallet-dot \{[^}]*\}/)?.[0] ?? "";
+    expect(dotBlock).toContain("position: absolute");
+    expect(dotBlock).toContain("border-radius: 99px");
+    expect(dotBlock).toContain("background: var(--green)");
+    // The same four health colors the revealed wallet slot uses.
+    const revealed = [
+      ["stale", "var(--amber)"],
+      ["cooldown", "var(--amber)"],
+      ["error", "var(--red)"],
+      ["unavailable", "var(--text-faint)"],
+    ] as const;
+    for (const [state, color] of revealed) {
+      const block =
+        css.match(
+          new RegExp(`\\.fq-dock-wallet-dot\\[data-state="${state}"\\][^}]*\\}`),
+        )?.[0] ?? "";
+      expect(block).toContain(color);
+    }
+    // A wallet is an absolute balance, not a quota: the dot never carries a
+    // meter fill, a percentage, or a quota color.
+    expect(dotBlock).not.toContain("fq-meter-fill");
+    expect(dotBlock).not.toContain("--fq-quota");
   });
 
   it("hides the pill while resting and reveals it with content motion only", () => {
