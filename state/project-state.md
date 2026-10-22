@@ -37,10 +37,28 @@
   no percentages, reset windows or period, and they never enter quota history,
   prediction or notifications. OpenRouter reads the official credits endpoint
   with the OpenCode auth entry; the key never leaves the process.
+- API Wallets Phase C (candidate): DeepSeek's prepaid balance joins OpenRouter
+  in the same wallet list, read from the official balance endpoint
+  (`GET https://api.deepseek.com/user/balance`). The credential is resolved
+  read-only from the OpenCodex provider config, falling back to the OpenCode
+  auth file; no credential record is created or modified. Money is carried per
+  currency (USD, CNY): amounts are never summed, converted, or read as USD
+  when they are not, and the floating bar keeps exactly one shared 44 px
+  wallet slot whose card lists every wallet with its own currency.
 - The compact wallet slot adds 44 px beside the unchanged provider meters
-  (revealed bar 646 px). The resting dock stays 600 px and shows meters only.
-  The floating window's declared native maximum is 646 px, matching that
-  widest layout; a regression test pins the two together.
+  (revealed bar 646 px). The floating window's declared native maximum is
+  646 px, matching that widest layout; a regression test pins the two
+  together.
+- The resting dock has no width of its own: it takes the active bar's width
+  for the same visible providers and the same wallet slot, so resting,
+  revealed and pinned share one footprint and the resting meters sit exactly
+  on the revealed bar's meters. The dock shows meters only, plus one wallet
+  status DOT in the revealed bar's own wallet slot — a wallet is an absolute
+  money balance, so it never gets a meter, a fill, or a percentage.
+- The floating bar's Grok detail card shows the runtime's passive Grok Bot
+  observation — the same one the main dashboard renders — so both surfaces
+  describe one pool from one source. The manual accessibility read stays the
+  explicit fallback and never displaces a live passive reading.
 
 ## Evidence and limits
 
@@ -74,3 +92,64 @@
   the existing signed workflow and integrity verifier. Required gates remain.
 - Execution/release status is tracked in Linear `MIC-311`; this file records
   technical state and does not replace that backlog.
+
+## Phase D — MiniMax subscription quota (in progress)
+
+- Branch `codex/minimax-quota-phase-d`, cut from the published v0.8.15
+  baseline `9ac6fe7fb6fb7ccebd081d79106d8e175e9a2110` in the isolated
+  worktree `C:/AI/limitscope-minimax-phase-d`.
+- `minimax-token-plan` is a standard provider: official read-only endpoint
+  `GET https://www.minimax.io/v1/token_plan/remains`, Bearer subscription key
+  (`sk-cp-…`). The credential is resolved read-only from the MiniMax Code
+  CLI's managed-login store through the account route; the CLI's OAuth
+  refresh token is never used, because MiniMax rotates it on use and doing
+  so would sign the user out of their own desktop app.
+- Two windows: `5-hour` and `Weekly`. MiniMax reports REMAINING percent, so
+  the adapter converts to used percent explicitly; `end_time` /
+  `weekly_end_time` are absolute epoch milliseconds, while `remains_time` /
+  `weekly_remains_time` are relative seconds and are ignored. The shared
+  `general` pool is reported alone, so model-specific and media pools are
+  never double-counted.
+- Verified on 2026-10-22 against the user's own one-month plan: live quota
+  read succeeded (both windows, correct resets); Rust 921 PASS / 16 ignored
+  live probes; frontend 1160 PASS; `cargo check --locked --all-targets` PASS;
+  `npm run build` PASS; `npm run scan:secrets` PASS. See
+  `docs/minimax-provider.md`.
+- Not yet done: Human Acceptance of the native Tauri surfaces, and the
+  release/integration step for the combined stable release. Phase D does not
+  merge, tag, publish, or deploy.
+
+## Combined v0.8.16 integration candidate
+
+- Branch `codex/v0.8.16-combined-integration`, worktree
+  `C:/AI/limitscope-v0816-integration`, cut from the published v0.8.15
+  baseline `9ac6fe7fb6fb7ccebd081d79106d8e175e9a2110` (= `origin/main`).
+  All four phases share that baseline as their merge base.
+- Four `--no-ff` merges preserve each phase's provenance as a second parent:
+  Phase A `a3bb6a6` (`codex/floating-dock-phase-a`), Phase B `50ac9bf`
+  (`codex/monitor-recovery`), Phase C `0d01380`
+  (`codex/deepseek-api-wallet`), Phase D `919f41e`
+  (`codex/minimax-quota-phase-d`). All four commits are ancestors of the
+  integration head.
+- Three real conflicts, all resolved by preserving both phases' behavior:
+  `src/lib/floatingQuota.ts` (import union — Phase A's `GrokBotUsage` /
+  `grokBotFor` with Phase C's wallet model),
+  `src/components/FloatingQuotaWindow.test.tsx` (Phase A's dock-dot
+  assertions rewritten onto Phase C's shared-wallet vocabulary), and
+  `src-tauri/src/runtime.rs` (import union — Phase C's `WalletAmount` with
+  Phase D's `minimax_token_plan`).
+- One integration defect fixed beyond the textual conflicts: the resting
+  dock's wallet dot read `wallets[0]`, which is Phase A's single-wallet
+  model. Phase C replaced it with ONE shared wallet slot covering every
+  wallet, so the dot now uses `floatingWalletSlotState` /
+  `floatingWalletSlotLabel` — the same aggregate state and spoken label the
+  revealed slot uses. The two placements can no longer disagree.
+- Verified on 2026-10-22 at `030dde91e10b7a22c9f57e92240520bd70297804`:
+  frontend 1257 PASS (71 files); Rust 966 PASS / 18 intentionally ignored
+  live probes; `cargo check --locked --all-targets` PASS (3 pre-existing
+  dead-code warnings in `zcode_reset` / `zcode_plans`, untouched by every
+  phase); `npm run build` PASS; `npm run scan:secrets` PASS;
+  `npm run tauri build` PASS; release integrity verifier 7 PASS / 0 FAIL /
+  1 skipped.
+- Not yet done: native Windows Human Acceptance of the combined surfaces.
+  The candidate does not bump the version, tag, publish, or deploy.

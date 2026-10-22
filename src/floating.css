@@ -820,6 +820,41 @@ html[data-window="floating"] body {
   color: var(--text-faint);
 }
 
+/* The API Wallets card lists every wallet the runtime knows about, one
+   section each. Sections are separated by a hairline so two wallets' money
+   never reads as one figure, and each section keeps its own status chip. */
+.fq-wallet-section + .fq-wallet-section {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--divider);
+}
+
+.fq-wallet-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-bottom: 2px;
+}
+
+.fq-wallet-section-head strong {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.fq-wallet-section-head .fq-status {
+  margin-left: auto;
+}
+
+/* A wallet that holds several currencies lists one amount per currency, each
+   with its own amount. The amounts are never added together. */
+.fq-wallet-amounts .fq-value + .fq-value {
+  margin-top: 2px;
+}
+
+.fq-wallet-amounts .fq-value-num {
+  font-size: 22px;
+}
+
 .fq-wallet-hint {
   margin: 7px 0 0;
   color: var(--text-dim);
@@ -898,9 +933,9 @@ html[data-window="floating"] body {
 /* ---------- Resting dock (top edge) ---------- */
 
 /*
- * The docked window rests as a 600×16 logical strip: a faint surface with a
+ * The docked window rests as a 16px logical strip: a faint surface with a
  * hairline boundary across the whole footprint — the hover target must stay
- * perceptible on a black desktop — carrying the five production meters, 3px
+ * perceptible on a black desktop — carrying the production meters, 3px
  * tall (the revealed bar's own meter height) on the exact x positions and
  * widths the revealed bar lays them out at (computed in floatingQuota.ts
  * from the same constants this file lays the real bar out with — pinned by
@@ -913,18 +948,25 @@ html[data-window="floating"] body {
   position: absolute;
   top: 0;
   left: 0;
-  /* The exact resting footprint, held while the reveal plays: the native
-     window has already grown to the bar while this surface fades out, so
-     the strip must not stretch with it. Width and height mirror
-     DOCK_WIDTH/DOCK_HEIGHT (floatingQuota.ts) — floating.css.test.ts pins
-     the match. */
-  width: 600px;
+  /* The resting footprint, held while the reveal plays: the native window
+     has already grown to the bar while this surface fades out, so the strip
+     must not stretch with it. The width is the window's own width — the same
+     width the revealed bar uses for the same visible providers — so the
+     resting dock never leaves empty space on the desktop. Only the height
+     is a resting constant (DOCK_HEIGHT, floatingQuota.ts). */
+  box-sizing: border-box;
+  width: 100%;
   height: 16px;
   /* The restrained resting surface: barely-there fill, one hairline round
      the footprint, corners at the shell's proportion. No shadow, no glow. */
   border-radius: 6px;
   background: rgba(255, 255, 255, 0.04);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  /* The hairline is an inset outline, not a border: an outline never
+     insets the padding box, and the padding box is the containing block of
+     the absolutely placed meters. A border would shift every resting meter
+     1px right of the revealed bar's meter it must land on. */
+  outline: 1px solid rgba(255, 255, 255, 0.08);
+  outline-offset: -1px;
   /* Beneath the shell in the root's stacking so the reveal crossfades the
      bar in over the strip instead of trading places. */
   z-index: 0;
@@ -946,6 +988,33 @@ html[data-window="floating"] body {
   height: 5px;
   width: 1px;
   background: var(--divider);
+}
+
+/* The resting dock's wallet status dot: the same state signal the revealed
+   bar's wallet slot carries, in the same slot position and with the same
+   health colors. A wallet is an absolute money balance, not a quota
+   window, so it never gets a meter or a percentage here — only presence
+   and health. */
+.fq-dock-wallet-dot {
+  position: absolute;
+  top: 6px;
+  width: 4px;
+  height: 4px;
+  border-radius: 99px;
+  background: var(--green);
+}
+
+.fq-dock-wallet-dot[data-state="stale"],
+.fq-dock-wallet-dot[data-state="cooldown"] {
+  background: var(--amber);
+}
+
+.fq-dock-wallet-dot[data-state="error"] {
+  background: var(--red);
+}
+
+.fq-dock-wallet-dot[data-state="unavailable"] {
+  background: var(--text-faint);
 }
 
 /* Resting: the pill stays mounted for state continuity but must not paint,
@@ -1022,6 +1091,35 @@ html[data-window="floating"] body {
   transform: translateY(2px);
 }
 
+/* The tray's "Locate Floating Bar" pulse. The bar was recovered — it may
+   have just appeared on a monitor the user was not looking at — so it
+   announces itself with a brief outline. Content-only: no layout shift, no
+   resize, no repaint of the meters. The resting strip pulses too, because
+   the docked bar is the hardest to spot on a wide desktop. It is declared
+   before the reduced-motion block so that block can switch it off. */
+.fq-root[data-locate-pulse="true"] .fq-shell {
+  animation: fq-locate-pulse 400ms ease-in-out 3;
+}
+
+.fq-root[data-locate-pulse="true"] .fq-dock-strip {
+  animation: fq-locate-pulse 400ms ease-in-out 3;
+}
+
+@keyframes fq-locate-pulse {
+  0%,
+  100% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 1px 5px rgba(0, 0, 0, 0.38);
+  }
+  50% {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 0 0 2px var(--teal),
+      0 1px 8px rgba(0, 0, 0, 0.45);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .fq-meter-fill,
   .fq-item,
@@ -1038,7 +1136,9 @@ html[data-window="floating"] body {
   .fq-card,
   .fq-wallet.is-refreshing .fq-wallet-dot,
   .fq-dock-strip.is-exiting,
-  .fq-root[data-dock-state="revealing"] .fq-shell {
+  .fq-root[data-dock-state="revealing"] .fq-shell,
+  .fq-root[data-locate-pulse="true"] .fq-shell,
+  .fq-root[data-locate-pulse="true"] .fq-dock-strip {
     animation: none;
   }
 

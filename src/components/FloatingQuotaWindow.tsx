@@ -4,7 +4,6 @@ import { useProviderUsage } from "../hooks/useProviderUsage";
 import { useSettings } from "../hooks/useSettings";
 import {
   DOCK_HEIGHT,
-  DOCK_WIDTH,
   floatingBarWidth,
   floatingQuotaItems,
   floatingWalletItems,
@@ -13,6 +12,7 @@ import {
 } from "../lib/floatingQuota";
 import { orderVisibleProviders } from "../lib/providerPreferences";
 import {
+  attachMonitorRecovery,
   attachDockReanchor,
   attachFloatingChrome,
   hideFloatingWindow,
@@ -57,6 +57,12 @@ export const DOCK_REVEAL_MS = 240;
  * bar shut.
  */
 const DOCK_LEAVE_GRACE_MS = 140;
+
+/**
+ * How long the "Locate Floating Bar" pulse stays on. Long enough to be
+ * seen on a three-monitor desktop, short enough not to linger.
+ */
+export const LOCATE_PULSE_MS = 1600;
 
 export function FloatingQuotaWindow() {
   const devOverlay =
@@ -116,6 +122,10 @@ export function FloatingQuotaWindow() {
   // Bumped by DPI/monitor re-anchor events; nudges the resize effect to
   // re-derive the docked anchor from the live monitor state.
   const [anchorTick, setAnchorTick] = useState(0);
+  // The tray's "Locate Floating Bar" action marks the bar with a brief
+  // pulse, so a bar that reappears on one of three monitors is findable.
+  const [locatePulse, setLocatePulse] = useState(false);
+  const locatePulseTimer = useRef<number | null>(null);
   const dockRef = useRef<FloatingDockMode>(dock);
   dockRef.current = dock;
   const leaveTimer = useRef<number | null>(null);
@@ -158,14 +168,42 @@ export function FloatingQuotaWindow() {
       // pinned card stays open; only the transient action group dismisses.
       setMenuOpen(false);
       setPointerInside(false);
-    }, controller.signal, setDockGesture).then((cleanup) => {
+    }, controller.signal, setDockGesture, () => {
+      // The locate pulse: a short, self-clearing highlight.
+      if (locatePulseTimer.current !== null) {
+        window.clearTimeout(locatePulseTimer.current);
+      }
+      setLocatePulse(true);
+      locatePulseTimer.current = window.setTimeout(() => {
+        locatePulseTimer.current = null;
+        setLocatePulse(false);
+      }, LOCATE_PULSE_MS);
+    }).then((cleanup) => {
       if (controller.signal.aborted) cleanup();
       else detach = cleanup;
     });
     return () => {
       controller.abort();
       detach();
+      if (locatePulseTimer.current !== null) {
+        window.clearTimeout(locatePulseTimer.current);
+        locatePulseTimer.current = null;
+      }
     };
+  }, []);
+
+  // The display-topology observer: it reconciles the bar's placement when
+  // the monitor topology changes, and it never persists the fallback it
+  // uses while the preferred monitor is still away.
+  useEffect(() => {
+    const detach = attachMonitorRecovery((action) => {
+      // A re-anchor nudges the resize effect, so the docked bar re-derives
+      // its anchor from the live monitor state.
+      if (action.kind === "move" && action.reanchor) {
+        setAnchorTick((tick) => tick + 1);
+      }
+    });
+    return detach;
   }, []);
 
   // The chrome serializes the constraint and size as one transition.
@@ -173,13 +211,13 @@ export function FloatingQuotaWindow() {
 
   // One resize effect drives both placements: undocked it resizes the free
   // bar to the production size; docked it anchors to the top edge of the
-  // current monitor's work area instead — the resting strip at a fixed
-  // 600×16, the revealed bar at the production size — with the top edge and
-  // the horizontal center kept on every change.
+  // current monitor's work area instead — the resting strip and the revealed
+  // bar at the SAME width, the production size for the visible providers —
+  // with the top edge and the horizontal center kept on every change.
   const resting = docked && !revealed;
   useEffect(() => {
     void resizeFloatingWindow(
-      resting ? DOCK_WIDTH : width,
+      width,
       resting ? DOCK_HEIGHT : height,
       overlay !== "none",
       docked,
@@ -432,7 +470,7 @@ export function FloatingQuotaWindow() {
         docked && (resting || stripExiting) ? (
           <FloatingDockStrip
             items={items}
-            hasWallet={walletItems.length > 0}
+            wallets={walletItems}
             exiting={stripExiting}
           />
         ) : null
@@ -442,6 +480,7 @@ export function FloatingQuotaWindow() {
       onDockToggle={toggleDock}
       docked={docked}
       dockGesture={dockGesture}
+      locatePulse={locatePulse}
     />
   );
 }

@@ -8,11 +8,13 @@ mod cursor_grok_bot;
 mod diagnostic_report;
 mod diagnostics;
 mod floating_drag;
+mod floating_monitor;
 mod grok;
 mod grok_bot;
 mod history;
 mod last_good;
 mod local_data;
+mod minimax_token_plan;
 mod notifications;
 mod opencode_go;
 mod opendesign;
@@ -28,6 +30,7 @@ mod usage_source_codex;
 mod usage_source_opencode;
 mod usage_source_zcode;
 mod wallet;
+mod wallet_deepseek;
 mod zai;
 mod zcode_plans;
 mod zcode_reset;
@@ -41,6 +44,8 @@ use tauri_plugin_single_instance::init as single_instance_init;
 
 const TRAY_SHOW_FLOATING_EVENT: &str = "tray://show-floating";
 const TRAY_HIDE_FLOATING_EVENT: &str = "tray://hide-floating";
+// The tray action that recovers a floating bar that is lost off-screen.
+const TRAY_LOCATE_FLOATING_EVENT: &str = "tray://locate-floating";
 // The floating webview announces visibility changes on this event so the
 // tray label can mirror the persisted pref (A10 symmetry).
 const FLOATING_VISIBLE_EVENT: &str = "floating://visible-changed";
@@ -68,6 +73,17 @@ fn show_floating_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.set_focusable(true);
     }
+}
+
+/// Brings the floating bar back into view without restarting the app.
+///
+/// The bar is a single window that is never re-created: the tray action
+/// shows it, and asks the webview to reconcile its placement against the
+/// current monitor topology. The webview owns the placement, so it owns the
+/// recovery too; the tray only makes the window visible and asks.
+fn locate_floating_window(app: &tauri::AppHandle) {
+    show_floating_window(app);
+    let _ = app.emit(TRAY_LOCATE_FLOATING_EVENT, ());
 }
 
 /// A10: one tray item mirrors the floating bar's visibility state; the label
@@ -137,6 +153,8 @@ fn main() {
             floating_drag::attach_floating_drag_lifecycle,
             floating_drag::detach_floating_drag_lifecycle,
             floating_drag::restore_floating_drag_origin,
+            floating_monitor::attach_floating_monitor_observer,
+            floating_monitor::detach_floating_monitor_observer,
             runtime::get_runtime_snapshot,
             runtime::request_refresh,
             runtime::request_wallet_refresh,
@@ -202,11 +220,22 @@ fn main() {
             )?;
             app.manage(FloatingTrayItem(floating.clone()));
             let refresh = MenuItem::with_id(app, "refresh", "Refresh", true, None::<&str>)?;
+            // Phase B: one action to find a floating bar that a display
+            // sleep or a monitor reconnection left off-screen. It never
+            // creates a second window — it shows the existing one and asks
+            // the webview to reconcile its placement.
+            let locate = MenuItem::with_id(
+                app,
+                "locate-floating",
+                "Locate Floating Bar",
+                true,
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
             let menu = Menu::with_items(
                 app,
-                &[&open, &floating, &refresh, &separator, &quit],
+                &[&open, &floating, &locate, &refresh, &separator, &quit],
             )?;
 
             TrayIconBuilder::with_id("main")
@@ -241,6 +270,7 @@ fn main() {
                         // webviews what changed.
                         app.state::<runtime::RuntimeHandle>().request_refresh();
                     }
+                    "locate-floating" => locate_floating_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -294,7 +324,8 @@ fn main() {
 mod tray_symmetry_tests {
     use super::{
         floating_menu_label, floating_tray_action, FloatingTrayAction,
-        FLOATING_VISIBLE_EVENT, TRAY_HIDE_FLOATING_EVENT, TRAY_SHOW_FLOATING_EVENT,
+        FLOATING_VISIBLE_EVENT, TRAY_HIDE_FLOATING_EVENT, TRAY_LOCATE_FLOATING_EVENT,
+        TRAY_SHOW_FLOATING_EVENT,
     };
 
     #[test]
@@ -314,6 +345,7 @@ mod tray_symmetry_tests {
         assert_eq!(TRAY_SHOW_FLOATING_EVENT, "tray://show-floating");
         assert_eq!(TRAY_HIDE_FLOATING_EVENT, "tray://hide-floating");
         assert_eq!(FLOATING_VISIBLE_EVENT, "floating://visible-changed");
+        assert_eq!(TRAY_LOCATE_FLOATING_EVENT, "tray://locate-floating");
     }
 
     #[test]
@@ -323,6 +355,17 @@ mod tray_symmetry_tests {
         assert_ne!(hide, show);
         assert!(hide.starts_with("Hide "));
         assert!(show.starts_with("Show "));
+    }
+
+    #[test]
+    fn the_locate_action_has_its_own_distinct_menu_name() {
+        // The tray's locate entry must not read like the show/hide toggle:
+        // it is a recovery action, not a visibility toggle.
+        let locate = "Locate Floating Bar";
+        assert_ne!(locate, floating_menu_label(true));
+        assert_ne!(locate, floating_menu_label(false));
+        assert_ne!(locate, "Refresh");
+        assert_ne!(locate, "Open");
     }
 }
 

@@ -63,6 +63,7 @@ describe("floating prefs persistence", () => {
       dockAnchor: null,
       x: 200,
       y: 150,
+      monitor: { id: null, x: null, y: null, width: null, height: null },
     });
   });
 

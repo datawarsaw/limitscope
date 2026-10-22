@@ -293,10 +293,27 @@ export type WalletHealth =
 /**
  * One prepaid API wallet entry from the shared runtime snapshot
  * (src-tauri/src/runtime.rs, `ApiWalletDto`). Deliberately not a provider:
- * `remainingUsd` is an absolute upstream money balance and is absent — never
+ * a balance is an absolute upstream money amount and is absent — never
  * zero — when no trustworthy reading exists. A real $0.00 balance is a
  * valid, distinct value.
+ *
+ * `balances` carries one entry per currency. Currencies are never merged,
+ * summed or converted: a wallet holding both USD and CNY reports two
+ * entries, and a combined total across them is never computed.
  */
+export type WalletBalance = {
+  /** ISO currency code exactly as the source reported it ("USD", "CNY").
+   * Never assumed and never defaulted to USD. */
+  currency: string;
+  /** The remaining amount in `currency`. Always finite and non-negative. */
+  amount: number;
+  /** The source's own breakdown of `amount`, when it reports one. Absent
+   * means the source states no breakdown — never a zero. */
+  granted?: number;
+  /** The topped-up part of `amount`, when the source reports one. */
+  toppedUp?: number;
+};
+
 export type ApiWallet = {
   id: string;
   name: string;
@@ -304,6 +321,17 @@ export type ApiWallet = {
   /** RFC-3339 stamp of the balance observation. A retained last-good value
    * keeps its original stamp; an error without last-good carries none. */
   checkedAt?: string;
+  /** The wallet's balances, one entry per currency, in source order. */
+  balances?: WalletBalance[];
+  /** The source's own "balance sufficient for API calls" verdict, when it
+   * reports one. Absent means the source makes no such claim — never false. */
+  available?: boolean;
+  /** The single USD amount, when the wallet holds exactly one balance and
+   * that balance is in USD.
+   *
+   * Absent for a wallet in another currency or a multi-currency wallet, so a
+   * consumer that only understands USD can never read a CNY amount as if it
+   * were dollars, and never sees a converted total. */
   remainingUsd?: number;
   /** Masked credential identity (`key:1234`); binds last-good data to the
    * account that produced it. */

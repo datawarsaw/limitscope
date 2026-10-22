@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { GrokBotSection } from "./GrokBotSection";
+import type { GrokBotUsage } from "../types";
 
 const invoke = vi.hoisted(() => vi.fn());
 
@@ -33,6 +34,12 @@ async function renderSection() {
   });
 }
 
+async function renderSectionWithObservation(observation: GrokBotUsage) {
+  await act(async () => {
+    root.render(<GrokBotSection now={NOW} observation={observation} />);
+  });
+}
+
 async function clickRefresh() {
   await act(async () => {
     container
@@ -50,6 +57,68 @@ const OK_RESULT = {
   resetText: "Resets in 3 days",
   appVersion: "0.68.1.0",
 };
+
+/** The runtime's passive observation, exactly as the main dashboard gets it. */
+const PASSIVE_OBSERVATION: GrokBotUsage = {
+  planName: "X Premium+",
+  planId: "x-premium-plus",
+  cursorPlanName: "Free",
+  usedPercent: 17.66,
+  periodStart: "2026-10-04T09:12:03.000Z",
+  resetAt: "2026-10-11T09:12:03.000Z",
+  hasAvailableUsage: true,
+  onDemandEnabled: false,
+};
+
+describe("GrokBotSection with the runtime's passive observation", () => {
+  it("shows the runtime's observation without any manual read", async () => {
+    await renderSectionWithObservation(PASSIVE_OBSERVATION);
+
+    // The plan label identifies the same pool the main dashboard renders.
+    expect(container.querySelector(".fq-grokbot-label")!.textContent).toBe(
+      "Grok Bot · X Premium+",
+    );
+    // The observed percentage, presented on the floating surface's own
+    // remaining perspective: 17.66% used is 82.34% remaining.
+    const line = container.querySelector(".fq-grokbot-line")!;
+    expect(line.textContent).toContain("82% remaining");
+    const meter = container.querySelector(".fq-grokbot .fq-meter-row")!;
+    expect(meter).not.toBeNull();
+    expect(meter.getAttribute("aria-label")).toContain("Grok Bot weekly quota");
+    // No manual read was needed, so the guidance is absent.
+    expect(container.querySelector(".fq-grokbot-status")).toBeNull();
+    expect(container.textContent).not.toContain("No Grok Bot data yet");
+  });
+
+  it("never invokes the manual read for a passive observation", async () => {
+    await renderSectionWithObservation(PASSIVE_OBSERVATION);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("keeps the passive observation when a manual refresh also succeeds", async () => {
+    invoke.mockResolvedValueOnce(OK_RESULT);
+    await renderSectionWithObservation(PASSIVE_OBSERVATION);
+    await clickRefresh();
+
+    // The runtime's current observation wins; the manual read never
+    // displaces it with a different acquisition's number.
+    const line = container.querySelector(".fq-grokbot-line")!;
+    expect(line.textContent).toContain("82% remaining");
+    expect(line.textContent).not.toContain("27% remaining");
+  });
+
+  it("shows no value and no status when the observation's percentage is malformed", async () => {
+    await renderSectionWithObservation({
+      ...PASSIVE_OBSERVATION,
+      usedPercent: Number.NaN,
+    });
+
+    expect(container.querySelector(".fq-grokbot-line")).toBeNull();
+    expect(container.querySelector(".fq-grokbot .fq-meter-row")).toBeNull();
+    expect(container.textContent).not.toContain("0% remaining");
+    expect(container.textContent).not.toContain("100% remaining");
+  });
+});
 
 describe("GrokBotSection", () => {
   it("shows the section header and Refresh action, with no data yet", async () => {

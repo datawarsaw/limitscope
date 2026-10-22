@@ -1,3 +1,9 @@
+import {
+  EMPTY_FLOATING_MONITOR,
+  parseFloatingMonitorIdentity,
+  type FloatingMonitorIdentity,
+} from "./floatingMonitorIdentity";
+
 /** Where the floating bar lives. "top" is the meter-only resting dock
  * anchored to the top edge of the current monitor's work area; "none" is the
  * free-floating bar. */
@@ -31,6 +37,19 @@ export type FloatingQuotaPrefs = {
   /** Last outer position in physical pixels, when one has been stored. */
   x: number | null;
   y: number | null;
+  /**
+   * The monitor the bar was last placed on, by device id with a work-area
+   * geometry fallback.
+   *
+   * The persisted x/y describe a *point*, and a point cannot say which
+   * monitor it belonged to. Without this record a bar whose monitor went
+   * away has no way back when that monitor returns, which is exactly the
+   * three-monitor reconnection case. It is written only when the user
+   * places the bar (a drag, a dock, an explicit undock) — never by the
+   * automatic recovery path, so a temporary fallback monitor can never
+   * overwrite the intended one.
+   */
+  monitor: FloatingMonitorIdentity;
 };
 
 export type WorkArea = {
@@ -48,6 +67,7 @@ export const DEFAULT_FLOATING_PREFS: FloatingQuotaPrefs = {
   dockAnchor: null,
   x: null,
   y: null,
+  monitor: EMPTY_FLOATING_MONITOR,
 };
 
 export const FLOATING_PREFS_STORAGE_KEY = "rate-limits.floating-quota.v1";
@@ -63,6 +83,7 @@ const KNOWN_FLOATING_KEYS: ReadonlySet<string> = new Set([
   "dockAnchor",
   "x",
   "y",
+  "monitor",
 ]);
 
 function finiteOrNull(value: unknown): number | null {
@@ -102,6 +123,7 @@ export function parseFloatingQuotaPrefs(raw: unknown): FloatingQuotaPrefs {
   prefs.dockAnchor = dockAnchor === null ? null : clampDockAnchor(dockAnchor);
   prefs.x = finiteOrNull(record.x);
   prefs.y = finiteOrNull(record.y);
+  prefs.monitor = parseFloatingMonitorIdentity(record.monitor);
   return prefs;
 }
 
@@ -148,6 +170,7 @@ export function mergeFloatingPrefsWithRaw(
   merged.dockAnchor = prefs.dockAnchor;
   merged.x = prefs.x;
   merged.y = prefs.y;
+  merged.monitor = prefs.monitor;
   return JSON.stringify(merged);
 }
 

@@ -62,6 +62,11 @@ describe("shortProviderName", () => {
     expect(
       shortProviderName(usage({ id: "antigravity", name: "Google Antigravity" })),
     ).toBe("Antigravity");
+    expect(
+      shortProviderName(
+        usage({ id: "minimax-token-plan", name: "MiniMax Token Plan" }),
+      ),
+    ).toBe("MiniMax");
   });
 
   it("falls back to a generic rule for unknown providers", () => {

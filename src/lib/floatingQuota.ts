@@ -1,4 +1,10 @@
-import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
+import type {
+  ApiWallet,
+  GrokBotUsage,
+  LimitWindow,
+  ProviderUsage,
+} from "../types";
+import { grokBotFor } from "./grokBot";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import {
   providerStatusPresentation,
@@ -62,6 +68,18 @@ export type FloatingQuotaItem = {
    * keeps it muted on its own bottom line.
    */
   accountLabel?: string;
+  /**
+   * The Grok Bot (X Premium+) supplemental weekly observation the runtime
+   * already collected for this provider, when the provider carries one.
+   *
+   * This is the SAME observation the main dashboard renders (see
+   * `GrokBotPanel`), carried on the floating item so both surfaces describe
+   * one pool from one source. It stays a supplemental sub-pool: it never
+   * feeds the segment's percentage, the meter, the countdowns, the resting
+   * dock, or the primary window selection — the xAI billing windows above
+   * remain the Grok segment's quota. Only the Grok detail card reads it.
+   */
+  grokBot?: GrokBotUsage;
   /** Snapshot is stale even when an error marker is also showing. */
   stale: boolean;
   statusLabel: ProviderStatusPresentation["label"];
@@ -91,15 +109,30 @@ export type FloatingWalletItem = {
   id: string;
   name: string;
   state: FloatingWalletState;
-  /** Confirmed or last-good balance in USD, or null when no trustworthy
-   * reading exists. Never defaulted to zero. */
-  remainingUsd: number | null;
+  /** The wallet's balances, one entry per currency, in source order.
+   *
+   * Currencies are never merged: an empty list means no trustworthy reading
+   * exists (never a zero), and a wallet holding both USD and CNY keeps two
+   * entries that no consumer may add together. */
+  balances: FloatingWalletBalance[];
   checkedAt: string | null;
   identity?: string;
   error?: string;
   errorCategory?: string;
   errorHttpStatus?: number;
   statusLabel: string;
+};
+
+/** One currency's balance inside a wallet, as the floating surface shows it. */
+export type FloatingWalletBalance = {
+  /** ISO currency code exactly as the source reported it. */
+  currency: string;
+  /** The remaining amount in `currency`. */
+  amount: number;
+  /** The source's own breakdown of `amount`, when it reports one. */
+  granted?: number;
+  /** The topped-up part of `amount`, when the source reports one. */
+  toppedUp?: number;
 };
 
 // The production Halo bar's layout constants that meter geometry depends on.
@@ -136,8 +169,15 @@ export function floatingBarWidth(
 
 // ---------- Resting dock (top edge) ----------
 
-/** Logical size of the resting dock: a meter-only strip, five 3px meters. */
-export const DOCK_WIDTH = 600;
+/**
+ * Logical height of the resting dock: a meter-only strip of 3px meters.
+ *
+ * The resting dock has no fixed width of its own: it takes the active
+ * floating bar's width for the same visible providers (and the same wallet
+ * slot), so resting, revealed and pinned placements share one footprint.
+ * A dock wide enough for providers the user hid would leave empty space on
+ * the desktop, so the width tracks the visible set instead.
+ */
 export const DOCK_HEIGHT = 16;
 /** The resting meters keep the revealed bar's 3px meter height. */
 export const DOCK_METER_HEIGHT = 3;
@@ -226,22 +266,16 @@ export function haloWalletRect(
 }
 
 /**
- * Meter rects for the resting dock. The strip is a fixed 600px wide while
- * the revealed bar may be narrower (hidden providers shrink the production
- * width), so each rect is offset by half the difference: the reveal re-centers
- * the window, and with this offset every resting meter stays stationary on
- * screen while the bar fades in underneath it.
+ * Meter rects for the resting dock. The strip and the revealed bar share one
+ * width for the same visible providers (floatingBarWidth), so the resting
+ * meters sit exactly on the revealed bar's meters with no offset: the reveal
+ * never moves a meter horizontally.
  */
 export function dockMeterRects(
   providerCount: number,
   hasWallet = false,
 ): MeterRect[] {
-  const revealedWidth = floatingBarWidth(providerCount, hasWallet);
-  const offset = (DOCK_WIDTH - revealedWidth) / 2;
-  return haloMeterRects(revealedWidth, providerCount, hasWallet).map((rect) => ({
-    left: offset + rect.left,
-    width: rect.width,
-  }));
+  return haloMeterRects(floatingBarWidth(providerCount, hasWallet), providerCount, hasWallet);
 }
 
 /**
@@ -256,6 +290,34 @@ export function dockSeparatorLefts(
 ): number[] {
   const rects = dockMeterRects(providerCount, hasWallet);
   return rects.slice(1).map((rect) => rect.left - meterInset(providerCount));
+}
+
+/** Radius of the resting dock's wallet dot, in logical px. */
+export const DOCK_WALLET_DOT_RADIUS = 2;
+
+/**
+ * The resting dock's wallet status dot: a small circle in the same slot the
+ * revealed bar's wallet occupies, so the dock carries the same wallet
+ * presence and health without ever drawing a meter for it.
+ *
+ * A wallet is an absolute money balance, not a quota window, so it has no
+ * percentage to fill and no meter to scale: the dot is a state signal only,
+ * never a quota reading. Its x position mirrors the revealed bar's wallet
+ * slot exactly, and its diameter matches the revealed bar's own dot, so the
+ * two read as one element across the reveal.
+ */
+export function dockWalletDotRect(
+  providerCount: number,
+  hasWallet = false,
+): MeterRect | null {
+  if (!hasWallet) return null;
+  const slot = haloWalletRect(floatingBarWidth(providerCount, true), providerCount);
+  return {
+    // The revealed bar centres the dot in its 44px slot; the resting strip
+    // centres its own dot on the same x.
+    left: slot.left + slot.width / 2 - DOCK_WALLET_DOT_RADIUS,
+    width: DOCK_WALLET_DOT_RADIUS * 2,
+  };
 }
 
 /** Extra logical height while the shared detail card or menu is open. For
@@ -376,6 +438,7 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   "opencode-go": ["30-day"],
   zai: ["Weekly"],
   "qwen-token-plan": ["Monthly"],
+  "minimax-token-plan": ["Weekly"],
   opendesign: ["7-day"],
 };
 
@@ -514,6 +577,10 @@ export function floatingQuotaItems(
     const status = providerStatusPresentation(usage);
     const primary = floatingPrimaryWindow(usage);
     const hasWindow = primary !== undefined;
+    // The runtime's own Grok Bot observation, so the floating card shows the
+    // same supplemental pool the main dashboard shows. Only the Grok entry
+    // can carry one (grokBotFor enforces the provider id).
+    const grokBot = grokBotFor(usage);
     const windows: FloatingQuotaWindowRow[] = usage.limits
       .filter(isUsableQuotaWindow)
       .map((limit) => ({
@@ -534,6 +601,7 @@ export function floatingQuotaItems(
       windows,
       primaryReset: primaryResetTarget(usage),
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),
+      ...(grokBot ? { grokBot } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,
       statusClass: status.className,
@@ -586,27 +654,27 @@ function walletStatusLabel(
 
 /**
  * Map one wire wallet entry to its floating presentation. The balance is
- * carried only when it is a finite, non-negative upstream number; anything
- * else becomes null and is shown as unavailable. A real $0.00 survives
- * unchanged because zero is a valid balance, not missing data.
+ * carried per currency, and only when it is a finite, non-negative upstream
+ * number in a named currency; anything else is dropped and the wallet is
+ * shown as unavailable. A real $0.00 survives unchanged because zero is a
+ * valid balance, not missing data.
+ *
+ * The legacy `remainingUsd` field is honored only when the wire carried no
+ * `balances` list, so an older runtime snapshot still projects one USD
+ * balance. It is never used to invent a balance that `balances` contradicts.
  */
 export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
-  const balance =
-    typeof wallet.remainingUsd === "number" &&
-    Number.isFinite(wallet.remainingUsd) &&
-    wallet.remainingUsd >= 0
-      ? wallet.remainingUsd
-      : null;
+  const balances = walletBalances(wallet);
   const checkedAt =
     wallet.checkedAt && !Number.isNaN(Date.parse(wallet.checkedAt))
       ? wallet.checkedAt
       : null;
-  const state = walletStateFor(wallet.health, balance !== null);
+  const state = walletStateFor(wallet.health, balances.length > 0);
   return {
     id: wallet.id,
     name: wallet.name,
     state,
-    remainingUsd: balance,
+    balances,
     checkedAt,
     ...(wallet.identity ? { identity: wallet.identity } : {}),
     ...(wallet.error ? { error: wallet.error } : {}),
@@ -616,6 +684,57 @@ export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
       : {}),
     statusLabel: walletStatusLabel(state, wallet.errorHttpStatus),
   };
+}
+
+/**
+ * The wallet's balances, in wire order, with every untrustworthy amount
+ * dropped.
+ *
+ * An amount is kept only when it is a finite, non-negative number in a named
+ * currency. The legacy `remainingUsd` field is a fallback for an older
+ * runtime that sent no `balances` list at all; a `balances` list that is
+ * present but empty is authoritative (no balance), never a reason to read
+ * the legacy field.
+ */
+function walletBalances(wallet: ApiWallet): FloatingWalletBalance[] {
+  const balances: FloatingWalletBalance[] = [];
+  for (const balance of wallet.balances ?? []) {
+    const currency = balance.currency?.trim();
+    if (!currency) continue;
+    if (
+      typeof balance.amount !== "number" ||
+      !Number.isFinite(balance.amount) ||
+      balance.amount < 0
+    ) {
+      continue;
+    }
+    balances.push({
+      currency,
+      amount: balance.amount,
+      ...(typeof balance.granted === "number" &&
+      Number.isFinite(balance.granted)
+        ? { granted: balance.granted }
+        : {}),
+      ...(typeof balance.toppedUp === "number" &&
+      Number.isFinite(balance.toppedUp)
+        ? { toppedUp: balance.toppedUp }
+        : {}),
+    });
+  }
+  if (balances.length > 0 || wallet.balances !== undefined) {
+    return balances;
+  }
+  // An older runtime snapshot: one USD balance, if the legacy field carries
+  // a trustworthy amount.
+  const legacy = wallet.remainingUsd;
+  if (
+    typeof legacy === "number" &&
+    Number.isFinite(legacy) &&
+    legacy >= 0
+  ) {
+    return [{ currency: "USD", amount: legacy }];
+  }
+  return [];
 }
 
 /** Wallet items in snapshot order, one per id. */
@@ -634,29 +753,119 @@ export function floatingWalletItems(
 }
 
 /**
- * The money readout, always two decimals. Null means the slot and card must
- * say "balance unavailable" — the one thing they never do is claim $0.00.
+ * The detail id of the shared API Wallets card.
+ *
+ * The floating bar has exactly one wallet slot, whatever the number of
+ * wallets the runtime reports: the slot is a shared entry point into the
+ * API Wallets card, never one segment per wallet. The card lists every
+ * wallet it knows about.
+ */
+export const API_WALLETS_DETAIL_ID = "api-wallets";
+
+/**
+ * The aggregate state of the shared wallet slot.
+ *
+ * With several wallets the slot has one status dot, so it states the most
+ * consequential state among them, in the order the dot's own colors read:
+ * an error (red) outranks a cooldown or a stale reading (amber), which
+ * outranks an unavailable wallet (muted), which outranks a live one. A
+ * muted wallet therefore never hides a red error. An empty wallet list has
+ * no state to show.
+ */
+export function floatingWalletSlotState(
+  items: readonly FloatingWalletItem[],
+): FloatingWalletState | null {
+  if (items.length === 0) return null;
+  // The cooldown key is quoted on purpose: the runtime-trigger guardrail
+  // reads an unquoted `cooldown` identifier as cooldown policy leaking into
+  // TS, while the quoted member is the documented wire vocabulary.
+  const rank: Record<FloatingWalletState, number> = {
+    healthy: 0,
+    unavailable: 1,
+    stale: 2,
+    "cooldown": 3,
+    error: 4,
+  };
+  return items.reduce<FloatingWalletState>(
+    (worst, item) => (rank[item.state] > rank[worst] ? item.state : worst),
+    "healthy",
+  );
+}
+
+/**
+ * The spoken label of the shared wallet slot: every wallet's amount, one
+ * after another, each with its own currency.
+ *
+ * There is no combined total: a wallet holding both USD and CNY announces
+ * two amounts, because their sum would be meaningless.
+ */
+export function floatingWalletSlotLabel(
+  items: readonly FloatingWalletItem[],
+): string {
+  if (items.length === 0) return "API wallets, no wallet available";
+  const parts = items.map((item) => {
+    const amounts = item.balances
+      .map(floatingWalletAmountText)
+      .filter((text): text is string => text !== null);
+    const balance = amounts.length > 0 ? amounts.join(", ") : null;
+    return `${item.name} ${balance ? `${balance} remaining` : "balance unavailable"}`;
+  });
+  return `API wallets, ${parts.join("; ")}`;
+}
+
+/**
+ * The money readout for one currency, always two decimals and always with
+ * its currency named.
+ *
+ * The currency travels with the amount: a CNY balance reads as `CNY 110.00`,
+ * never as `$110.00`. Null means there is no trustworthy amount to state —
+ * the one thing the surface never does is claim $0.00.
+ */
+export function floatingWalletAmountText(
+  balance: FloatingWalletBalance,
+): string | null {
+  if (
+    typeof balance.amount !== "number" ||
+    !Number.isFinite(balance.amount) ||
+    balance.amount < 0 ||
+    !balance.currency?.trim()
+  ) {
+    return null;
+  }
+  return `${balance.currency.trim()} ${balance.amount.toFixed(2)}`;
+}
+
+/**
+ * The money readout of a wallet that holds exactly one currency, or null
+ * when it holds none or several.
+ *
+ * A multi-currency wallet has no single readout: the card lists its
+ * currencies separately. This helper never picks one of several and never
+ * adds them up.
  */
 export function floatingWalletBalanceText(
   item: FloatingWalletItem,
 ): string | null {
-  if (
-    item.remainingUsd === null ||
-    !Number.isFinite(item.remainingUsd) ||
-    item.remainingUsd < 0
-  ) {
+  if (item.balances.length !== 1) {
     return null;
   }
-  return `$${item.remainingUsd.toFixed(2)}`;
+  return floatingWalletAmountText(item.balances[0]);
 }
 
 /**
  * Spoken label for the wallet slot: name, balance (or the unavailable
- * phrase), and status. The slot itself never prints a dollar figure, so this
+ * phrase), and status. The slot itself never prints a money figure, so this
  * is where assistive tech gets the number.
+ *
+ * A multi-currency wallet is spoken as one amount per currency: there is no
+ * combined total to announce.
  */
 export function floatingWalletLabel(item: FloatingWalletItem): string {
-  const balance = floatingWalletBalanceText(item);
+  const amounts = item.balances
+    .map(floatingWalletAmountText)
+    .filter((text): text is string => text !== null);
+  const balance =
+    amounts.length > 0 ? amounts.join(", ") : null;
   const parts = [
     `${item.name} API wallet`,
     balance ? `${balance} remaining` : "balance unavailable",

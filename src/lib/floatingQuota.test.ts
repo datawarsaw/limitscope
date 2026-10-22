@@ -1,21 +1,25 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
+import { grokBotFor } from "./grokBot";
 import {
   DOCK_HEIGHT,
   DOCK_METER_HEIGHT,
-  DOCK_WIDTH,
+  DOCK_WALLET_DOT_RADIUS,
   FLOATING_WINDOW_HEIGHT,
   WALLET_SLOT_WIDTH,
   clampPopoverAlign,
   dockMeterRects,
   dockSeparatorLefts,
+  dockWalletDotRect,
   floatingBarWidth,
   floatingClickAction,
   floatingItemLabel,
   floatingPrimaryWindow,
   floatingQuotaItems,
   floatingWalletBalanceText,
+  floatingWalletSlotLabel,
+  floatingWalletSlotState,
   floatingWalletItem,
   floatingWalletItems,
   floatingWalletLabel,
@@ -438,6 +442,74 @@ describe("floating primary quota selection", () => {
     expect(items[0]).toMatchObject({ percent: 25, windowLabel: "Weekly credits" });
   });
 
+  it("carries the runtime's Grok Bot observation onto the floating item", () => {
+    // The main dashboard renders the runtime's passive Grok Bot observation
+    // (GrokBotPanel). The floating card must show the same pool, so the
+    // observation rides the floating item.
+    const grokBot = {
+      planName: "X Premium+",
+      usedPercent: 17.66,
+      resetAt: RESET_AT,
+    };
+    const items = floatingQuotaItems([
+      usage("grok", [limit("Weekly credits", 25, RESET_AT)], {
+        name: "Grok (xAI)",
+        grokBot,
+      }),
+    ]);
+
+    expect(items[0].grokBot).toEqual(grokBot);
+    // The observation stays supplemental: it never becomes the segment's
+    // quota, which remains the xAI weekly-credit window.
+    expect(items[0]).toMatchObject({ percent: 25, windowLabel: "Weekly credits" });
+  });
+
+  it("carries the same Grok Bot observation the main dashboard renders", () => {
+    // One source, two surfaces: the main dashboard reads the observation off
+    // the provider entry (grokBotFor), and the floating item now carries the
+    // very same observation. They can never disagree about Grok's usage.
+    const usageWithObservation = usage(
+      "grok",
+      [limit("Weekly credits", 25, RESET_AT)],
+      {
+        name: "Grok (xAI)",
+        grokBot: { planName: "X Premium+", usedPercent: 17.66 },
+      },
+    );
+
+    expect(grokBotFor(usageWithObservation)).toEqual({
+      planName: "X Premium+",
+      usedPercent: 17.66,
+    });
+    expect(floatingQuotaItems([usageWithObservation])[0].grokBot).toEqual(
+      grokBotFor(usageWithObservation),
+    );
+  });
+
+  it("carries no Grok Bot observation for other providers", () => {
+    const items = floatingQuotaItems([
+      usage("zai", [limit("Weekly", 25, RESET_AT)], {
+        name: "Z.ai",
+        // A malformed payload on another provider must never surface as a
+        // Grok observation: only the Grok entry can carry one.
+        grokBot: { usedPercent: 17.66 },
+      }),
+    ]);
+
+    expect(items[0].grokBot).toBeUndefined();
+  });
+
+  it("drops a malformed Grok Bot observation instead of carrying it", () => {
+    const items = floatingQuotaItems([
+      usage("grok", [limit("Weekly credits", 25, RESET_AT)], {
+        name: "Grok (xAI)",
+        grokBot: { usedPercent: Number.NaN },
+      }),
+    ]);
+
+    expect(items[0].grokBot).toBeUndefined();
+  });
+
   it("designates OpenCode Go's 30-day window over both shorter windows", () => {
     const items = floatingQuotaItems([
       usage("opencode-go", [
@@ -473,6 +545,51 @@ describe("floating primary quota selection", () => {
       percent: 44,
       usedPercent: 43.78,
       windowLabel: "Monthly",
+    });
+  });
+
+  it("designates the MiniMax Token Plan weekly window over its 5-hour window", () => {
+    // The MiniMax subscription reports both a five-hour and a weekly pool.
+    // The weekly pool is the plan-level budget the floating bar answers
+    // "how much long-term quota do I have left?" with - never whichever
+    // window happens to be most depleted right now.
+    const items = floatingQuotaItems([
+      usage(
+        "minimax-token-plan",
+        [
+          limit("5-hour", 62, "2026-10-22T07:01:06.447Z"),
+          limit("Weekly", 18, "2026-10-29T02:01:06.447Z"),
+        ],
+        { name: "MiniMax Token Plan" },
+      ),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 18,
+      usedPercent: 18,
+      windowLabel: "Weekly",
+    });
+  });
+
+  it("keeps the MiniMax 5-hour window in the popover inventory", () => {
+    const items = floatingQuotaItems([
+      usage(
+        "minimax-token-plan",
+        [
+          limit("5-hour", 62, "2026-10-22T07:01:06.447Z"),
+          limit("Weekly", 18, "2026-10-29T02:01:06.447Z"),
+        ],
+        { name: "MiniMax Token Plan" },
+      ),
+    ]);
+
+    expect(items[0].windows.map((row) => row.label)).toEqual([
+      "5-hour",
+      "Weekly",
+    ]);
+    expect(items[0].primaryReset).toEqual({
+      label: "Weekly",
+      resetAt: "2026-10-29T02:01:06.447Z",
     });
   });
 
@@ -668,10 +785,27 @@ describe("floating bar geometry", () => {
 });
 
 describe("resting dock geometry", () => {
-  it("rests at a fixed 600×16 logical strip with 3px meters", () => {
-    expect(DOCK_WIDTH).toBe(600);
+  it("rests as a 16px logical strip with 3px meters", () => {
     expect(DOCK_HEIGHT).toBe(16);
     expect(DOCK_METER_HEIGHT).toBe(3);
+  });
+
+  it("takes its width from the active bar for every visible-provider count", () => {
+    for (const count of [1, 2, 3, 4, 5]) {
+      expect(dockMeterRects(count)).toEqual(
+        haloMeterRects(floatingBarWidth(count), count),
+      );
+    }
+    // The widths stay bounded: the dock is never wider than the bar it
+    // becomes, and never carries an empty tail for hidden providers.
+    expect([1, 2, 3, 4, 5].map((count) => floatingBarWidth(count))).toEqual([
+      300, 300, 400, 520, 600,
+    ]);
+  });
+
+  it("keeps the existing fallback width when no provider is visible", () => {
+    expect(floatingBarWidth(0)).toBe(300);
+    expect(dockMeterRects(0)).toEqual(haloMeterRects(300, 0));
   });
 
   it("places the five resting meters exactly on the revealed Halo meters", () => {
@@ -689,18 +823,11 @@ describe("resting dock geometry", () => {
     expect(dockMeterRects(5)).toEqual(revealed);
   });
 
-  it("keeps docked meters stationary on screen when fewer providers reveal narrower", () => {
-    // Two visible providers reveal at 300 wide; the reveal re-centers the
-    // window, so each strip rect is the revealed rect shifted by half the
-    // width difference — every meter fades into its own revealed position.
+  it("keeps docked meters on the revealed positions when fewer providers show", () => {
+    // Two visible providers rest and reveal at 300 wide; the strip's meters
+    // ARE the revealed bar's meters, with no width difference to offset.
     expect(floatingBarWidth(2)).toBe(300);
-    const offset = (DOCK_WIDTH - 300) / 2;
-    expect(dockMeterRects(2)).toEqual(
-      haloMeterRects(300, 2).map((rect) => ({
-        left: offset + rect.left,
-        width: rect.width,
-      })),
-    );
+    expect(dockMeterRects(2)).toEqual(haloMeterRects(300, 2));
   });
 
   it("lays the meter band out with real bar proportions on every production width", () => {
@@ -773,21 +900,35 @@ describe("API wallet geometry", () => {
     expect(haloWalletRect(646, 5)).toEqual({ left: 593, width: 44 });
   });
 
-  it("keeps the resting 600px dock meters on the same revealed positions", () => {
-    // The 646px reveal re-centers over the fixed 600px strip, so each meter
-    // moves 23px left on screen but lands on the same bar segment.
-    expect(dockMeterRects(5, true)).toEqual([
-      { left: 40, width: 62 },
-      { left: 154, width: 62 },
-      { left: 268, width: 62 },
-      { left: 382, width: 62 },
-      { left: 496, width: 62 },
-    ]);
-    expect(dockSeparatorLefts(5, true)).toEqual([114, 228, 342, 456]);
-    // The strip itself stays meters-only and 600×16 while the wallet shows
-    // only in the revealed bar.
-    expect(DOCK_WIDTH).toBe(600);
+  it("keeps the resting dock meters on the same revealed positions with a wallet", () => {
+    // The wallet's own slot comes out of the shell content, so five
+    // providers plus the wallet rest AND reveal at 646px. The resting
+    // meters therefore sit on exactly the revealed bar's meters — no
+    // width difference, no horizontal offset.
+    expect(floatingBarWidth(5, true)).toBe(646);
+    expect(dockMeterRects(5, true)).toEqual(haloMeterRects(646, 5, true));
+    expect(dockSeparatorLefts(5, true)).toEqual([137, 251, 365, 479]);
     expect(DOCK_HEIGHT).toBe(16);
+  });
+
+  it("places the wallet status dot in the revealed bar's own wallet slot", () => {
+    // The dot sits in the same slot the revealed bar's wallet occupies, so
+    // the two read as one element across the reveal.
+    const slot = haloWalletRect(floatingBarWidth(5, true), 5);
+    const dot = dockWalletDotRect(5, true)!;
+    expect(dot).not.toBeNull();
+    expect(dot.width).toBe(DOCK_WALLET_DOT_RADIUS * 2);
+    expect(dot.left).toBeCloseTo(
+      slot.left + slot.width / 2 - DOCK_WALLET_DOT_RADIUS,
+      6,
+    );
+    // The dot never leaves the window it belongs to.
+    expect(dot.left + dot.width).toBeLessThanOrEqual(floatingBarWidth(5, true));
+  });
+
+  it("has no wallet dot when the floating bar carries no wallet", () => {
+    expect(dockWalletDotRect(5, false)).toBeNull();
+    expect(dockWalletDotRect(0, false)).toBeNull();
   });
 });
 
@@ -797,7 +938,7 @@ function wallet(extra: Partial<ApiWallet> = {}): ApiWallet {
     name: "OpenRouter",
     health: "live",
     checkedAt: CHECKED_AT,
-    remainingUsd: 12.5,
+    balances: [{ currency: "USD", amount: 12.5 }],
     ...extra,
   };
 }
@@ -809,36 +950,87 @@ describe("floating wallet presentation", () => {
       id: "openrouter",
       name: "OpenRouter",
       state: "healthy",
-      remainingUsd: 12.5,
       checkedAt: CHECKED_AT,
       statusLabel: "Live",
     });
-    expect(floatingWalletBalanceText(item)).toBe("$12.50");
+    expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
+    expect(floatingWalletBalanceText(item)).toBe("USD 12.50");
     expect(floatingWalletLabel(item)).toBe(
-      "OpenRouter API wallet, $12.50 remaining, Live",
+      "OpenRouter API wallet, USD 12.50 remaining, Live",
     );
   });
 
-  it("keeps a real zero balance as $0.00", () => {
-    const item = floatingWalletItem(wallet({ remainingUsd: 0 }));
+  it("keeps a real zero balance as 0.00", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [{ currency: "USD", amount: 0 }] }),
+    );
     expect(item.state).toBe("healthy");
-    expect(item.remainingUsd).toBe(0);
-    expect(floatingWalletBalanceText(item)).toBe("$0.00");
+    expect(item.balances[0].amount).toBe(0);
+    expect(floatingWalletBalanceText(item)).toBe("USD 0.00");
   });
 
   it.each([undefined, -0.01, Number.NaN, Number.POSITIVE_INFINITY])(
     "never turns an untrustworthy balance (%s) into money",
     (remainingUsd) => {
-      const item = floatingWalletItem(wallet({ remainingUsd }));
+      const item = floatingWalletItem(
+        wallet({ balances: [{ currency: "USD", amount: remainingUsd as number }] }),
+      );
       expect(item.state).toBe("unavailable");
-      expect(item.remainingUsd).toBeNull();
+      expect(item.balances).toEqual([]);
       expect(floatingWalletBalanceText(item)).toBeNull();
       expect(floatingWalletLabel(item)).toBe(
         "OpenRouter API wallet, balance unavailable, Unavailable",
       );
-      expect(floatingWalletLabel(item)).not.toContain("$0.00");
+      expect(floatingWalletLabel(item)).not.toContain("0.00");
     },
   );
+
+  it("keeps a CNY balance in its own currency and never as dollars", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [{ currency: "CNY", amount: 110 }] }),
+    );
+    expect(item.state).toBe("healthy");
+    expect(floatingWalletBalanceText(item)).toBe("CNY 110.00");
+    expect(floatingWalletBalanceText(item)).not.toContain("$");
+  });
+
+  it("keeps several currencies separate and never sums them", () => {
+    const item = floatingWalletItem(
+      wallet({
+        balances: [
+          { currency: "USD", amount: 12.5 },
+          { currency: "CNY", amount: 110 },
+        ],
+      }),
+    );
+    expect(item.balances).toHaveLength(2);
+    // A multi-currency wallet has no single readout.
+    expect(floatingWalletBalanceText(item)).toBeNull();
+    const label = floatingWalletLabel(item);
+    expect(label).toContain("USD 12.50");
+    expect(label).toContain("CNY 110.00");
+    expect(label).not.toContain("122.50");
+  });
+
+  it("reads a legacy runtime snapshot without a balances list", () => {
+    const item = floatingWalletItem({
+      id: "openrouter",
+      name: "OpenRouter",
+      health: "live",
+      checkedAt: CHECKED_AT,
+      remainingUsd: 12.5,
+    });
+    expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
+    expect(floatingWalletBalanceText(item)).toBe("USD 12.50");
+  });
+
+  it("never invents a balance from an empty balances list", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [], remainingUsd: 12.5 }),
+    );
+    expect(item.balances).toEqual([]);
+    expect(item.state).toBe("unavailable");
+  });
 
   it("keeps every non-live health as its own slot state", () => {
     expect(floatingWalletItem(wallet({ health: "stale" })).statusLabel).toBe(
@@ -880,5 +1072,75 @@ describe("floating wallet presentation", () => {
     expect(items[0].identity).toBe("key:1234");
     expect(items[1].error).toBe("refresh failed");
     expect(items[1].errorCategory).toBe("http");
+  });
+
+  it("states the most consequential state among the wallets it covers", () => {
+    expect(floatingWalletSlotState([])).toBeNull();
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "live" })),
+      ]),
+    ).toBe("healthy");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "live" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "stale" })),
+      ]),
+    ).toBe("stale");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "stale" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "cooldown" })),
+      ]),
+    ).toBe("cooldown");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "cooldown" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "error" })),
+      ]),
+    ).toBe("error");
+  });
+
+  it("never lets a muted wallet hide a red error", () => {
+    // The slot's dot is one color, so the ranking must follow the dot's own
+    // severity: an error outranks an unavailable wallet, not the other way
+    // around.
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "error" })),
+      ]),
+    ).toBe("error");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "stale" })),
+      ]),
+    ).toBe("stale");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+      ]),
+    ).toBe("unavailable");
+  });
+
+  it("speaks every wallet's amount with its own currency", () => {
+    expect(floatingWalletSlotLabel([])).toBe(
+      "API wallets, no wallet available",
+    );
+    const label = floatingWalletSlotLabel([
+      floatingWalletItem(wallet()),
+      floatingWalletItem(
+        wallet({
+          id: "deepseek",
+          name: "DeepSeek",
+          balances: [{ currency: "CNY", amount: 110 }],
+        }),
+      ),
+    ]);
+    expect(label).toBe(
+      "API wallets, OpenRouter USD 12.50 remaining; DeepSeek CNY 110.00 remaining",
+    );
+    expect(label).not.toContain("122.50");
   });
 });
