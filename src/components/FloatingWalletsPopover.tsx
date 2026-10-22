@@ -206,7 +206,7 @@ function WalletSection({
       ) : (
         <p className="fq-value">
           <span className="fq-value-num fq-wallet-balance is-unavailable">
-            $ —
+            —
           </span>
           <span className="fq-value-unit">balance unavailable</span>
         </p>

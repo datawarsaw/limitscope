@@ -9966,6 +9966,52 @@ mod tests {
         assert!(!wire.to_string().contains("key:sha256:"));
     }
 
+    #[test]
+    fn a_multi_currency_wallet_serializes_its_currencies_and_never_a_usd_total() {
+        let dto = ApiWalletDto {
+            id: "deepseek".to_string(),
+            name: "DeepSeek".to_string(),
+            health: WalletHealth::Live,
+            checked_at: Some("2026-09-29T12:00:00.000Z".to_string()),
+            balances: vec![
+                WalletBalanceDto {
+                    currency: "USD".to_string(),
+                    amount: 12.5,
+                    granted: None,
+                    topped_up: None,
+                },
+                WalletBalanceDto {
+                    currency: "CNY".to_string(),
+                    amount: 110.0,
+                    granted: Some(10.0),
+                    topped_up: Some(100.0),
+                },
+            ],
+            available: Some(true),
+            // A multi-currency wallet has no single USD amount, so the
+            // convenience field is absent rather than a cross-currency sum.
+            remaining_usd: None,
+            identity: Some("key:A1".to_string()),
+            credential_binding: Some(WALLET_BINDING_A.to_string()),
+            error: None,
+            error_category: None,
+            error_http_status: None,
+        };
+        let wire = serde_json::to_value(&dto).unwrap();
+        assert!(wire.get("remainingUsd").is_none(), "no combined total");
+        assert_eq!(wire["available"], serde_json::json!(true));
+        let balances = wire["balances"].as_array().expect("the balances");
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0]["currency"], "USD");
+        assert_eq!(balances[0]["amount"], 12.5);
+        assert_eq!(balances[1]["currency"], "CNY");
+        assert_eq!(balances[1]["amount"], 110.0);
+        assert_eq!(balances[1]["granted"], 10.0);
+        assert_eq!(balances[1]["toppedUp"], 100.0);
+        // The credential binding never reaches the wire.
+        assert!(!wire.to_string().contains("key:sha256:"));
+    }
+
     #[tokio::test]
     async fn a_snapshot_never_serves_a_balance_after_the_credential_changed() {
         let calls = Arc::new(AtomicUsize::new(0));

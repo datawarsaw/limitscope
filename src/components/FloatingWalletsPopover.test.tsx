@@ -147,7 +147,7 @@ describe("FloatingWalletsPopover", () => {
       ],
     });
     const text = dialog().textContent ?? "";
-    expect(text).toContain("$ —");
+    expect(text).toContain("—");
     expect(text).toContain("balance unavailable");
     expect(text).toContain("Last check failed");
     expect(text).toContain("credential missing");
@@ -208,6 +208,28 @@ describe("FloatingWalletsPopover", () => {
     expect(text).toContain("USD 12.50");
     expect(text).toContain("CNY 110.00");
     expect(text).not.toContain("122.50");
+  });
+
+  it("names no currency when there is no balance to state", async () => {
+    // The unavailable placeholder must not claim a currency: a wallet with
+    // no balance is not known to be a USD wallet.
+    await renderPopover({
+      items: [
+        item({
+          id: "deepseek",
+          name: "DeepSeek",
+          state: "unavailable",
+          balances: [],
+          checkedAt: null,
+          statusLabel: "Unavailable",
+        }),
+      ],
+    });
+    const text = dialog().textContent ?? "";
+    expect(text).toContain("—");
+    expect(text).toContain("balance unavailable");
+    expect(text).not.toContain("$");
+    expect(text).not.toContain("USD");
   });
 
   it("refreshes only through its own action and shows the in-flight state", async () => {
