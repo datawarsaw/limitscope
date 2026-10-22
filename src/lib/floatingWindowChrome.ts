@@ -28,6 +28,18 @@ import {
   saveFloatingQuotaPrefs,
   type FloatingDockMode,
 } from "./floatingWindowPrefs";
+import {
+  EMPTY_FLOATING_MONITOR,
+  type FloatingMonitorIdentity,
+} from "./floatingMonitorIdentity";
+import {
+  identityOf,
+  mayReconcile,
+  reconcilePlacement,
+  TOPOLOGY_SETTLE_MS,
+  type MonitorWorkArea,
+  type RecoveryAction,
+} from "./floatingMonitorRecovery";
 import { clampWindowBoundsToWorkArea } from "./windowBounds";
 import {
   evaluateSmartDock,
@@ -78,6 +90,11 @@ type NativeDragSession = {
 let nativeDragSession: NativeDragSession | null = null;
 let gesturePreviewListener: ((gesture: SmartDockGesture | null) => void) | null = null;
 let publishedGesture: SmartDockGesture | null = null;
+// Bumped by every user placement commit. A monitor identity whose lookup
+// started before a newer placement must not be written: it would name the
+// wrong monitor, and the wrong monitor is exactly what the recovery is
+// supposed to survive.
+let placementIntentEpoch = 0;
 let deferredResize: {
   width: number;
   height: number;
@@ -243,12 +260,16 @@ export async function setFloatingDock(dock: FloatingDockMode): Promise<void> {
   // update supplies the replacement intent; do not resize with its old size.
   deferredResize = null;
   placementRevision++;
+  placementIntentEpoch++;
   const prefs = loadFloatingQuotaPrefs();
   parked = null;
   if (dock === "top" && prefs.dock !== "top") dockOrigin = null;
   freePosition = dock === "none" && prefs.x !== null && prefs.y !== null
     ? { x: prefs.x, y: prefs.y } : dock === "none" ? dockOrigin : null;
   saveFloatingQuotaPrefs({ ...prefs, dock });
+  // Docking is a user placement: the dock belongs to the monitor the bar
+  // is on, and that is what lets it return there after a reconnection.
+  void recordCurrentPlacementMonitor();
 }
 
 /**
@@ -381,11 +402,15 @@ async function handleDockedMove(
     }
     placementRevision++;
     options?.onPlacementRevision?.(placementRevision);
+    placementIntentEpoch++;
     parked = null;
     freePosition = { x: payload.x, y: payload.y };
     saveFloatingQuotaPrefs(options?.deferPositionSave
       ? { ...current, dock: "none" }
       : { ...current, dock: "none", x: payload.x, y: payload.y });
+    // The drag-away undock is a user placement: it names the monitor the
+    // bar was left on.
+    void recordCurrentPlacementMonitor();
     onDockChange?.("none");
   } catch (error) {
     console.warn("Floating window could not evaluate the dock state", error);
@@ -451,6 +476,7 @@ export async function attachFloatingChrome(
   onBlur?: () => void,
   signal?: AbortSignal,
   onGesturePreview?: (gesture: SmartDockGesture | null) => void,
+  onLocate?: () => void,
 ): Promise<() => void> {
   if (!isTauriRuntime()) return () => {};
   publishedGesture = null;
@@ -516,6 +542,8 @@ export async function attachFloatingChrome(
       const current = loadFloatingQuotaPrefs();
       if (current.dock === "top") return;
       saveFloatingQuotaPrefs({ ...current, x, y });
+      // The user placed the bar here: this is the monitor they chose.
+      void recordCurrentPlacementMonitor();
     },
   );
 
@@ -528,6 +556,9 @@ export async function attachFloatingChrome(
     (x) => {
       if (loadFloatingQuotaPrefs().dock !== "top") return;
       const revision = placementRevision;
+      // A settled docked drag is a user placement: the dock now belongs to
+      // the monitor it was dragged on.
+      void recordCurrentPlacementMonitor();
       if (dockGeometry) onDockChange?.("top");
       else void persistDockAnchor(x).then(() => {
         if (ownsPlacement(revision, true)) onDockChange?.("top");
@@ -800,6 +831,7 @@ export async function attachFloatingChrome(
     if (current.dock !== "top") {
       if (freePosition) freePosition = { ...payload };
       saveFloatingQuotaPrefs({ ...current, x: payload.x, y: payload.y });
+      void recordCurrentPlacementMonitor();
       return;
     }
     const geometry = dockGeometry;
@@ -808,6 +840,9 @@ export async function attachFloatingChrome(
         payload.x + geometry.width / 2,
         { x: geometry.monitor.workArea.position.x, width: geometry.monitor.workArea.size.width },
       ) });
+      // A settled docked drag is a user placement too: the dock now
+      // belongs to the monitor it was dragged on.
+      void recordCurrentPlacementMonitor();
       return;
     }
     const [monitor, size] = await Promise.all([
@@ -843,19 +878,23 @@ export async function attachFloatingChrome(
     const current = loadFloatingQuotaPrefs();
     if (phase?.kind === "snap-preview" && phase.eligible && current.dock !== "top") {
       placementRevision++;
+      placementIntentEpoch++;
       session.revision = placementRevision;
       deferredResize = null;
       saveFloatingQuotaPrefs({ ...current, dock: "top", dockAnchor: phase.anchor });
+      void recordCurrentPlacementMonitor();
       onDockChange?.("top");
       return;
     }
     if (phase?.kind === "unsnap-preview" && current.dock === "top") {
       placementRevision++;
+      placementIntentEpoch++;
       session.revision = placementRevision;
       deferredResize = null;
       parked = null;
       freePosition = { x: payload.x, y: payload.y };
       saveFloatingQuotaPrefs({ ...current, dock: "none", x: payload.x, y: payload.y });
+      void recordCurrentPlacementMonitor();
       onDockChange?.("none");
       return;
     }
@@ -1055,6 +1094,16 @@ export async function attachFloatingChrome(
         const current = loadFloatingQuotaPrefs();
         saveFloatingQuotaPrefs({ ...current, visible: false });
         void announceFloatingVisibility(false);
+      }),
+    );
+    // The tray's locate action: show the bar, put it back on a screen it
+    // can live on, and pulse it so the user can see which window it is.
+    unlistens.push(
+      await listen(TRAY_LOCATE_FLOATING_EVENT, () => {
+        const current = loadFloatingQuotaPrefs();
+        saveFloatingQuotaPrefs({ ...current, visible: true });
+        void announceFloatingVisibility(true);
+        void locateFloatingWindow(() => onLocate?.());
       }),
     );
   } catch (error) {
@@ -1277,3 +1326,344 @@ export function attachDockReanchor(onReanchor: () => void): () => void {
     }
   };
 }
+
+// ---------- Monitor-topology recovery ----------
+
+/**
+ * The native event the Rust side emits when the display topology changes.
+ * It is the only signal that fires when a monitor is plugged, unplugged or
+ * comes back from sleep: the windowing layer's own events report the bar's
+ * own geometry, not the topology around it.
+ */
+export const FLOATING_MONITOR_TOPOLOGY_EVENT = "floating://monitor-topology";
+
+/** The tray action that brings a lost floating bar back into view. */
+export const TRAY_LOCATE_FLOATING_EVENT = "tray://locate-floating";
+
+/**
+ * Reads the currently available monitors as work areas, with the platform's
+ * monitor identity attached.
+ *
+ * The identity is what makes the preferred monitor findable after a
+ * reconnection: Windows renumbers display devices freely, so a work-area
+ * coordinate is not a durable key, but the device name is.
+ */
+export async function readMonitorWorkAreas(): Promise<MonitorWorkArea[]> {
+  const monitors = await availableMonitors();
+  return monitors.map((monitor) => ({
+    x: monitor.workArea.position.x,
+    y: monitor.workArea.position.y,
+    width: monitor.workArea.size.width,
+    height: monitor.workArea.size.height,
+    id: monitor.name ?? null,
+  }));
+}
+
+/**
+ * The monitor the bar currently sits on, as an identity. Used to record
+ * the user's intended monitor when they place the bar, and to find a
+ * fallback when the preferred one is gone.
+ */
+export async function currentMonitorIdentity(): Promise<FloatingMonitorIdentity> {
+  const monitor =
+    (await currentMonitor()) ?? (await primaryMonitor());
+  if (!monitor) return { ...EMPTY_FLOATING_MONITOR };
+  return identityOf({
+    x: monitor.workArea.position.x,
+    y: monitor.workArea.position.y,
+    width: monitor.workArea.size.width,
+    height: monitor.workArea.size.height,
+    id: monitor.name ?? null,
+  });
+}
+
+/**
+ * Records the monitor the user just placed the bar on.
+ *
+ * This is the only writer of the persisted monitor identity, and it is
+ * called from the *user-intent* paths (a settled drag, a dock, an
+ * undock) — never from the automatic recovery path. That separation is
+ * what guarantees a temporary fallback monitor can never overwrite the
+ * intended one.
+ */
+export async function recordPlacementMonitor(
+  identity: FloatingMonitorIdentity,
+): Promise<void> {
+  const current = loadFloatingQuotaPrefs();
+  saveFloatingQuotaPrefs({ ...current, monitor: identity });
+}
+
+/**
+ * Records the monitor the bar currently sits on, for the paths that place
+ * the bar from an async monitor lookup.
+ */
+async function recordCurrentPlacementMonitor(): Promise<void> {
+  const epoch = placementIntentEpoch;
+  const identity = await currentMonitorIdentity();
+  // A newer placement happened while the lookup was in flight: that newer
+  // placement owns the monitor record, and this one is stale.
+  if (epoch !== placementIntentEpoch) return;
+  await recordPlacementMonitor(identity);
+}
+
+/**
+ * Moves the bar onto the monitor it belongs to, without touching the
+ * persisted placement.
+ *
+ * The persisted x/y and dock anchor stay exactly as the user left them, so
+ * the bar returns to its intended spot as soon as the intended monitor is
+ * back. Only the live window position changes.
+ */
+async function applyRecovery(action: RecoveryAction): Promise<boolean> {
+  if (action.kind !== "move") return false;
+  if (nativeDragSession?.streamActive) {
+    // A user drag owns the placement; recovery must not fight it.
+    return false;
+  }
+  const revision = placementRevision;
+  const run = resizeQueue.then(async () => {
+    if (!ownsPlacement(revision, loadFloatingQuotaPrefs().dock === "top")) {
+      return;
+    }
+    // The free bar's committed point must not be undone by a recovery
+    // move: clear it, or the next resize would pull the bar back to the
+    // pre-recovery position.
+    if (!action.reanchor) freePosition = null;
+    await positionFloatingWindow(action.x, action.y);
+  });
+  resizeQueue = run.catch(() => {});
+  await run;
+  return true;
+}
+
+/**
+ * Reconciles the bar's live position against the persisted intent and the
+ * current monitor topology.
+ *
+ * Returns the action it took, so the caller can report it. The persisted
+ * placement is never modified here.
+ */
+export async function reconcileFloatingPlacement(): Promise<RecoveryAction> {
+  if (!isTauriRuntime()) return { kind: "none" };
+  const prefs = loadFloatingQuotaPrefs();
+  const areas = await readMonitorWorkAreas();
+  if (areas.length === 0) return { kind: "unplaceable" };
+  const win = getCurrentWindow();
+  const [position, size] = await Promise.all([
+    win.outerPosition(),
+    win.outerSize(),
+  ]);
+  const action = reconcilePlacement({
+    intent: {
+      dock: prefs.dock,
+      dockAnchor: prefs.dockAnchor,
+      x: prefs.x,
+      y: prefs.y,
+    },
+    areas,
+    size: { width: size.width, height: size.height },
+    current: { x: position.x, y: position.y },
+    identity: prefs.monitor,
+  });
+  if (action.kind === "move") {
+    await applyRecovery(action);
+  }
+  return action;
+}
+
+/**
+ * Observes display-topology changes and reconciles the bar's placement
+ * once the topology settles.
+ *
+ * The settle window is what makes a staggered three-monitor reconnection
+ * work: the first reconnect is usually not the last, and reconciling
+ * against a half-arrived topology would move the bar to a fallback and
+ * then move it again. The reconciler therefore waits for the topology to
+ * go quiet, bounded by a total budget so a flapping topology cannot
+ * strand the bar.
+ *
+ * A user drag owns the placement while it is in flight: recovery is
+ * suppressed for the duration of a gesture, so it never fights an
+ * intentional drag.
+ */
+export function attachMonitorRecovery(
+  onReconciled?: (action: RecoveryAction) => void,
+): () => void {
+  if (!isTauriRuntime()) return () => {};
+  const unlistens: Promise<() => void>[] = [];
+  let active = true;
+  let timer: number | null = null;
+  let changes = 0;
+  let firstChangeAt = 0;
+  let observerGeneration = 0;
+
+  const clearTimer = () => {
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
+  };
+
+  /**
+   * A reconcile that arrived while the user was dragging is deferred, not
+   * dropped: the drag owns the placement until it ends, and a cancelled
+   * drag restores the *pre-drag* point — which may be on a monitor that is
+   * still away. The retry therefore waits for the gesture's terminal.
+   */
+  let deferred = false;
+
+  const reconcile = async () => {
+    clearTimer();
+    if (!active) return;
+    if (nativeDragSession?.streamActive) {
+      // The user is dragging: the placement is theirs until they let go.
+      changes = 0;
+      deferred = true;
+      return;
+    }
+    changes = 0;
+    deferred = false;
+    try {
+      const action = await reconcileFloatingPlacement();
+      if (active) onReconciled?.(action);
+    } catch (error) {
+      console.warn("Floating window could not reconcile its placement", error);
+    }
+  };
+
+  const schedule = () => {
+    clearTimer();
+    const now = Date.now();
+    if (changes === 0) {
+      firstChangeAt = now;
+    }
+    changes += 1;
+    // A burst of reconnects is reconciled once, against the settled
+    // topology: the timer re-arms on every change, so it only fires after
+    // the topology has been quiet for a settle window. The total budget
+    // bounds the wait, so a flapping topology cannot strand the bar.
+    const totalMs = now - firstChangeAt;
+    if (mayReconcile({ changes, quietMs: 0, totalMs })) {
+      void reconcile();
+      return;
+    }
+    timer = window.setTimeout(() => {
+      timer = null;
+      void reconcile();
+    }, TOPOLOGY_SETTLE_MS);
+  };
+
+  try {
+    unlistens.push(
+      listen(FLOATING_MONITOR_TOPOLOGY_EVENT, () => {
+        if (!active) return;
+        schedule();
+      }),
+    );
+    // The drag's terminal: a deferred reconcile runs once the user has
+    // let go of the bar.
+    unlistens.push(
+      listen(FLOATING_DRAG_LIFECYCLE_EVENT, ({ payload }) => {
+        if (!active || !deferred) return;
+        const phase = (payload as { phase?: string } | undefined)?.phase;
+        if (phase !== "end") return;
+        deferred = false;
+        void reconcile();
+      }),
+    );
+  } catch (error) {
+    console.warn("Floating window could not subscribe to topology events", error);
+  }
+
+  // The native observer is attached after the listener, so a topology
+  // change that arrives during startup is never missed.
+  void invoke<number>("attach_floating_monitor_observer")
+    .then((generation) => {
+      if (!active) {
+        if (Number.isSafeInteger(generation) && generation > 0) {
+          void invoke("detach_floating_monitor_observer", { generation })
+            .catch(() => {});
+        }
+        return;
+      }
+      if (Number.isSafeInteger(generation) && generation > 0) {
+        observerGeneration = generation;
+      }
+    })
+    .catch((error) => {
+      console.warn("Floating window could not observe monitor topology", error);
+    });
+
+  return () => {
+    active = false;
+    clearTimer();
+    for (const unlisten of unlistens) {
+      unlisten.then((fn) => fn()).catch(() => {});
+    }
+    if (observerGeneration > 0) {
+      void invoke("detach_floating_monitor_observer", {
+        generation: observerGeneration,
+      }).catch((error) => {
+        console.warn("Floating window could not stop observing monitor topology", error);
+      });
+      observerGeneration = 0;
+    }
+  };
+}
+
+
+/**
+ * Handles the tray's "Locate Floating Bar" action.
+ *
+ * Three things must happen, in this order:
+ *
+ * 1. The window must be visible. A bar that is hidden is not lost, but the
+ *    user asked to see it.
+ * 2. The bar must be on a screen. The reconcile is the same one the
+ *    topology observer runs, so the tray action and the automatic recovery
+ *    can never disagree about where the bar belongs.
+ * 3. The bar must be findable. A brief pulse marks the bar as "this is
+ *    the one", because a bar that silently appears in a corner of a
+ *    three-monitor desktop is easy to miss.
+ *
+ * No second window is ever created: the existing floating-quota window is
+ * shown, moved and pulsed. No restart is required.
+ *
+ * Returns what it did, so the caller can report the outcome.
+ */
+export type LocateOutcome =
+  /** The bar was already visible and in place; only the pulse ran. */
+  | { kind: "already-visible" }
+  /** The bar was moved back onto an available screen. */
+  | { kind: "repositioned"; action: RecoveryAction }
+  /** No monitor could host the bar; the window is shown but may be off-screen. */
+  | { kind: "unplaceable" };
+
+export async function locateFloatingWindow(
+  onPulse?: () => void,
+): Promise<LocateOutcome> {
+  if (!isTauriRuntime()) {
+    onPulse?.();
+    return { kind: "already-visible" };
+  }
+  const win = getCurrentWindow();
+  // The tray already showed the window; the webview's own visibility
+  // announcement keeps the tray label truthful.
+  try {
+    await win.show();
+  } catch (error) {
+    console.warn("Floating window could not show itself for the tray locator", error);
+  }
+  const action = await reconcileFloatingPlacement();
+  if (action.kind === "unplaceable") {
+    onPulse?.();
+    return { kind: "unplaceable" };
+  }
+  onPulse?.();
+  if (action.kind === "move") {
+    return { kind: "repositioned", action };
+  }
+  return { kind: "already-visible" };
+}
+
+

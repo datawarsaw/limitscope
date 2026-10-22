@@ -119,6 +119,27 @@ describe("floating quota bar motion guards", () => {
     expect(block).toContain("transition: none");
     expect(block).toContain("animation: none");
   });
+
+  it("marks the recovered bar with a locate pulse that reduced motion switches off", () => {
+    // The pulse is a short outline on the shell and on the resting strip:
+    // the docked bar is the hardest to spot on a wide desktop, so both
+    // surfaces must announce themselves.
+    expect(css).toContain('.fq-root[data-locate-pulse="true"] .fq-shell');
+    expect(css).toContain('.fq-root[data-locate-pulse="true"] .fq-dock-strip');
+    expect(css).toContain("@keyframes fq-locate-pulse");
+    // It must not resize or move the bar: an outline only.
+    const keyframes =
+      css.match(/@keyframes fq-locate-pulse \{[\s\S]*?\n\}/)?.[0] ?? "";
+    expect(keyframes).toContain("box-shadow");
+    expect(keyframes).not.toContain("transform");
+    expect(keyframes).not.toContain("width");
+    expect(keyframes).not.toContain("height");
+    // The pulse must be declared before the reduced-motion block, so that
+    // block can switch it off.
+    expect(css.indexOf("@keyframes fq-locate-pulse")).toBeLessThan(
+      css.indexOf("@media (prefers-reduced-motion: reduce)"),
+    );
+  });
 });
 
 describe("floating quota bar semantic color guards", () => {

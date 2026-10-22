@@ -67,6 +67,12 @@ const ALLOWED_COMMANDS = new Set([
   "attach_floating_drag_lifecycle",
   "detach_floating_drag_lifecycle",
   "restore_floating_drag_origin",
+  // Native monitor-topology observation (Phase B): attach/detach the
+  // Rust-owned observer of Windows' display-topology broadcasts, so the
+  // floating bar can recover its placement after a monitor reconnects.
+  // Not a fetch and not a refresh.
+  "attach_floating_monitor_observer",
+  "detach_floating_monitor_observer",
 ]);
 
 function tsSources(dir: string): string[] {

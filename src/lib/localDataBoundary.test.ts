@@ -60,6 +60,11 @@ const IPC_SURFACE = new Set([
   "floating_drag::attach_floating_drag_lifecycle",
   "floating_drag::detach_floating_drag_lifecycle",
   "floating_drag::restore_floating_drag_origin",
+  // Native monitor-topology observation (Phase B): the Rust window subclass
+  // watches Windows' display-topology broadcasts; these commands attach and
+  // detach that observer only. It reads no files and clears nothing.
+  "floating_monitor::attach_floating_monitor_observer",
+  "floating_monitor::detach_floating_monitor_observer",
 ]);
 
 /** Credential material LimitScope must never name as a target. */
