@@ -7496,6 +7496,68 @@ mod tests {
         assert_eq!(out[0].used_percent, 40.0, "the window keeps its data");
     }
 
+    // The "7-day" window class (OpenDesign's long-term allowance) carries
+    // its own 15-day horizon at the same chokepoint: it is the weekly class
+    // under a different spelling, so it must not fall through to the
+    // generic 35-day fallback.
+    #[test]
+    fn limits_from_applies_the_explicit_seven_day_horizon() {
+        const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+        let now_ms = fixed_now().timestamp_millis();
+        let at = |ms: i64| {
+            (fixed_now() + chrono::Duration::milliseconds(ms))
+                .to_rfc3339_opts(SecondsFormat::Millis, true)
+        };
+        let limits = vec![
+            ("7-day".to_string(), 10.0, Some(at(7 * DAY_MS))),
+            ("7-day".to_string(), 20.0, Some(at(15 * DAY_MS - 1))),
+            ("7-day".to_string(), 30.0, Some(at(15 * DAY_MS))),
+            ("7-day".to_string(), 40.0, Some(at(20 * DAY_MS))),
+            ("5-hour".to_string(), 50.0, Some(at(10 * 60 * 60 * 1000))),
+            ("5-hour".to_string(), 60.0, Some(at(11 * 60 * 60 * 1000))),
+            ("Weekly".to_string(), 70.0, Some(at(15 * DAY_MS - 1))),
+            ("Weekly".to_string(), 80.0, Some(at(20 * DAY_MS))),
+            ("monthly".to_string(), 90.0, Some(at(20 * DAY_MS))),
+            ("monthly".to_string(), 95.0, Some(at(36 * DAY_MS))),
+        ];
+
+        let out = limits_from(&limits, now_ms);
+        assert!(out[0].reset_at.is_some(), "a nominal 7-day reset survives");
+        assert!(
+            out[1].reset_at.is_some(),
+            "a 7-day reset one millisecond inside the horizon survives"
+        );
+        assert_eq!(out[2].reset_at, None, "the 15-day boundary is exclusive");
+        assert_eq!(
+            out[3].reset_at, None,
+            "a 7-day reset 20 days out is rejected"
+        );
+        assert!(
+            out[4].reset_at.is_some(),
+            "the 5-hour horizon still accepts 10 h"
+        );
+        assert_eq!(
+            out[5].reset_at, None,
+            "the 5-hour horizon still rejects exactly 11 h"
+        );
+        assert!(
+            out[6].reset_at.is_some(),
+            "the weekly horizon still accepts one millisecond inside 15 days"
+        );
+        assert_eq!(
+            out[7].reset_at, None,
+            "the weekly horizon still rejects 20 days"
+        );
+        assert!(
+            out[8].reset_at.is_some(),
+            "the monthly horizon still accepts 20 days"
+        );
+        assert_eq!(
+            out[9].reset_at, None,
+            "the monthly horizon still rejects 36 days"
+        );
+    }
+
     // Full degradation pass: normalize drops only the bound, the observation
     // records with the window's data intact and no reset anchor.
     #[test]

@@ -275,10 +275,23 @@ impl std::fmt::Debug for CreditResponse {
 
 /// The MiniMax Code CLI's OAuth credential store. Only the fields the
 /// adapter needs are read; the token values never leave this process.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct AuthStore {
     #[serde(default)]
     records: Option<Value>,
+}
+
+/// Manual 'Debug' so the store's raw OAuth record can never reach a log
+/// through formatting. 'records' holds the CLI's own JSON verbatim, which
+/// carries the access token and the refresh token, so the derived Debug
+/// would print both. The sibling secret holders in this module
+/// ('AuthRecord', 'CreditResponse', 'SubscriptionKey') redact the same way.
+impl std::fmt::Debug for AuthStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthStore")
+            .field("records", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -1102,6 +1115,78 @@ mod tests {
         let rendered = format!("{record:?}");
         assert!(!rendered.contains("access-token-value"));
         assert!(!rendered.contains("refresh-token-value"));
+    }
+
+    #[test]
+    fn formatting_the_credential_store_never_exposes_a_credential() {
+        // The store holds the CLI's own OAuth record verbatim, access token
+        // and refresh token included. Its Debug must redact them the same
+        // way 'AuthRecord', 'CreditResponse' and 'SubscriptionKey' do, in
+        // both the compact and the alternate rendering.
+        let raw = r#"{
+          "schemaVersion": 1,
+          "records": {
+            "com.minimax.mcode.oauth.prod.en:account": {
+              "schemaVersion": 1,
+              "accessToken": "store-access-token-value",
+              "refreshToken": "store-refresh-token-value",
+              "idToken": "store-id-token-value",
+              "clientId": "store-client-id-value",
+              "userId": "store-user-id-value",
+              "email": "store-user-email-value",
+              "expiresAtMs": 1792639286783
+            }
+          }
+        }"#;
+        let store: AuthStore = serde_json::from_str(raw).expect("store");
+        // The store really does carry the credential material in memory.
+        let raw_records = store
+            .records
+            .as_ref()
+            .and_then(Value::as_object)
+            .expect("records")
+            .values()
+            .next()
+            .expect("record")
+            .to_string();
+        assert!(raw_records.contains("store-access-token-value"));
+        assert!(raw_records.contains("store-refresh-token-value"));
+
+        for rendered in [format!("{store:?}"), format!("{store:#?}")] {
+            assert!(
+                !rendered.contains("store-access-token-value"),
+                "the access token must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("store-refresh-token-value"),
+                "the refresh token must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("store-id-token-value"),
+                "the id token must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("store-client-id-value"),
+                "the client id must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("store-user-id-value"),
+                "the user id must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("store-user-email-value"),
+                "the account email must never be printed: {rendered}"
+            );
+            assert!(
+                !rendered.contains("com.minimax.mcode.oauth.prod.en:account"),
+                "the account id must never be printed: {rendered}"
+            );
+            // The redaction marker is what the reader gets instead.
+            assert!(
+                rendered.contains("<redacted>"),
+                "the store reports itself as redacted: {rendered}"
+            );
+        }
     }
 
     #[test]

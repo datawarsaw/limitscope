@@ -43,7 +43,7 @@ const DAY_MS: i64 = 24 * HOUR_MS;
 /// | `N hours` / `Nh` with `1 ≤ N ≤ 24`     | 2·N h + 1 h |
 /// | `hourly`, `1 hour`                     | 3 h         |
 /// | `daily`, `1 day`, `24 hours`           | 48 h        |
-/// | `weekly`                               | 15 d        |
+/// | `weekly`, `7-day`                      | 15 d        |
 /// | `monthly`                              | 35 d        |
 /// | anything else (conservative fallback)  | 35 d        |
 pub(crate) fn plausible_reset_at(window_label: &str, reset_at: &str, now_ms: i64) -> bool {
@@ -70,7 +70,11 @@ fn max_horizon_ms(window_label: &str) -> i64 {
     match label.as_str() {
         "hourly" | "1 hour" => return 3 * HOUR_MS,
         "daily" | "1 day" | "24 hours" => return 48 * HOUR_MS,
-        "weekly" => return 15 * DAY_MS,
+        // "7-day" is the OpenDesign spelling of the weekly class (the Go
+        // plan's long-term allowance), not a separate window class: it
+        // shares the weekly 15-day horizon instead of falling through to
+        // the generic 35-day fallback.
+        "weekly" | "7-day" => return 15 * DAY_MS,
         "monthly" => return 35 * DAY_MS,
         _ => {}
     }
@@ -107,12 +111,17 @@ mod tests {
             .timestamp_millis()
     }
 
-    /// A reset stamp `hours` hours from the fixed now.
-    fn reset_hours_from_now(hours: f64) -> String {
-        let ms = now_ms() + (hours * HOUR_MS as f64).round() as i64;
+    /// A reset stamp `ms` milliseconds from the fixed now.
+    fn reset_ms_from_now(ms: i64) -> String {
+        let ms = now_ms() + ms;
         DateTime::from_timestamp_millis(ms)
             .unwrap()
             .to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    /// A reset stamp `hours` hours from the fixed now.
+    fn reset_hours_from_now(hours: f64) -> String {
+        reset_ms_from_now((hours * HOUR_MS as f64).round() as i64)
     }
 
     // Each table row pins its horizon: exactly at the horizon is outside
@@ -161,6 +170,65 @@ mod tests {
             &reset_hours_from_now(47.0),
             now_ms()
         ));
+    }
+
+    #[test]
+    fn seven_day_label_has_its_own_fifteen_day_boundaries() {
+        const HORIZON_MS: i64 = 15 * DAY_MS;
+
+        assert!(
+            plausible_reset_at("7-day", &reset_ms_from_now(7 * DAY_MS), now_ms()),
+            "a reset a week out is the nominal 7-day window"
+        );
+        assert!(
+            plausible_reset_at("7-day", &reset_ms_from_now(HORIZON_MS - 1), now_ms()),
+            "one millisecond inside the 15-day horizon is plausible"
+        );
+        assert!(
+            !plausible_reset_at("7-day", &reset_ms_from_now(HORIZON_MS), now_ms()),
+            "the 15-day boundary is exclusive"
+        );
+        assert!(
+            !plausible_reset_at("7-day", &reset_ms_from_now(20 * DAY_MS), now_ms()),
+            "a 20-day reset must not fall through to the 35-day fallback"
+        );
+        // The label class is locale-fixed like every other row: trimmed and
+        // lowercased, never case-sensitive.
+        assert!(
+            plausible_reset_at("  7-DAY  ", &reset_ms_from_now(HORIZON_MS - 1), now_ms()),
+            "the trimmed and lowercased spelling pins the same horizon"
+        );
+    }
+
+    #[test]
+    fn the_seven_day_row_does_not_move_the_other_window_classes() {
+        // The weekly class keeps its own 15-day horizon, the monthly class
+        // its 35-day one, and an unknown label still falls back to 35 days.
+        // Only the "7-day" row is new.
+        assert!(
+            plausible_reset_at("weekly", &reset_ms_from_now(15 * DAY_MS - 1), now_ms()),
+            "weekly still accepts one millisecond inside 15 days"
+        );
+        assert!(
+            !plausible_reset_at("weekly", &reset_ms_from_now(20 * DAY_MS), now_ms()),
+            "weekly still rejects 20 days"
+        );
+        assert!(
+            plausible_reset_at("monthly", &reset_ms_from_now(20 * DAY_MS), now_ms()),
+            "monthly still accepts 20 days"
+        );
+        assert!(
+            !plausible_reset_at("monthly", &reset_ms_from_now(36 * DAY_MS), now_ms()),
+            "monthly still rejects 36 days"
+        );
+        assert!(
+            plausible_reset_at("quarterly", &reset_ms_from_now(30 * DAY_MS), now_ms()),
+            "an unknown label still falls back to the conservative 35-day horizon"
+        );
+        assert!(
+            !plausible_reset_at("quarterly", &reset_ms_from_now(36 * DAY_MS), now_ms()),
+            "an unknown label still rejects 36 days"
+        );
     }
 
     #[test]

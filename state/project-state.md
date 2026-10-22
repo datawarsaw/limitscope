@@ -27,6 +27,12 @@
   `0a984dced406933007b4074fad1529c4d60dd629`, carrying the identical tree of
   the accepted candidate `404ad731847ab0c95c6518b8a36ce8012788d70a`.
 - Technical baseline for the release: `0a984dced406933007b4074fad1529c4d60dd629`.
+- Maintenance candidate (not released): branch
+  `codex/maintenance-reset7d-horizon-minimax-authstore`, worktree
+  `C:/AI/limitscope-maintenance-reset7d-minimax`, based on `origin/main`
+  `54546d255b44bbf04600c446fc31423f05cb65a7`. It carries the 7-day reset
+  horizon correction and the MiniMax `AuthStore` redaction as two separate
+  commits. No version surface, release manifest or tag is touched.
 - Historical dirty checkout `C:/AI/Token_Monitor` is outside the mutation scope.
 
 ## Architecture and boundaries
@@ -41,6 +47,12 @@
   reset is invented. See `docs/opendesign-provider.md`.
 - Existing providers, ZCode Reset Cards, OpenCode Go and signing infrastructure
   retain their established behavior. Z.ai `unexpected_response` is out of scope.
+- The reset plausibility table (Lane B) gives the `7-day` label class the
+  weekly 15-day horizon. `7-day` is the weekly class under a second
+  spelling — OpenDesign's long-term allowance and Codex's humanized
+  7-day window — so it must not fall through to the conservative 35-day
+  generic fallback. Every other class is unchanged: `weekly` 15 d, `monthly`
+  35 d, unknown labels 35 d.
 - Prepaid API wallets are a separate snapshot list (`wallets`), not providers:
   no percentages, reset windows or period, and they never enter quota history,
   prediction or notifications. OpenRouter reads the official credits endpoint
@@ -92,10 +104,22 @@
   signature were re-downloaded after publication and re-hashed; both match
   the run manifest, and `minisign-verify 0.2.5` with `allow_legacy=false`
   passes against the published installer.
-- The MiniMax `AuthStore` derives `Debug` over the raw OAuth record. This is
-  a latent, non-blocking P2 finding tracked as Linear MIC-315; it was not
-  fixed in v0.8.16 because the release commit is version-only and no release
-  policy requires the remediation.
+- Maintenance candidate verified on 2026-10-22 at `bd34798`: Rust 970 PASS /
+  0 FAIL / 18 intentionally ignored live probes;
+  `cargo check --locked --all-targets` PASS (the same 3 pre-existing
+  dead-code warnings in `zcode_reset` / `zcode_plans`);
+  `npm run build` PASS; `npm run scan:secrets` PASS (4 files, `dist/` and
+  `tauri.conf.json`). Both fixes are proven by a negative control: the new
+  reset-plausibility tests and the new credential-redaction test each fail
+  against the unfixed code. No frontend source changed, so no frontend
+  behavior is affected.
+- The MiniMax `AuthStore` `Debug` over the raw OAuth record is closed on the
+  maintenance candidate branch: the derived `Debug` is replaced by a manual
+  redacting impl, so no access token, refresh token, id token, client id,
+  user id, email or account id can reach a log through formatting. The
+  finding was latent (no call site formatted the store) and was tracked as
+  Linear MIC-315; it was not fixed in v0.8.16 because the release commit is
+  version-only and no release policy requires the remediation.
 - Authenticated OpenDesign validation requires the user-owned Plan & balance
   page in Chrome. Agent validation is separate from Human Acceptance, which the
   operator recorded against the candidate SHA before the release.
