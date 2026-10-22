@@ -1,4 +1,10 @@
-import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
+import type {
+  ApiWallet,
+  GrokBotUsage,
+  LimitWindow,
+  ProviderUsage,
+} from "../types";
+import { grokBotFor } from "./grokBot";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import {
   providerStatusPresentation,
@@ -62,6 +68,18 @@ export type FloatingQuotaItem = {
    * keeps it muted on its own bottom line.
    */
   accountLabel?: string;
+  /**
+   * The Grok Bot (X Premium+) supplemental weekly observation the runtime
+   * already collected for this provider, when the provider carries one.
+   *
+   * This is the SAME observation the main dashboard renders (see
+   * `GrokBotPanel`), carried on the floating item so both surfaces describe
+   * one pool from one source. It stays a supplemental sub-pool: it never
+   * feeds the segment's percentage, the meter, the countdowns, the resting
+   * dock, or the primary window selection — the xAI billing windows above
+   * remain the Grok segment's quota. Only the Grok detail card reads it.
+   */
+  grokBot?: GrokBotUsage;
   /** Snapshot is stale even when an error marker is also showing. */
   stale: boolean;
   statusLabel: ProviderStatusPresentation["label"];
@@ -136,8 +154,15 @@ export function floatingBarWidth(
 
 // ---------- Resting dock (top edge) ----------
 
-/** Logical size of the resting dock: a meter-only strip, five 3px meters. */
-export const DOCK_WIDTH = 600;
+/**
+ * Logical height of the resting dock: a meter-only strip of 3px meters.
+ *
+ * The resting dock has no fixed width of its own: it takes the active
+ * floating bar's width for the same visible providers (and the same wallet
+ * slot), so resting, revealed and pinned placements share one footprint.
+ * A dock wide enough for providers the user hid would leave empty space on
+ * the desktop, so the width tracks the visible set instead.
+ */
 export const DOCK_HEIGHT = 16;
 /** The resting meters keep the revealed bar's 3px meter height. */
 export const DOCK_METER_HEIGHT = 3;
@@ -226,22 +251,16 @@ export function haloWalletRect(
 }
 
 /**
- * Meter rects for the resting dock. The strip is a fixed 600px wide while
- * the revealed bar may be narrower (hidden providers shrink the production
- * width), so each rect is offset by half the difference: the reveal re-centers
- * the window, and with this offset every resting meter stays stationary on
- * screen while the bar fades in underneath it.
+ * Meter rects for the resting dock. The strip and the revealed bar share one
+ * width for the same visible providers (floatingBarWidth), so the resting
+ * meters sit exactly on the revealed bar's meters with no offset: the reveal
+ * never moves a meter horizontally.
  */
 export function dockMeterRects(
   providerCount: number,
   hasWallet = false,
 ): MeterRect[] {
-  const revealedWidth = floatingBarWidth(providerCount, hasWallet);
-  const offset = (DOCK_WIDTH - revealedWidth) / 2;
-  return haloMeterRects(revealedWidth, providerCount, hasWallet).map((rect) => ({
-    left: offset + rect.left,
-    width: rect.width,
-  }));
+  return haloMeterRects(floatingBarWidth(providerCount, hasWallet), providerCount, hasWallet);
 }
 
 /**
@@ -256,6 +275,34 @@ export function dockSeparatorLefts(
 ): number[] {
   const rects = dockMeterRects(providerCount, hasWallet);
   return rects.slice(1).map((rect) => rect.left - meterInset(providerCount));
+}
+
+/** Radius of the resting dock's wallet dot, in logical px. */
+export const DOCK_WALLET_DOT_RADIUS = 2;
+
+/**
+ * The resting dock's wallet status dot: a small circle in the same slot the
+ * revealed bar's wallet occupies, so the dock carries the same wallet
+ * presence and health without ever drawing a meter for it.
+ *
+ * A wallet is an absolute money balance, not a quota window, so it has no
+ * percentage to fill and no meter to scale: the dot is a state signal only,
+ * never a quota reading. Its x position mirrors the revealed bar's wallet
+ * slot exactly, and its diameter matches the revealed bar's own dot, so the
+ * two read as one element across the reveal.
+ */
+export function dockWalletDotRect(
+  providerCount: number,
+  hasWallet = false,
+): MeterRect | null {
+  if (!hasWallet) return null;
+  const slot = haloWalletRect(floatingBarWidth(providerCount, true), providerCount);
+  return {
+    // The revealed bar centres the dot in its 44px slot; the resting strip
+    // centres its own dot on the same x.
+    left: slot.left + slot.width / 2 - DOCK_WALLET_DOT_RADIUS,
+    width: DOCK_WALLET_DOT_RADIUS * 2,
+  };
 }
 
 /** Extra logical height while the shared detail card or menu is open. For
@@ -514,6 +561,10 @@ export function floatingQuotaItems(
     const status = providerStatusPresentation(usage);
     const primary = floatingPrimaryWindow(usage);
     const hasWindow = primary !== undefined;
+    // The runtime's own Grok Bot observation, so the floating card shows the
+    // same supplemental pool the main dashboard shows. Only the Grok entry
+    // can carry one (grokBotFor enforces the provider id).
+    const grokBot = grokBotFor(usage);
     const windows: FloatingQuotaWindowRow[] = usage.limits
       .filter(isUsableQuotaWindow)
       .map((limit) => ({
@@ -534,6 +585,7 @@ export function floatingQuotaItems(
       windows,
       primaryReset: primaryResetTarget(usage),
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),
+      ...(grokBot ? { grokBot } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,
       statusClass: status.className,

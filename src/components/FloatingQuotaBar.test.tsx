@@ -470,6 +470,36 @@ describe("Grok detail card Grok Bot section", () => {
     primaryReset: { label: "Weekly credits", resetAt: RESET_AT },
   });
 
+  it("shows the runtime's Grok Bot observation, like the main dashboard does", async () => {
+    // The runtime's passive observation rides the floating item, so the
+    // floating card shows the same pool the main app renders — with no
+    // manual read needed.
+    const withObservation = item({
+      providerId: "grok",
+      name: "Grok",
+      percent: 22,
+      windowLabel: "Weekly credits",
+      resetAt: RESET_AT,
+      windows: [{ label: "On-demand", usedPercent: 9, resetAt: RESET_AT }],
+      primaryReset: { label: "Weekly credits", resetAt: RESET_AT },
+      grokBot: { planName: "X Premium+", usedPercent: 17.66 },
+    });
+
+    await renderBar({ items: [withObservation], detailId: "grok", pinned: true });
+    const dialog = container.querySelector('[role="dialog"]')!;
+    // The same plan label the main dashboard's Grok Bot panel shows.
+    expect(dialog.querySelector(".fq-grokbot-label")!.textContent).toBe(
+      "Grok Bot · X Premium+",
+    );
+    // 17.66% used is 82% remaining on the floating surface's perspective.
+    expect(dialog.querySelector(".fq-grokbot-line")!.textContent).toContain(
+      "82% remaining",
+    );
+    // No manual read was needed, so the guidance is absent.
+    expect(dialog.querySelector(".fq-grokbot-status")).toBeNull();
+    expect(dialog.textContent).not.toContain("No Grok Bot data yet");
+  });
+
   it("adds a Grok Bot section below the quota windows, before the actions", async () => {
     await renderBar({ items: [GROK], detailId: "grok", pinned: true });
     const dialog = container.querySelector('[role="dialog"]')!;

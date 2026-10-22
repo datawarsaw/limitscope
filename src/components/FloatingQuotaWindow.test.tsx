@@ -81,7 +81,12 @@ vi.mock("../lib/floatingWindowChrome", () => ({
   setFloatingPinned: () => Promise.resolve(),
 }));
 
-import { dockMeterRects } from "../lib/floatingQuota";
+import {
+  DOCK_WALLET_DOT_RADIUS,
+  dockMeterRects,
+  floatingBarWidth,
+  haloWalletRect,
+} from "../lib/floatingQuota";
 import { FLOATING_PREFS_STORAGE_KEY } from "../lib/floatingWindowPrefs";
 import { DOCK_REVEAL_MS, FloatingQuotaWindow } from "./FloatingQuotaWindow";
 
@@ -475,13 +480,15 @@ describe("FloatingQuotaWindow resting dock", () => {
   }
 
   it(
-    "rests 600×16 on startup when the dock pref is top, meters only",
+    "rests at the active bar width on startup when the dock pref is top",
     async () => {
       dockPref();
       await renderWindow();
 
       // Startup restore: the first native resize is the resting strip.
-      expect(mocks.resizeCalls[0]).toEqual([600, 16, false, true]);
+      // Two visible providers: the resting strip matches the 300px
+      // production bar, so no empty width is left on the desktop.
+      expect(mocks.resizeCalls[0]).toEqual([300, 16, false, true]);
       expect(document.querySelector(".fq-root")!.getAttribute("data-dock-state")).toBe(
         "resting",
       );
@@ -525,7 +532,7 @@ describe("FloatingQuotaWindow resting dock", () => {
 
       await hoverOut(document.querySelector(".fq-root")!);
       await advance(150);
-      expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+      expect(mocks.resizeCalls.at(-1)).toEqual([300, 16, false, true]);
       expect(dockStrip()).not.toBeNull();
       expect(
         document.querySelector(".fq-root")!.getAttribute("data-dock-state"),
@@ -581,7 +588,7 @@ describe("FloatingQuotaWindow resting dock", () => {
       await hoverOut(document.querySelector(".fq-root")!);
       await advance(400);
       expect(card()).not.toBeNull();
-      expect(mocks.resizeCalls.some(([width, height]) => width === 600 && height === 16)).toBe(
+      expect(mocks.resizeCalls.some(([width, height]) => width === 300 && height === 16)).toBe(
         false,
       );
 
@@ -595,7 +602,7 @@ describe("FloatingQuotaWindow resting dock", () => {
       });
       await advance(200);
       await advance(200);
-      expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+      expect(mocks.resizeCalls.at(-1)).toEqual([300, 16, false, true]);
       expect(dockStrip()).not.toBeNull();
     }),
   );
@@ -636,13 +643,13 @@ describe("FloatingQuotaWindow resting dock", () => {
       await click(dock!);
 
       // Docking dismisses the menu: top-anchored at the production size —
-      // 300 wide for the fixture's two visible providers, only the resting
-      // strip is fixed at 600.
+      // 300 wide for the fixture's two visible providers, and the resting
+      // strip keeps that same width.
       expect(mocks.resizeCalls.at(-1)).toEqual([300, 64, false, true]);
       expect(document.querySelector(".fq-menu")).toBeNull();
       // No outside click is needed for the dock to settle.
       await advance(150);
-      expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+      expect(mocks.resizeCalls.at(-1)).toEqual([300, 16, false, true]);
       expect(dockStrip()).not.toBeNull();
     }),
   );
@@ -650,7 +657,7 @@ describe("FloatingQuotaWindow resting dock", () => {
   it("follows a drag-away undock reported by the chrome", async () => {
     dockPref();
     await renderWindow();
-    expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+    expect(mocks.resizeCalls.at(-1)).toEqual([300, 16, false, true]);
 
     await act(async () => {
       mocks.onDockChange?.("none");
@@ -658,6 +665,93 @@ describe("FloatingQuotaWindow resting dock", () => {
     expect(mocks.resizeCalls.at(-1)).toEqual([300, 64, false, false]);
     expect(dockStrip()).toBeNull();
   });
+
+  it(
+    "rests, reveals and pins at one width for three visible providers",
+    withFakeTimers(async () => {
+      mocks.extraProviders.push(extraProvider(1));
+      dockPref();
+      await renderWindow();
+
+      // Three visible providers: the resting strip, the revealed bar and the
+      // pinned card all use the same 400px footprint.
+      expect(mocks.resizeCalls[0]).toEqual([400, 16, false, true]);
+      const meters = Array.from(
+        dockStrip()!.querySelectorAll<HTMLElement>(".fq-dock-meter"),
+      );
+      expect(meters).toHaveLength(3);
+      const rects = dockMeterRects(3);
+      meters.forEach((meter, index) => {
+        expect(meter.style.left).toBe(`${rects[index].left}px`);
+        expect(meter.style.width).toBe(`${rects[index].width}px`);
+      });
+
+      await hoverIn(dockStrip()!);
+      expect(mocks.resizeCalls.at(-1)).toEqual([400, 64, false, true]);
+      await advance(DOCK_REVEAL_MS);
+
+      await click(document.querySelector('[data-provider-id="zai"]')!);
+      expect(card()).not.toBeNull();
+      const detailCalls = mocks.resizeCalls.filter(([, , overlay]) => overlay);
+      expect(detailCalls.length).toBeGreaterThan(0);
+      for (const [width] of detailCalls) expect(width).toBe(400);
+
+      await hoverOut(document.querySelector(".fq-root")!);
+      await act(async () => {
+        window.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "Escape", bubbles: true }),
+        );
+      });
+      await advance(200);
+      await advance(200);
+      expect(mocks.resizeCalls.at(-1)).toEqual([400, 16, false, true]);
+      expect(dockStrip()).not.toBeNull();
+    }),
+  );
+
+  it(
+    "shrinks the resting dock when a provider is hidden",
+    withFakeTimers(async () => {
+      mocks.extraProviders.push(extraProvider(1));
+      dockPref();
+      await renderWindow();
+      expect(mocks.resizeCalls.at(-1)).toEqual([400, 16, false, true]);
+
+      // Hiding the third provider takes the visible set to two, so the dock
+      // follows the active bar's 300px instead of leaving empty width.
+      mocks.prefs.hidden = ["extra-1"];
+      await renderWindow();
+      expect(document.querySelector('[data-provider-id="extra-1"]')).toBeNull();
+      expect(mocks.resizeCalls.at(-1)).toEqual([300, 16, false, true]);
+      expect(dockStrip()!.querySelectorAll(".fq-dock-meter")).toHaveLength(2);
+    }),
+  );
+
+  it(
+    "keeps the revealed state when the visible set changes",
+    withFakeTimers(async () => {
+      mocks.extraProviders.push(extraProvider(1));
+      dockPref();
+      await renderWindow();
+      expect(mocks.resizeCalls.at(-1)).toEqual([400, 16, false, true]);
+
+      await hoverIn(dockStrip()!);
+      expect(mocks.resizeCalls.at(-1)).toEqual([400, 64, false, true]);
+      await advance(DOCK_REVEAL_MS);
+      expect(
+        document.querySelector(".fq-root")!.getAttribute("data-dock-state"),
+      ).toBe("revealed");
+
+      // The bar reflows in place and stays revealed — the resting height
+      // never intervenes.
+      mocks.prefs.hidden = ["extra-1"];
+      await renderWindow();
+      expect(mocks.resizeCalls.at(-1)).toEqual([300, 64, false, true]);
+      expect(
+        document.querySelector(".fq-root")!.getAttribute("data-dock-state"),
+      ).toBe("revealed");
+    }),
+  );
 });
 
 const WALLET = {
@@ -680,7 +774,7 @@ function extraProvider(index: number) {
 }
 
 describe("FloatingQuotaWindow API wallet slot", () => {
-  it("reveals the five-provider bar at 646px while the resting strip stays 600×16", () => {
+  it("rests and reveals the five-provider bar at 646px with a wallet", () => {
     return withFakeTimers(async () => {
       mocks.wallets.push(WALLET);
       mocks.extraProviders.push(
@@ -694,7 +788,9 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       );
       await renderWindow();
 
-      expect(mocks.resizeCalls[0]).toEqual([600, 16, false, true]);
+      // The resting strip shares the revealed bar's width, so the wallet's
+      // own slot is present in both placements.
+      expect(mocks.resizeCalls[0]).toEqual([646, 16, false, true]);
       const strip = document.querySelector<HTMLElement>(".fq-dock-strip")!;
       await hoverIn(strip);
       expect(mocks.resizeCalls.at(-1)).toEqual([646, 64, false, true]);
@@ -706,7 +802,7 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       await advance(DOCK_REVEAL_MS);
       await hoverOut(document.querySelector(".fq-root")!);
       await advance(150);
-      expect(mocks.resizeCalls.at(-1)).toEqual([600, 16, false, true]);
+      expect(mocks.resizeCalls.at(-1)).toEqual([646, 16, false, true]);
     });
   });
 
@@ -732,13 +828,56 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       expect(meter.style.left).toBe(`${rects[index].left}px`);
       expect(meter.style.width).toBe(`${rects[index].width}px`);
     });
-    // A wallet is a revealed-bar slot only: the strip stays meters-only.
+    // A wallet never becomes a quota meter: the strip keeps a status DOT
+    // only — presence and health, never a percentage or a filled track.
     expect(
       document.querySelector(
         ".fq-dock-strip .fq-wallet, .fq-dock-strip .fq-percent, .fq-dock-strip .fq-mark",
       ),
     ).toBeNull();
+    const dot = document.querySelector<HTMLElement>(".fq-dock-wallet-dot");
+    expect(dot).not.toBeNull();
+    expect(dot!.getAttribute("data-state")).toBe("healthy");
+    expect(dot!.querySelector(".fq-meter-fill")).toBeNull();
+    // A wallet is an absolute money balance, never a quota: the dot is not a
+    // progressbar and its spoken label names the balance, not a percentage
+    // of a quota window.
+    expect(dot!.getAttribute("role")).toBe("img");
+    expect(dot!.getAttribute("role")).not.toBe("progressbar");
+    expect(dot!.getAttribute("aria-label")).toContain("OpenRouter API wallet");
+    expect(dot!.getAttribute("aria-label")).toContain("$12.50 remaining");
+    expect(dot!.getAttribute("aria-label")).not.toContain("%");
+    // The dot sits in the revealed bar's own wallet slot.
+    const slot = haloWalletRect(floatingBarWidth(5, true), 5);
+    expect(parseFloat(dot!.style.left)).toBeCloseTo(
+      slot.left + slot.width / 2 - DOCK_WALLET_DOT_RADIUS,
+      6,
+    );
     expect(document.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
+  });
+
+  it("shows no wallet dot when the bar carries no wallet", async () => {
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ visible: true, dock: "top" }),
+    );
+    await renderWindow();
+
+    expect(document.querySelector(".fq-dock-wallet-dot")).toBeNull();
+  });
+
+  it("mirrors the wallet's health in the resting dot", async () => {
+    mocks.wallets.push({ ...WALLET, health: "stale" });
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ visible: true, dock: "top" }),
+    );
+    await renderWindow();
+
+    // The same health vocabulary the revealed wallet slot uses.
+    expect(
+      document.querySelector(".fq-dock-wallet-dot")!.getAttribute("data-state"),
+    ).toBe("stale");
   });
 
   it(

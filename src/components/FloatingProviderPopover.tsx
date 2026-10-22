@@ -230,10 +230,14 @@ export function FloatingProviderPopover({
           </div>
         ) : null}
 
-        {/* Grok Bot's own manual read lives below a hairline, separate from
-            the Grok Weekly quota above: different source, different meter,
-            explicit Refresh only. */}
-        {item.providerId === "grok" ? <GrokBotSection now={now} /> : null}
+        {/* Grok Bot lives below a hairline, separate from the Grok Weekly
+            quota above: a different pool, a different meter. The runtime's
+            passive observation is what the main dashboard shows for the
+            same pool, so both windows agree; the explicit Refresh is the
+            manual fallback read. */}
+        {item.providerId === "grok" ? (
+          <GrokBotSection now={now} observation={item.grokBot} />
+        ) : null}
         {item.providerId === "opendesign" ? <OpenDesignRefreshControl /> : null}
 
         {item.error ? (

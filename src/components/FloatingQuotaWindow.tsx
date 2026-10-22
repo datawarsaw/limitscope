@@ -4,7 +4,6 @@ import { useProviderUsage } from "../hooks/useProviderUsage";
 import { useSettings } from "../hooks/useSettings";
 import {
   DOCK_HEIGHT,
-  DOCK_WIDTH,
   floatingBarWidth,
   floatingQuotaItems,
   floatingWalletItems,
@@ -173,13 +172,13 @@ export function FloatingQuotaWindow() {
 
   // One resize effect drives both placements: undocked it resizes the free
   // bar to the production size; docked it anchors to the top edge of the
-  // current monitor's work area instead — the resting strip at a fixed
-  // 600×16, the revealed bar at the production size — with the top edge and
-  // the horizontal center kept on every change.
+  // current monitor's work area instead — the resting strip and the revealed
+  // bar at the SAME width, the production size for the visible providers —
+  // with the top edge and the horizontal center kept on every change.
   const resting = docked && !revealed;
   useEffect(() => {
     void resizeFloatingWindow(
-      resting ? DOCK_WIDTH : width,
+      width,
       resting ? DOCK_HEIGHT : height,
       overlay !== "none",
       docked,
@@ -432,7 +431,7 @@ export function FloatingQuotaWindow() {
         docked && (resting || stripExiting) ? (
           <FloatingDockStrip
             items={items}
-            hasWallet={walletItems.length > 0}
+            wallets={walletItems}
             exiting={stripExiting}
           />
         ) : null
