@@ -2,10 +2,14 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import type { ReactNode } from "react";
 import type { FloatingQuotaItem, FloatingWalletItem } from "../lib/floatingQuota";
 import type { SmartDockGesture } from "../lib/smartDocking";
-import { clampPopoverAlign, floatingClickAction } from "../lib/floatingQuota";
+import {
+  API_WALLETS_DETAIL_ID,
+  clampPopoverAlign,
+  floatingClickAction,
+} from "../lib/floatingQuota";
 import { FloatingProviderItem } from "./FloatingProviderItem";
 import { FloatingProviderPopover } from "./FloatingProviderPopover";
-import { FloatingWalletPopover } from "./FloatingWalletPopover";
+import { FloatingWalletsPopover } from "./FloatingWalletsPopover";
 import { FloatingWalletSlot } from "./FloatingWalletSlot";
 
 /** One card width for hover previews and pinned clicks alike. */
@@ -105,11 +109,13 @@ export function FloatingQuotaBar({
   selectorRef.current = selector;
   const placeTimer = useRef<number | null>(null);
   const active = items.find((item) => item.providerId === detailId) ?? null;
-  const activeWallet =
-    active === null
-      ? wallets.find((wallet) => wallet.id === detailId) ?? null
-      : null;
-  const activeId = active?.providerId ?? activeWallet?.id ?? null;
+  // One shared wallet slot opens the API Wallets card, whatever the number
+  // of wallets the runtime reports.
+  const activeWallets =
+    active === null && detailId === API_WALLETS_DETAIL_ID ? wallets : null;
+  const activeId =
+    active?.providerId ??
+    (activeWallets !== null ? API_WALLETS_DETAIL_ID : null);
 
   useLayoutEffect(() => {
     const shell = shellRef.current;
@@ -261,18 +267,17 @@ export function FloatingQuotaBar({
                 onContextMenu={onContextMenu}
               />
             ))}
-            {wallets.map((wallet) => (
+            {wallets.length > 0 ? (
               <FloatingWalletSlot
-                key={wallet.id}
-                item={wallet}
-                expanded={detailId === wallet.id}
+                items={wallets}
+                expanded={detailId === API_WALLETS_DETAIL_ID}
                 busy={walletBusy}
                 onHover={onHover}
                 onHoverEnd={onHoverEnd}
                 onOpen={onOpen}
                 onContextMenu={onContextMenu}
               />
-            ))}
+            ) : null}
           </>
         )}
       </div>
@@ -309,9 +314,9 @@ export function FloatingQuotaBar({
           }}
           onOpenMain={onOpenMain}
         />
-      ) : activeWallet ? (
-        <FloatingWalletPopover
-          item={activeWallet}
+      ) : activeWallets !== null ? (
+        <FloatingWalletsPopover
+          items={activeWallets}
           pinned={pinned}
           now={now}
           align={align}

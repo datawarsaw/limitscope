@@ -665,7 +665,15 @@ const WALLET = {
   name: "OpenRouter",
   health: "live",
   checkedAt: "2026-09-28T09:55:00.000Z",
-  remainingUsd: 12.5,
+  balances: [{ currency: "USD", amount: 12.5 }],
+};
+
+const DEEPSEEK_WALLET = {
+  id: "deepseek",
+  name: "DeepSeek",
+  health: "live",
+  checkedAt: "2026-09-28T09:55:00.000Z",
+  balances: [{ currency: "CNY", amount: 110 }],
 };
 
 function extraProvider(index: number) {
@@ -699,7 +707,7 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       await hoverIn(strip);
       expect(mocks.resizeCalls.at(-1)).toEqual([646, 64, false, true]);
       expect(
-        document.querySelector('[data-wallet-id="openrouter"]'),
+        document.querySelector('[data-wallet-id="api-wallets"]'),
       ).not.toBeNull();
       expect(document.querySelectorAll("[data-provider-id]")).toHaveLength(5);
 
@@ -738,7 +746,7 @@ describe("FloatingQuotaWindow API wallet slot", () => {
         ".fq-dock-strip .fq-wallet, .fq-dock-strip .fq-percent, .fq-dock-strip .fq-mark",
       ),
     ).toBeNull();
-    expect(document.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
+    expect(document.querySelector('[data-wallet-id="api-wallets"]')).not.toBeNull();
   });
 
   it(
@@ -747,14 +755,14 @@ describe("FloatingQuotaWindow API wallet slot", () => {
       mocks.wallets.push(WALLET);
       await renderWindow();
       const wallet = document.querySelector<HTMLElement>(
-        '[data-wallet-id="openrouter"]',
+        '[data-wallet-id="api-wallets"]',
       )!;
 
       await click(wallet);
       const dialog = document.querySelector('[role="dialog"]');
       expect(dialog).not.toBeNull();
-      expect(dialog!.getAttribute("data-wallet")).toBe("openrouter");
-      expect(dialog!.textContent).toContain("$12.50");
+      expect(dialog!.getAttribute("data-wallet")).toBe("api-wallets");
+      expect(dialog!.textContent).toContain("USD 12.50");
       expect(document.activeElement).toBe(
         dialog!.querySelector(".fq-wallet-refresh"),
       );
@@ -775,6 +783,26 @@ describe("FloatingQuotaWindow API wallet slot", () => {
     mocks.prefs.hidden = ["zai", "grok"];
     await renderWindow();
     expect(document.querySelector(".fq-empty")).toBeNull();
-    expect(document.querySelector('[data-wallet-id="openrouter"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-wallet-id="api-wallets"]'),
+    ).not.toBeNull();
+  });
+
+  it("shows both wallets in the one shared wallet slot and card", async () => {
+    mocks.wallets.push(WALLET, DEEPSEEK_WALLET);
+    await renderWindow();
+    // One slot, whatever the number of wallets.
+    expect(document.querySelectorAll("[data-wallet-id]")).toHaveLength(1);
+    const wallet = document.querySelector<HTMLElement>(
+      '[data-wallet-id="api-wallets"]',
+    )!;
+    await click(wallet);
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("OpenRouter");
+    expect(dialog.textContent).toContain("USD 12.50");
+    expect(dialog.textContent).toContain("DeepSeek");
+    expect(dialog.textContent).toContain("CNY 110.00");
+    // No combined total across currencies.
+    expect(dialog.textContent).not.toContain("122.50");
   });
 });

@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { FloatingWalletPopover } from "./FloatingWalletPopover";
+import { FloatingWalletsPopover } from "./FloatingWalletsPopover";
 import type { FloatingWalletItem } from "../lib/floatingQuota";
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -15,14 +15,14 @@ function item(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
     id: "openrouter",
     name: "OpenRouter",
     state: "healthy",
-    remainingUsd: 12.5,
+    balances: [{ currency: "USD", amount: 12.5 }],
     checkedAt: CHECKED_AT,
     statusLabel: "Live",
     ...extra,
   };
 }
 
-type PopoverProps = Parameters<typeof FloatingWalletPopover>[0];
+type PopoverProps = Parameters<typeof FloatingWalletsPopover>[0];
 
 let container: HTMLDivElement;
 let root: Root;
@@ -40,7 +40,7 @@ afterEach(async () => {
 
 async function renderPopover(overrides: Partial<PopoverProps> = {}) {
   const props: PopoverProps = {
-    item: item(),
+    items: [item()],
     now: NOW,
     pinned: false,
     align: 0,
@@ -53,7 +53,7 @@ async function renderPopover(overrides: Partial<PopoverProps> = {}) {
     onRefresh: vi.fn(),
     ...overrides,
   };
-  await act(async () => root.render(<FloatingWalletPopover {...props} />));
+  await act(async () => root.render(<FloatingWalletsPopover {...props} />));
   return props;
 }
 
@@ -77,23 +77,23 @@ async function click(element: Element) {
   });
 }
 
-describe("FloatingWalletPopover", () => {
+describe("FloatingWalletsPopover", () => {
   it("presents the wallet balance with its status and observation age", async () => {
     await renderPopover();
     const text = dialog().textContent ?? "";
+    expect(text).toContain("API Wallets");
     expect(text).toContain("OpenRouter");
-    expect(text).toContain("$12.50");
+    expect(text).toContain("USD 12.50");
     expect(text).toContain("remaining");
     expect(text).toContain("Live");
     expect(text).toContain("Checked ");
     expect(text).toContain("5m ago");
-    expect(dialog().getAttribute("data-wallet")).toBe("openrouter");
-    expect(dialog().getAttribute("data-state")).toBe("healthy");
+    expect(dialog().getAttribute("data-wallet")).toBe("api-wallets");
   });
 
   it("labels a retained reading as last known rather than freshly checked", async () => {
     await renderPopover({
-      item: item({ state: "stale", statusLabel: "Stale" }),
+      items: [item({ state: "stale", statusLabel: "Stale" })],
     });
     expect(dialog().textContent).toContain("Last known");
     expect(dialog().textContent).toContain("Stale");
@@ -101,10 +101,11 @@ describe("FloatingWalletPopover", () => {
 
   it("explains a rate-limit cooldown and disables the wallet action", async () => {
     const props = await renderPopover({
-      item: item({ state: "cooldown", statusLabel: "Cooling down" }),
+      items: [item({ state: "cooldown", statusLabel: "Cooling down" })],
     });
     expect(dialog().textContent).toContain("Cooling down");
     expect(dialog().textContent).toContain("Cooling down: the last check hit");
+    expect(dialog().textContent).toContain("OpenRouter");
     expect(refreshButton().disabled).toBe(true);
     expect(
       refreshButton().getAttribute("aria-describedby"),
@@ -115,17 +116,19 @@ describe("FloatingWalletPopover", () => {
 
   it("shows a 429 as rate limited and never retries the action", async () => {
     const props = await renderPopover({
-      item: item({
-        state: "error",
-        statusLabel: "Rate limited",
-        error: "OpenRouter rate limited the check",
-        errorHttpStatus: 429,
-      }),
+      items: [
+        item({
+          state: "error",
+          statusLabel: "Rate limited",
+          error: "DeepSeek rate limited the check",
+          errorHttpStatus: 429,
+        }),
+      ],
     });
     const text = dialog().textContent ?? "";
     expect(text).toContain("Rate limited");
     expect(text).toContain("HTTP 429");
-    expect(text).toContain("OpenRouter rate limited the check");
+    expect(text).toContain("DeepSeek rate limited the check");
     expect(refreshButton().disabled).toBe(false);
     await click(refreshButton());
     expect(props.onRefresh).toHaveBeenCalledTimes(1);
@@ -133,13 +136,15 @@ describe("FloatingWalletPopover", () => {
 
   it("shows a failed check with no balance recorded and no $0.00", async () => {
     await renderPopover({
-      item: item({
-        state: "error",
-        remainingUsd: null,
-        checkedAt: null,
-        statusLabel: "Refresh failed",
-        error: "credential missing",
-      }),
+      items: [
+        item({
+          state: "error",
+          balances: [],
+          checkedAt: null,
+          statusLabel: "Refresh failed",
+          error: "credential missing",
+        }),
+      ],
     });
     const text = dialog().textContent ?? "";
     expect(text).toContain("$ —");
@@ -154,15 +159,55 @@ describe("FloatingWalletPopover", () => {
 
   it("describes an unavailable wallet with no observation as unchecked", async () => {
     await renderPopover({
-      item: item({
-        state: "unavailable",
-        remainingUsd: null,
-        checkedAt: null,
-        statusLabel: "Unavailable",
-      }),
+      items: [
+        item({
+          state: "unavailable",
+          balances: [],
+          checkedAt: null,
+          statusLabel: "Unavailable",
+        }),
+      ],
     });
     expect(dialog().textContent).toContain("No balance recorded");
     expect(dialog().textContent).not.toContain("just now");
+  });
+
+  it("lists every wallet in one card, each with its own currency", async () => {
+    await renderPopover({
+      items: [
+        item(),
+        item({
+          id: "deepseek",
+          name: "DeepSeek",
+          balances: [{ currency: "CNY", amount: 110 }],
+        }),
+      ],
+    });
+    const text = dialog().textContent ?? "";
+    expect(text).toContain("OpenRouter");
+    expect(text).toContain("USD 12.50");
+    expect(text).toContain("DeepSeek");
+    expect(text).toContain("CNY 110.00");
+    // The card has exactly one shared refresh action.
+    expect(dialog().querySelectorAll(".fq-wallet-refresh")).toHaveLength(1);
+    expect(dialog().querySelectorAll(".fq-wallet-section")).toHaveLength(2);
+  });
+
+  it("never states a combined total across currencies", async () => {
+    await renderPopover({
+      items: [
+        item({
+          balances: [
+            { currency: "USD", amount: 12.5 },
+            { currency: "CNY", amount: 110 },
+          ],
+        }),
+      ],
+    });
+    const text = dialog().textContent ?? "";
+    expect(text).toContain("USD 12.50");
+    expect(text).toContain("CNY 110.00");
+    expect(text).not.toContain("122.50");
   });
 
   it("refreshes only through its own action and shows the in-flight state", async () => {
@@ -179,7 +224,7 @@ describe("FloatingWalletPopover", () => {
   });
 
   it("keeps the masked credential identity muted in the footer", async () => {
-    await renderPopover({ item: item({ identity: "key:1234" }) });
+    await renderPopover({ items: [item({ identity: "key:1234" })] });
     const footer = dialog().querySelector(".fq-footer");
     expect(footer).not.toBeNull();
     expect(footer!.textContent).toContain("credential: key:1234");
@@ -191,11 +236,11 @@ describe("FloatingWalletPopover", () => {
 
     await renderPopover({
       pinned: false,
-      item: item({ state: "cooldown", statusLabel: "Cooling down" }),
+      items: [item({ state: "cooldown", statusLabel: "Cooling down" })],
     });
     await renderPopover({
       pinned: true,
-      item: item({ state: "cooldown", statusLabel: "Cooling down" }),
+      items: [item({ state: "cooldown", statusLabel: "Cooling down" })],
     });
     expect(document.activeElement).toBe(dialog());
   });

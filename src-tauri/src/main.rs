@@ -28,6 +28,7 @@ mod usage_source_codex;
 mod usage_source_opencode;
 mod usage_source_zcode;
 mod wallet;
+mod wallet_deepseek;
 mod zai;
 mod zcode_plans;
 mod zcode_reset;

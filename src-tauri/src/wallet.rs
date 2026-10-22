@@ -1,21 +1,31 @@
 //! Read-only prepaid wallet balances.
 //!
 //! A wallet is money, not quota: it has no percentage, no reset clock and no
-//! limit window. The first implementation covers OpenRouter's prepaid USD
-//! balance from the official credits endpoint
-//! (GET https://openrouter.ai/api/v1/credits):
+//! limit window. Two prepaid sources are supported:
 //!
-//!     remainingUsd = data.total_credits - data.total_usage
+//! - OpenRouter's prepaid balance from the official credits endpoint
+//!   (GET https://openrouter.ai/api/v1/credits):
 //!
-//! Credential resolution reuses the OpenCode auth file convention already
-//! shared with the OpenCode Go backend (the openrouter entry). No new
-//! credential store is introduced, the key never leaves this process, and
-//! every failure after the credential was resolved is scrubbed exactly like
-//! a provider failure.
+//!       remainingUsd = data.total_credits - data.total_usage
+//!
+//! - DeepSeek's prepaid balance from the official balance endpoint
+//!   (GET https://api.deepseek.com/user/balance), which reports one entry
+//!   per currency (USD, CNY).
+//!
+//! Money is always carried per currency. Two currencies are never summed and
+//! never converted: a wallet holding USD 12.50 and CNY 1.38 states two
+//! balances, not one.
+//!
+//! Credential resolution reuses the credential stores already present on the
+//! machine (the OpenCode auth file, the OpenCodex config). No new credential
+//! store is introduced, no authentication record is ever modified, the key
+//! never leaves this process, and every failure after the credential was
+//! resolved is scrubbed exactly like a provider failure.
 //!
 //! Validation is strict on purpose: a missing, malformed, negative or
 //! non-finite amount is an error, never a fabricated 0.00 balance. A real
-//! zero (usage equal to credits) is a valid observation and is preserved.
+//! zero (usage equal to credits, or a reported zero balance) is a valid
+//! observation and is preserved.
 
 use std::fs;
 use std::path::Path;
@@ -32,11 +42,37 @@ pub const OPENROUTER_CREDITS_URL: &str = "https://openrouter.ai/api/v1/credits";
 const USER_AGENT: &str = concat!("rate-limits/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// One currency's balance inside a wallet.
+///
+/// Currencies are never merged: a wallet that reports both USD and CNY
+/// carries two of these, and no code path adds, averages or converts them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WalletAmount {
+    /// ISO currency code exactly as the source reported it (`"USD"`,
+    /// `"CNY"`). Never assumed and never defaulted to USD.
+    pub currency: String,
+    /// The remaining amount in `currency`. Always finite and non-negative.
+    pub amount: f64,
+    /// The source's own breakdown of `amount`, when it reports one
+    /// (DeepSeek: the not-expired granted part and the topped-up part).
+    /// Absent means the source states no breakdown — never a zero.
+    pub granted: Option<f64>,
+    /// The topped-up part of `amount`, when the source reports one.
+    pub topped_up: Option<f64>,
+}
+
 /// One successful balance observation, plus the masked identity of the
 /// credential that produced it (used only for last-good retention).
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalletBalance {
-    pub remaining_usd: f64,
+    /// The wallet's balances, one entry per currency, in source order.
+    /// Never empty for a successful observation: a wallet with no amount
+    /// to state is a failed observation, not an empty balance.
+    pub balances: Vec<WalletAmount>,
+    /// The source's own "balance sufficient for API calls" verdict, when it
+    /// reports one (DeepSeek's `is_available`). Absent means the source
+    /// makes no such claim — never `false`.
+    pub available: Option<bool>,
     /// Display-safe masked tail (`key:1234`). Never used as an isolation
     /// boundary: short suffixes collide.
     pub identity: Option<String>,
@@ -70,6 +106,31 @@ pub(crate) fn credential_bindings_match(attempted: Option<&str>, retained: Optio
         (Some(attempted), Some(retained)) => !attempted.is_empty() && attempted == retained,
         _ => false,
     }
+}
+
+/// Normalizes a source-reported currency code to the form the wallet data
+/// uses: trimmed and upper-cased. A blank code is never invented — the
+/// caller rejects it, because an unnamed amount cannot be displayed
+/// honestly.
+pub(crate) fn normalize_currency(raw: &str) -> String {
+    raw.trim().to_ascii_uppercase()
+}
+
+/// The single-currency convenience view of a balance: the amount in
+/// `currency`, when the wallet holds exactly one currency and it is `wanted`.
+///
+/// A wallet holding several currencies has no single amount, so this returns
+/// `None` — the caller then shows every currency separately instead of
+/// picking one or adding them up.
+pub(crate) fn single_amount(balances: &[WalletAmount], wanted: &str) -> Option<f64> {
+    if balances.len() != 1 {
+        return None;
+    }
+    let only = balances.first()?;
+    if only.currency != wanted {
+        return None;
+    }
+    Some(only.amount)
 }
 
 // Manual impl so the key can never reach logs through Debug formatting.
@@ -294,11 +355,17 @@ async fn fetch_credits_from(
     }
 
     Ok(WalletBalance {
-        remaining_usd: parse_credits(&body).map_err(|error| {
+        balances: vec![WalletAmount {
+            currency: "USD".to_string(),
+            amount: parse_credits(&body).map_err(|error| {
             error
                 .with_identity_hint(identity.clone())
                 .with_credential_binding(binding.clone())
         })?,
+            granted: None,
+            topped_up: None,
+        }],
+        available: None,
         identity,
         credential_binding: binding,
     })
@@ -318,7 +385,7 @@ pub async fn get_openrouter_credits() -> Result<WalletBalance, ProviderError> {
 // ---------- tests ----------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -337,6 +404,21 @@ mod tests {
 
     fn key(raw: &str) -> OpenRouterKey {
         OpenRouterKey(raw.to_string())
+    }
+
+    /// A single USD balance, the shape the OpenRouter collector produces.
+    pub(crate) fn usd_balance(amount: f64) -> WalletBalance {
+        WalletBalance {
+            balances: vec![WalletAmount {
+                currency: "USD".to_string(),
+                amount,
+                granted: None,
+                topped_up: None,
+            }],
+            available: None,
+            identity: None,
+            credential_binding: None,
+        }
     }
 
     /// Serves exactly one canned HTTP response, then closes. Returns the URL.
@@ -510,7 +592,9 @@ mod tests {
         let balance = fetch_credits_from(&url, &key("sk-or-test-key-1234"))
             .await
             .unwrap();
-        assert_eq!(balance.remaining_usd, 25.5);
+        assert_eq!(balance.balances.len(), 1);
+        assert_eq!(balance.balances[0].currency, "USD");
+        assert_eq!(balance.balances[0].amount, 25.5);
         assert_eq!(balance.identity.as_deref(), Some("key:1234"));
     }
 
@@ -641,7 +725,13 @@ mod tests {
     #[test]
     fn short_or_odd_keys_get_no_identity() {
         let balance = WalletBalance {
-            remaining_usd: 1.0,
+            balances: vec![WalletAmount {
+                currency: "USD".to_string(),
+                amount: 1.0,
+                granted: None,
+                topped_up: None,
+            }],
+            available: None,
             identity: opencode_go::key_tail("short").map(|tail| format!("key:{tail}")),
             credential_binding: None,
         };
@@ -653,7 +743,8 @@ mod tests {
     fn live_fetch_returns_balance() {
         let balance = tauri::async_runtime::block_on(get_openrouter_credits())
             .expect("live fetch");
-        println!("remaining USD: {:.2}", balance.remaining_usd);
-        assert!(balance.remaining_usd.is_finite() && balance.remaining_usd >= 0.0);
+        let amount = single_amount(&balance.balances, "USD").expect("a USD balance");
+        println!("remaining USD: {:.2}", amount);
+        assert!(amount.is_finite() && amount >= 0.0);
     }
 }

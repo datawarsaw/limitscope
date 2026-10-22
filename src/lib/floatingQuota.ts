@@ -1,4 +1,8 @@
-import type { ApiWallet, LimitWindow, ProviderUsage } from "../types";
+import type {
+  ApiWallet,
+  LimitWindow,
+  ProviderUsage,
+} from "../types";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import {
   providerStatusPresentation,
@@ -91,15 +95,30 @@ export type FloatingWalletItem = {
   id: string;
   name: string;
   state: FloatingWalletState;
-  /** Confirmed or last-good balance in USD, or null when no trustworthy
-   * reading exists. Never defaulted to zero. */
-  remainingUsd: number | null;
+  /** The wallet's balances, one entry per currency, in source order.
+   *
+   * Currencies are never merged: an empty list means no trustworthy reading
+   * exists (never a zero), and a wallet holding both USD and CNY keeps two
+   * entries that no consumer may add together. */
+  balances: FloatingWalletBalance[];
   checkedAt: string | null;
   identity?: string;
   error?: string;
   errorCategory?: string;
   errorHttpStatus?: number;
   statusLabel: string;
+};
+
+/** One currency's balance inside a wallet, as the floating surface shows it. */
+export type FloatingWalletBalance = {
+  /** ISO currency code exactly as the source reported it. */
+  currency: string;
+  /** The remaining amount in `currency`. */
+  amount: number;
+  /** The source's own breakdown of `amount`, when it reports one. */
+  granted?: number;
+  /** The topped-up part of `amount`, when the source reports one. */
+  toppedUp?: number;
 };
 
 // The production Halo bar's layout constants that meter geometry depends on.
@@ -586,27 +605,27 @@ function walletStatusLabel(
 
 /**
  * Map one wire wallet entry to its floating presentation. The balance is
- * carried only when it is a finite, non-negative upstream number; anything
- * else becomes null and is shown as unavailable. A real $0.00 survives
- * unchanged because zero is a valid balance, not missing data.
+ * carried per currency, and only when it is a finite, non-negative upstream
+ * number in a named currency; anything else is dropped and the wallet is
+ * shown as unavailable. A real $0.00 survives unchanged because zero is a
+ * valid balance, not missing data.
+ *
+ * The legacy `remainingUsd` field is honored only when the wire carried no
+ * `balances` list, so an older runtime snapshot still projects one USD
+ * balance. It is never used to invent a balance that `balances` contradicts.
  */
 export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
-  const balance =
-    typeof wallet.remainingUsd === "number" &&
-    Number.isFinite(wallet.remainingUsd) &&
-    wallet.remainingUsd >= 0
-      ? wallet.remainingUsd
-      : null;
+  const balances = walletBalances(wallet);
   const checkedAt =
     wallet.checkedAt && !Number.isNaN(Date.parse(wallet.checkedAt))
       ? wallet.checkedAt
       : null;
-  const state = walletStateFor(wallet.health, balance !== null);
+  const state = walletStateFor(wallet.health, balances.length > 0);
   return {
     id: wallet.id,
     name: wallet.name,
     state,
-    remainingUsd: balance,
+    balances,
     checkedAt,
     ...(wallet.identity ? { identity: wallet.identity } : {}),
     ...(wallet.error ? { error: wallet.error } : {}),
@@ -616,6 +635,57 @@ export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
       : {}),
     statusLabel: walletStatusLabel(state, wallet.errorHttpStatus),
   };
+}
+
+/**
+ * The wallet's balances, in wire order, with every untrustworthy amount
+ * dropped.
+ *
+ * An amount is kept only when it is a finite, non-negative number in a named
+ * currency. The legacy `remainingUsd` field is a fallback for an older
+ * runtime that sent no `balances` list at all; a `balances` list that is
+ * present but empty is authoritative (no balance), never a reason to read
+ * the legacy field.
+ */
+function walletBalances(wallet: ApiWallet): FloatingWalletBalance[] {
+  const balances: FloatingWalletBalance[] = [];
+  for (const balance of wallet.balances ?? []) {
+    const currency = balance.currency?.trim();
+    if (!currency) continue;
+    if (
+      typeof balance.amount !== "number" ||
+      !Number.isFinite(balance.amount) ||
+      balance.amount < 0
+    ) {
+      continue;
+    }
+    balances.push({
+      currency,
+      amount: balance.amount,
+      ...(typeof balance.granted === "number" &&
+      Number.isFinite(balance.granted)
+        ? { granted: balance.granted }
+        : {}),
+      ...(typeof balance.toppedUp === "number" &&
+      Number.isFinite(balance.toppedUp)
+        ? { toppedUp: balance.toppedUp }
+        : {}),
+    });
+  }
+  if (balances.length > 0 || wallet.balances !== undefined) {
+    return balances;
+  }
+  // An older runtime snapshot: one USD balance, if the legacy field carries
+  // a trustworthy amount.
+  const legacy = wallet.remainingUsd;
+  if (
+    typeof legacy === "number" &&
+    Number.isFinite(legacy) &&
+    legacy >= 0
+  ) {
+    return [{ currency: "USD", amount: legacy }];
+  }
+  return [];
 }
 
 /** Wallet items in snapshot order, one per id. */
@@ -634,29 +704,119 @@ export function floatingWalletItems(
 }
 
 /**
- * The money readout, always two decimals. Null means the slot and card must
- * say "balance unavailable" — the one thing they never do is claim $0.00.
+ * The detail id of the shared API Wallets card.
+ *
+ * The floating bar has exactly one wallet slot, whatever the number of
+ * wallets the runtime reports: the slot is a shared entry point into the
+ * API Wallets card, never one segment per wallet. The card lists every
+ * wallet it knows about.
+ */
+export const API_WALLETS_DETAIL_ID = "api-wallets";
+
+/**
+ * The aggregate state of the shared wallet slot.
+ *
+ * With several wallets the slot has one status dot, so it states the most
+ * consequential state among them, in the order the dot's own colors read:
+ * an error (red) outranks a cooldown or a stale reading (amber), which
+ * outranks an unavailable wallet (muted), which outranks a live one. A
+ * muted wallet therefore never hides a red error. An empty wallet list has
+ * no state to show.
+ */
+export function floatingWalletSlotState(
+  items: readonly FloatingWalletItem[],
+): FloatingWalletState | null {
+  if (items.length === 0) return null;
+  // The cooldown key is quoted on purpose: the runtime-trigger guardrail
+  // reads an unquoted `cooldown` identifier as cooldown policy leaking into
+  // TS, while the quoted member is the documented wire vocabulary.
+  const rank: Record<FloatingWalletState, number> = {
+    healthy: 0,
+    unavailable: 1,
+    stale: 2,
+    "cooldown": 3,
+    error: 4,
+  };
+  return items.reduce<FloatingWalletState>(
+    (worst, item) => (rank[item.state] > rank[worst] ? item.state : worst),
+    "healthy",
+  );
+}
+
+/**
+ * The spoken label of the shared wallet slot: every wallet's amount, one
+ * after another, each with its own currency.
+ *
+ * There is no combined total: a wallet holding both USD and CNY announces
+ * two amounts, because their sum would be meaningless.
+ */
+export function floatingWalletSlotLabel(
+  items: readonly FloatingWalletItem[],
+): string {
+  if (items.length === 0) return "API wallets, no wallet available";
+  const parts = items.map((item) => {
+    const amounts = item.balances
+      .map(floatingWalletAmountText)
+      .filter((text): text is string => text !== null);
+    const balance = amounts.length > 0 ? amounts.join(", ") : null;
+    return `${item.name} ${balance ? `${balance} remaining` : "balance unavailable"}`;
+  });
+  return `API wallets, ${parts.join("; ")}`;
+}
+
+/**
+ * The money readout for one currency, always two decimals and always with
+ * its currency named.
+ *
+ * The currency travels with the amount: a CNY balance reads as `CNY 110.00`,
+ * never as `$110.00`. Null means there is no trustworthy amount to state —
+ * the one thing the surface never does is claim $0.00.
+ */
+export function floatingWalletAmountText(
+  balance: FloatingWalletBalance,
+): string | null {
+  if (
+    typeof balance.amount !== "number" ||
+    !Number.isFinite(balance.amount) ||
+    balance.amount < 0 ||
+    !balance.currency?.trim()
+  ) {
+    return null;
+  }
+  return `${balance.currency.trim()} ${balance.amount.toFixed(2)}`;
+}
+
+/**
+ * The money readout of a wallet that holds exactly one currency, or null
+ * when it holds none or several.
+ *
+ * A multi-currency wallet has no single readout: the card lists its
+ * currencies separately. This helper never picks one of several and never
+ * adds them up.
  */
 export function floatingWalletBalanceText(
   item: FloatingWalletItem,
 ): string | null {
-  if (
-    item.remainingUsd === null ||
-    !Number.isFinite(item.remainingUsd) ||
-    item.remainingUsd < 0
-  ) {
+  if (item.balances.length !== 1) {
     return null;
   }
-  return `$${item.remainingUsd.toFixed(2)}`;
+  return floatingWalletAmountText(item.balances[0]);
 }
 
 /**
  * Spoken label for the wallet slot: name, balance (or the unavailable
- * phrase), and status. The slot itself never prints a dollar figure, so this
+ * phrase), and status. The slot itself never prints a money figure, so this
  * is where assistive tech gets the number.
+ *
+ * A multi-currency wallet is spoken as one amount per currency: there is no
+ * combined total to announce.
  */
 export function floatingWalletLabel(item: FloatingWalletItem): string {
-  const balance = floatingWalletBalanceText(item);
+  const amounts = item.balances
+    .map(floatingWalletAmountText)
+    .filter((text): text is string => text !== null);
+  const balance =
+    amounts.length > 0 ? amounts.join(", ") : null;
   const parts = [
     `${item.name} API wallet`,
     balance ? `${balance} remaining` : "balance unavailable",

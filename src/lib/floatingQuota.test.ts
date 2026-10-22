@@ -16,6 +16,8 @@ import {
   floatingPrimaryWindow,
   floatingQuotaItems,
   floatingWalletBalanceText,
+  floatingWalletSlotLabel,
+  floatingWalletSlotState,
   floatingWalletItem,
   floatingWalletItems,
   floatingWalletLabel,
@@ -797,7 +799,7 @@ function wallet(extra: Partial<ApiWallet> = {}): ApiWallet {
     name: "OpenRouter",
     health: "live",
     checkedAt: CHECKED_AT,
-    remainingUsd: 12.5,
+    balances: [{ currency: "USD", amount: 12.5 }],
     ...extra,
   };
 }
@@ -809,36 +811,87 @@ describe("floating wallet presentation", () => {
       id: "openrouter",
       name: "OpenRouter",
       state: "healthy",
-      remainingUsd: 12.5,
       checkedAt: CHECKED_AT,
       statusLabel: "Live",
     });
-    expect(floatingWalletBalanceText(item)).toBe("$12.50");
+    expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
+    expect(floatingWalletBalanceText(item)).toBe("USD 12.50");
     expect(floatingWalletLabel(item)).toBe(
-      "OpenRouter API wallet, $12.50 remaining, Live",
+      "OpenRouter API wallet, USD 12.50 remaining, Live",
     );
   });
 
-  it("keeps a real zero balance as $0.00", () => {
-    const item = floatingWalletItem(wallet({ remainingUsd: 0 }));
+  it("keeps a real zero balance as 0.00", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [{ currency: "USD", amount: 0 }] }),
+    );
     expect(item.state).toBe("healthy");
-    expect(item.remainingUsd).toBe(0);
-    expect(floatingWalletBalanceText(item)).toBe("$0.00");
+    expect(item.balances[0].amount).toBe(0);
+    expect(floatingWalletBalanceText(item)).toBe("USD 0.00");
   });
 
   it.each([undefined, -0.01, Number.NaN, Number.POSITIVE_INFINITY])(
     "never turns an untrustworthy balance (%s) into money",
     (remainingUsd) => {
-      const item = floatingWalletItem(wallet({ remainingUsd }));
+      const item = floatingWalletItem(
+        wallet({ balances: [{ currency: "USD", amount: remainingUsd as number }] }),
+      );
       expect(item.state).toBe("unavailable");
-      expect(item.remainingUsd).toBeNull();
+      expect(item.balances).toEqual([]);
       expect(floatingWalletBalanceText(item)).toBeNull();
       expect(floatingWalletLabel(item)).toBe(
         "OpenRouter API wallet, balance unavailable, Unavailable",
       );
-      expect(floatingWalletLabel(item)).not.toContain("$0.00");
+      expect(floatingWalletLabel(item)).not.toContain("0.00");
     },
   );
+
+  it("keeps a CNY balance in its own currency and never as dollars", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [{ currency: "CNY", amount: 110 }] }),
+    );
+    expect(item.state).toBe("healthy");
+    expect(floatingWalletBalanceText(item)).toBe("CNY 110.00");
+    expect(floatingWalletBalanceText(item)).not.toContain("$");
+  });
+
+  it("keeps several currencies separate and never sums them", () => {
+    const item = floatingWalletItem(
+      wallet({
+        balances: [
+          { currency: "USD", amount: 12.5 },
+          { currency: "CNY", amount: 110 },
+        ],
+      }),
+    );
+    expect(item.balances).toHaveLength(2);
+    // A multi-currency wallet has no single readout.
+    expect(floatingWalletBalanceText(item)).toBeNull();
+    const label = floatingWalletLabel(item);
+    expect(label).toContain("USD 12.50");
+    expect(label).toContain("CNY 110.00");
+    expect(label).not.toContain("122.50");
+  });
+
+  it("reads a legacy runtime snapshot without a balances list", () => {
+    const item = floatingWalletItem({
+      id: "openrouter",
+      name: "OpenRouter",
+      health: "live",
+      checkedAt: CHECKED_AT,
+      remainingUsd: 12.5,
+    });
+    expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
+    expect(floatingWalletBalanceText(item)).toBe("USD 12.50");
+  });
+
+  it("never invents a balance from an empty balances list", () => {
+    const item = floatingWalletItem(
+      wallet({ balances: [], remainingUsd: 12.5 }),
+    );
+    expect(item.balances).toEqual([]);
+    expect(item.state).toBe("unavailable");
+  });
 
   it("keeps every non-live health as its own slot state", () => {
     expect(floatingWalletItem(wallet({ health: "stale" })).statusLabel).toBe(
@@ -880,5 +933,75 @@ describe("floating wallet presentation", () => {
     expect(items[0].identity).toBe("key:1234");
     expect(items[1].error).toBe("refresh failed");
     expect(items[1].errorCategory).toBe("http");
+  });
+
+  it("states the most consequential state among the wallets it covers", () => {
+    expect(floatingWalletSlotState([])).toBeNull();
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "live" })),
+      ]),
+    ).toBe("healthy");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "live" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "stale" })),
+      ]),
+    ).toBe("stale");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "stale" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "cooldown" })),
+      ]),
+    ).toBe("cooldown");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "cooldown" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "error" })),
+      ]),
+    ).toBe("error");
+  });
+
+  it("never lets a muted wallet hide a red error", () => {
+    // The slot's dot is one color, so the ranking must follow the dot's own
+    // severity: an error outranks an unavailable wallet, not the other way
+    // around.
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "error" })),
+      ]),
+    ).toBe("error");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+        floatingWalletItem(wallet({ id: "deepseek", health: "stale" })),
+      ]),
+    ).toBe("stale");
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet({ health: "unavailable" })),
+      ]),
+    ).toBe("unavailable");
+  });
+
+  it("speaks every wallet's amount with its own currency", () => {
+    expect(floatingWalletSlotLabel([])).toBe(
+      "API wallets, no wallet available",
+    );
+    const label = floatingWalletSlotLabel([
+      floatingWalletItem(wallet()),
+      floatingWalletItem(
+        wallet({
+          id: "deepseek",
+          name: "DeepSeek",
+          balances: [{ currency: "CNY", amount: 110 }],
+        }),
+      ),
+    ]);
+    expect(label).toBe(
+      "API wallets, OpenRouter USD 12.50 remaining; DeepSeek CNY 110.00 remaining",
+    );
+    expect(label).not.toContain("122.50");
   });
 });
