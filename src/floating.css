@@ -1124,6 +1124,66 @@ html[data-window="floating"] body {
   }
 }
 
+/* The locate beacon's water ripple: three staggered crests expanding from
+   the bar's center. They live in the transient overlay window (see
+   lib/locateRipple.ts) because the bar's own window is sized exactly to the
+   bar and would clip every wave to a slit. The stage fills that overlay and
+   takes no input (the window is click-through too; both layers are belt and
+   braces). Rings size against vmin so one rule fits any bar width, monitor
+   scale, and the docked strip's 16px window alike. Declared before the
+   reduced-motion block so that block can switch it off. */
+.locate-ripple-stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.locate-ripple-ring {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 96vmin;
+  height: 96vmin;
+  margin: -48vmin 0 0 -48vmin;
+  border-radius: 50%;
+  border: 3px solid rgba(45, 212, 191, 0.5);
+  box-shadow:
+    0 0 24px rgba(45, 212, 191, 0.22),
+    inset 0 0 36px rgba(45, 212, 191, 0.1);
+  opacity: 0;
+  transform: scale(0.08);
+  animation: locate-ripple-wave 1600ms cubic-bezier(0.17, 0.6, 0.35, 1) forwards;
+}
+
+.locate-ripple-ring-2 {
+  animation-delay: 220ms;
+}
+
+.locate-ripple-ring-3 {
+  animation-delay: 440ms;
+}
+
+/* A crest surfaces quickly, spreads as the ring thins and fades, and is
+   fully gone at the end of its run — the overlay is only ever destroyed
+   around an empty stage. */
+@keyframes locate-ripple-wave {
+  0% {
+    opacity: 0;
+    transform: scale(0.08);
+  }
+  14% {
+    opacity: 0.62;
+  }
+  70% {
+    opacity: 0.2;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .fq-meter-fill,
   .fq-item,
@@ -1144,6 +1204,22 @@ html[data-window="floating"] body {
   .fq-root[data-locate-pulse="true"] .fq-shell,
   .fq-root[data-locate-pulse="true"] .fq-dock-strip {
     animation: none;
+  }
+
+  /* Motion off does not mean locate off: the crest the pulse would have
+     drawn is held still for the pulse's duration, and the ripple rings are
+     fully invisible (the chrome does not open their window at all). */
+  .fq-root[data-locate-pulse="true"] .fq-shell,
+  .fq-root[data-locate-pulse="true"] .fq-dock-strip {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 0 0 2px var(--teal),
+      0 1px 8px rgba(0, 0, 0, 0.45);
+  }
+
+  .locate-ripple-ring {
+    animation: none;
+    opacity: 0;
   }
 
   .fq-root[data-dock-gesture="snap"] .fq-shell,

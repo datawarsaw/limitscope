@@ -157,6 +157,44 @@ describe("floating quota bar motion guards", () => {
   });
 });
 
+describe("locate ripple beacon guards", () => {
+  it("spreads the locate beacon as three staggered waves in an inert stage", () => {
+    const stage = css.match(/\.locate-ripple-stage \{[^}]*\}/)?.[0] ?? "";
+    expect(stage).toContain("position: fixed");
+    expect(stage).toContain("pointer-events: none");
+    const ring = css.match(/\.locate-ripple-ring \{[^}]*\}/)?.[0] ?? "";
+    expect(ring).toContain("border-radius: 50%");
+    expect(ring).toContain("animation: locate-ripple-wave 1600ms");
+    expect(ring).toContain("opacity: 0");
+    // Three crests, trailing one another; the total stays inside the
+    // 1.5–2.5s window the locate beacon promises.
+    expect(css).toContain(".locate-ripple-ring-2");
+    expect(css).toContain(".locate-ripple-ring-3");
+    expect(css).toContain("animation-delay: 220ms");
+    expect(css).toContain("animation-delay: 440ms");
+    const wave =
+      css.match(/@keyframes locate-ripple-wave \{[\s\S]*?\n\}/)?.[0] ?? "";
+    expect(wave).toContain("scale(1)");
+    expect(wave).toContain("opacity: 0");
+    // Declared before the reduced-motion block, so that block can switch
+    // the waves off.
+    expect(css.indexOf(".locate-ripple-ring")).toBeLessThan(
+      css.indexOf("@media (prefers-reduced-motion: reduce)"),
+    );
+  });
+
+  it("keeps a still locate cue and no waves under prefers-reduced-motion", () => {
+    const block = css.match(
+      /@media \(prefers-reduced-motion: reduce\) \{[\s\S]*\n\}/,
+    )?.[0];
+    expect(block).not.toBeNull();
+    expect(block).toContain(".locate-ripple-ring");
+    // The crest the in-window pulse would have drawn is held still instead:
+    // motion off must not mean locate off.
+    expect(block).toContain("0 0 0 2px var(--teal)");
+  });
+});
+
 describe("floating quota bar semantic color guards", () => {
   const QUOTA_LEVELS: ReadonlyArray<readonly [string, string | null]> = [
     ...HALO_REMAINING_QUOTA_SCALE.map(

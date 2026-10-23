@@ -19,8 +19,18 @@
             internals.metadata &&
             internals.metadata.currentWindow &&
             internals.metadata.currentWindow.label;
-          if (label === "floating-quota") {
-            document.documentElement.setAttribute("data-window", "floating");
+          if (
+            label === "floating-quota" ||
+            (typeof label === "string" &&
+              label.indexOf("locate-ripple") === 0)
+          ) {
+            // The ripple overlay is transparent like the bar: its waves are
+            // drawn over the desktop, never over a page background. This
+            // runs before first paint so the window cannot flash opaque.
+            document.documentElement.setAttribute(
+              "data-window",
+              label === "floating-quota" ? "floating" : "locate-ripple",
+            );
             document.documentElement.style.background = "transparent";
           }
         } catch (e) {}
