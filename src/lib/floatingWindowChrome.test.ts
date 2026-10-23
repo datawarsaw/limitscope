@@ -26,6 +26,11 @@ const mocks = vi.hoisted(() => {
     },
     mainVisible: true,
     mainWindowExists: true,
+    monitors: null as null | Array<{
+      name: string | null;
+      scaleFactor: number;
+      workArea: { position: { x: number; y: number }; size: { width: number; height: number } };
+    }>,
   };
   const listen = vi.fn(async (event: string, handler: (event: unknown) => void) => {
     state.listeners.set(event, handler);
@@ -41,7 +46,8 @@ const mocks = vi.hoisted(() => {
     hide: vi.fn(async () => undefined),
     show: vi.fn(async () => undefined),
     unminimize: vi.fn(async () => undefined),
-    setAlwaysOnTop: vi.fn(async () => undefined),
+    setAlwaysOnTop: vi.fn(async (_value: boolean) => undefined),
+    setFocusable: vi.fn(async () => undefined),
     setPosition: vi.fn(async (position: { x: number; y: number }) => {
       state.position = { x: position.x, y: position.y };
     }),
@@ -75,6 +81,8 @@ const mocks = vi.hoisted(() => {
       label === "main" && state.mainWindowExists ? mainFns : null,
     ),
   };
+  const spawnRipple = vi.fn(async () => true);
+  const closeRipple = vi.fn();
   return {
     state,
     listen,
@@ -83,12 +91,15 @@ const mocks = vi.hoisted(() => {
     winFns,
     mainFns,
     WebviewWindow: webviewWindowMock,
+    spawnRipple,
+    closeRipple,
     reset: () => {
       state.listeners.clear();
       state.emitted.length = 0;
       state.position = { x: 80, y: 40 };
       state.movedHandler = undefined;
       state.monitor = null;
+      state.monitors = null;
       state.mainVisible = true;
       state.mainWindowExists = true;
       for (const fn of [
@@ -98,6 +109,8 @@ const mocks = vi.hoisted(() => {
         emit,
         invoke,
         webviewWindowMock.getByLabel,
+        spawnRipple,
+        closeRipple,
       ]) {
         (fn as ReturnType<typeof vi.fn>).mockClear();
       }
@@ -106,12 +119,16 @@ const mocks = vi.hoisted(() => {
 });
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("./locateRipple", () => ({
+  spawnLocateRipple: mocks.spawnRipple,
+  closeLocateRipple: mocks.closeRipple,
+}));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: mocks.listen,
   emit: mocks.emit,
 }));
 vi.mock("@tauri-apps/api/window", () => ({
-  availableMonitors: vi.fn(async () => []),
+  availableMonitors: vi.fn(async () => mocks.state.monitors ?? []),
   currentMonitor: vi.fn(async () => mocks.state.monitor),
   primaryMonitor: vi.fn(async () => null),
   getCurrentWindow: vi.fn(() => mocks.winFns),
@@ -140,12 +157,15 @@ vi.mock("@tauri-apps/api/webviewWindow", () => ({
 
 import {
   FLOATING_VISIBILITY_EVENT,
+  LOCATE_ELEVATE_HOLD_MS,
+  TRAY_LOCATE_FLOATING_EVENT,
   attachDockReanchor,
   attachFloatingChrome,
   dockAnchorCenterX,
   dockAnchorFromCenter,
   dockCenterForAnchor,
   hideFloatingWindow,
+  locateFloatingWindow,
   requestGlobalRefresh,
   resizeFloatingWindow,
   setFloatingBarEnabled,
@@ -2205,5 +2225,155 @@ describe("native smart docking session commits", () => {
     expect(prefs.x).toBeNull();
     expect(prefs.y).toBeNull();
     expect(restoreCalls).toEqual([]);
+  });
+});
+
+describe("locateFloatingWindow (raise + ripple beacon)", () => {
+  /** One hosted monitor so the reconcile has somewhere to keep the bar. */
+  const hostedMonitor = {
+    name: "monitor-1",
+    scaleFactor: 1,
+    workArea: {
+      position: { x: 0, y: 0 },
+      size: { width: 1920, height: 1040 },
+    },
+  };
+
+  async function flush(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  beforeEach(() => {
+    // An earlier suite's cleanup mock-resets this mock without restoring an
+    // implementation; the locate reconcile needs a working one.
+    vi.mocked(availableMonitors).mockImplementation(
+      async () =>
+        (mocks.state.monitors ?? []) as Awaited<
+          ReturnType<typeof availableMonitors>
+        >,
+    );
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("lifts the bar for the beacon and restores the configured pin once, after the hold", async () => {
+    vi.useFakeTimers();
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ alwaysOnTop: false, dock: "none" }),
+    );
+    mocks.state.monitors = [hostedMonitor];
+
+    await locateFloatingWindow();
+    expect(mocks.winFns.setAlwaysOnTop).toHaveBeenCalledWith(true);
+    const restores = () =>
+      mocks.winFns.setAlwaysOnTop.mock.calls.filter(([value]) => value === false);
+    expect(restores()).toHaveLength(0);
+
+    // A repeated Locate re-arms the single restore instead of stacking one:
+    // the original deadline passes silently, the re-armed one restores.
+    await vi.advanceTimersByTimeAsync(1000);
+    await locateFloatingWindow();
+    await vi.advanceTimersByTimeAsync(LOCATE_ELEVATE_HOLD_MS - 1000);
+    expect(restores()).toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(LOCATE_ELEVATE_HOLD_MS);
+    expect(restores()).toHaveLength(1);
+  });
+
+  it("shows the bar unfocused — un-minimized, raised before shown — and beacons after it is visible", async () => {
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ alwaysOnTop: false, dock: "none" }),
+    );
+    mocks.state.monitors = [hostedMonitor];
+    const onPulse = vi.fn();
+
+    await locateFloatingWindow(onPulse);
+    await flush();
+
+    const order = (fn: ReturnType<typeof vi.fn>) => fn.mock.invocationCallOrder[0];
+    const raise = order(mocks.winFns.setAlwaysOnTop);
+    const unminimize = order(mocks.winFns.unminimize);
+    const show = order(mocks.winFns.show);
+    expect(raise).toBeLessThan(unminimize);
+    expect(unminimize).toBeLessThan(show);
+    // No keyboard focus is taken: the window is unfocusable around the show,
+    // exactly like the Rust tray handler's own show path.
+    expect(mocks.winFns.setFocusable.mock.calls).toEqual([[false], [true]]);
+    expect(mocks.winFns.setFocusable.mock.invocationCallOrder[0]).toBeLessThan(show);
+    expect(onPulse).toHaveBeenCalledTimes(1);
+    // The ripple reads the bar's settled physical rect and monitor scale.
+    expect(mocks.spawnRipple).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnRipple).toHaveBeenCalledWith(
+      { x: 80, y: 40, width: 520, height: 64 },
+      1,
+    );
+  });
+
+  it("pulses without a ripple when no monitor can host the bar", async () => {
+    mocks.state.monitors = [];
+    const onPulse = vi.fn();
+
+    const outcome = await locateFloatingWindow(onPulse);
+    await flush();
+
+    expect(outcome.kind).toBe("unplaceable");
+    expect(onPulse).toHaveBeenCalledTimes(1);
+    expect(mocks.spawnRipple).not.toHaveBeenCalled();
+  });
+
+  it("hides cancel the beacon: ripple closed, elevation restored, timer dropped", async () => {
+    vi.useFakeTimers();
+    window.localStorage.setItem(
+      FLOATING_PREFS_STORAGE_KEY,
+      JSON.stringify({ alwaysOnTop: false, dock: "none" }),
+    );
+    mocks.state.monitors = [hostedMonitor];
+
+    await locateFloatingWindow();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(mocks.closeRipple).not.toHaveBeenCalled();
+
+    await hideFloatingWindow();
+    expect(mocks.closeRipple).toHaveBeenCalledTimes(1);
+    // The configured pin is back immediately, not on the later timer.
+    expect(mocks.winFns.setAlwaysOnTop).toHaveBeenLastCalledWith(false);
+    const restores = () =>
+      mocks.winFns.setAlwaysOnTop.mock.calls.filter(([value]) => value === false);
+    expect(restores()).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(LOCATE_ELEVATE_HOLD_MS);
+    expect(restores()).toHaveLength(1);
+  });
+
+  it("the tray's hide event cancels the beacon too", async () => {
+    const cleanup = await attachFloatingChrome(() => false);
+    mocks.state.monitors = [hostedMonitor];
+
+    await locateFloatingWindow();
+    await flush();
+    expect(mocks.spawnRipple).toHaveBeenCalledTimes(1);
+
+    mocks.state.listeners.get("tray://hide-floating")?.(undefined);
+    await flush();
+    expect(mocks.closeRipple).toHaveBeenCalledTimes(1);
+
+    cleanup();
+  });
+
+  it("the tray locate event runs the whole beacon", async () => {
+    const onLocate = vi.fn();
+    const cleanup = await attachFloatingChrome(() => false, undefined, undefined, undefined, undefined, onLocate);
+    mocks.state.monitors = [hostedMonitor];
+
+    mocks.state.listeners.get(TRAY_LOCATE_FLOATING_EVENT)?.(undefined);
+    await flush();
+
+    expect(loadFloatingQuotaPrefs().visible).toBe(true);
+    expect(mocks.spawnRipple).toHaveBeenCalledTimes(1);
+    expect(onLocate).toHaveBeenCalledTimes(1);
+
+    cleanup();
   });
 });

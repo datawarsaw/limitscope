@@ -39,6 +39,7 @@ import {
   type MonitorWorkArea,
   type RecoveryAction,
 } from "./floatingMonitorRecovery";
+import { closeLocateRipple, spawnLocateRipple } from "./locateRipple";
 import { clampWindowBoundsToWorkArea } from "./windowBounds";
 import {
   evaluateSmartDock,
@@ -223,10 +224,84 @@ export async function restoreMainWindowFocus(): Promise<void> {
   }
 }
 
+// ---------- Locate beacon: raise + water ripple ----------
+
+/**
+ * How long the locate beacon's temporary topmost elevation holds before the
+ * bar returns to its configured always-on-top state. It must cover the whole
+ * ripple (see LOCATE_RIPPLE_TOTAL_MS) plus a small tail, so the bar does not
+ * sink back under the app that covered it while the waves are still playing.
+ */
+export const LOCATE_ELEVATE_HOLD_MS = 2600;
+
+// The elevation's restore is always exactly one pending timer: a repeated
+// Locate re-arms it instead of stacking timers, and nothing restores the
+// window state twice.
+let locateElevationTimer: number | null = null;
+
+function clearLocateElevationTimer(): void {
+  if (locateElevationTimer !== null) {
+    window.clearTimeout(locateElevationTimer);
+    locateElevationTimer = null;
+  }
+}
+
+function restoreConfiguredTopmost(): void {
+  getCurrentWindow()
+    .setAlwaysOnTop(loadFloatingQuotaPrefs().alwaysOnTop)
+    .catch((error) => {
+      console.warn(
+        "Floating window could not restore its always-on-top state",
+        error,
+      );
+    });
+}
+
+/**
+ * Lifts the bar above ordinary application windows for the beacon only.
+ *
+ * Windows only raises a window reliably while the process owns the
+ * foreground, and the tray action must never steal focus from whatever the
+ * user is doing — so no SetForegroundWindow path is used. A temporary
+ * topmost elevation (SetWindowPos HWND_TOPMOST) needs no foreground rights,
+ * works from the tray, and beats every non-topmost window including a
+ * maximized one. The elevation is undone by a single coalesced timer that
+ * restores the user's configured always-on-top preference — never a guessed
+ * prior state, so repeated Locates cannot latch the bar to topmost.
+ */
+async function elevateForLocate(): Promise<void> {
+  try {
+    await getCurrentWindow().setAlwaysOnTop(true);
+  } catch (error) {
+    console.warn("Floating window could not raise itself for the locator", error);
+    return;
+  }
+  clearLocateElevationTimer();
+  locateElevationTimer = window.setTimeout(() => {
+    locateElevationTimer = null;
+    restoreConfiguredTopmost();
+  }, LOCATE_ELEVATE_HOLD_MS);
+}
+
+/**
+ * Ends the locate beacon immediately: closes the ripple, drops the pending
+ * elevation restore, and returns the bar to its configured always-on-top
+ * state. Every path that hides the bar runs this, so no ripple wave or
+ * topmost elevation can outlive the window it marks.
+ */
+export function cancelLocatePresentation(): void {
+  clearLocateElevationTimer();
+  closeLocateRipple();
+  if (!isTauriRuntime()) return;
+  restoreConfiguredTopmost();
+}
+
 export async function hideFloatingWindow(): Promise<void> {
   const prefs = loadFloatingQuotaPrefs();
   saveFloatingQuotaPrefs({ ...prefs, visible: false });
   if (!isTauriRuntime()) return;
+  // Nothing the locate beacon started may outlive the bar it marks.
+  cancelLocatePresentation();
   const win = getCurrentWindow();
   try {
     await win.hide();
@@ -1077,6 +1152,7 @@ export async function attachFloatingChrome(
         savePosition.flush();
         const current = loadFloatingQuotaPrefs();
         saveFloatingQuotaPrefs({ ...current, visible: false });
+        cancelLocatePresentation();
         void announceFloatingVisibility(false);
       }),
     );
@@ -1091,6 +1167,7 @@ export async function attachFloatingChrome(
       await listen("tray://hide-floating", () => {
         const current = loadFloatingQuotaPrefs();
         saveFloatingQuotaPrefs({ ...current, visible: false });
+        cancelLocatePresentation();
         void announceFloatingVisibility(false);
       }),
     );
@@ -1613,19 +1690,27 @@ export function attachMonitorRecovery(
 /**
  * Handles the tray's "Locate Floating Bar" action.
  *
- * Three things must happen, in this order:
+ * Four things must happen, in this order:
  *
- * 1. The window must be visible. A bar that is hidden is not lost, but the
- *    user asked to see it.
+ * 1. The window must be seen. A hidden bar is not lost, but the user asked
+ *    to see it: un-minimize and show it without taking focus, and lift it
+ *    above ordinary application windows for the beacon's lifetime, because
+ *    Windows will not raise a background process's window on request and a
+ *    maximized app otherwise keeps it covered. The elevation is temporary —
+ *    the configured always-on-top preference is restored once the beacon is
+ *    done (or immediately when the bar hides).
  * 2. The bar must be on a screen. The reconcile is the same one the
  *    topology observer runs, so the tray action and the automatic recovery
  *    can never disagree about where the bar belongs.
- * 3. The bar must be findable. A brief pulse marks the bar as "this is
+ * 3. The bar must be findable. The water ripple spreads from the bar's
+ *    resting spot, and the in-window pulse marks the bar itself as "this is
  *    the one", because a bar that silently appears in a corner of a
  *    three-monitor desktop is easy to miss.
+ * 4. None of it may linger: repeated Locates replace the running beacon,
+ *    hides cancel it, and the elevation restores the prior preference.
  *
- * No second window is ever created: the existing floating-quota window is
- * shown, moved and pulsed. No restart is required.
+ * No second bar window is ever created: the existing floating-quota window
+ * is shown, moved and pulsed. No restart is required.
  *
  * Returns what it did, so the caller can report the outcome.
  */
@@ -1637,6 +1722,61 @@ export type LocateOutcome =
   /** No monitor could host the bar; the window is shown but may be off-screen. */
   | { kind: "unplaceable" };
 
+/**
+ * Shows the bar without taking keyboard focus, wherever it was left: a
+ * minimized window is restored first, and the show is wrapped in the same
+ * unfocusable window the Rust tray handler uses, so activation cannot pull
+ * the foreground off the user's current application.
+ */
+async function showFloatingWindowForLocate(): Promise<void> {
+  const win = getCurrentWindow();
+  try {
+    await win.setFocusable(false);
+  } catch (error) {
+    console.warn("Floating window could not drop its focusability", error);
+  }
+  for (const step of [() => win.unminimize(), () => win.show()]) {
+    try {
+      await step();
+    } catch (error) {
+      console.warn(
+        "Floating window could not show itself for the tray locator",
+        error,
+      );
+    }
+  }
+  try {
+    await win.setFocusable(true);
+  } catch (error) {
+    console.warn("Floating window could not restore its focusability", error);
+  }
+}
+
+/**
+ * Fires the ripple beacon centered on the bar's settled on-screen rect. The
+ * overlay destroys itself; a failure here only means fewer waves, never a
+ * stuck window, and the in-window pulse still runs.
+ */
+async function spawnLocateRippleFromWindow(): Promise<void> {
+  const win = getCurrentWindow();
+  try {
+    // Read after the reconcile: a bar that was just moved back onto a
+    // screen ripples from where it actually landed, on that monitor's
+    // scale.
+    const [position, size, monitor] = await Promise.all([
+      win.outerPosition(),
+      win.outerSize(),
+      currentMonitor(),
+    ]);
+    await spawnLocateRipple(
+      { x: position.x, y: position.y, width: size.width, height: size.height },
+      monitor?.scaleFactor ?? 1,
+    );
+  } catch (error) {
+    console.warn("Floating window could not show the locate ripple", error);
+  }
+}
+
 export async function locateFloatingWindow(
   onPulse?: () => void,
 ): Promise<LocateOutcome> {
@@ -1644,19 +1784,16 @@ export async function locateFloatingWindow(
     onPulse?.();
     return { kind: "already-visible" };
   }
-  const win = getCurrentWindow();
-  // The tray already showed the window; the webview's own visibility
-  // announcement keeps the tray label truthful.
-  try {
-    await win.show();
-  } catch (error) {
-    console.warn("Floating window could not show itself for the tray locator", error);
-  }
+  // Raise first, then show: a window that becomes visible already topmost
+  // cannot be covered by another app in the gap between show and raise.
+  await elevateForLocate();
+  await showFloatingWindowForLocate();
   const action = await reconcileFloatingPlacement();
   if (action.kind === "unplaceable") {
     onPulse?.();
     return { kind: "unplaceable" };
   }
+  void spawnLocateRippleFromWindow();
   onPulse?.();
   if (action.kind === "move") {
     return { kind: "repositioned", action };
