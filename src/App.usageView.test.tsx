@@ -1,23 +1,26 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import App from "./App";
-import type { QuotaPrediction } from "./lib/prediction/types";
-import type { ProviderUsage } from "./types";
-import type { UsageAnalytics } from "./lib/usageAnalytics";
+import type { UsageIntelligence } from "./lib/usageIntelligence";
 
-// The analytics loader is mocked at the module boundary: the app's default
-// loader IS loadUsageAnalytics, so the Usage view in these tests exercises
-// the production wiring.
-const { loadUsageAnalytics } = vi.hoisted(() => ({
-  loadUsageAnalytics: vi.fn(),
+// The intelligence loader is mocked at the module boundary: the app's default
+// loader IS loadUsageIntelligence, so the Usage overview in these tests
+// exercises the production wiring.
+const { loadUsageIntelligence } = vi.hoisted(() => ({
+  loadUsageIntelligence: vi.fn(),
 }));
 
-vi.mock("./lib/usageAnalytics", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./lib/usageAnalytics")>();
-  return { ...actual, loadUsageAnalytics };
+vi.mock("./lib/usageIntelligence", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("./lib/usageIntelligence")>();
+  return { ...actual, loadUsageIntelligence };
 });
+
+const mocks = vi.hoisted(() => ({
+  usageIntelligence: true,
+  refresh: vi.fn(),
+}));
 
 vi.mock("./hooks/useSettings", () => ({
   useSettings: () => ({
@@ -27,27 +30,26 @@ vi.mock("./hooks/useSettings", () => ({
       theme: "graphite",
       quotaNotifications: false,
       quotaPerspective: "used",
+      providerPreferences: { order: [], hidden: [] },
+      usageIntelligence: mocks.usageIntelligence,
     },
     setLaunchAtStartup: vi.fn(),
     setRefreshInterval: vi.fn(),
     setTheme: vi.fn(),
     setQuotaNotifications: vi.fn(),
+    setUsageIntelligence: vi.fn(),
+    setProviderHidden: vi.fn(),
+    moveProvider: vi.fn(),
     setQuotaPerspective: vi.fn(),
+    resetPreferences: vi.fn(),
     startupPending: false,
     startupError: null,
   }),
 }));
 
-const mocks = vi.hoisted(() => ({
-  usages: [] as ProviderUsage[],
-  predictionFor: (_providerId: string, _windowLabel: string) =>
-    undefined as QuotaPrediction | undefined,
-  refresh: vi.fn(),
-}));
-
 vi.mock("./hooks/useProviderUsage", () => ({
   useProviderUsage: () => ({
-    usages: mocks.usages,
+    usages: [],
     loading: false,
     lastUpdatedAt: new Date("2026-09-28T21:58:00"),
     refresh: mocks.refresh,
@@ -65,222 +67,161 @@ vi.mock("./hooks/useNow", () => ({
 
 vi.mock("./hooks/useQuotaPredictions", () => ({
   useQuotaPredictions: () => ({
-    predictionFor: mocks.predictionFor,
+    predictionFor: () => undefined,
     historyUnavailable: false,
     clearLocalHistory: vi.fn(),
   }),
 }));
 
-function usage(overrides: Partial<ProviderUsage>): ProviderUsage {
-  return {
-    id: "zai",
-    name: "Z.ai",
-    status: "ok",
-    health: "live",
-    checkedAt: "2026-09-28T21:58:00Z",
-    limits: [],
-    ...overrides,
-  };
-}
-
-function standardUsages(): ProviderUsage[] {
-  return [
-    usage({
-      id: "openai-codex",
-      name: "OpenAI / Codex",
-      limits: [{ label: "Weekly credits", usedPercent: 78 }],
-    }),
-    usage({
-      id: "grok",
-      name: "Grok (xAI)",
-      limits: [{ label: "Weekly", usedPercent: 96 }],
-    }),
-  ];
-}
-
-function analyticsPayload(): UsageAnalytics {
+function intelligencePayload(
+  range: "today" | "7d" | "30d" = "today",
+): UsageIntelligence {
   return {
     schemaVersion: 1,
-    range: "24h",
-    rangeStart: "2026-09-27T22:00:00.000Z",
+    range,
+    rangeStart: "2026-09-28T00:00:00.000Z",
     rangeEnd: "2026-09-28T22:00:00.000Z",
     generatedAt: "2026-09-28T22:00:00.000Z",
-    timezoneOffsetMinutes: 0,
-    summary: {
-      peakObservedUsage: {
-        usedPercent: 84,
-        providerId: "openai-codex",
-        windowLabel: "Weekly credits",
-        observedAt: "2026-09-28T18:00:00.000Z",
-        exactness: "exact",
-      },
-      mostConstrainedWindow: {
-        usedPercent: 84,
-        providerId: "openai-codex",
-        windowLabel: "Weekly credits",
-        observedAt: "2026-09-28T18:00:00.000Z",
-        exactness: "exact",
-      },
-      observedResetCycles: {
-        count: 1,
-        exactness: "lowerBound",
-        detection: "historyResetBoundaryTransitions",
-      },
-      observedDays: { count: 1, timezoneOffsetMinutes: 0 },
-      timeNearLimit: undefined,
-    },
-    heatmap: [
+    enabled: true,
+    eventsInRange: 12,
+    groups: [
       {
-        date: "2026-09-28",
-        observed: true,
-        peakUsedPercent: 84,
-        peakObservedAt: "2026-09-28T18:00:00.000Z",
-        providerId: "openai-codex",
-        windowLabel: "Weekly credits",
-        band: 4,
-        peakExactness: "exact",
-      },
-      { date: "2026-09-27", observed: false },
-    ],
-    trends: [
-      {
-        providerId: "openai-codex",
-        windowLabel: "Weekly credits",
-        points: [
+        provider: "zai",
+        models: [
           {
-            observedAt: "2026-09-28T02:00:00.000Z",
-            usedPercent: 40,
-            cycleId: "c1",
-            cycleStart: true,
-            resetBoundary: false,
-            resolution: "detailed",
-          },
-          {
-            observedAt: "2026-09-28T18:00:00.000Z",
-            usedPercent: 84,
-            cycleId: "c1",
-            cycleStart: false,
-            resetBoundary: false,
-            resolution: "detailed",
+            model: "GLM-5.3",
+            events: 9,
+            inputTokens: 412_000,
+            cacheReadTokens: 3_150_000,
+            cacheWriteTokens: 148_000,
+            outputTokens: 530_000,
+            reasoningTokens: 302_000,
+            totalTokens: 4_542_000,
           },
         ],
-        coverage: {
-          gapThresholdMs: 9 * 60 * 60 * 1000,
-          comparableSpanMs: 16 * 60 * 60 * 1000,
-          comparableSpanRatio: 0.66,
-          gaps: [],
-        },
+        events: 9,
+        inputTokens: 412_000,
+        cacheReadTokens: 3_150_000,
+        cacheWriteTokens: 148_000,
+        outputTokens: 530_000,
+        reasoningTokens: 302_000,
+        totalTokens: 4_542_000,
       },
     ],
-    gapSemantics: "notObservedNeverZeroFilled",
-    availabilityInference: "none",
+    totals: {
+      events: 12,
+      inputTokens: 500_000,
+      cacheReadTokens: 3_200_000,
+      cacheWriteTokens: 160_000,
+      outputTokens: 600_000,
+      reasoningTokens: 310_000,
+      totalTokens: 4_770_000,
+    },
+    collectionStartedAt: "2026-09-19T08:00:00.000Z",
+    incompleteHistory: false,
+    sources: [
+      {
+        source: "zcode",
+        state: "ok",
+        watermarkAt: "2026-09-28T21:20:00.000Z",
+        baselinedAt: "2026-09-19T08:00:00.000Z",
+        lastObservedAt: "2026-09-28T21:48:00.000Z",
+      },
+    ],
+    semantics: "reportedTokenUsageCollectedLocally",
   };
 }
 
-describe("Overview | Usage primary navigation", () => {
+describe("Usage | Settings primary navigation", () => {
   beforeEach(() => {
-    mocks.usages = [];
-    mocks.predictionFor = () => undefined;
-    loadUsageAnalytics.mockReset();
-    loadUsageAnalytics.mockResolvedValue(analyticsPayload());
+    mocks.usageIntelligence = true;
+    loadUsageIntelligence.mockReset();
+    loadUsageIntelligence.mockImplementation(async (query: { range: string }) =>
+      intelligencePayload(query.range as "today"),
+    );
   });
 
   afterEach(cleanup);
 
-  it("switches to the Usage view and back, keeping Overview intact", async () => {
-    mocks.usages = standardUsages();
+  it("lands on the Usage overview with exactly two destinations", async () => {
     render(<App />);
-    // Overview is the landing view.
-    expect(screen.getByRole("tabpanel")).toBeTruthy();
-    expect(screen.queryByText("Peak observed")).toBeNull();
-
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    const usageRegion = await screen.findByLabelText("Usage analytics");
-    expect(within(usageRegion).getByText("Peak observed")).toBeTruthy();
-    // The attention rail is Overview-only; the provider rail stays.
-    expect(screen.queryByLabelText("Needs attention")).toBeNull();
-    expect(screen.getByRole("tablist", { name: "Providers" })).toBeTruthy();
-
-    fireEvent.click(screen.getByRole("button", { name: "Overview" }));
-    expect(screen.getByRole("tabpanel")).toBeTruthy();
-    expect(within(screen.getByRole("tabpanel")).getByText("Grok (xAI)")).toBeTruthy();
-    expect(screen.queryByLabelText("Usage analytics")).toBeNull();
-  });
-
-  it("queries analytics only while the Usage view is open", async () => {
-    mocks.usages = standardUsages();
-    render(<App />);
-    expect(loadUsageAnalytics).not.toHaveBeenCalled();
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    expect(loadUsageAnalytics).toHaveBeenCalledWith({ range: "24h" });
-  });
-
-  it("scopes the analytics query from the provider rail", async () => {
-    mocks.usages = standardUsages();
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    fireEvent.click(screen.getByRole("tab", { name: /OpenAI \/ Codex/ }));
-    await screen.findByText("All providers");
-    expect(loadUsageAnalytics).toHaveBeenLastCalledWith({
-      range: "24h",
-      providerId: "openai-codex",
-    });
-  });
-
-  it("keeps the provider rail keyboard-operable in the Usage view", async () => {
-    const user = userEvent.setup();
-    mocks.usages = standardUsages();
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    // Nothing selected under "All providers"; the first entry is the tab stop.
-    const codex = screen.getByRole("tab", { name: /OpenAI \/ Codex/ });
-    expect(codex.tabIndex).toBe(0);
-    codex.focus();
-    await user.keyboard("{ArrowDown}");
-    const grok = screen.getByRole("tab", { name: /Grok \(xAI\)/ });
-    expect(grok.getAttribute("aria-selected")).toBe("true");
-    expect(document.activeElement).toBe(grok);
-    await waitForLastQuery({ range: "24h", providerId: "grok" });
-  });
-
-  it("isolates an analytics failure from the live provider UI", async () => {
-    loadUsageAnalytics.mockRejectedValue(new Error("analytics down"));
-    mocks.usages = standardUsages();
-    render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    const alert = await screen.findByRole("alert");
-    expect(within(alert).getByText(/analytics down/)).toBeTruthy();
-    // The provider rail and header stay fully functional…
-    expect(screen.getByRole("tablist", { name: "Providers" })).toBeTruthy();
+    const usageMain = await screen.findByLabelText("Usage overview");
+    expect(usageMain).toBeTruthy();
+    // The removed Status/Overview destination is gone from navigation.
+    expect(screen.queryByRole("button", { name: "Overview" })).toBeNull();
+    const nav = screen.getByRole("group", { name: "View" });
+    const buttons = within(nav).getAllByRole("button");
+    expect(buttons.map((button) => button.textContent)).toEqual([
+      "Usage",
+      "Settings",
+    ]);
     expect(
-      (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement).disabled,
-    ).toBe(false);
-    // …and Overview renders the live quota cards untouched by the failure.
-    fireEvent.click(screen.getByRole("button", { name: "Overview" }));
-    const panel = screen.getByRole("tabpanel");
-    expect(within(panel).getByText("Grok (xAI)")).toBeTruthy();
-    expect(panel.querySelector(".primary-percent")?.textContent).toBe(
-      "96% used",
+      within(nav).getByRole("button", { name: "Usage" }).getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("queries Usage Intelligence on mount with the Today range", async () => {
+    render(<App />);
+    await screen.findByText("Reported tokens");
+    expect(loadUsageIntelligence).toHaveBeenCalledWith(
+      expect.objectContaining({ range: "today" }),
     );
   });
 
-  it("keeps the settings drawer and utility bar in the Usage view", async () => {
-    mocks.usages = standardUsages();
+  it("re-queries when the range changes", async () => {
     render(<App />);
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
+    await screen.findByText("Reported tokens");
+    fireEvent.click(screen.getByRole("button", { name: "7d" }));
+    await vi.waitFor(() =>
+      expect(loadUsageIntelligence).toHaveBeenLastCalledWith({ range: "7d" }),
+    );
+  });
+
+  it("never queries while the opt-in is off and routes to Settings", async () => {
+    mocks.usageIntelligence = false;
+    render(<App />);
+    expect(
+      await screen.findByText("Usage Intelligence is off."),
+    ).toBeTruthy();
+    expect(loadUsageIntelligence).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Open Settings" }));
+    expect(
+      await screen.findByRole("switch", { name: "Quota notifications" }),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText("Usage overview")).toBeNull();
+  });
+
+  it("isolates an intelligence failure from the shell", async () => {
+    loadUsageIntelligence.mockRejectedValue(new Error("store unavailable"));
+    render(<App />);
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(/store unavailable/)).toBeTruthy();
+    // The shell stays fully functional…
+    expect(
+      (screen.getByRole("button", { name: "Refresh" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+    // …and Settings still opens.
     fireEvent.click(screen.getByRole("button", { name: "Settings" }));
     expect(
-      screen.getByRole("switch", { name: "Quota notifications" }),
+      await screen.findByRole("switch", { name: "Quota notifications" }),
     ).toBeTruthy();
   });
-});
 
-async function waitForLastQuery(query: Record<string, unknown>) {
-  await vi.waitFor(() => {
-    expect(loadUsageAnalytics).toHaveBeenLastCalledWith(query);
+  it("keeps the utility bar and manual refresh across both views", async () => {
+    render(<App />);
+    expect(screen.getByText(/Updated/)).toBeTruthy();
+    expect(screen.getByText("Auto-refresh · 15 min")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(mocks.refresh).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Settings" }));
+    expect(screen.getByText(/Updated/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(mocks.refresh).toHaveBeenCalledTimes(2);
+    // Round trip back to the usage overview.
+    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
   });
-}
+});

@@ -15,26 +15,29 @@ import {
   formatReceiptJson,
   formatReceiptMarkdown,
 } from "./lib/executionReceipt";
-import type { UsageAnalytics } from "./lib/usageAnalytics";
 import type { QuotaPrediction } from "./lib/prediction/types";
 import type { ProviderUsage } from "./types";
 
 /**
- * v0.7 PRODUCT integration rehearsal pins.
+ * v0.7 PRODUCT integration rehearsal pins, adapted to the v0.9 Usage-first
+ * main window (Usage | Settings; the quota Overview surface moved to the
+ * floating bar).
  *
- * These scenarios exercise the integrated product surface — Usage UI × quota
- * perspective × Local data controls × execution runs — through the real
+ * These scenarios exercise the integrated product surface — Settings page ×
+ * quota perspective × Local data controls × execution runs — through the real
  * App with the real (localStorage-backed) settings hook. Runtime transport
- * (provider snapshots, history store, analytics store, updater) is mocked at
- * the hook boundary, which is the same seam the production runtime uses.
+ * (provider snapshots, history store, updater) is mocked at the hook
+ * boundary, which is the same seam the production runtime uses.
  *
- * Scenario numbering matches the rehearsal task's cross-feature list.
+ * Scenario numbering matches the rehearsal task's cross-feature list; the
+ * former perspective-presentation scenarios (1-5) asserted the removed
+ * Overview/analytics surfaces and moved with them.
  */
 
 const mocks = vi.hoisted(() => ({
   usages: [] as ProviderUsage[],
   historyRevision: 1,
-    usageIntelligenceRevision: 0,
+  usageIntelligenceRevision: 0,
   historyCleared: false,
   refresh: vi.fn(),
 }));
@@ -49,6 +52,7 @@ vi.mock("./hooks/useProviderUsage", () => ({
     stale: false,
     staleMinutes: 0,
     historyRevision: mocks.historyRevision,
+    usageIntelligenceRevision: mocks.usageIntelligenceRevision,
   }),
 }));
 
@@ -80,131 +84,10 @@ vi.mock("./hooks/useUpdater", () => ({
   }),
 }));
 
-// The analytics loader is mocked at the module boundary; the cleared flag
-// stands in for the Rust store being emptied underneath the view.
-vi.mock("./lib/usageAnalytics", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("./lib/usageAnalytics")>();
-  return {
-    ...actual,
-    loadUsageAnalytics: vi.fn(async () => analyticsPayload()),
-  };
-});
-
-import { loadUsageAnalytics } from "./lib/usageAnalytics";
-const loader = loadUsageAnalytics as ReturnType<typeof vi.fn>;
-
-const NOW = Date.parse("2026-09-28T22:00:00Z");
-const HOUR = 3600000;
-
-function analyticsPayload(range: "24h" | "7d" = "24h"): UsageAnalytics {
-  return {
-    range,
-    rangeStart: new Date(NOW - 24 * HOUR).toISOString(),
-    rangeEnd: new Date(NOW).toISOString(),
-    schemaVersion: 1,
-    generatedAt: new Date(NOW).toISOString(),
-    timezoneOffsetMinutes: 0,
-    summary: {
-      peakObservedUsage: {
-        providerId: "openai-codex",
-        account: "key:3456",
-        windowLabel: "Weekly credits",
-        observedAt: new Date(NOW - 2 * HOUR).toISOString(),
-        usedPercent: 95,
-        exactness: "exact",
-      },
-      mostConstrainedWindow: {
-        providerId: "openai-codex",
-        account: "key:3456",
-        windowLabel: "Weekly credits",
-        observedAt: new Date(NOW - 2 * HOUR).toISOString(),
-        usedPercent: 95,
-        exactness: "exact",
-      },
-      observedResetCycles: {
-        count: 1,
-        exactness: "exact",
-        detection: "historyResetBoundaryTransitions",
-      },
-      observedDays: { count: 2, timezoneOffsetMinutes: 0 },
-      timeNearLimit: {
-        estimated: true,
-        method: "piecewiseLinearBetweenAdjacentSameCycleObservations",
-        intervalPolicy: "onlyIntervalsAtOrBelowPerSeriesGapThreshold",
-        comparableSpanMs: 8 * HOUR,
-        comparableSpanRatio: 0.33,
-        estimates: [
-          { thresholdPercent: 80, estimatedDurationMs: 84 * 60 * 1000, estimatedShare: 0.3 },
-          { thresholdPercent: 95, estimatedDurationMs: 18 * 60 * 1000, estimatedShare: 0.06 },
-        ],
-      },
-    },
-    heatmap: [
-      { date: "2026-09-28", observed: true, peakUsedPercent: 84, peakExactness: "exact", band: 4 },
-      { date: "2026-09-27", observed: false },
-    ],
-    trends: [
-      {
-        providerId: "openai-codex",
-        account: "key:3456",
-        windowLabel: "Weekly credits",
-        coverage: {
-          gapThresholdMs: HOUR,
-          comparableSpanMs: 3 * HOUR,
-          comparableSpanRatio: 0.125,
-          gaps: [],
-        },
-        points: [
-          {
-            observedAt: new Date(NOW - 3 * HOUR).toISOString(),
-            usedPercent: 90,
-            cycleId: "c1",
-            cycleStart: true,
-            resetBoundary: false,
-            resolution: "detailed",
-          },
-          {
-            observedAt: new Date(NOW - 2 * HOUR).toISOString(),
-            usedPercent: 95,
-            cycleId: "c1",
-            cycleStart: false,
-            resetBoundary: false,
-            resolution: "detailed",
-          },
-        ],
-      },
-    ],
-    gapSemantics: "notObservedNeverZeroFilled",
-    availabilityInference: "none",
-  };
-}
-
 const minutesAgo = (minutes: number) =>
   new Date(Date.now() - minutes * 60_000).toISOString();
 const hoursAhead = (hours: number) =>
   new Date(Date.now() + hours * 3600000).toISOString();
-
-function emptyAnalytics(range: "24h" | "7d" = "24h"): UsageAnalytics {
-  return {
-    ...analyticsPayload(range),
-    summary: {
-      peakObservedUsage: undefined,
-      mostConstrainedWindow: undefined,
-      observedResetCycles: {
-        count: 0,
-        exactness: "exact",
-        detection: "historyResetBoundaryTransitions",
-      },
-      observedDays: { count: 0, timezoneOffsetMinutes: 0 },
-      timeNearLimit: undefined,
-    },
-    heatmap: [
-      { date: "2026-09-28", observed: false },
-      { date: "2026-09-27", observed: false },
-    ],
-    trends: [],
-  };
-}
 
 function codexUsage(overrides: Partial<ProviderUsage> = {}): ProviderUsage {
   return {
@@ -245,18 +128,15 @@ function renderApp(usages: ProviderUsage[]) {
   return render(<App />);
 }
 
-async function expandDrawer(user: ReturnType<typeof userEvent.setup>) {
-  const button = screen.getByRole("button", { name: "Settings" });
-  if (button.getAttribute("aria-expanded") !== "true") {
-    await user.click(button);
-  }
+async function openSettings(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "Settings" }));
 }
 
 async function choosePerspective(
   user: ReturnType<typeof userEvent.setup>,
   perspective: "Used" | "Remaining",
 ) {
-  await expandDrawer(user);
+  await openSettings(user);
   await user.click(screen.getByRole("radio", { name: perspective }));
 }
 
@@ -270,147 +150,33 @@ function persistedRuns(): {
     : EMPTY_EXECUTION_RUNS_STATE;
 }
 
-/** Locale-independent access to the heatmap day cells. */
-function heatmapCells() {
-  return within(
-    screen.getByRole("list", { name: "Daily peak observed usage" }),
-  ).getAllByRole("listitem");
-}
-
 beforeEach(() => {
   localStorage.clear();
   mocks.usages = [];
   mocks.historyRevision = 1;
   mocks.historyCleared = false;
   mocks.refresh = vi.fn();
-  loader.mockReset();
-  loader.mockImplementation(async () =>
-    mocks.historyCleared ? emptyAnalytics() : analyticsPayload(),
-  );
 });
 
 afterEach(() => {
   cleanup();
 });
 
-describe("quota perspective across the product (scenarios 1-5)", () => {
-  it("1. Used -> Remaining flips Overview presentation without touching canonical values", async () => {
-    const user = userEvent.setup();
-    const view = renderApp([codexUsage()]);
-
-    const overviewPercent = () =>
-      view.container.querySelector(".primary-percent")?.textContent ?? "";
-    // The primary window is the most constrained one (Weekly, 95% used).
-    expect(overviewPercent()).toBe("95% used");
-
-    await choosePerspective(user, "Remaining");
-    expect(overviewPercent()).toBe("5% remaining");
-
-    // Canonical storage/persisted settings never see an inverted value: the
-    // stored object only records the perspective preference itself.
-    const stored = JSON.parse(
-      localStorage.getItem("rate-limits.settings.v1") ?? "{}",
-    ) as Record<string, unknown>;
-    expect(stored.quotaPerspective).toBe("remaining");
-
-    await choosePerspective(user, "Used");
-    expect(overviewPercent()).toBe("95% used");
-  });
-
-  it("2. Used -> Remaining flips the Usage summary values in place", async () => {
-    const user = userEvent.setup();
-    renderApp([codexUsage(), grokUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-
-    const summary = within(screen.getByLabelText("Usage summary"));
-    expect(summary.getByText("95% used")).toBeTruthy();
-
-    await choosePerspective(user, "Remaining");
-    // Peak and most constrained both show the derived complement.
-    expect(
-      summary.getAllByText("5% remaining", { selector: ".usage-metric-value" }),
-    ).toHaveLength(2);
-  });
-
-  it("3. severity stays canonical on used in Remaining mode (95% used is Critical)", async () => {
-    const user = userEvent.setup();
-    renderApp([codexUsage(), grokUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-
-    const summary = within(screen.getByLabelText("Usage summary"));
-    expect(summary.getByText("Critical")).toBeTruthy();
-
-    await choosePerspective(user, "Remaining");
-    // 5% remaining must NOT read as healthy.
-    expect(summary.getByText("Critical")).toBeTruthy();
-    expect(
-      summary.getAllByText("5% remaining", { selector: ".usage-metric-value" }),
-    ).toHaveLength(2);
-  });
-
-  it("4. heatmap band and color class stay the used-band equivalent in Remaining mode", async () => {
-    const user = userEvent.setup();
-    renderApp([codexUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Daily peak");
-
-    const cell = heatmapCells()[0];
-    expect(cell.className).toContain("usage-band-4");
-    expect(cell.getAttribute("aria-label")).toContain("84% used, band 75–100%");
-
-    await choosePerspective(user, "Remaining");
-    const remainingCell = heatmapCells()[0];
-    // Same color scale: the class is still the canonical used band.
-    expect(remainingCell.className).toContain("usage-band-4");
-    // The label may say remaining, but it names the used equivalence too.
-    expect(remainingCell.getAttribute("aria-label")).toContain(
-      "16% remaining (84% used), band 75–100%",
-    );
-  });
-
-  it("5. near-limit thresholds stay >=80%/>=95% used in Remaining mode, with an equivalence note", async () => {
-    const user = userEvent.setup();
-    renderApp([codexUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Near limit");
-
-    const summary = within(screen.getByLabelText("Usage summary"));
-    expect(summary.getByText("≥80% used · 1h 24m")).toBeTruthy();
-    expect(summary.getByText("≥95% used · 18m")).toBeTruthy();
-    expect(screen.queryByText(/≤20% remaining/)).toBeNull();
-
-    await choosePerspective(user, "Remaining");
-    const remainingSummary = within(screen.getByLabelText("Usage summary"));
-    // The canonical thresholds and their estimated durations are unchanged…
-    expect(remainingSummary.getByText("≥80% used · 1h 24m")).toBeTruthy();
-    expect(remainingSummary.getByText("≥95% used · 18m")).toBeTruthy();
-    // …and the perspective only adds the explained equivalence.
-    expect(remainingSummary.getByText("thresholds measure used: ≤20% remaining ≈ ≥80% used")).toBeTruthy();
-  });
-});
-
 describe("local data × usage (scenarios 6-11)", () => {
-  it("6+7. clearing history while Usage is open re-queries and shows the empty state", async () => {
+  it("6+7. clearing usage history from Settings settles with feedback and leaves the Usage destination intact", async () => {
     const user = userEvent.setup();
-    const view = renderApp([codexUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    expect(screen.queryByText(/No usage history yet/)).toBeNull();
+    renderApp([codexUsage()]);
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Clear usage history" }));
     await user.click(await screen.findByRole("button", { name: "Clear usage history" }));
-
-    // The Rust runtime answers the clear with a bumped history revision in
-    // the next snapshot; the rerender stands in for that push at this seam.
-    view.rerender(<App />);
     expect(mocks.historyCleared).toBe(true);
+    expect(await screen.findByText("Usage history cleared.")).toBeTruthy();
 
-    // The open Usage view re-queries and shows the honest empty state
-    // without leaving the view.
-    await screen.findByText(/No usage history yet/);
+    // The Usage destination (an independent data plane) is unaffected by a
+    // quota-history clear.
+    await user.click(screen.getByRole("button", { name: "Usage" }));
+    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
   });
 
   it("8. settings survive a history clear", async () => {
@@ -419,7 +185,7 @@ describe("local data × usage (scenarios 6-11)", () => {
     await choosePerspective(user, "Remaining");
     const before = localStorage.getItem("rate-limits.settings.v1");
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Clear usage history" }));
     await user.click(await screen.findByRole("button", { name: "Clear usage history" }));
     await screen.findByText("Usage history cleared.");
@@ -430,22 +196,15 @@ describe("local data × usage (scenarios 6-11)", () => {
 
   it("9. reset preferences returns the perspective to Used", async () => {
     const user = userEvent.setup();
-    const view = renderApp([codexUsage()]);
+    renderApp([codexUsage()]);
     await choosePerspective(user, "Remaining");
-    expect(view.container.querySelector(".primary-percent")?.textContent).toBe(
-      "5% remaining",
-    );
 
-    await expandDrawer(user);
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
 
     const radio = screen.getByRole("radio", { name: "Used" }) as HTMLInputElement;
     expect(radio.checked).toBe(true);
-    expect(view.container.querySelector(".primary-percent")?.textContent).toBe(
-      "95% used",
-    );
     expect(
       (JSON.parse(localStorage.getItem("rate-limits.settings.v1") ?? "{}") as Record<string, unknown>)
         .quotaPerspective,
@@ -455,18 +214,16 @@ describe("local data × usage (scenarios 6-11)", () => {
   it("10. reset preferences preserves usage history", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
 
     expect(mocks.historyCleared).toBe(false);
-    // The Usage view still shows the same observations.
-    expect(screen.getByText("Peak observed")).toBeTruthy();
-    expect(screen.getByLabelText("Usage summary")).toBeTruthy();
+    // The Usage destination still renders.
+    await user.click(screen.getByRole("button", { name: "Usage" }));
+    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
   });
 
   it("11. reset preferences preserves execution runs", async () => {
@@ -494,7 +251,7 @@ describe("local data × usage (scenarios 6-11)", () => {
     saveExecutionRunsState(finished.state);
     renderApp([codexUsage()]);
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
@@ -514,7 +271,7 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     await user.click(screen.getByRole("button", { name: "Finish run" }));
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
 
-    await expandDrawer(user);
+    await openSettings(user);
       await user.click(screen.getByRole("button", { name: "Clear execution runs" }));
     expect(screen.getByText("Clear execution runs?")).toBeTruthy();
     await user.click(await screen.findByRole("button", { name: "Clear execution runs" }));
@@ -531,7 +288,7 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     await user.click(screen.getByRole("button", { name: "Start run" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Discard active run and clear" }));
     // The confirmation names the in-progress consequence.
     expect(
@@ -560,35 +317,33 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     await user.click(screen.getByRole("button", { name: "Start run" }));
     await user.click(screen.getByRole("button", { name: "Finish run" }));
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Clear execution runs" }));
     await user.click(await screen.findByRole("button", { name: "Clear execution runs" }));
     await screen.findByText("Execution runs cleared.");
 
     expect(mocks.historyCleared).toBe(false);
     await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    expect(screen.getByLabelText("Usage summary")).toBeTruthy();
+    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
   });
 });
 
 describe("execution runs × navigation × usage (scenarios 15-18)", () => {
-  it("15+16. a run started on Overview stays active across the Usage round-trip", async () => {
+  it("15+16. a run started on Usage stays active across the Settings round-trip", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
+    // Usage is the landing destination.
+    expect(screen.getByLabelText("Usage overview")).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Execution run" }));
     await user.click(screen.getByRole("button", { name: "Start run" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
-    // Overview is still the active view.
-    expect(screen.getByRole("tabpanel")).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(screen.getByText("Peak observed")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Settings" }));
     expect(
       screen.getByRole("button", { name: /Execution run in progress, running for/ }),
     ).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Overview" }));
+    await user.click(screen.getByRole("button", { name: "Usage" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
     expect(persistedRuns().activeRun).not.toBeNull();
   });
@@ -624,8 +379,8 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     ];
     view.rerender(<App />);
 
+    await user.click(screen.getByRole("button", { name: "Settings" }));
     await user.click(screen.getByRole("button", { name: "Usage" }));
-    await user.click(screen.getByRole("button", { name: "Overview" }));
     await user.click(screen.getByRole("button", { name: "Finish run" }));
 
     const summary = within(screen.getByLabelText("Execution summary"));
@@ -636,7 +391,7 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     ).toBe("openai-codex");
   });
 
-  it("18. the recent run survives Overview/Usage switching", async () => {
+  it("18. the recent run survives Usage/Settings switching", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
     await user.click(screen.getByRole("button", { name: "Execution run" }));
@@ -644,9 +399,8 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     await user.click(screen.getByRole("button", { name: "Finish run" }));
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
 
+    await user.click(screen.getByRole("button", { name: "Settings" }));
     await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    await user.click(screen.getByRole("button", { name: "Overview" }));
     // The open panel (and its recent-run history) survives the round trip.
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
   });
@@ -732,42 +486,50 @@ describe("receipts from the integrated pipeline (scenarios 19-20)", () => {
 });
 
 describe("ProviderUsage DTO coexistence (scenarios 21-23)", () => {
-  it("21. reset credits and planType coexist on a provider through Overview and Usage", async () => {
+  it("21. reset credits and planType coexist on a provider through Usage and Settings", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage(), grokUsage()]);
 
-    // Overview renders the attributed, plan-typed provider.
-    expect(screen.getByRole("tab", { name: /OpenAI \/ Codex/ })).toBeTruthy();
+    // Settings renders the attributed, plan-typed provider's preferences row.
+    await openSettings(user);
+    const providers = screen.getByRole("group", { name: "Providers" });
+    expect(
+      within(providers).getByRole("switch", {
+        name: "Show OpenAI / Codex in the floating bar",
+      }),
+    ).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    // The analytics surface is unaffected by the extra DTO fields.
-    expect(screen.getByText("95% used")).toBeTruthy();
+    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
     // The reset-credit payload travels with the usage object untouched.
     expect(mocks.usages[0]?.resetCredits?.bankedCredits).toBe(3);
     expect(mocks.usages[0]?.planType).toBe("team");
   });
 
-  it("22. absent reset credits change nothing in the Usage surface", async () => {
+  it("22. absent reset credits change nothing in the product surface", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage({ resetCredits: undefined }), grokUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-    expect(screen.getByLabelText("Usage summary")).toBeTruthy();
-    expect(screen.getByText("95% used")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Execution run" }));
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(screen.getByText(/Running ·/)).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Finish run" }));
+    expect(screen.getByText("Recent runs (1)")).toBeTruthy();
   });
 
   it("23. the account identity surfaces only in its masked display form", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    await screen.findByText("Peak observed");
-
-    const summary = within(screen.getByLabelText("Usage summary"));
-    // The masked label (fingerprint scheme + tail) is display-safe…
-    expect(summary.getAllByText(/key:3456/).length).toBeGreaterThan(0);
+    await openSettings(user);
+    // The provider row shows the friendly name; the masked label (fingerprint
+    // scheme + tail) is display-safe…
+    expect(
+      screen.getByRole("switch", {
+        name: "Show OpenAI / Codex in the floating bar",
+      }),
+    ).toBeTruthy();
     // …and no raw identity material beyond it is rendered anywhere.
     expect(document.body.textContent).not.toContain("sk-");
+    expect(document.body.textContent).not.toContain("key:3456");
   });
 });
 
@@ -803,7 +565,7 @@ describe("settings schema robustness (scenarios 24-25)", () => {
     localStorage.setItem("rate-limits.settings.v1", FUTURE.replace("used", "remaining"));
     renderApp([codexUsage()]);
 
-    await expandDrawer(user);
+    await openSettings(user);
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");

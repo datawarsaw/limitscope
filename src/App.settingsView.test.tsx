@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   setRefreshInterval: vi.fn(),
   setTheme: vi.fn(),
   setQuotaNotifications: vi.fn(),
+  setUsageIntelligence: vi.fn(),
   setProviderHidden: vi.fn(),
   moveProvider: vi.fn(),
   setQuotaPerspective: vi.fn(),
@@ -41,11 +42,13 @@ vi.mock("./hooks/useSettings", () => ({
       quotaNotifications: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      usageIntelligence: false,
     },
     setLaunchAtStartup: mocks.setLaunchAtStartup,
     setRefreshInterval: mocks.setRefreshInterval,
     setTheme: mocks.setTheme,
     setQuotaNotifications: mocks.setQuotaNotifications,
+    setUsageIntelligence: mocks.setUsageIntelligence,
     setProviderHidden: mocks.setProviderHidden,
     moveProvider: mocks.moveProvider,
     setQuotaPerspective: mocks.setQuotaPerspective,
@@ -64,6 +67,8 @@ vi.mock("./hooks/useProviderUsage", () => ({
     refreshOverdue: false,
     stale: false,
     staleMinutes: 0,
+    historyRevision: 1,
+    usageIntelligenceRevision: 0,
   }),
 }));
 
@@ -83,11 +88,11 @@ function settingsButton() {
   return screen.getByRole("button", { name: "Settings" });
 }
 
-function expandDrawer() {
+function openSettings() {
   fireEvent.click(settingsButton());
 }
 
-describe("compact settings drawer", () => {
+describe("settings destination", () => {
   afterEach(() => {
     cleanup();
   });
@@ -95,10 +100,8 @@ describe("compact settings drawer", () => {
     vi.clearAllMocks();
   });
 
-  it("is collapsed by default", () => {
+  it("keeps settings controls absent until the destination opens", () => {
     render(<App />);
-    const button = settingsButton();
-    expect(button.getAttribute("aria-expanded")).toBe("false");
     expect(
       screen.queryByRole("switch", {
         name: "Launch LimitScope when Windows starts",
@@ -110,16 +113,25 @@ describe("compact settings drawer", () => {
     ).toBeNull();
   });
 
-  it("shows the current update time and auto-refresh interval while collapsed", () => {
+  it("shows the current update time and auto-refresh interval on both views", () => {
     render(<App />);
     expect(screen.getByText(/Updated/)).toBeTruthy();
     expect(screen.getByText("Auto-refresh · 15 min")).toBeTruthy();
+    openSettings();
+    expect(screen.getByText(/Updated/)).toBeTruthy();
   });
 
-  it("expands on Settings click and exposes every control", () => {
+  it("opens on Settings click and exposes every control in four groups", () => {
     render(<App />);
-    expandDrawer();
-    expect(settingsButton().getAttribute("aria-expanded")).toBe("true");
+    openSettings();
+    for (const heading of [
+      "General",
+      "Providers & Wallets",
+      "Data & Privacy",
+      "Support",
+    ]) {
+      expect(screen.getByRole("heading", { name: heading })).toBeTruthy();
+    }
     expect(
       screen.getByRole("switch", {
         name: "Launch LimitScope when Windows starts",
@@ -131,6 +143,9 @@ describe("compact settings drawer", () => {
     expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
     expect(screen.getByLabelText("Theme")).toBeTruthy();
     expect(screen.getByRole("radiogroup", { name: "Quota display" })).toBeTruthy();
+    expect(
+      screen.getByRole("switch", { name: "Usage Intelligence" }),
+    ).toBeTruthy();
     expect(
       screen.getByRole("group", { name: "Local data" }),
     ).toBeTruthy();
@@ -149,23 +164,27 @@ describe("compact settings drawer", () => {
     expect(
       screen.getByRole("button", { name: "Export diagnostics" }),
     ).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Check for updates" }),
+    ).toBeTruthy();
+    // The wallet feature keeps a named seam inside its group.
+    expect(
+      screen.getByRole("group", { name: "API wallets" }),
+    ).toBeTruthy();
   });
 
-  it("collapses again on a second Settings click", () => {
+  it("returns to the Usage overview on the Usage button", () => {
     render(<App />);
-    expandDrawer();
-    expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
-    fireEvent.click(settingsButton());
-    expect(settingsButton().getAttribute("aria-expanded")).toBe("false");
-    expect(screen.queryByRole("combobox")).toBeNull();
-    expect(
-      screen.queryByRole("button", { name: "Clear usage history" }),
-    ).toBeNull();
+    openSettings();
+    expect(screen.getByLabelText("Theme")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    expect(screen.queryByLabelText("Theme")).toBeNull();
+    expect(screen.getByLabelText("Usage overview")).toBeTruthy();
   });
 
   it("still fires the existing setting callbacks", () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(
       screen.getByRole("switch", {
         name: "Launch LimitScope when Windows starts",
@@ -184,11 +203,13 @@ describe("compact settings drawer", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("oled");
     fireEvent.click(screen.getByRole("radio", { name: "Remaining" }));
     expect(mocks.setQuotaPerspective).toHaveBeenCalledWith("remaining");
+    fireEvent.click(screen.getByRole("switch", { name: "Usage Intelligence" }));
+    expect(mocks.setUsageIntelligence).toHaveBeenCalledWith(true);
   });
 
   it("confirms a clear before clearing the usage history", async () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(
       screen.getByRole("button", { name: "Clear usage history" }),
     );
@@ -206,7 +227,7 @@ describe("compact settings drawer", () => {
 
   it("clears the provider cache and resets preferences from the same section", async () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
 
     fireEvent.click(
       screen.getByRole("button", { name: "Clear provider cache" }),
@@ -234,7 +255,7 @@ describe("compact settings drawer", () => {
       fileName: "runtime-diagnostics-20260929T120000Z.json",
     });
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(mocks.exportDiagnostics).toHaveBeenCalledWith({
       launchAtStartup: false,
@@ -243,6 +264,7 @@ describe("compact settings drawer", () => {
       quotaNotifications: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      usageIntelligence: false,
     });
     expect(
       await screen.findByText(
@@ -256,7 +278,7 @@ describe("compact settings drawer", () => {
       new Error("Authorization: Bearer must-not-render"),
     );
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(await screen.findByText("Could not export diagnostics.")).toBeTruthy();
     expect(screen.queryByText(/must-not-render/)).toBeNull();
@@ -272,7 +294,7 @@ describe("compact settings drawer", () => {
       fileName: "limitscope-usage-20260930T120000Z.csv",
     });
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     const save = screen.getByRole("button", { name: "Save" });
     expect(save.hasAttribute("disabled")).toBe(true);
@@ -302,7 +324,7 @@ describe("compact settings drawer", () => {
       fileName: "limitscope-usage-20260930T120000Z.json",
     });
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -318,7 +340,7 @@ describe("compact settings drawer", () => {
       new Error("Access is denied must-not-render"),
     );
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -341,7 +363,7 @@ describe("compact settings drawer", () => {
       })
       .mockResolvedValueOnce({ status: "saved", fileName: "existing.csv" });
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -364,7 +386,7 @@ describe("compact settings drawer", () => {
       fileName: "existing.csv",
     });
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -379,7 +401,7 @@ describe("compact settings drawer", () => {
 
   it("closes the chooser without invoking when cancelled", async () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(mocks.exportUsageHistory).not.toHaveBeenCalled();
@@ -391,7 +413,7 @@ describe("compact settings drawer", () => {
   it("keeps the chooser usable when the folder picker is cancelled", async () => {
     mocks.pickUsageExportDirectory.mockResolvedValueOnce(null);
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await waitFor(() =>
@@ -408,52 +430,17 @@ describe("compact settings drawer", () => {
     expect(mocks.exportUsageHistory).not.toHaveBeenCalled();
   });
 
-  it("is keyboard accessible with disclosure semantics", async () => {
+  it("is keyboard reachable as a navigation destination", async () => {
     const user = userEvent.setup();
     render(<App />);
     const button = settingsButton();
     expect(button.tagName).toBe("BUTTON");
-    expect(button.getAttribute("aria-controls")).toBe("settings-drawer");
     button.focus();
     expect(document.activeElement).toBe(button);
     await user.keyboard("{Enter}");
-    expect(button.getAttribute("aria-expanded")).toBe("true");
     expect(screen.getByLabelText("Theme")).toBeTruthy();
-  });
-
-  // A01/K02 (v0.8): nonmodal drawer focus contract.
-  it("moves focus to the first setting when it opens", () => {
-    render(<App />);
-    expandDrawer();
-    expect(document.activeElement).toBe(
-      screen.getByRole("switch", {
-        name: "Launch LimitScope when Windows starts",
-      }),
-    );
-  });
-
-  it("closes on Escape from inside and restores focus to the Settings invoker", () => {
-    render(<App />);
-    expandDrawer();
-    const firstSwitch = screen.getByRole("switch", {
-      name: "Launch LimitScope when Windows starts",
-    });
-    expect(document.activeElement).toBe(firstSwitch);
-    fireEvent.keyDown(firstSwitch, { key: "Escape" });
     expect(
-      screen.queryByRole("switch", {
-        name: "Launch LimitScope when Windows starts",
-      }),
-    ).toBeNull();
-    expect(document.activeElement).toBe(settingsButton());
-  });
-
-  it("leaves the drawer open on Escape outside its content (component-level handler)", () => {
-    render(<App />);
-    expandDrawer();
-    fireEvent.keyDown(document.body, { key: "Escape" });
-    expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
-    expect(settingsButton().getAttribute("aria-expanded")).toBe("true");
+      button.getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 });
-

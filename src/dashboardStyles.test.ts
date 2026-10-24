@@ -53,15 +53,24 @@ describe("dashboard layout styles", () => {
     );
   });
 
-  // W02 (v0.8): the settings drawer must yield space instead of pushing the
-  // utility bar below a short viewport — it shrinks and scrolls its own
-  // content while the footer keeps its fixed height.
-  it("lets the settings drawer shrink and scroll instead of clipping the utility bar", () => {
-    const drawerBlock = withoutComments.match(/\.settings-drawer\s*\{[^}]*\}/)?.[0] ?? "";
-    expect(drawerBlock).not.toContain("flex: none");
-    expect(drawerBlock).toContain("flex: 0 1 auto");
-    expect(drawerBlock).toContain("min-height: 0");
-    expect(drawerBlock).toContain("overflow-y: auto");
+  // W02 (v0.9): Settings is a navigation destination rendered inside the
+  // scrolling dashboard column; the page itself must never push the utility
+  // bar out of a short viewport, so the footer keeps its fixed height and
+  // every destination stays single-column in the wider layout modes.
+  it("keeps the settings page inside the scrolling destination column", () => {
+    expect(withoutComments).toMatch(/\.settings-view\s*\{/);
+    expect(withoutComments).toMatch(/\.settings-section\s*\{/);
+    for (const view of ["usage", "settings"]) {
+      expect(withoutComments).toMatch(
+        new RegExp(
+          `\\.app\\[data-view="${view}"\\]\\[data-layout="wide"\\] \\.dashboard`,
+        ),
+      );
+    }
+    const singleColumn = withoutComments.match(
+      /\.app\[data-view="usage"\]\[data-layout="wide"\] \.dashboard,\s*[^{]*\{[^}]*\}/,
+    )?.[0] ?? "";
+    expect(singleColumn).toContain('grid-template-areas: "main"');
     const utilityBlock = withoutComments.match(/\.utility-bar\s*\{[^}]*\}/)?.[0] ?? "";
     expect(utilityBlock).toContain("flex: none");
   });
