@@ -33,6 +33,7 @@ function intelligence(
     collectionStartedAt: "2026-10-04T09:30:00.000Z",
     incompleteHistory: false,
     sources: [],
+    daily: [],
     semantics: "reportedTokenUsageCollectedLocally",
     ...overrides,
   };

@@ -63,6 +63,22 @@ export type UsageSourceDiagnostics = {
   };
 };
 
+/**
+ * One local calendar day of the Daily activity projection. A day without
+ * recorded events is `observed: false` and carries no `totalTokens` — the
+ * backend never serializes a missing day as a confirmed zero.
+ */
+export type UsageDailyDay = {
+  /** Local calendar date of the collecting machine, `YYYY-MM-DD`. */
+  date: string;
+  observed: boolean;
+  events: number;
+  /** Reported token total; absent when the day has no recorded events. */
+  totalTokens?: number;
+  /** The whole day precedes local collection start: no data can exist. */
+  beforeCollection: boolean;
+};
+
 export type UsageIntelligence = {
   schemaVersion: 1;
   range: UsageIntelligenceRange;
@@ -76,6 +92,9 @@ export type UsageIntelligence = {
   collectionStartedAt?: string;
   incompleteHistory: boolean;
   sources: UsageSourceDiagnostics[];
+  /** One cell per local calendar day touched by the range; sums reconcile
+   * with `totals` / `eventsInRange`. */
+  daily: UsageDailyDay[];
   semantics: "reportedTokenUsageCollectedLocally";
 };
 

@@ -41,8 +41,8 @@ function RefreshIcon() {
  * resets, and wallets; the main window is a calm overview of locally
  * observed AI usage. Usage (the default) is one coherent surface over the
  * Usage Intelligence projection — reported tokens, events, model and source
- * rankings, an honest collection context, and a reserved Daily activity
- * area. Settings is a dedicated page (formerly the bottom drawer)
+ * rankings, an honest collection context, and the Daily activity heatmap.
+ * Settings is a dedicated page (formerly the bottom drawer)
  * organized into General, Providers & Wallets, Data & Privacy, and Support.
  *
  * App owns only orchestration — runtime data, the active view, and the

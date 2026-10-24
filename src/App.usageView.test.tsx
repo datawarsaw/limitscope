@@ -128,6 +128,15 @@ function intelligencePayload(
         lastObservedAt: "2026-09-28T21:48:00.000Z",
       },
     ],
+    daily: [
+      {
+        date: "2026-09-28",
+        observed: true,
+        events: 12,
+        totalTokens: 4_770_000,
+        beforeCollection: false,
+      },
+    ],
     semantics: "reportedTokenUsageCollectedLocally",
   };
 }

@@ -16,6 +16,7 @@ import type {
   UsageTrendSeries,
 } from "../lib/usageAnalytics";
 import type {
+  UsageDailyDay,
   UsageIntelligence,
   UsageIntelligenceQuery,
   UsageIntelligenceRange,
@@ -582,6 +583,7 @@ function intelligencePayload(
     collectionStartedAt?: string;
     incompleteHistory?: boolean;
     sources?: UsageSourceDiagnostics[];
+    daily?: UsageDailyDay[];
   } = {},
 ): UsageIntelligence {
   const totals = groups.reduce(
@@ -611,6 +613,7 @@ function intelligencePayload(
       : {}),
     incompleteHistory: options.incompleteHistory ?? false,
     sources: options.sources ?? [],
+    daily: options.daily ?? [],
     semantics: "reportedTokenUsageCollectedLocally",
   };
 }
@@ -625,9 +628,52 @@ function rangeSpan(now: number, range: UsageIntelligenceRange): [number, number]
   return [now - days * 24 * HOUR, now];
 }
 
+/**
+ * Deterministic Daily activity projection for a fixture: one cell per local
+ * calendar day touched by the range, a repeating token pattern that lands on
+ * every intensity level, an observed-zero day, one missing mid-window day,
+ * and before-collection days ahead of the anchor. Fixture-side generation
+ * only — the production projection is the Rust store's.
+ */
+function dailyFixture(
+  rangeStartMs: number,
+  rangeEndMs: number,
+  collectionStartedMs: number | undefined,
+): UsageDailyDay[] {
+  const pattern = [4_600_000, 1_150_000, 3_100_000, 0, 820_000, 2_400_000, 540_000];
+  const startedDay = dayKey(collectionStartedMs ?? Number.NaN);
+  const days: UsageDailyDay[] = [];
+  const start = new Date(rangeStartMs);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(rangeEndMs);
+  end.setHours(0, 0, 0, 0);
+  const cursor = new Date(start);
+  let index = 0;
+  while (cursor.getTime() <= end.getTime()) {
+    const date = dayKey(cursor.getTime());
+    const beforeCollection =
+      collectionStartedMs !== undefined && date < startedDay;
+    // Before-collection days can hold no data at all; the missing mid-window
+    // day stands in for a day with no recorded events.
+    const missing = beforeCollection || index % 11 === 5;
+    const tokens = missing ? undefined : pattern[index % pattern.length];
+    days.push({
+      date,
+      observed: !missing,
+      events: missing ? 0 : Math.max(1, Math.round((tokens ?? 0) / 120_000)),
+      ...(tokens === undefined ? {} : { totalTokens: tokens }),
+      beforeCollection,
+    });
+    cursor.setDate(cursor.getDate() + 1);
+    index += 1;
+  }
+  return days;
+}
+
 /** Rich, partial, empty, and off states for the Usage-first overview. */
 function intelligenceFixtures(now: number): Record<string, DevFixture> {
-  const started = iso(now - 9 * 24 * HOUR);
+  const startedMs = now - 9 * 24 * HOUR;
+  const started = iso(startedMs);
   const watermark = iso(now - 40 * MINUTE);
 
   const richGroups = [
@@ -702,6 +748,7 @@ function intelligenceFixtures(now: number): Record<string, DevFixture> {
           collectionStartedAt: started,
           incompleteHistory: range === "30d",
           sources: healthySources,
+          daily: dailyFixture(start, end, startedMs),
         });
       },
     },
@@ -713,6 +760,7 @@ function intelligenceFixtures(now: number): Record<string, DevFixture> {
           collectionStartedAt: started,
           incompleteHistory: true,
           sources: partialSources,
+          daily: dailyFixture(start, end, startedMs),
         });
       },
     },
@@ -720,9 +768,18 @@ function intelligenceFixtures(now: number): Record<string, DevFixture> {
       usageIntelligenceEnabled: true,
       payload: (range) => {
         const [start, end] = rangeSpan(now, range);
+        const emptyStartedMs = now - 3 * 24 * HOUR;
         return intelligencePayload(range, start, end, [], {
-          collectionStartedAt: iso(now - 3 * 24 * HOUR),
+          collectionStartedAt: iso(emptyStartedMs),
           sources: healthySources,
+          // No events anywhere: every cell stays unobserved, matching the
+          // empty groups.
+          daily: dailyFixture(start, end, emptyStartedMs).map((day) => ({
+            ...day,
+            observed: false,
+            events: 0,
+            totalTokens: undefined,
+          })),
         });
       },
     },

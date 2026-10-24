@@ -6,6 +6,7 @@ import {
   UsageOverview,
 } from "./UsageOverview";
 import type {
+  UsageDailyDay,
   UsageIntelligence,
   UsageIntelligenceRange,
   UsageIntelligenceLoader,
@@ -15,8 +16,7 @@ import type {
  * Focused presentation pins for the v0.9 Usage-first overview. The loader is
  * injected, so every number on screen is traceable to the payload below —
  * the tests assert exactly that consistency, plus the honesty states
- * (off, empty, incomplete, failed source) and the reserved Daily activity
- * placeholder.
+ * (off, empty, incomplete, failed source) and the Daily activity heatmap.
  */
 
 function model(
@@ -111,6 +111,7 @@ function payload(
       },
     ],
     semantics: "reportedTokenUsageCollectedLocally",
+    daily: dailyDefault(),
     ...overrides,
   };
 }
@@ -146,6 +147,32 @@ function sinceDate(iso: string) {
 }
 
 const STARTED_AT = "2026-10-15T08:00:00.000Z";
+
+function dailyDay(overrides: Partial<UsageDailyDay>): UsageDailyDay {
+  return {
+    date: "2026-10-24",
+    observed: true,
+    events: 3,
+    totalTokens: 1_000,
+    beforeCollection: false,
+    ...overrides,
+  };
+}
+
+/** A small, honest default projection: four days, one missing. */
+function dailyDefault(): UsageDailyDay[] {
+  return [
+    dailyDay({ date: "2026-10-21", totalTokens: 2_000_000, events: 20 }),
+    dailyDay({ date: "2026-10-22", totalTokens: 4_000_000, events: 40 }),
+    dailyDay({
+      date: "2026-10-23",
+      observed: false,
+      events: 0,
+      totalTokens: undefined,
+    }),
+    dailyDay({ date: "2026-10-24", totalTokens: 1_000_000, events: 10 }),
+  ];
+}
 
 describe("UsageOverview", () => {
   beforeEach(() => {
@@ -336,18 +363,68 @@ describe("UsageOverview", () => {
     expect(await screen.findByLabelText("Usage summary")).toBeTruthy();
   });
 
-  it("reserves a clearly non-functional place for Daily activity", async () => {
+  it("renders the Daily activity heatmap from the payload's daily projection", async () => {
     renderOverview(loaderWith(() => payload()));
-    const daily = await screen.findByLabelText("Daily activity");
+    const grid = await screen.findByRole("list", {
+      name: "Daily reported token activity",
+    });
+    const cells = within(grid).getAllByRole("listitem");
+    expect(cells).toHaveLength(4);
+    // Intensity scales to the busiest day of the payload (4.0M).
+    expect(cells[0].className).toContain("usage-daily-l2"); // 2.0M = 50%
+    expect(cells[1].className).toContain("usage-daily-l4"); // 4.0M = peak
+    expect(cells[2].className).toContain("usage-daily-cell-none");
+    expect(cells[3].className).toContain("usage-daily-l1"); // 1.0M = 25%
+    // The missing day is labeled missing — never a zero.
+    expect(cells[2].getAttribute("aria-label")).toContain(
+      "no recorded events — not confirmed zero usage",
+    );
+    // The placeholder is gone for good.
+    expect(screen.queryByText("Daily token activity will chart here")).toBeNull();
+  });
+
+  it("re-renders the heatmap when the range switches to a different projection", async () => {
+    const thirtyDays = [
+      dailyDay({ date: "2026-09-25", totalTokens: 900_000, events: 9 }),
+      ...Array.from({ length: 28 }, (_, index) =>
+        dailyDay({
+          date: `2026-10-${String(index + 1).padStart(2, "0")}`,
+          observed: false,
+          events: 0,
+          totalTokens: undefined,
+          beforeCollection: index < 10,
+        }),
+      ),
+      dailyDay({ date: "2026-10-29", totalTokens: 500_000, events: 5 }),
+    ];
+    const loader = vi.fn(async (query: { range: UsageIntelligenceRange }) =>
+      payload({ range: query.range, daily: query.range === "30d" ? thirtyDays : dailyDefault() }),
+    );
+    renderOverview(loader);
+    await screen.findByRole("list", { name: "Daily reported token activity" });
+    fireEvent.click(screen.getByRole("button", { name: "30d" }));
+    const grid = await screen.findByRole("list", {
+      name: "Daily reported token activity",
+    });
+    expect(within(grid).getAllByRole("listitem")).toHaveLength(30);
+    const preCollection = within(grid)
+      .getAllByRole("listitem")
+      .filter((cell) =>
+        (cell.getAttribute("aria-label") ?? "").includes(
+          "before local collection started",
+        ),
+      );
+    expect(preCollection).toHaveLength(10);
+  });
+
+  it("shows no Daily activity at all while the opt-in is off", () => {
+    const loader = vi.fn();
+    renderOverview(loader, false);
+    expect(loader).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Daily activity")).toBeNull();
     expect(
-      within(daily).getByText("Daily token activity will chart here"),
-    ).toBeTruthy();
-    expect(
-      within(daily).getByText(/does not invent history/),
-    ).toBeTruthy();
-    // Nothing that could read as data: no chart roles, no cell grids.
-    expect(daily.querySelector(".ranking-bar-fill")).toBeNull();
-    expect(daily.querySelectorAll("[role='img'], svg").length).toBe(0);
+      screen.queryByRole("list", { name: "Daily reported token activity" }),
+    ).toBeNull();
   });
 
   it("re-queries with the local midnight anchor when the range changes", async () => {
