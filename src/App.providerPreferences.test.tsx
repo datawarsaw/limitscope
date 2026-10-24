@@ -6,7 +6,10 @@ import App from './App';
 import type { ProviderUsage } from './types';
 
 // Real useSettings (localStorage-backed, inert outside Tauri) so visibility,
-// ordering, selection fallback, and persistence are tested end to end.
+// ordering, and persistence are tested end to end through the Settings
+// destination. The main window no longer carries the provider rail — the
+// floating bar (a separate surface) and the run panel consume the same
+// preferences.
 vi.mock('./hooks/useProviderUsage', () => ({
   useProviderUsage: () => ({
     usages: standardUsages(),
@@ -83,16 +86,14 @@ function standardUsages(): ProviderUsage[] {
   ];
 }
 
-function expandDrawer() {
+function openSettings() {
   fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
 }
 
-function providerSwitches() {
-  return within(screen.getByRole('group', { name: 'Providers' })).getAllByRole('switch');
-}
-
-function railNames() {
-  return screen.getAllByRole('tab').map((tab) => tab.getAttribute('aria-label') ?? '');
+function providerSwitchLabels() {
+  return within(screen.getByRole('group', { name: 'Providers' }))
+    .getAllByRole('switch')
+    .map((el) => el.getAttribute('aria-label') ?? '');
 }
 
 function storedPrefs() {
@@ -109,14 +110,14 @@ describe('provider presentation preferences', () => {
 
   it('lists providers in canonical registry order with visibility switches', () => {
     render(<App />);
-    expandDrawer();
-    expect(providerSwitches().map((el) => el.getAttribute('aria-label'))).toEqual([
-      'Show OpenAI / Codex in the dashboard',
-      'Show Z.ai in the dashboard',
-      'Show OpenCode Go in the dashboard',
-      'Show Google Antigravity in the dashboard',
-      'Show Grok (xAI) in the dashboard',
-      'Show MiniMax Token Plan in the dashboard',
+    openSettings();
+    expect(providerSwitchLabels()).toEqual([
+      'Show OpenAI / Codex in the floating bar',
+      'Show Z.ai in the floating bar',
+      'Show OpenCode Go in the floating bar',
+      'Show Google Antigravity in the floating bar',
+      'Show Grok (xAI) in the floating bar',
+      'Show MiniMax Token Plan in the floating bar',
     ]);
   });
 
@@ -125,26 +126,23 @@ describe('provider presentation preferences', () => {
     // provider must be a single switch, and hiding it must not stop the
     // runtime from refreshing it (history and notifications continue).
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(
-      screen.getByRole('switch', { name: 'Show MiniMax Token Plan in the dashboard' }),
+      screen.getByRole('switch', { name: 'Show MiniMax Token Plan in the floating bar' }),
     );
-    expect(screen.queryByRole('tab', { name: /MiniMax/ })).toBeNull();
     expect(storedPrefs().hidden).toEqual(['minimax-token-plan']);
   });
 
-  it('hides a provider from the main navigation and persists the choice', () => {
+  it('hides a provider and persists the choice', () => {
     render(<App />);
-    expandDrawer();
-    fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the dashboard' }));
-    expect(screen.queryByRole('tab', { name: /Grok/ })).toBeNull();
-    expect(railNames()).toHaveLength(5);
+    openSettings();
+    fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the floating bar' }));
     expect(storedPrefs().hidden).toEqual(['grok']);
   });
 
   it('refuses to hide the final visible provider with feedback', () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     const names = [
       'OpenAI / Codex',
       'Z.ai',
@@ -153,28 +151,27 @@ describe('provider presentation preferences', () => {
       'MiniMax Token Plan',
     ];
     for (const name of names) {
-      fireEvent.click(screen.getByRole('switch', { name: 'Show ' + name + ' in the dashboard' }));
+      fireEvent.click(screen.getByRole('switch', { name: 'Show ' + name + ' in the floating bar' }));
     }
-    expect(railNames()).toHaveLength(1);
-    fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the dashboard' }));
+    fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the floating bar' }));
     expect(screen.getByText('At least one provider stays visible.')).toBeTruthy();
-    expect(railNames()).toHaveLength(1);
-    expect(railNames()[0]).toMatch(/Grok/);
+    // Grok — the last visible provider — was not hidden.
+    expect(storedPrefs().hidden).toHaveLength(5);
+    expect(storedPrefs().hidden).not.toContain('grok');
   });
 
   it('reorders providers with move buttons', () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     fireEvent.click(screen.getByRole('button', { name: 'Move OpenCode up' }));
     fireEvent.click(screen.getByRole('button', { name: 'Move OpenCode up' }));
-    const names = railNames();
-    expect(names[0]).toMatch(/OpenCode Go/);
+    expect(providerSwitchLabels()[0]).toBe('Show OpenCode Go in the floating bar');
     expect(storedPrefs().order.slice(0, 2)).toEqual(['opencode-go', 'openai-codex']);
   });
 
   it('disables move up for the first provider and move down for the last', () => {
     render(<App />);
-    expandDrawer();
+    openSettings();
     const moveFirstUp = screen.getByRole('button', { name: 'Move Codex up' }) as HTMLButtonElement;
     const moveLastDown = screen.getByRole('button', {
       name: 'Move MiniMax down',
@@ -183,34 +180,15 @@ describe('provider presentation preferences', () => {
     expect(moveLastDown.disabled).toBe(true);
   });
 
-  it('falls back when the selected provider is hidden', () => {
-    render(<App />);
-    fireEvent.click(screen.getByRole('tab', { name: /OpenCode Go/ }));
-    expect(within(screen.getByRole('tabpanel')).getByText('OpenCode Go')).toBeTruthy();
-    expandDrawer();
-    fireEvent.click(screen.getByRole('switch', { name: 'Show OpenCode Go in the dashboard' }));
-    expect(within(screen.getByRole('tabpanel')).getByText('Grok (xAI)')).toBeTruthy();
-  });
-
-  it('anchors the default selection on the highest visible provider', () => {
-    render(<App />);
-    expect(within(screen.getByRole('tabpanel')).getByText('Grok (xAI)')).toBeTruthy();
-    expandDrawer();
-    fireEvent.click(screen.getByRole('switch', { name: 'Show Grok (xAI) in the dashboard' }));
-    expect(within(screen.getByRole('tabpanel')).getByText('OpenAI / Codex')).toBeTruthy();
-  });
-
   it('supports keyboard operation of the reorder controls', async () => {
     const user = userEvent.setup();
     render(<App />);
-    expandDrawer();
+    openSettings();
     const moveDown = screen.getByRole('button', { name: 'Move Z.ai down' });
     moveDown.focus();
     expect(document.activeElement).toBe(moveDown);
     await user.keyboard('{Enter}');
-    const names = railNames();
-    expect(names[1]).toMatch(/OpenCode Go/);
-    expect(names[2]).toMatch(/Z\.ai/);
+    expect(providerSwitchLabels()[1]).toBe('Show OpenCode Go in the floating bar');
+    expect(providerSwitchLabels()[2]).toBe('Show Z.ai in the floating bar');
   });
 });
-

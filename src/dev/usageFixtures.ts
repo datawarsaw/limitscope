@@ -15,6 +15,16 @@ import type {
   UsageTrendPoint,
   UsageTrendSeries,
 } from "../lib/usageAnalytics";
+import type {
+  UsageIntelligence,
+  UsageIntelligenceQuery,
+  UsageIntelligenceRange,
+  UsageIntelligenceLoader,
+  UsageModelBreakdown,
+  UsageProviderBreakdown,
+  UsageSourceDiagnostics,
+  UsageTokenSums,
+} from "../lib/usageIntelligence";
 
 /**
  * DEV-ONLY visual-acceptance fixtures for the Usage view (`npm run dev` +
@@ -35,6 +45,10 @@ export type DevFixture = {
   name: string;
   usages: ProviderUsage[];
   loader: (query: UsageAnalyticsQuery) => Promise<UsageAnalytics>;
+  /** v0.9 Usage-first overview: force the opt-in state for a screenshot. */
+  usageIntelligenceEnabled?: boolean;
+  /** v0.9 Usage-first overview: hand-authored intelligence payloads. */
+  intelligenceLoader?: UsageIntelligenceLoader;
 };
 
 function iso(ms: number): string {
@@ -510,6 +524,227 @@ function buildFixtures(): Record<string, DevFixture> {
         const endMs = Date.parse(base.rangeEnd);
         return analytics(query.range ?? "24h", startMs, endMs, filtered, exactness);
       },
+    };
+  }
+
+  Object.assign(built, intelligenceFixtures(now));
+  return built;
+}
+
+/* ----------------------------------------------------------------- */
+/* v0.9 Usage-first overview fixtures (Usage Intelligence payloads).  */
+/* ----------------------------------------------------------------- */
+
+function sums(
+  events: number,
+  input: number,
+  cacheRead: number,
+  cacheWrite: number,
+  output: number,
+  reasoning: number,
+): UsageTokenSums {
+  return {
+    events,
+    inputTokens: input,
+    cacheReadTokens: cacheRead,
+    cacheWriteTokens: cacheWrite,
+    outputTokens: output,
+    reasoningTokens: reasoning,
+    totalTokens: input + cacheRead + cacheWrite + output + reasoning,
+  };
+}
+
+function group(
+  provider: string,
+  models: UsageModelBreakdown[],
+): UsageProviderBreakdown {
+  const totals = models.reduce(
+    (acc, model) => ({
+      events: acc.events + model.events,
+      inputTokens: acc.inputTokens + model.inputTokens,
+      cacheReadTokens: acc.cacheReadTokens + model.cacheReadTokens,
+      cacheWriteTokens: acc.cacheWriteTokens + model.cacheWriteTokens,
+      outputTokens: acc.outputTokens + model.outputTokens,
+      reasoningTokens: acc.reasoningTokens + model.reasoningTokens,
+      totalTokens: acc.totalTokens + model.totalTokens,
+    }),
+    sums(0, 0, 0, 0, 0, 0),
+  );
+  return { provider, models, ...totals };
+}
+
+function intelligencePayload(
+  range: UsageIntelligenceRange,
+  rangeStartMs: number,
+  rangeEndMs: number,
+  groups: UsageProviderBreakdown[],
+  options: {
+    collectionStartedAt?: string;
+    incompleteHistory?: boolean;
+    sources?: UsageSourceDiagnostics[];
+  } = {},
+): UsageIntelligence {
+  const totals = groups.reduce(
+    (acc, g) => ({
+      events: acc.events + g.events,
+      inputTokens: acc.inputTokens + g.inputTokens,
+      cacheReadTokens: acc.cacheReadTokens + g.cacheReadTokens,
+      cacheWriteTokens: acc.cacheWriteTokens + g.cacheWriteTokens,
+      outputTokens: acc.outputTokens + g.outputTokens,
+      reasoningTokens: acc.reasoningTokens + g.reasoningTokens,
+      totalTokens: acc.totalTokens + g.totalTokens,
+    }),
+    sums(0, 0, 0, 0, 0, 0),
+  );
+  return {
+    schemaVersion: 1,
+    range,
+    rangeStart: iso(rangeStartMs),
+    rangeEnd: iso(rangeEndMs),
+    generatedAt: iso(rangeEndMs),
+    enabled: true,
+    eventsInRange: totals.events,
+    groups,
+    totals,
+    ...(options.collectionStartedAt
+      ? { collectionStartedAt: options.collectionStartedAt }
+      : {}),
+    incompleteHistory: options.incompleteHistory ?? false,
+    sources: options.sources ?? [],
+    semantics: "reportedTokenUsageCollectedLocally",
+  };
+}
+
+function rangeSpan(now: number, range: UsageIntelligenceRange): [number, number] {
+  if (range === "today") {
+    const midnight = new Date(now);
+    midnight.setHours(0, 0, 0, 0);
+    return [midnight.getTime(), now];
+  }
+  const days = range === "7d" ? 7 : 30;
+  return [now - days * 24 * HOUR, now];
+}
+
+/** Rich, partial, empty, and off states for the Usage-first overview. */
+function intelligenceFixtures(now: number): Record<string, DevFixture> {
+  const started = iso(now - 9 * 24 * HOUR);
+  const watermark = iso(now - 40 * MINUTE);
+
+  const richGroups = [
+    group("zai", [
+      { model: "GLM-5.3", ...sums(96, 412_000, 3_150_000, 148_000, 530_000, 302_000) },
+      { model: "GLM-5.3-Air", ...sums(41, 120_000, 640_000, 22_000, 141_000, 34_000) },
+      { model: "GLM-4.6", ...sums(9, 21_000, 40_000, 4_000, 26_000, 6_000) },
+    ]),
+    group("openai-codex", [
+      { model: "gpt-5.1-codex", ...sums(58, 980_000, 2_240_000, 96_000, 410_000, 0) },
+      { model: "gpt-5.1", ...sums(17, 84_000, 130_000, 8_000, 52_000, 0) },
+    ]),
+  ];
+  const healthySources: UsageSourceDiagnostics[] = [
+    {
+      source: "zcode",
+      state: "ok",
+      watermarkAt: watermark,
+      baselinedAt: started,
+      lastObservedAt: iso(now - 12 * MINUTE),
+      lastScan: { accepted: 12, duplicates: 0, rejected: 0 },
+    },
+    {
+      source: "codex",
+      state: "collecting",
+      watermarkAt: watermark,
+      baselinedAt: started,
+      lastObservedAt: iso(now - 3 * MINUTE),
+      lastScan: { accepted: 7, duplicates: 1, rejected: 0 },
+    },
+    {
+      source: "opencode",
+      state: "ok",
+      watermarkAt: watermark,
+      baselinedAt: started,
+      lastObservedAt: iso(now - 2 * HOUR),
+      lastScan: { accepted: 5, duplicates: 0, rejected: 1, usageNotReported: 23 },
+    },
+  ];
+
+  const partialGroups = [group("zai", richGroups[0].models.slice(0, 2))];
+  const partialSources: UsageSourceDiagnostics[] = [
+    healthySources[0],
+    {
+      source: "codex",
+      state: "readFailure",
+      watermarkAt: watermark,
+      baselinedAt: started,
+      lastObservedAt: iso(now - 26 * HOUR),
+      detail: "history file locked by another process",
+    },
+    {
+      source: "opencode",
+      state: "sourceAbsent",
+      watermarkAt: started,
+      baselinedAt: started,
+    },
+  ];
+
+  const byName: Record<
+    string,
+    {
+      usageIntelligenceEnabled: boolean;
+      payload: (range: UsageIntelligenceRange) => UsageIntelligence;
+    }
+  > = {
+    "usage-first": {
+      usageIntelligenceEnabled: true,
+      payload: (range) => {
+        const [start, end] = rangeSpan(now, range);
+        return intelligencePayload(range, start, end, richGroups, {
+          collectionStartedAt: started,
+          incompleteHistory: range === "30d",
+          sources: healthySources,
+        });
+      },
+    },
+    "usage-first-partial": {
+      usageIntelligenceEnabled: true,
+      payload: (range) => {
+        const [start, end] = rangeSpan(now, range);
+        return intelligencePayload(range, start, end, partialGroups, {
+          collectionStartedAt: started,
+          incompleteHistory: true,
+          sources: partialSources,
+        });
+      },
+    },
+    "usage-first-empty": {
+      usageIntelligenceEnabled: true,
+      payload: (range) => {
+        const [start, end] = rangeSpan(now, range);
+        return intelligencePayload(range, start, end, [], {
+          collectionStartedAt: iso(now - 3 * 24 * HOUR),
+          sources: healthySources,
+        });
+      },
+    },
+    "usage-first-off": {
+      usageIntelligenceEnabled: false,
+      payload: (range) => {
+        const [start, end] = rangeSpan(now, range);
+        return intelligencePayload(range, start, end, []);
+      },
+    },
+  };
+
+  const built: Record<string, DevFixture> = {};
+  for (const [name, fixture] of Object.entries(byName)) {
+    built[name] = {
+      name,
+      usages: [],
+      loader: async () =>
+        analytics("24h", now - 24 * HOUR, now, [], "exact"),
+      usageIntelligenceEnabled: fixture.usageIntelligenceEnabled,
+      intelligenceLoader: async (query: UsageIntelligenceQuery) =>
+        fixture.payload(query.range),
     };
   }
   return built;

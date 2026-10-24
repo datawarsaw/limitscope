@@ -157,7 +157,6 @@ body {
 }
 
 .refresh-btn:focus-visible,
-.utility-settings-btn:focus-visible,
 .setting-row select:focus-visible,
 .setting-row input[type="checkbox"]:focus-visible,
 .rail-item:focus-visible,
@@ -963,65 +962,6 @@ body {
   white-space: nowrap;
 }
 
-.utility-settings-btn {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  border: 0;
-  border-radius: 6px;
-  background: none;
-  padding: 2px 4px;
-  color: var(--text-dim);
-  font: inherit;
-  font-size: 10.5px;
-  white-space: nowrap;
-  cursor: pointer;
-}
-
-.utility-settings-btn:hover {
-  color: var(--text);
-}
-
-.utility-chevron {
-  width: 9px;
-  height: 6px;
-  transition: transform 120ms ease;
-}
-
-.utility-chevron.open {
-  transform: rotate(180deg);
-}
-
-/* Secondary drawer: no card, just a divided strip above the utility bar so
-   quota content stays visually primary. W02: the drawer may exceed the space
-   a short viewport leaves, so it shrinks under pressure and scrolls its own
-   content instead of pushing the utility bar (and its Settings control)
-   below the clipped viewport — the footer keeps its fixed height, the
-   dashboard keeps scrolling, and no control becomes unreachable. */
-.settings-drawer {
-  flex: 0 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  overscroll-behavior: contain;
-  margin: 0 12px 4px;
-  padding: 0 2px;
-  border-top: 1px solid var(--divider);
-  animation: drawer-in 120ms ease-out;
-}
-
-@keyframes drawer-in {
-  from {
-    opacity: 0;
-    transform: translateY(3px);
-  }
-  to {
-    opacity: 1;
-    transform: none;
-  }
-}
-
 .setting-row {
   display: flex;
   align-items: center;
@@ -1546,6 +1486,17 @@ body {
   }
 }
 
+@keyframes drawer-in {
+  from {
+    opacity: 0;
+    transform: translateY(3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .execution-panel {
   flex: none;
   margin: 10px 12px 0;
@@ -1766,16 +1717,15 @@ body {
   box-shadow: inset 0 0 0 1px var(--accent-border);
 }
 
-/* Usage keeps the rail (provider scope) and drops the attention zone, so
-   the analytics surface gets the full main column. */
-.app[data-view="usage"][data-layout="medium"] .dashboard {
-  grid-template-columns: 172px minmax(0, 1fr);
-  grid-template-areas: "rail main";
-}
-
-.app[data-view="usage"][data-layout="wide"] .dashboard {
-  grid-template-columns: 176px minmax(0, 1fr);
-  grid-template-areas: "rail main";
+/* The Usage-first main window has one destination column in every layout —
+   live quotas belong to the floating bar, so the rail and attention zones
+   never open here and the destination gets the full width. */
+.app[data-view="usage"][data-layout="medium"] .dashboard,
+.app[data-view="usage"][data-layout="wide"] .dashboard,
+.app[data-view="settings"][data-layout="medium"] .dashboard,
+.app[data-view="settings"][data-layout="wide"] .dashboard {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "main";
 }
 
 .usage-main {
@@ -2511,12 +2461,8 @@ body {
     transition: none;
   }
 
-  .settings-drawer {
+  .execution-panel {
     animation: none;
-  }
-
-  .utility-chevron {
-    transition: none;
   }
 }
 
@@ -2885,4 +2831,365 @@ body {
   .token-usage-provider-row > .token-usage-num:nth-of-type(5) {
     display: none;
   }
+}
+
+/* ---------------------------------------------------------------
+ * v0.9 Usage-first main window: the Usage overview and the Settings
+ * page. Dark graphite surfaces with the restrained teal accent,
+ * readable KPI tiles, compact rankings, and a clearly-reserved (never
+ * faked) Daily activity placeholder.
+ * --------------------------------------------------------------- */
+
+.usage-overview {
+  gap: 10px;
+}
+
+.usage-subtitle {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
+.usage-kpis {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+@media (min-width: 640px) {
+  .usage-kpis {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.usage-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 10px 12px 11px;
+}
+
+.usage-kpi-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.usage-kpi-value {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.usage-kpi-value.usage-kpi-date {
+  font-size: 12.5px;
+  line-height: 1.35;
+  padding-top: 3px;
+}
+
+.usage-kpi-sub {
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.usage-rankings {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+}
+
+@media (min-width: 640px) {
+  .usage-rankings {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+.ranking-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ranking-item + .ranking-item {
+  border-top: 1px solid var(--divider);
+}
+
+.ranking-row {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: none;
+  padding: 7px 2px 8px;
+  font: inherit;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  border-radius: 6px;
+}
+
+.ranking-row:hover {
+  background: var(--accent-soft);
+}
+
+.ranking-item-static {
+  display: block;
+  padding: 7px 2px 8px;
+}
+
+.ranking-line {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.ranking-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.ranking-value {
+  flex: none;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+}
+
+.ranking-bar-track {
+  display: block;
+  margin-top: 5px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--bar-track);
+  overflow: hidden;
+}
+
+.ranking-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--teal);
+  opacity: 0.75;
+}
+
+.ranking-sub {
+  display: block;
+  margin-top: 4px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.model-detail {
+  padding: 2px 2px 8px;
+}
+
+.model-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--divider);
+  border-radius: 8px;
+  background: var(--field-bg);
+}
+
+@media (min-width: 480px) {
+  .model-detail-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.model-detail-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.model-detail-label {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+  color: var(--text-faint);
+}
+
+.model-detail-value {
+  font-size: 12.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.model-detail-note {
+  margin: 6px 0 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.ranking-more {
+  border: 0;
+  background: none;
+  padding: 6px 2px;
+  font: inherit;
+  font-size: 11px;
+  color: var(--text-faint);
+  cursor: pointer;
+  text-align: left;
+}
+
+.ranking-more:hover {
+  color: var(--teal);
+}
+
+.usage-sources-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 8px 0 0;
+  border-top: 1px solid var(--divider);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.usage-sources-standalone {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.usage-source-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+
+.usage-source-row .status-dot {
+  flex: none;
+  transform: translateY(-1px);
+}
+
+.usage-source-copy {
+  min-width: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow-wrap: anywhere;
+}
+
+/* The reserved Daily activity area: quiet, dashed, and unmistakably not a
+   functioning chart — no cells, no bars, no invented history. */
+.usage-daily-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-height: 64px;
+  padding: 12px 14px;
+  border: 1px dashed var(--card-border);
+  border-radius: 8px;
+  background: none;
+  text-align: center;
+}
+
+.usage-daily-title {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.usage-daily-note {
+  margin: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+/* The Usage Intelligence opt-in explainer (feature off). */
+.usage-off {
+  display: flex;
+  flex-direction: column;
+}
+
+.usage-off-note {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.usage-off-copy {
+  margin: 6px 0 12px;
+  max-width: 52ch;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.usage-off-btn {
+  align-self: flex-start;
+  border: 1px solid var(--accent-border);
+  border-radius: 7px;
+  background: var(--accent-soft);
+  padding: 5px 12px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--teal);
+  cursor: pointer;
+}
+
+.usage-off-btn:hover {
+  background: var(--teal);
+  color: var(--bg);
+}
+
+.usage-off-btn:focus-visible,
+.ranking-row:focus-visible,
+.ranking-more:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------
+ * v0.9 Settings page: the former bottom drawer as a destination,
+ * organized into four scannable card sections.
+ * --------------------------------------------------------------- */
+
+.settings-view {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 640px;
+}
+
+.settings-section {
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 10px 14px 12px;
+}
+
+.settings-section-heading {
+  margin: 0 0 4px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--text-faint);
 }
