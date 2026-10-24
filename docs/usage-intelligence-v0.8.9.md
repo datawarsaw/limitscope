@@ -165,3 +165,28 @@ sourceAbsent | schemaUnsupported | readFailure | scanCeiling | ok`, plus
 the last observation time). Phase 1 creates no notifications and no
 predictions from this data, and a source failure can never degrade
 quota-provider health.
+
+### Daily activity projection (`daily`, added in the v0.9 Usage view)
+
+The same `get_usage_intelligence` response additionally carries `daily`:
+one cell per **local calendar day** (machine timezone, same
+`chrono::Local` convention as the quota plane's heatmap) touched by the
+selected range, bucketing the already-filtered in-range events — so the
+daily event and token sums always reconcile with `eventsInRange` and
+`totals`, and no second collection pass exists. Cell semantics:
+
+- `observed: true` — the day holds recorded events; `totalTokens` is the
+  day's reported-token sum (`0` is a measured, reported zero).
+- `observed: false` — no recorded events that day; `totalTokens` is
+  **absent on the wire** (missing is never serialized as a confirmed
+  zero) and the frontend renders a hatched cell labeled "no recorded
+  events — not confirmed zero usage".
+- `beforeCollection: true` — the whole day precedes the local collection
+  start; no observation can exist (no historical backfill), rendered and
+  labeled distinctly from an in-window empty day.
+
+Intensity is presentation policy on the frontend (`src/lib/usageDaily.ts`):
+five levels scaled **relative** to the busiest observed day in the
+selected range — explicitly not quota consumption, billing data, or total
+account usage. Dev fixture URLs accept `?range=7d|30d` alongside
+`?fixture=…` for visual QA.

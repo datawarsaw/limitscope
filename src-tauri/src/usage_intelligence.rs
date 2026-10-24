@@ -77,6 +77,16 @@
 //! A corrupt or foreign-version file degrades to the empty defaults —
 //! including `enabled: false`, the fail-closed direction for an opt-in
 //! flag — and the sanitized state is written back.
+//!
+//! # Daily activity projection
+//!
+//! `aggregate` additionally exposes one cell per local calendar day
+//! touched by the selected range (`daily`), bucketing the same in-range
+//! events the totals aggregate — no second pass over sources, no schema
+//! migration, and the daily sums always reconcile with `totals`. Days
+//! without recorded events are `observed: false` with `totalTokens`
+//! absent on the wire (missing is never a serialized zero), and days
+//! wholly before the local collection start carry `beforeCollection`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -85,6 +95,7 @@ use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use chrono::TimeZone;
 
 use crate::local_data::LocalDataClearOutcome;
 use crate::runtime::RuntimeHandle;
@@ -955,6 +966,8 @@ impl UsageIntelligenceStore {
             })
             .collect();
 
+        let daily = build_daily_days(&in_range, range_start, now_ms, collection_started_at);
+
         UsageIntelligenceDto {
             schema_version: USAGE_INTELLIGENCE_SCHEMA_VERSION,
             range: range_label.to_string(),
@@ -980,6 +993,7 @@ impl UsageIntelligenceStore {
                 .map(|started| started > range_start)
                 .unwrap_or(false),
             sources,
+            daily,
             semantics: "reportedTokenUsageCollectedLocally",
         }
     }
@@ -1027,6 +1041,56 @@ fn dedup_and_sort(mut events: Vec<UsageEvent>) -> Vec<UsageEvent> {
     events.retain(|event| seen.insert(event.id.clone()));
     events.sort_by(|a, b| a.event_at.cmp(&b.event_at).then_with(|| a.id.cmp(&b.id)));
     events
+}
+
+/// The local calendar day of an epoch-ms instant, on the collecting
+/// machine's timezone (`chrono::Local`, same convention as the quota
+/// plane's heatmap in `usage_analytics.rs`). An instant-to-local
+/// conversion is unambiguous by construction; the fallback keeps a
+/// malformed system clock from panicking the read path.
+fn local_day_key(ms: i64) -> chrono::NaiveDate {
+    chrono::Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .unwrap_or_else(|| chrono::Local.timestamp_millis_opt(0).single().unwrap())
+        .date_naive()
+}
+
+/// Buckets the range's events into one cell per local calendar day touched
+/// by `[range_start, now_ms]`. The input is the already-filtered `in_range`
+/// set, so the daily sums reconcile exactly with the range totals; dedup
+/// and retention have already been applied upstream. Days without events
+/// are not observed — never serialized as zero — and days wholly before
+/// the local collection start carry `before_collection`.
+fn build_daily_days(
+    in_range: &[&UsageEvent],
+    range_start: i64,
+    now_ms: i64,
+    collection_started_at: Option<i64>,
+) -> Vec<UsageDailyDayDto> {
+    let mut buckets: HashMap<chrono::NaiveDate, (usize, u64)> = HashMap::new();
+    for event in in_range {
+        let entry = buckets.entry(local_day_key(event.event_at)).or_default();
+        entry.0 += 1;
+        entry.1 += event.total_tokens;
+    }
+
+    let collection_day = collection_started_at.map(local_day_key);
+    let mut days = Vec::new();
+    let mut date = local_day_key(range_start);
+    let end_day = local_day_key(now_ms);
+    while date <= end_day {
+        let bucket = buckets.get(&date);
+        days.push(UsageDailyDayDto {
+            date: date.format("%Y-%m-%d").to_string(),
+            observed: bucket.is_some(),
+            events: bucket.map(|(events, _)| *events).unwrap_or(0),
+            total_tokens: bucket.map(|(_, tokens)| *tokens),
+            before_collection: collection_day.map(|started| date < started).unwrap_or(false),
+        });
+        date = date.succ_opt().expect("calendar date cannot overflow");
+    }
+    days
 }
 
 #[derive(Default, Clone, Copy)]
@@ -1208,9 +1272,35 @@ pub struct UsageIntelligenceDto {
     pub collection_started_at: Option<String>,
     pub incomplete_history: bool,
     pub sources: Vec<SourceDiagnosticsDto>,
+    /// One cell per local calendar day touched by the selected range,
+    /// bucketing the same events the totals aggregate — the daily sums
+    /// always reconcile with `totals` and `events_in_range`.
+    pub daily: Vec<UsageDailyDayDto>,
     /// Honesty pin: these are reported tokens collected locally, never
     /// account quota, billing usage, or exact spend.
     pub semantics: &'static str,
+}
+
+/// One local calendar day of the Daily activity projection. A day without
+/// recorded events is `observed: false` with `total_tokens` absent on the
+/// wire — missing observations are never serialized as a confirmed zero.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageDailyDayDto {
+    /// Local calendar date of the collecting machine, `YYYY-MM-DD`.
+    pub date: String,
+    /// The day holds at least one recorded event within the range.
+    pub observed: bool,
+    /// Recorded events bucketed to this day (0 when not observed).
+    pub events: usize,
+    /// Reported token total for the day. `None` when the day has no
+    /// recorded events; `Some(0)` is a measured, reported zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    /// The whole day precedes the local collection start: no observation
+    /// can exist (no historical backfill), distinct in wording from a day
+    /// inside the collection window that simply recorded nothing.
+    pub before_collection: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1308,6 +1398,7 @@ pub fn get_usage_intelligence(
             collection_started_at: None,
             incomplete_history: false,
             sources: Vec::new(),
+            daily: Vec::new(),
             semantics: "reportedTokenUsageCollectedLocally",
         },
     }
@@ -1948,5 +2039,210 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // ---------- daily activity projection ----------
+
+    /// The local midnight of the fixed test clock's day, computed the same
+    /// way production buckets days (machine-local `chrono::Local`), so the
+    /// straddle test holds on any machine timezone.
+    fn local_midnight_ms(of_ms: i64) -> i64 {
+        let naive = local_day_key(of_ms).and_hms_opt(0, 0, 0).unwrap();
+        match chrono::Local.from_local_datetime(&naive) {
+            chrono::LocalResult::Single(dt) => dt.timestamp_millis(),
+            chrono::LocalResult::Ambiguous(dt, _) => dt.timestamp_millis(),
+            chrono::LocalResult::None => {
+                panic!("the test machine's timezone has no local midnight")
+            }
+        }
+    }
+
+    fn daily_date_key_of_offset(ms: i64) -> String {
+        local_day_key(ms).format("%Y-%m-%d").to_string()
+    }
+
+    // 14. daily bucketing: events either side of local midnight land on
+    //     their own local calendar days, the Today range is exactly one
+    //     cell, and the 7d cells reconcile with the range totals.
+    #[test]
+    fn daily_buckets_events_by_local_midnight_and_reconciles_with_totals() {
+        let midnight = local_midnight_ms(NOW_MS);
+        let (store, _dir) = temp_store("daily-midnight");
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(
+                vec![
+                    event("zcode:d1", "zai", "GLM-5.3", midnight - 1),
+                    event("zcode:d2", "zai", "GLM-5.3", midnight + 1),
+                ],
+                NOW_MS - 1_000,
+            ),
+        );
+
+        let today = store.aggregate(UsageRange::Today, Some(midnight));
+        assert_eq!(today.events_in_range, 1, "only the after-midnight event");
+        assert_eq!(today.daily.len(), 1, "Today is exactly one local day");
+        assert!(today.daily[0].observed);
+        assert_eq!(today.daily[0].events, 1);
+        assert_eq!(today.daily[0].total_tokens, Some(380));
+        assert!(!today.daily[0].before_collection);
+
+        let seven = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(seven.daily.len(), 8, "a rolling 7d touches 8 local days");
+        let day_of = |date: &str| {
+            seven
+                .daily
+                .iter()
+                .find(|day| day.date == date)
+                .expect("each event day is a cell")
+        };
+        let before = day_of(&daily_date_key_of_offset(midnight - 1));
+        let after = day_of(&daily_date_key_of_offset(midnight + 1));
+        assert_eq!(before.events, 1);
+        assert_eq!(after.events, 1);
+        let daily_events: usize = seven.daily.iter().map(|day| day.events).sum();
+        let daily_tokens: u64 = seven
+            .daily
+            .iter()
+            .filter_map(|day| day.total_tokens)
+            .sum();
+        assert_eq!(daily_events, seven.events_in_range, "events reconcile");
+        assert_eq!(
+            daily_tokens,
+            seven.totals.total_tokens,
+            "reported tokens reconcile with the range totals"
+        );
+    }
+
+    // 15. missing days: a day without recorded events is not observed and
+    //     serializes no token total (missing is never a wire zero), days
+    //     wholly before the local collection start carry the
+    //     before-collection flag, and a failed source fabricates nothing.
+    #[test]
+    fn daily_missing_days_are_not_observed_and_flag_before_collection() {
+        let (now, clock) = manual_clock(NOW_MS - 3 * 24 * 60 * 60_000);
+        let (store, _dir) = temp_store_with_clock("daily-missing", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
+        // A second source failed today — its failure must not invent data.
+        store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, None);
+        *now.lock().unwrap() = NOW_MS;
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(
+                vec![event("zcode:a", "zai", "GLM-5.3", NOW_MS - 1_000)],
+                NOW_MS - 1_000,
+            ),
+        );
+
+        let seven = store.aggregate(UsageRange::SevenDays, None);
+        let collection_day = daily_date_key_of_offset(NOW_MS - 3 * 24 * 60 * 60_000);
+        let observed_days: Vec<&UsageDailyDayDto> =
+            seven.daily.iter().filter(|day| day.observed).collect();
+        assert_eq!(
+            observed_days.len(),
+            1,
+            "exactly one day carries the recorded event"
+        );
+        assert_eq!(observed_days[0].total_tokens, Some(380));
+        assert!(!observed_days[0].before_collection);
+
+        let wire = serde_json::to_value(&seven).unwrap();
+        for (index, day) in seven.daily.iter().enumerate() {
+            let cell = &wire["daily"][index];
+            assert_eq!(cell["observed"], day.observed);
+            if day.observed {
+                assert!(cell["totalTokens"].is_number(), "observed day serializes tokens");
+            } else {
+                assert!(
+                    cell.get("totalTokens").is_none(),
+                    "a day without events never serializes a zero"
+                );
+            }
+            let before_flag = day.date < collection_day;
+            assert_eq!(
+                day.before_collection, before_flag,
+                "only days wholly before the local collection start are flagged"
+            );
+            if day.before_collection {
+                assert!(!day.observed, "pre-collection days have no data");
+            }
+        }
+        assert!(
+            seven.daily.iter().any(|day| !day.observed && !day.before_collection),
+            "an in-window day with no events stays explicitly not observed"
+        );
+        assert!(seven.incomplete_history, "7d reaches before collection");
+    }
+
+    // 16. dedup interplay: re-ingesting an overlap never inflates a day.
+    #[test]
+    fn daily_is_idempotent_under_overlapping_scans() {
+        let midnight = local_midnight_ms(NOW_MS);
+        let (store, _dir) = temp_store("daily-dedup");
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 120_000, None);
+        let events = vec![
+            event("zcode:a", "zai", "GLM-5.3", midnight - 1),
+            event("zcode:b", "zai", "GLM-5.3-Flash", midnight + 1),
+        ];
+        store.apply_scan(USAGE_SOURCE_ZCODE, scan_from(events.clone(), midnight + 1));
+        store.apply_scan(USAGE_SOURCE_ZCODE, scan_from(events, midnight + 1));
+
+        let today = store.aggregate(UsageRange::Today, Some(midnight));
+        assert_eq!(today.events_in_range, 1);
+        assert_eq!(today.daily[0].events, 1, "the duplicate is not re-bucketed");
+        assert_eq!(today.totals.total_tokens, 380);
+        assert_eq!(today.daily[0].total_tokens, Some(380));
+    }
+
+    // 17. an implausible webview midnight degrades to the trailing day and
+    //     the daily cells stay consistent with whatever range was used.
+    #[test]
+    fn daily_tracks_the_degraded_today_range() {
+        let (store, _dir) = temp_store("daily-degraded");
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(
+                vec![
+                    event("zcode:a", "zai", "GLM-5.3", NOW_MS - 30 * 60 * 60_000),
+                    event("zcode:b", "zai", "GLM-5.3", NOW_MS - 1_000),
+                ],
+                NOW_MS - 1_000,
+            ),
+        );
+        let dto = store.aggregate(UsageRange::Today, Some(NOW_MS - 10 * 24 * 60 * 60_000));
+        assert!(
+            (1..=2).contains(&dto.daily.len()),
+            "a trailing 24h touches at most two local days"
+        );
+        let daily_events: usize = dto.daily.iter().map(|day| day.events).sum();
+        assert_eq!(daily_events, dto.events_in_range, "cells reconcile");
+    }
+
+    // 18. empty store: the projection covers the range with unobserved
+    //     cells and claims no collection window.
+    #[test]
+    fn daily_empty_store_has_only_unobserved_cells() {
+        let (store, _dir) = temp_store("daily-empty");
+        let dto = store.aggregate(UsageRange::ThirtyDays, None);
+        assert!(!dto.daily.is_empty());
+        for day in &dto.daily {
+            assert!(!day.observed);
+            assert_eq!(day.total_tokens, None);
+            assert!(!day.before_collection, "no anchor, no window claim");
+        }
+        let wire = serde_json::to_value(&dto).unwrap();
+        assert!(
+            wire["daily"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|cell| cell.get("totalTokens").is_none()),
+            "no cell serializes a fabricated zero"
+        );
     }
 }

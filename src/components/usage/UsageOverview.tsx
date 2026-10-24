@@ -12,6 +12,7 @@ import {
   type UsageSourceDiagnostics,
 } from "../../lib/usageIntelligence";
 import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
+import { UsageDailyActivity } from "./UsageDailyActivity";
 
 /**
  * The Usage-first main-window overview (v0.9): one calm surface over the
@@ -31,14 +32,27 @@ import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
  *   ("less history than the range");
  * - only sources with collected data get provider groups; source failures
  *   and completions-without-reported-usage stay visible;
- * - the Daily activity area is a clearly-marked reserved placeholder — no
- *   historical token observations exist yet, so none are drawn.
+ * - the Daily activity heatmap renders the backend's per-local-day
+ *   projection (`daily`): relative reported-token intensity, hatched
+ *   missing days, and before-collection days — never invented history.
  */
 
 /** Ranking rows stay compact; the full model list opens on demand. */
 const MAX_VISIBLE_MODELS = 6;
 
 type ModelRow = UsageModelBreakdown & { provider: string };
+
+/**
+ * Dev-only initial range from `?range=7d|30d` (visual-fixture URLs mirror
+ * the `?view=` seam in App.tsx). Production always lands on Today.
+ */
+function devInitialRange(): UsageIntelligenceRange {
+  if (import.meta.env.DEV && typeof window !== "undefined") {
+    const param = new URLSearchParams(window.location.search).get("range");
+    if (param === "7d" || param === "30d") return param;
+  }
+  return "today";
+}
 
 export function UsageOverview({
   enabled,
@@ -55,7 +69,9 @@ export function UsageOverview({
   /** Navigates to Settings (the "off" explainer's action). */
   onOpenSettings?: () => void;
 }) {
-  const [range, setRange] = useState<UsageIntelligenceRange>("today");
+  const [range, setRange] = useState<UsageIntelligenceRange>(
+    () => devInitialRange(),
+  );
   const [expandedModel, setExpandedModel] = useState<string | null>(null);
   const [showAllModels, setShowAllModels] = useState(false);
 
@@ -396,18 +412,7 @@ export function UsageOverview({
             </section>
           </div>
 
-          <section className="usage-panel usage-daily" aria-label="Daily activity">
-            <h3 className="panel-heading">Daily activity</h3>
-            <div className="usage-daily-placeholder">
-              <p className="usage-daily-title">
-                Daily token activity will chart here
-              </p>
-              <p className="usage-daily-note">
-                Reserved for a future release — LimitScope does not invent
-                history, so nothing is drawn yet.
-              </p>
-            </div>
-          </section>
+          <UsageDailyActivity days={data.daily} />
         </>
       ) : null}
 

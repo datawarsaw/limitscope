@@ -3093,30 +3093,55 @@ body {
   overflow-wrap: anywhere;
 }
 
-/* The reserved Daily activity area: quiet, dashed, and unmistakably not a
-   functioning chart — no cells, no bars, no invented history. */
-.usage-daily-placeholder {
+/* Daily activity heatmap: one cell per local calendar day. Intensity is
+   relative to the busiest observed day in the selected range (teal scale);
+   a hatched cell is "no recorded events", never a confirmed zero. */
+.usage-daily-grid {
   display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  min-height: 64px;
-  padding: 12px 14px;
-  border: 1px dashed var(--card-border);
-  border-radius: 8px;
-  background: none;
-  text-align: center;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-.usage-daily-title {
-  margin: 0;
-  font-size: 11.5px;
-  color: var(--text-dim);
+.usage-daily-cell {
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1px solid var(--card-border);
+}
+
+.usage-daily-l0 {
+  background: var(--bar-track);
+}
+
+.usage-daily-l1 {
+  background: rgba(45, 212, 191, 0.2);
+}
+
+.usage-daily-l2 {
+  background: rgba(45, 212, 191, 0.4);
+}
+
+.usage-daily-l3 {
+  background: rgba(45, 212, 191, 0.62);
+}
+
+.usage-daily-l4 {
+  background: rgba(45, 212, 191, 0.85);
+  border-color: rgba(45, 212, 191, 0.55);
+}
+
+.usage-daily-cell-none {
+  background: repeating-linear-gradient(
+    135deg,
+    transparent,
+    transparent 3px,
+    var(--bar-track) 3px,
+    var(--bar-track) 5px
+  );
 }
 
 .usage-daily-note {
-  margin: 0;
+  margin: 7px 0 0;
   font-size: 10.5px;
   color: var(--text-faint);
 }
