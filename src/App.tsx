@@ -277,6 +277,7 @@ export default function App() {
               revision={usageIntelligenceRevision}
               loader={devFixture?.intelligenceLoader}
               onOpenSettings={() => setView("settings")}
+              nowMs={nowMs}
             />
           </main>
         ) : (
