@@ -333,6 +333,108 @@ describe("execution run panel: bounded conflict resolution (case 3)", () => {
   });
 });
 
+describe("execution run panel: per-provider selection", () => {
+  function zaiUsage(overrides: Partial<ProviderUsage> = {}): ProviderUsage {
+    return codexUsage({
+      id: "zai",
+      name: "Z.ai / ZCode",
+      account: { label: "plan:pro", identity: "plan:pro" },
+      limits: [
+        { label: "5-hour", usedPercent: 61, resetAt: hoursAhead(3) },
+        { label: "Weekly", usedPercent: 72, resetAt: hoursAhead(80) },
+      ],
+      ...overrides,
+    });
+  }
+
+  it("anchors on the deterministic default and starts the run on the explicitly selected provider", async () => {
+    const user = userEvent.setup();
+    // zai's primary window (72%) outranks codex's (38%), so zai is the
+    // deterministic default the panel anchors on.
+    renderApp([codexUsage(), zaiUsage()]);
+    await openRunPanel(user);
+
+    const providerSelect = screen.getByLabelText("Provider") as HTMLSelectElement;
+    expect(providerSelect.value).toBe("zai");
+    expect(screen.getByText(/Baseline: Z\.ai \/ ZCode/)).toBeTruthy();
+
+    await user.selectOptions(providerSelect, "openai-codex");
+    expect(providerSelect.value).toBe("openai-codex");
+    expect(screen.getByText(/Baseline: OpenAI \/ Codex/)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    // The bracket starts against the chosen provider, not the default.
+    expect(screen.getByText(/Run started on OpenAI \/ Codex\./)).toBeTruthy();
+    expect(screen.getByText(/Started .*OpenAI \/ Codex/)).toBeTruthy();
+  });
+
+  it("falls back to the default when the explicit choice disappears from the choices", async () => {
+    const user = userEvent.setup();
+    const codex = codexUsage();
+    const zai = zaiUsage();
+    const view = render(
+      <ExecutionRunPanel
+        activeRun={null}
+        recentRuns={[]}
+        selectedUsage={codex}
+        usages={[codex, zai]}
+        nowMs={Date.now()}
+        onStart={vi.fn()}
+        onFinish={vi.fn()}
+        onDiscard={vi.fn()}
+        onRefresh={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const providerSelect = screen.getByLabelText("Provider") as HTMLSelectElement;
+    await user.selectOptions(providerSelect, "zai");
+    expect(providerSelect.value).toBe("zai");
+
+    // The chosen provider leaves the choices (hidden or removed upstream).
+    view.rerender(
+      <ExecutionRunPanel
+        activeRun={null}
+        recentRuns={[]}
+        selectedUsage={codex}
+        usages={[codex]}
+        nowMs={Date.now()}
+        onStart={vi.fn()}
+        onFinish={vi.fn()}
+        onDiscard={vi.fn()}
+        onRefresh={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(
+      (screen.getByLabelText("Provider") as HTMLSelectElement).value,
+    ).toBe("openai-codex");
+    expect(screen.getByText(/Baseline: OpenAI \/ Codex/)).toBeTruthy();
+  });
+
+  it("offers only the app's visible providers, never hidden ones", async () => {
+    const codex = codexUsage();
+    const zai = zaiUsage();
+    render(
+      <ExecutionRunPanel
+        activeRun={null}
+        recentRuns={[]}
+        selectedUsage={codex}
+        usages={[codex, zai]}
+        providerChoices={[codex]}
+        nowMs={Date.now()}
+        onStart={vi.fn()}
+        onFinish={vi.fn()}
+        onDiscard={vi.fn()}
+        onRefresh={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    const providerSelect = screen.getByLabelText("Provider") as HTMLSelectElement;
+    expect(providerSelect.textContent).toContain("OpenAI / Codex");
+    expect(providerSelect.textContent).not.toContain("Z.ai / ZCode");
+  });
+});
+
 describe("execution run workflow: keyboard accessibility (case 18)", () => {
   it("opens with Enter, moves focus into the panel, starts via keyboard, closes with Escape back to the toolbar", async () => {
     const user = userEvent.setup();

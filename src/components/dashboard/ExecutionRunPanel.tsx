@@ -23,12 +23,17 @@ import type { ProviderUsage } from "../../types";
  * provenance core's run object — this component never recomputes deltas.
  * All primary actions are native buttons/inputs, reachable by keyboard, and
  * focus lands somewhere sensible after each transition.
+ *
+ * The start form carries its own per-provider selection: it anchors on the
+ * app's deterministic default (`selectedUsage`) and offers every selectable
+ * provider for an explicit choice.
  */
 export function ExecutionRunPanel({
   activeRun,
   recentRuns,
   selectedUsage,
   usages,
+  providerChoices,
   nowMs,
   onStart,
   onFinish,
@@ -40,6 +45,11 @@ export function ExecutionRunPanel({
   recentRuns: ExecutionProvenanceRun[];
   selectedUsage: ProviderUsage | undefined;
   usages: ProviderUsage[];
+  /**
+   * Providers offered for explicit selection; the app passes its visible
+   * providers so hidden ones stay unselectable. Defaults to `usages`.
+   */
+  providerChoices?: ProviderUsage[];
   /** Wall clock for the live "Running · 12m" elapsed readout. */
   nowMs: number;
   onStart: (request: StartRunRequest) => StartRunOutcome;
@@ -51,6 +61,8 @@ export function ExecutionRunPanel({
   const [harness, setHarness] = useState<ExecutionHarness>(DEFAULT_EXECUTION_HARNESS);
   const [model, setModel] = useState("");
   const [reasoningEffort, setReasoningEffort] = useState("");
+  // Explicit per-provider choice; null means "use the deterministic default".
+  const [providerId, setProviderId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
   const [finishError, setFinishError] = useState<string | null>(null);
   // A start attempt refused because a run is already active. The active run
@@ -82,10 +94,22 @@ export function ExecutionRunPanel({
 
   const accountLabel = (run: ExecutionProvenanceRun) => (run.account ? ` · ${run.account}` : "");
 
+  // The run's provider: an explicit choice sticks while it stays selectable;
+  // a choice that disappears (provider hidden or removed) falls back to the
+  // deterministic default instead of sticking on an unselectable provider.
+  const choices = providerChoices ?? usages;
+  const runProviderId =
+    providerId !== null && choices.some((usage) => usage.id === providerId)
+      ? providerId
+      : selectedUsage && choices.some((usage) => usage.id === selectedUsage.id)
+        ? selectedUsage.id
+        : (choices[0]?.id ?? "");
+  const runUsage = choices.find((usage) => usage.id === runProviderId);
+
   const handleStart = () => {
     setStartError(null);
     const outcome = onStart({
-      usage: selectedUsage,
+      usage: runUsage,
       harness,
       model: model.trim() !== "" ? model : undefined,
       reasoningEffort: reasoningEffort.trim() !== "" ? reasoningEffort : undefined,
@@ -130,7 +154,7 @@ export function ExecutionRunPanel({
   };
 
   const lastRun = recentRuns[0];
-  const baseline = resolveStartSnapshot(selectedUsage, Date.now());
+  const baseline = resolveStartSnapshot(runUsage, Date.now());
 
   return (
     <section
@@ -231,6 +255,23 @@ export function ExecutionRunPanel({
             }}
           >
             <div className="run-field-row">
+              <label className="run-field-label" htmlFor="run-provider-select">
+                Provider
+              </label>
+              <select
+                id="run-provider-select"
+                className="run-select"
+                value={runProviderId}
+                onChange={(event) => setProviderId(event.target.value)}
+              >
+                {choices.map((usage) => (
+                  <option key={usage.id} value={usage.id}>
+                    {usage.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div className="run-field-row">
               <label className="run-field-label" htmlFor="run-harness-select">
                 Harness
               </label>
@@ -278,7 +319,7 @@ export function ExecutionRunPanel({
             </details>
             <p className="run-baseline">
               {baseline.ok
-                ? `Baseline: ${selectedUsage?.name ?? ""}${
+                ? `Baseline: ${runUsage?.name ?? ""}${
                     baseline.snapshot.accountIdentity !== undefined
                       ? ` · ${baseline.snapshot.accountIdentity}`
                       : ""

@@ -11,6 +11,7 @@ import type {
   UsageIntelligenceRange,
   UsageIntelligenceLoader,
 } from "../../lib/usageIntelligence";
+import { localMidnightMs } from "../../lib/usageIntelligence";
 
 /**
  * Focused presentation pins for the v0.9 Usage-first overview. The loader is
@@ -197,6 +198,50 @@ describe("UsageOverview", () => {
     ).toBeTruthy();
     expect(within(kpis).getByText(`since ${sinceDate(STARTED_AT)}`)).toBeTruthy();
     expect(within(kpis).getByText(/covers the Today range/)).toBeTruthy();
+  });
+
+  it("counts distinct model identities, not provider-qualified rows", async () => {
+    // The same normalized identity (`gpt-5.4`) observed under two providers
+    // (bare Codex vs OpenCode's separate provider axis) is one distinct
+    // model — while both provider-qualified rows stay in the ranking.
+    const crossProvider = payload({
+      groups: [
+        {
+          provider: "openai-codex",
+          models: [model("gpt-5.4", 10, 1000, 0, 0, 500, 0)],
+          events: 10,
+          inputTokens: 1000,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 500,
+          reasoningTokens: 0,
+          totalTokens: 1500,
+        },
+        {
+          provider: "openai",
+          models: [
+            model("gpt-5.4", 5, 2000, 0, 0, 1000, 0),
+            model("gpt-5.6-sol", 2, 100, 0, 0, 50, 0),
+          ],
+          events: 7,
+          inputTokens: 2100,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 1050,
+          reasoningTokens: 0,
+          totalTokens: 3150,
+        },
+      ],
+    });
+    renderOverview(loaderWith(() => crossProvider));
+    const kpis = await screen.findByLabelText("Usage summary");
+    // Three provider-qualified rows, two distinct identities.
+    expect(within(kpis).getByText("2")).toBeTruthy();
+    expect(
+      within(kpis).getByText("distinct models across providers"),
+    ).toBeTruthy();
+    const models = screen.getByLabelText("Models");
+    expect(within(models).getAllByRole("button")).toHaveLength(3);
   });
 
   it("ranks models and sources with totals consistent with the payload", async () => {
@@ -440,5 +485,68 @@ describe("UsageOverview", () => {
       const last = calls[calls.length - 1][0];
       expect(last).toEqual({ range: "30d" });
     });
+  });
+
+  it("re-anchors the Today query when the local day rolls over while the app stays open", async () => {
+    const loader = loaderWith((range) => payload({ range }));
+    // Local (no Z suffix) timestamps keep the test timezone-agnostic.
+    const beforeMidnight = new Date("2026-10-24T23:59:00");
+    const afterMidnight = new Date("2026-10-25T00:01:00");
+    const view = render(
+      <UsageOverview
+        enabled
+        revision={0}
+        loader={loader}
+        nowMs={beforeMidnight.getTime()}
+      />,
+    );
+    await screen.findByLabelText("Usage summary");
+    const calls = vi.mocked(loader).mock.calls;
+    expect(calls[0][0].todayStartMs).toBe(localMidnightMs(beforeMidnight));
+
+    // The app's existing wall-clock tick crosses local midnight.
+    view.rerender(
+      <UsageOverview
+        enabled
+        revision={0}
+        loader={loader}
+        nowMs={afterMidnight.getTime()}
+      />,
+    );
+    await vi.waitFor(() => {
+      const last = calls[calls.length - 1][0];
+      expect(last.range).toBe("today");
+      expect(last.todayStartMs).toBe(localMidnightMs(afterMidnight));
+    });
+    // Exactly one re-query: the rollover itself, no per-tick refetches.
+    expect(calls).toHaveLength(2);
+  });
+
+  it("keeps the Today anchor stable across same-day clock ticks", async () => {
+    const loader = loaderWith((range) => payload({ range }));
+    const noon = new Date("2026-10-24T12:00:00").getTime();
+    const view = render(
+      <UsageOverview enabled revision={0} loader={loader} nowMs={noon} />,
+    );
+    await screen.findByLabelText("Usage summary");
+
+    view.rerender(
+      <UsageOverview
+        enabled
+        revision={0}
+        loader={loader}
+        nowMs={noon + 60_000}
+      />,
+    );
+    view.rerender(
+      <UsageOverview
+        enabled
+        revision={0}
+        loader={loader}
+        nowMs={noon + 3_600_000}
+      />,
+    );
+    // Same local day: the query key never changes, so no re-query fires.
+    expect(vi.mocked(loader).mock.calls).toHaveLength(1);
   });
 });

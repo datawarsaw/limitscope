@@ -59,6 +59,7 @@ export function UsageOverview({
   revision,
   loader = loadUsageIntelligence,
   onOpenSettings,
+  nowMs,
 }: {
   /** The persisted Usage Intelligence opt-in (settings). */
   enabled: boolean;
@@ -68,6 +69,12 @@ export function UsageOverview({
   loader?: UsageIntelligenceLoader;
   /** Navigates to Settings (the "off" explainer's action). */
   onOpenSettings?: () => void;
+  /**
+   * Wall clock for the Today anchor — the app's existing tick (useNow),
+   * so a view that stays open across local midnight re-anchors without a
+   * dedicated timer. The derived anchor changes value only at midnight.
+   */
+  nowMs?: number;
 }) {
   const [range, setRange] = useState<UsageIntelligenceRange>(
     () => devInitialRange(),
@@ -75,12 +82,20 @@ export function UsageOverview({
   const [expandedModel, setExpandedModel] = useState<string | null>(null);
   const [showAllModels, setShowAllModels] = useState(false);
 
+  // The Today anchor is derived from the wall clock, not captured once per
+  // range switch: the memo recomputes only when the local day actually
+  // changes, which alone changes the query key and re-queries the backend.
+  const todayStartMs =
+    range === "today"
+      ? localMidnightMs(new Date(nowMs ?? Date.now()))
+      : undefined;
+
   const query = useMemo(
     () => ({
       range,
-      ...(range === "today" ? { todayStartMs: localMidnightMs() } : {}),
+      ...(todayStartMs !== undefined ? { todayStartMs } : {}),
     }),
-    [range],
+    [range, todayStartMs],
   );
 
   const intelligence = useUsageIntelligence(query, enabled, revision, loader);
@@ -103,12 +118,18 @@ export function UsageOverview({
     return [...data.groups].sort((a, b) => b.totalTokens - a.totalTokens);
   }, [data]);
 
-  const modelsObserved = modelRows.length;
+  // The naming contract makes `model` the normalized model identity and
+  // keeps the provider qualifier on the separate provider axis (Codex splits
+  // `xai/grok-4.6`; ZCode and OpenCode report the provider directly). The
+  // same identity can therefore surface under several providers as distinct
+  // rows — both observations stay in the ranking above, but the KPI counts
+  // identities, not provider-qualified rows.
+  const modelsObserved = new Set(modelRows.map((row) => row.model)).size;
   const maxModelTokens = modelRows[0]?.totalTokens ?? 0;
   const maxProviderTokens = providerRows[0]?.totalTokens ?? 0;
   const hiddenModelCount = Math.max(
     0,
-    modelsObserved - (showAllModels ? modelsObserved : MAX_VISIBLE_MODELS),
+    modelRows.length - (showAllModels ? modelRows.length : MAX_VISIBLE_MODELS),
   );
   const visibleModelRows = showAllModels ? modelRows : modelRows.slice(0, MAX_VISIBLE_MODELS);
 
@@ -241,7 +262,9 @@ export function UsageOverview({
               <span className="usage-kpi-label">Models observed</span>
               <span className="usage-kpi-value">{modelsObserved}</span>
               <span className="usage-kpi-sub">
-                {modelsObserved === 1 ? "1 distinct model" : `distinct models in range`}
+                {modelsObserved === 1
+                  ? "1 distinct model"
+                  : `distinct models across providers`}
               </span>
             </div>
             <div className="usage-kpi">
