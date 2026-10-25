@@ -253,6 +253,7 @@ export default function App() {
           recentRuns={recentRuns}
           selectedUsage={selectedUsage}
           usages={usages}
+          providerChoices={visibleUsages}
           nowMs={nowMs}
           onStart={startRun}
           onFinish={() => finishRun()}
