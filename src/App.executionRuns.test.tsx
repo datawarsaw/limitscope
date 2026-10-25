@@ -412,7 +412,6 @@ describe("execution run panel: per-provider selection", () => {
   });
 
   it("offers only the app's visible providers, never hidden ones", async () => {
-    const user = userEvent.setup();
     const codex = codexUsage();
     const zai = zaiUsage();
     render(
