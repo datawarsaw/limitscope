@@ -27,7 +27,12 @@ import {
   type Settings,
   type Theme,
 } from "../../lib/settings";
-import type { ProviderUsage } from "../../types";
+import {
+  isWalletInFloatingBar,
+  isWalletMonitored,
+  walletRegistryNote,
+} from "../../lib/walletPreferences";
+import type { ApiWallet, ProviderUsage } from "../../types";
 import type { ReleaseNote, SafeUpdateError, UpdatePhase } from "../../lib/updater";
 import type { LocalDataClearResult } from "../../lib/localData";
 
@@ -60,11 +65,17 @@ export type SettingsViewProps = {
     direction: 1 | -1,
     registryIds: readonly string[],
   ) => boolean;
+  /** Per-wallet monitor switch; off stops the runtime's polling. */
+  setWalletMonitored: (walletId: string, monitored: boolean) => void;
+  /** Per-wallet floating-bar visibility; presentation only. */
+  setWalletInFloatingBar: (walletId: string, visible: boolean) => void;
   resetPreferences: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   startupPending: boolean;
   startupError: string | null;
   /** Full provider registry (hidden providers keep their preferences rows). */
   usages: readonly ProviderUsage[];
+  /** Registered wallets ( collectors plus the disabled OpenAI placeholder). */
+  wallets: readonly ApiWallet[];
   /** Visible providers, for the hidden-state switch. */
   visibleUsages: readonly ProviderUsage[];
   registryIds: readonly string[];
@@ -92,10 +103,13 @@ export function SettingsView({
   setQuotaPerspective,
   setProviderHidden,
   moveProvider,
+  setWalletMonitored,
+  setWalletInFloatingBar,
   resetPreferences,
   startupPending,
   startupError,
   usages,
+  wallets,
   visibleUsages,
   registryIds,
   onClearUsageHistory,
@@ -355,11 +369,85 @@ export function SettingsView({
           ) : null}
         </div>
         <div className="wallet-prefs" role="group" aria-label="API wallets">
-          <span className="setting-label">API wallets</span>
+          <span className="setting-label">API Wallets</span>
           <p className="providers-prefs-note">
-            Wallet balances live in the floating bar. Per-wallet monitor and
-            floating-bar controls arrive with the API wallet feature.
+            Monitor controls a wallet's automatic balance collection;
+            turning it off stops polling and keeps the last known balance.
+            Floating bar controls the wallet's place in the floating API
+            Wallets card, and a hidden wallet keeps being monitored.
           </p>
+          {wallets.length === 0 ? (
+            <p className="providers-prefs-note">No wallets registered.</p>
+          ) : (
+            <>
+              <div className="wallet-prefs-head" aria-hidden="true">
+                <span />
+                <span>Monitor</span>
+                <span>Floating bar</span>
+              </div>
+              <ul className="providers-prefs-list">
+                {wallets.map((wallet) => {
+                  const note = walletRegistryNote(wallet.id);
+                  const monitored = isWalletMonitored(
+                    settings.walletPreferences,
+                    wallet.id,
+                  );
+                  const inBar = isWalletInFloatingBar(
+                    settings.walletPreferences,
+                    wallet.id,
+                  );
+                  return (
+                    <li key={wallet.id} className="provider-prefs-row">
+                      <span className="provider-prefs-name">
+                        {wallet.name}
+                      </span>
+                      <label className="provider-prefs-visibility">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          aria-label={"Monitor " + wallet.name}
+                          checked={monitored}
+                          disabled={note !== null}
+                          onChange={(event) =>
+                            setWalletMonitored(wallet.id, event.target.checked)
+                          }
+                        />
+                      </label>
+                      <label className="provider-prefs-visibility">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          aria-label={
+                            "Show " + wallet.name + " in the floating bar"
+                          }
+                          checked={inBar}
+                          disabled={note !== null}
+                          onChange={(event) =>
+                            setWalletInFloatingBar(
+                              wallet.id,
+                              event.target.checked,
+                            )
+                          }
+                        />
+                      </label>
+                    </li>
+                  );
+                })}
+              </ul>
+              {wallets.map((wallet) => {
+                const note = walletRegistryNote(wallet.id);
+                return note ? (
+                  <p
+                    className="setting-note"
+                    role="status"
+                    key={wallet.id + "-note"}
+                  >
+                    {wallet.name}: {note}
+                  </p>
+                ) : null;
+              })}
+            </>
+          )}
         </div>
       </section>
 

@@ -31,6 +31,7 @@ mod usage_source_opencode;
 mod usage_source_zcode;
 mod wallet;
 mod wallet_deepseek;
+mod wallet_prefs;
 mod zai;
 mod zcode_plans;
 mod zcode_reset;
@@ -161,6 +162,7 @@ fn main() {
             runtime::request_refresh_on_reconnect,
             runtime::set_refresh_interval,
             runtime::set_quota_notifications_enabled,
+            runtime::set_wallet_monitoring,
             history::get_history,
             history::get_history_range,
             usage_analytics::get_usage_analytics,

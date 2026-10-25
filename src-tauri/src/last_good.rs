@@ -1738,6 +1738,7 @@ mod tests {
         WalletSpec {
             id,
             name,
+            monitored_by_default: true,
             current_credential_binding: Arc::new(move || binding.map(str::to_string)),
             fetch: Arc::new(|| {
                 Box::pin(async {

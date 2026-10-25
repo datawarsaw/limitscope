@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef } from "react";
 import type { CSSProperties, FocusEvent, ReactNode } from "react";
-import { formatAge } from "../lib/format";
+import { formatTime } from "../lib/format";
 import type { FloatingWalletItem } from "../lib/floatingQuota";
 import { floatingWalletAmountText } from "../lib/floatingQuota";
 import { WalletMark } from "./FloatingWalletSlot";
@@ -10,6 +10,8 @@ function walletStatusClass(item: FloatingWalletItem): string {
   switch (item.state) {
     case "healthy":
       return "ok";
+    case "paused":
+      return "unknown";
     case "stale":
     case "cooldown":
       return "stale";
@@ -21,25 +23,22 @@ function walletStatusClass(item: FloatingWalletItem): string {
 }
 
 /**
- * The observation line. A retained last-good balance keeps its original
- * timestamp, so it is described as last known rather than freshly checked.
- * No stamp never becomes "checked just now".
+ * The observation line, in the subscription cards' convention: the stamp of
+ * the wallet's own last successful observation, absolute and local
+ * ("Checked 10:44 pm"), muted and not emphasized. A retained last-good
+ * balance is described as last known rather than freshly checked. No stamp
+ * never becomes "checked just now".
  */
-function freshnessLine(
-  item: FloatingWalletItem,
-  now: Date,
-): { muted: string; strong: string | null } {
+function freshnessLine(item: FloatingWalletItem): string {
   if (item.checkedAt) {
-    return {
-      muted: item.state === "healthy" ? "Checked " : "Last known ",
-      strong: formatAge(item.checkedAt, now),
-    };
+    return (
+      (item.state === "healthy" ? "Checked " : "Last known ") +
+      formatTime(item.checkedAt)
+    );
   }
-  if (item.state === "error") return { muted: "Last check failed", strong: null };
-  if (item.state === "unavailable") {
-    return { muted: "No balance recorded", strong: null };
-  }
-  return { muted: "Not checked yet", strong: null };
+  if (item.state === "error") return "Last check failed";
+  if (item.state === "unavailable") return "No balance recorded";
+  return "Not checked yet";
 }
 
 /**
@@ -64,9 +63,11 @@ function walletHint(item: FloatingWalletItem): string | null {
 
 /**
  * A manual read can only help where the runtime did not settle a fresh
- * balance. A healthy wallet is maintained by the runtime's own polling, and
- * a cooling wallet has no supported read until its rate limit clears, so
- * neither gets an action that would either duplicate or fail.
+ * balance. A healthy wallet is maintained by the runtime's own polling, a
+ * cooling wallet has no supported read until its rate limit clears, and a
+ * paused (monitoring-off) wallet is not collected on purpose — its frozen
+ * reading is the truth until monitoring is re-enabled. None of the three
+ * gets an action that would either duplicate or fail.
  */
 function walletNeedsManualRefresh(item: FloatingWalletItem): boolean {
   return (
@@ -88,7 +89,6 @@ function walletNeedsManualRefresh(item: FloatingWalletItem): boolean {
  */
 export function FloatingWalletsPopover({
   items,
-  now,
   pinned,
   align,
   exiting,
@@ -100,7 +100,6 @@ export function FloatingWalletsPopover({
   onRefresh,
 }: {
   items: FloatingWalletItem[];
-  now: Date;
   pinned: boolean;
   align: number;
   exiting: boolean;
@@ -163,7 +162,7 @@ export function FloatingWalletsPopover({
         </header>
 
         {items.map((item) => (
-          <WalletSection key={item.id} item={item} now={now} hintId={hintId} />
+          <WalletSection key={item.id} item={item} hintId={hintId} />
         ))}
 
         {showRefresh ? (
@@ -188,21 +187,21 @@ export function FloatingWalletsPopover({
 /**
  * One wallet's section inside the shared card: its name and state, its
  * amounts (each with its currency), its freshness, and its masked
- * credential identity.
+ * credential identity. A fresh wallet carries no status chip — its muted
+ * "Checked <local time>" stamp is the whole freshness statement — while a
+ * stale, cooling, failed, unavailable, or paused wallet names its state.
  */
 function WalletSection({
   item,
-  now,
   hintId,
 }: {
   item: FloatingWalletItem;
-  now: Date;
   hintId: string;
 }) {
   const amounts = item.balances
     .map(floatingWalletAmountText)
     .filter((text): text is string => text !== null);
-  const freshness = freshnessLine(item, now);
+  const freshness = freshnessLine(item);
   const hint = walletHint(item);
 
   return (
@@ -213,9 +212,11 @@ function WalletSection({
     >
       <header className="fq-wallet-section-head">
         <strong>{item.name}</strong>
-        <span className={"fq-status status-" + walletStatusClass(item)}>
-          {item.statusLabel}
-        </span>
+        {item.statusLabel ? (
+          <span className={"fq-status status-" + walletStatusClass(item)}>
+            {item.statusLabel}
+          </span>
+        ) : null}
       </header>
 
       {amounts.length > 0 ? (
@@ -236,16 +237,7 @@ function WalletSection({
         </p>
       )}
 
-      <p className="fq-primary-reset">
-        {freshness.strong ? (
-          <>
-            {freshness.muted}
-            <strong>{freshness.strong}</strong>
-          </>
-        ) : (
-          freshness.muted
-        )}
-      </p>
+      <p className="fq-primary-reset">{freshness}</p>
 
       {item.error ? (
         <p className="fq-popover-error" role="alert">

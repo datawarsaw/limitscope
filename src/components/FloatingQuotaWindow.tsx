@@ -10,6 +10,7 @@ import {
   floatingWindowHeight,
   type FloatingOverlay,
 } from "../lib/floatingQuota";
+import { isWalletInFloatingBar } from "../lib/walletPreferences";
 import { orderVisibleProviders } from "../lib/providerPreferences";
 import {
   attachMonitorRecovery,
@@ -85,8 +86,18 @@ export function FloatingQuotaWindow() {
   const usages = devFixture?.usages ?? runtimeUsages;
   // Wallets are an independent snapshot collection: hidden-provider
   // preferences never filter them, and an older runtime without the field
-  // simply yields an empty list.
-  const walletItems = floatingWalletItems(runtimeWallets ?? []);
+  // simply yields an empty list. Their own preferences do apply: floating-bar
+  // visibility is presentation only (a hidden wallet keeps being monitored),
+  // and the monitor flag decides whether an item presents as live or paused.
+  // With every wallet hidden the slot drops out and the bar's width math
+  // sizes the window to the providers alone.
+  const visibleWallets = (runtimeWallets ?? []).filter((wallet) =>
+    isWalletInFloatingBar(settings.walletPreferences, wallet.id),
+  );
+  const walletItems = floatingWalletItems(
+    visibleWallets,
+    settings.walletPreferences,
+  );
   const now = new Date(useNow());
   // Presentation only: hidden providers leave the glanceable bar, but the
   // runtime snapshot above stays complete (history, notifications).

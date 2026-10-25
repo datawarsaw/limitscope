@@ -1088,6 +1088,41 @@ body {
   border-color: var(--text-faint);
 }
 
+/* Per-wallet preferences (v0.8.17): one row per registered wallet with two
+   switches — monitor and floating-bar visibility. Reuses the provider
+   preference row layout; the header labels the two switch columns. */
+.wallet-prefs {
+  padding: 7px 0;
+}
+
+.wallet-prefs + .setting-row {
+  border-top: 1px solid var(--divider);
+}
+
+.wallet-prefs-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.wallet-prefs-head span:first-child {
+  flex: 1 1 auto;
+}
+
+.wallet-prefs-head span:not(:first-child) {
+  flex: none;
+  width: 62px;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* The row's switch labels take the header's column width, so each switch
+   sits under its own label. */
+.wallet-prefs .provider-prefs-visibility {
+  width: 62px;
+}
+
 .provider-prefs-moves button:disabled {
   opacity: 0.35;
   cursor: default;

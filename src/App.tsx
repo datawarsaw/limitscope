@@ -60,6 +60,8 @@ export default function App() {
     setUsageIntelligence,
     setProviderHidden,
     moveProvider,
+    setWalletMonitored,
+    setWalletInFloatingBar,
     setQuotaPerspective,
     resetPreferences,
     startupPending,
@@ -67,6 +69,7 @@ export default function App() {
   } = useSettings();
   const {
     usages: runtimeUsages,
+    wallets: runtimeWallets,
     loading,
     lastUpdatedAt,
     refresh,
@@ -84,6 +87,8 @@ export default function App() {
       ? readDevFixture(window.location.search)
       : null;
   const usages = devFixture?.usages ?? runtimeUsages;
+  // An older runtime (or a test surface without the field) yields no wallets.
+  const wallets = runtimeWallets ?? [];
   // Local wall clock for the reset countdowns; no provider refetch involved.
   const nowMs = useNow();
   const { historyUnavailable, clearLocalHistory } =
@@ -297,10 +302,13 @@ export default function App() {
               setQuotaPerspective={setQuotaPerspective}
               setProviderHidden={setProviderHidden}
               moveProvider={moveProvider}
+              setWalletMonitored={setWalletMonitored}
+              setWalletInFloatingBar={setWalletInFloatingBar}
               resetPreferences={resetPreferences}
               startupPending={startupPending}
               startupError={startupError}
               usages={usages}
+              wallets={wallets}
               visibleUsages={visibleUsages}
               registryIds={registryIds}
               onClearUsageHistory={clearLocalHistory}

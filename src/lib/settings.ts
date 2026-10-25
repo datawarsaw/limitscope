@@ -6,6 +6,11 @@ import {
   isQuotaPerspective,
   type QuotaPerspective,
 } from "./quotaPresentation";
+import {
+  DEFAULT_WALLET_PREFERENCES,
+  sanitizeWalletPreferences,
+  type WalletPreferences,
+} from "./walletPreferences";
 
 export const REFRESH_INTERVAL_MINUTES = [1, 5, 15, 30] as const;
 export type RefreshIntervalMinutes = (typeof REFRESH_INTERVAL_MINUTES)[number];
@@ -46,6 +51,15 @@ export type Settings = {
    * history are never rewritten to match it.
    */
   quotaPerspective: QuotaPerspective;
+  /**
+   * Per-wallet preferences (v0.8.17): whether each prepaid wallet is
+   * monitored at all and whether it appears in the floating API Wallets
+   * card. The monitor half is mirrored into a persisted Rust store, so a
+   * disabled wallet is not polled — the startup cycle included. An id
+   * with no entry falls back to its registry default (OpenRouter and
+   * DeepSeek: monitored and visible).
+   */
+  walletPreferences: WalletPreferences;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -60,6 +74,7 @@ export const DEFAULT_SETTINGS: Settings = {
   usageIntelligence: false,
   providerPreferences: { order: [], hidden: [] },
   quotaPerspective: "used",
+  walletPreferences: { ...DEFAULT_WALLET_PREFERENCES },
 };
 
 // Plain localStorage is the smallest mechanism that survives restarts without
@@ -76,6 +91,7 @@ const KNOWN_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "usageIntelligence",
   "providerPreferences",
   "quotaPerspective",
+  "walletPreferences",
 ]);
 
 function isRefreshInterval(value: unknown): value is RefreshIntervalMinutes {
@@ -98,6 +114,7 @@ export function parseSettings(raw: unknown): Settings {
   const settings: Settings = {
     ...DEFAULT_SETTINGS,
     providerPreferences: { ...DEFAULT_SETTINGS.providerPreferences },
+    walletPreferences: { ...DEFAULT_SETTINGS.walletPreferences },
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return settings;
   const record = raw as Record<string, unknown>;
@@ -122,6 +139,9 @@ export function parseSettings(raw: unknown): Settings {
   if (isQuotaPerspective(record.quotaPerspective)) {
     settings.quotaPerspective = record.quotaPerspective;
   }
+  settings.walletPreferences = sanitizeWalletPreferences(
+    record.walletPreferences,
+  );
   return settings;
 }
 
@@ -171,6 +191,9 @@ export function mergeSettingsWithRaw(
     settings.providerPreferences,
   );
   merged.quotaPerspective = settings.quotaPerspective;
+  merged.walletPreferences = sanitizeWalletPreferences(
+    settings.walletPreferences,
+  );
   return JSON.stringify(merged);
 }
 
@@ -198,6 +221,7 @@ export function resetSettings(): Settings {
   const defaults: Settings = {
     ...DEFAULT_SETTINGS,
     providerPreferences: { ...DEFAULT_SETTINGS.providerPreferences },
+    walletPreferences: { ...DEFAULT_SETTINGS.walletPreferences },
   };
   saveSettings(defaults);
   return defaults;

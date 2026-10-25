@@ -6,6 +6,7 @@ import type {
 } from "../types";
 import { grokBotFor } from "./grokBot";
 import { isUsableQuotaWindow } from "./quotaStrip";
+import { isWalletMonitored, type WalletPreferences } from "./walletPreferences";
 import {
   providerStatusPresentation,
   type ProviderStatusPresentation,
@@ -96,9 +97,13 @@ export type FloatingClickAction = {
  * Wallet presentation state. It deliberately names its own set rather than
  * reusing `FloatingQuotaState`: a wallet can be in an upstream cooldown with
  * a perfectly good last-good balance, which no quota state expresses.
+ * `paused` is the monitoring-off presentation: the runtime stopped polling
+ * the wallet, so its last known balance is frozen and nothing may read as
+ * live.
  */
 export type FloatingWalletState =
   | "healthy"
+  | "paused"
   | "stale"
   | "cooldown"
   | "error"
@@ -120,7 +125,13 @@ export type FloatingWalletItem = {
   error?: string;
   errorCategory?: string;
   errorHttpStatus?: number;
-  statusLabel: string;
+  /**
+   * The one-word state chip, or null when the wallet needs no chip at all.
+   * A fresh balance carries its own observation stamp, so a healthy wallet
+   * renders no status word (the same convention as the subscription
+   * cards' muted "Checked <time>" line).
+   */
+  statusLabel: string | null;
 };
 
 /** One currency's balance inside a wallet, as the floating surface shows it. */
@@ -637,10 +648,15 @@ function walletStateFor(
 function walletStatusLabel(
   state: FloatingWalletState,
   httpStatus: number | undefined,
-): string {
+): string | null {
   switch (state) {
     case "healthy":
-      return "Live";
+      // No status word for a fresh balance: the muted observation stamp
+      // below it ("Checked <local time>") already says the reading is
+      // current, so "Live" would repeat it.
+      return null;
+    case "paused":
+      return "Monitoring off";
     case "stale":
       return "Stale";
     case "cooldown":
@@ -659,17 +675,27 @@ function walletStatusLabel(
  * shown as unavailable. A real $0.00 survives unchanged because zero is a
  * valid balance, not missing data.
  *
+ * A wallet with monitoring turned off presents as `paused` regardless of its
+ * last health: nothing may read as live while the runtime is not polling
+ * it. Its last known balance and observation stamp are kept, so the card
+ * still says what the wallet held when collection stopped.
+ *
  * The legacy `remainingUsd` field is honored only when the wire carried no
  * `balances` list, so an older runtime snapshot still projects one USD
  * balance. It is never used to invent a balance that `balances` contradicts.
  */
-export function floatingWalletItem(wallet: ApiWallet): FloatingWalletItem {
+export function floatingWalletItem(
+  wallet: ApiWallet,
+  monitored = true,
+): FloatingWalletItem {
   const balances = walletBalances(wallet);
   const checkedAt =
     wallet.checkedAt && !Number.isNaN(Date.parse(wallet.checkedAt))
       ? wallet.checkedAt
       : null;
-  const state = walletStateFor(wallet.health, balances.length > 0);
+  const state: FloatingWalletState = monitored
+    ? walletStateFor(wallet.health, balances.length > 0)
+    : "paused";
   return {
     id: wallet.id,
     name: wallet.name,
@@ -737,9 +763,17 @@ function walletBalances(wallet: ApiWallet): FloatingWalletBalance[] {
   return [];
 }
 
-/** Wallet items in snapshot order, one per id. */
+/**
+ * Wallet items in snapshot order, one per id.
+ *
+ * `prefs` carries the per-wallet preferences (v0.8.17): it decides which
+ * items present as monitored, and the caller filters floating-bar
+ * visibility before calling — an id with no preference entry resolves to
+ * its registry default, so existing users see today's behavior.
+ */
 export function floatingWalletItems(
   wallets: readonly ApiWallet[],
+  prefs?: WalletPreferences | null,
 ): FloatingWalletItem[] {
   const items: FloatingWalletItem[] = [];
   const seen = new Set<string>();
@@ -747,7 +781,9 @@ export function floatingWalletItems(
     const id = wallet.id?.trim();
     if (!id || seen.has(id)) continue;
     seen.add(id);
-    items.push(floatingWalletItem({ ...wallet, id }));
+    items.push(
+      floatingWalletItem({ ...wallet, id }, isWalletMonitored(prefs, id)),
+    );
   }
   return items;
 }
@@ -768,9 +804,9 @@ export const API_WALLETS_DETAIL_ID = "api-wallets";
  * With several wallets the slot has one status dot, so it states the most
  * consequential state among them, in the order the dot's own colors read:
  * an error (red) outranks a cooldown or a stale reading (amber), which
- * outranks an unavailable wallet (muted), which outranks a live one. A
- * muted wallet therefore never hides a red error. An empty wallet list has
- * no state to show.
+ * outranks an unavailable or paused wallet (muted), which outranks a live
+ * one. A muted wallet therefore never hides a red error. An empty wallet
+ * list has no state to show.
  */
 export function floatingWalletSlotState(
   items: readonly FloatingWalletItem[],
@@ -781,10 +817,11 @@ export function floatingWalletSlotState(
   // TS, while the quoted member is the documented wire vocabulary.
   const rank: Record<FloatingWalletState, number> = {
     healthy: 0,
-    unavailable: 1,
-    stale: 2,
-    "cooldown": 3,
-    error: 4,
+    paused: 1,
+    unavailable: 2,
+    stale: 3,
+    "cooldown": 4,
+    error: 5,
   };
   return items.reduce<FloatingWalletState>(
     (worst, item) => (rank[item.state] > rank[worst] ? item.state : worst),
@@ -854,11 +891,12 @@ export function floatingWalletBalanceText(
 
 /**
  * Spoken label for the wallet slot: name, balance (or the unavailable
- * phrase), and status. The slot itself never prints a money figure, so this
- * is where assistive tech gets the number.
+ * phrase), and status when there is one. The slot itself never prints a
+ * money figure, so this is where assistive tech gets the number.
  *
  * A multi-currency wallet is spoken as one amount per currency: there is no
- * combined total to announce.
+ * combined total to announce. A fresh (healthy) wallet carries no status
+ * word — its spoken balance plus the shared surface is the whole message.
  */
 export function floatingWalletLabel(item: FloatingWalletItem): string {
   const amounts = item.balances
@@ -869,7 +907,7 @@ export function floatingWalletLabel(item: FloatingWalletItem): string {
   const parts = [
     `${item.name} API wallet`,
     balance ? `${balance} remaining` : "balance unavailable",
-    item.statusLabel,
+    ...(item.statusLabel ? [item.statusLabel] : []),
   ];
   return parts.join(", ");
 }

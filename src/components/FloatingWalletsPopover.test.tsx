@@ -4,10 +4,10 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { FloatingWalletsPopover } from "./FloatingWalletsPopover";
 import type { FloatingWalletItem } from "../lib/floatingQuota";
+import { formatTime } from "../lib/format";
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
-const NOW = new Date("2026-09-28T10:00:00.000Z");
 const CHECKED_AT = "2026-09-28T09:55:00.000Z";
 
 function item(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
@@ -17,7 +17,7 @@ function item(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
     state: "healthy",
     balances: [{ currency: "USD", amount: 12.5 }],
     checkedAt: CHECKED_AT,
-    statusLabel: "Live",
+    statusLabel: null,
     ...extra,
   };
 }
@@ -41,7 +41,6 @@ afterEach(async () => {
 async function renderPopover(overrides: Partial<PopoverProps> = {}) {
   const props: PopoverProps = {
     items: [item()],
-    now: NOW,
     pinned: false,
     align: 0,
     exiting: false,
@@ -78,25 +77,51 @@ async function click(element: Element) {
 }
 
 describe("FloatingWalletsPopover", () => {
-  it("presents the wallet balance with its status and observation age", async () => {
+  it("presents the wallet balance with its observation stamp and no status chip", async () => {
     await renderPopover();
     const text = dialog().textContent ?? "";
     expect(text).toContain("API Wallets");
     expect(text).toContain("OpenRouter");
     expect(text).toContain("USD 12.50");
     expect(text).toContain("remaining");
-    expect(text).toContain("Live");
-    expect(text).toContain("Checked ");
-    expect(text).toContain("5m ago");
+    // A fresh balance carries no "Live" chip: the muted observation stamp
+    // already says the reading is current.
+    expect(text).not.toContain("Live");
+    expect(text).toContain("Checked " + formatTime(CHECKED_AT));
     expect(dialog().getAttribute("data-wallet")).toBe("api-wallets");
+  });
+
+  it("states the observation stamp in the subscription cards' muted, non-bold convention", async () => {
+    await renderPopover();
+    const section = dialog().querySelector<HTMLElement>(".fq-wallet-section");
+    expect(section).not.toBeNull();
+    const line = section!.querySelector<HTMLElement>(".fq-primary-reset");
+    expect(line).not.toBeNull();
+    // Absolute local time, exactly one muted line, nothing emphasized.
+    expect(line!.textContent).toBe("Checked " + formatTime(CHECKED_AT));
+    expect(line!.querySelector("strong")).toBeNull();
   });
 
   it("labels a retained reading as last known rather than freshly checked", async () => {
     await renderPopover({
       items: [item({ state: "stale", statusLabel: "Stale" })],
     });
-    expect(dialog().textContent).toContain("Last known");
+    expect(dialog().textContent).toContain(
+      "Last known " + formatTime(CHECKED_AT),
+    );
     expect(dialog().textContent).toContain("Stale");
+  });
+
+  it("presents a monitoring-off wallet as paused with no refresh action", async () => {
+    await renderPopover({
+      items: [item({ state: "paused", statusLabel: "Monitoring off" })],
+    });
+    const text = dialog().textContent ?? "";
+    expect(text).toContain("Monitoring off");
+    expect(text).toContain("Last known " + formatTime(CHECKED_AT));
+    // The wallet is not collected on purpose, so there is nothing a manual
+    // read could add.
+    expect(dialog().querySelector(".fq-wallet-refresh")).toBeNull();
   });
 
   it("explains a rate-limit cooldown and offers no action that would fail", async () => {
