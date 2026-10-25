@@ -70,6 +70,7 @@ describe("settings persistence", () => {
       usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
   });
 
@@ -129,6 +130,7 @@ describe("v0.6 settings migration contract", () => {
       usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
   });
 
@@ -142,6 +144,7 @@ describe("v0.6 settings migration contract", () => {
       usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
   });
 
@@ -213,6 +216,7 @@ describe("v0.6 settings migration contract", () => {
       usageIntelligence: false,
       providerPreferences: { order: ["openai-codex"], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
 
     saveSettings(loaded);
@@ -239,6 +243,7 @@ describe("v0.6 settings migration contract", () => {
       usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
   });
 
@@ -301,6 +306,7 @@ describe("v0.6 settings migration contract", () => {
         hidden: ["grok"],
       },
       quotaPerspective: "remaining",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
 
     saveSettings(loaded);
@@ -327,6 +333,7 @@ describe("settings safe write contract", () => {
       usageIntelligence: false,
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
+      walletPreferences: { monitored: {}, floatingBar: {} },
     });
   });
 
@@ -382,6 +389,7 @@ describe("settings reset (v0.7 local data)", () => {
       "refreshIntervalMinutes",
       "theme",
       "usageIntelligence",
+      "walletPreferences",
     ]);
     expect(stored.futureLaneField).toEqual({ nested: [1, 2, 3] });
     expect(stored.quotaPerspective).toBe("used");
@@ -439,5 +447,78 @@ describe("settings reset (v0.7 local data)", () => {
     resetSettings();
     expect(resetSettings()).toEqual(DEFAULT_SETTINGS);
     expect(loadSettings()).toEqual(DEFAULT_SETTINGS);
+  });
+});
+
+describe("wallet preferences persistence", () => {
+  it("round-trips per-wallet monitor and floating-bar flags", () => {
+    stubStorage();
+    saveSettings({
+      ...DEFAULT_SETTINGS,
+      walletPreferences: {
+        monitored: { openrouter: false, deepseek: true },
+        floatingBar: { deepseek: false },
+      },
+    });
+    const loaded = loadSettings();
+    expect(loaded.walletPreferences.monitored).toEqual({
+      openrouter: false,
+      deepseek: true,
+    });
+    expect(loaded.walletPreferences.floatingBar).toEqual({
+      deepseek: false,
+    });
+    // A reload from the stored JSON lands on the same flags.
+    expect(loadSettings().walletPreferences).toEqual(
+      loaded.walletPreferences,
+    );
+  });
+
+  it("defaults wallet preferences for settings written before they existed", () => {
+    stubStorage().set(
+      "rate-limits.settings.v1",
+      JSON.stringify({ launchAtStartup: true, refreshIntervalMinutes: 15 }),
+    );
+    expect(loadSettings().walletPreferences).toEqual({
+      monitored: {},
+      floatingBar: {},
+    });
+  });
+
+  it("drops non-boolean wallet flags instead of poisoning the map", () => {
+    stubStorage().set(
+      "rate-limits.settings.v1",
+      JSON.stringify({
+        ...DEFAULT_SETTINGS,
+        walletPreferences: {
+          monitored: { openrouter: false, deepseek: "yes" },
+          floatingBar: "hidden",
+        },
+      }),
+    );
+    const loaded = loadSettings();
+    expect(loaded.walletPreferences.monitored).toEqual({ openrouter: false });
+    expect(loaded.walletPreferences.floatingBar).toEqual({});
+  });
+
+  it("keeps wallet preferences when another field is saved", () => {
+    stubStorage();
+    const loaded = loadSettings();
+    saveSettings({
+      ...loaded,
+      walletPreferences: {
+        monitored: { openrouter: false },
+        floatingBar: {},
+      },
+    });
+    saveSettings({ ...loadSettings(), theme: "glass" });
+    const stored = JSON.parse(
+      localStorage.getItem("rate-limits.settings.v1")!,
+    );
+    expect(stored.theme).toBe("glass");
+    expect(stored.walletPreferences).toEqual({
+      monitored: { openrouter: false },
+      floatingBar: {},
+    });
   });
 });

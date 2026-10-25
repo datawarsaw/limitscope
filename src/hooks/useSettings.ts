@@ -21,6 +21,11 @@ import {
   moveProviderOrder,
   toggleProviderHidden,
 } from "../lib/providerPreferences";
+import {
+  withWalletFloatingBar,
+  withWalletMonitored,
+  type WalletPreferences,
+} from "../lib/walletPreferences";
 
 
 export function useSettings() {
@@ -153,6 +158,58 @@ export function useSettings() {
     });
   }, []);
 
+  const setWalletPreferences = useCallback(
+    (walletPreferences: WalletPreferences) => {
+      setSettings((prev) => {
+        const next = { ...prev, walletPreferences };
+        saveSettings(next);
+        return next;
+      });
+    },
+    [],
+  );
+
+  /**
+   * Turns one wallet's automatic balance collection on or off. The runtime
+   * enforces the flag (its own persisted mirror is loaded before the first
+   * collection cycle); a disabled wallet keeps its last known balance and
+   * never loses historical data.
+   */
+  const setWalletMonitored = useCallback((walletId: string, monitored: boolean) => {
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        walletPreferences: withWalletMonitored(
+          prev.walletPreferences,
+          walletId,
+          monitored,
+        ),
+      };
+      saveSettings(next);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Shows or hides one wallet in the floating API Wallets card.
+   * Presentation only: a hidden wallet keeps being monitored, and a
+   * monitored wallet stays displayable with no other configuration change.
+   */
+  const setWalletInFloatingBar = useCallback((walletId: string, visible: boolean) => {
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        walletPreferences: withWalletFloatingBar(
+          prev.walletPreferences,
+          walletId,
+          visible,
+        ),
+      };
+      saveSettings(next);
+      return next;
+    });
+  }, []);
+
   const setProviderPreferences = useCallback(
     (providerPreferences: ProviderPreferences) => {
       setSettings((prev) => {
@@ -245,12 +302,17 @@ export function useSettings() {
       // The runtime persists two of these preferences itself (the
       // notification lane's enabled flag and the refresh interval), so the
       // reset is mirrored into it. Both setters are idempotent, which makes
-      // the ordinary change effects firing on the same state harmless.
+      // the ordinary change effects firing on the same state harmless. The
+      // wallet monitor map is mirrored the same way: its Rust store is
+      // loaded before the first collection cycle.
       await invoke("set_quota_notifications_enabled", {
         enabled: defaults.quotaNotifications,
       });
       await invoke("set_refresh_interval", {
         minutes: defaults.refreshIntervalMinutes,
+      });
+      await invoke("set_wallet_monitoring", {
+        monitored: defaults.walletPreferences.monitored,
       });
     } catch (error) {
       console.error("Failed to push the reset preferences to the runtime", error);
@@ -286,6 +348,21 @@ export function useSettings() {
     });
   }, [settings.usageIntelligence]);
 
+  // The runtime gates wallet collection on these flags (v0.8.17), so the
+  // monitor map is forwarded to Rust on attach and on every change, like
+  // the notification lane. The wallet-prefs store persists it itself,
+  // which covers the scheduler's immediate startup cycle before any window
+  // attaches. `withWalletMonitored` replaces the record on every change,
+  // so the effect fires exactly when a wallet flag moves.
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+    void invoke("set_wallet_monitoring", {
+      monitored: settings.walletPreferences.monitored,
+    }).catch((error) => {
+      console.error("Failed to sync the wallet monitoring settings", error);
+    });
+  }, [settings.walletPreferences.monitored]);
+
   return {
     settings,
     setLaunchAtStartup,
@@ -297,6 +374,9 @@ export function useSettings() {
     setProviderPreferences,
     setProviderHidden,
     moveProvider,
+    setWalletPreferences,
+    setWalletMonitored,
+    setWalletInFloatingBar,
     resetPreferences,
     startupPending,
     startupError,

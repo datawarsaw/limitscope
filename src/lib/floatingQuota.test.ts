@@ -944,20 +944,64 @@ function wallet(extra: Partial<ApiWallet> = {}): ApiWallet {
 }
 
 describe("floating wallet presentation", () => {
-  it("maps a live reading to a healthy wallet with two decimals", () => {
+  it("maps a live reading to a healthy wallet with two decimals and no status chip", () => {
     const item = floatingWalletItem(wallet());
     expect(item).toMatchObject({
       id: "openrouter",
       name: "OpenRouter",
       state: "healthy",
       checkedAt: CHECKED_AT,
-      statusLabel: "Live",
+      statusLabel: null,
     });
     expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
     expect(floatingWalletBalanceText(item)).toBe("USD 12.50");
+    // A fresh balance carries no status word: its muted observation stamp
+    // already says the reading is current.
     expect(floatingWalletLabel(item)).toBe(
-      "OpenRouter API wallet, USD 12.50 remaining, Live",
+      "OpenRouter API wallet, USD 12.50 remaining",
     );
+  });
+
+  it("presents a wallet with monitoring off as paused with its last known balance", () => {
+    const item = floatingWalletItem(wallet(), false);
+    expect(item.state).toBe("paused");
+    expect(item.statusLabel).toBe("Monitoring off");
+    // The frozen reading is kept: monitoring off never deletes data.
+    expect(item.balances).toEqual([{ currency: "USD", amount: 12.5 }]);
+    expect(item.checkedAt).toBe(CHECKED_AT);
+    expect(floatingWalletLabel(item)).toBe(
+      "OpenRouter API wallet, USD 12.50 remaining, Monitoring off",
+    );
+  });
+
+  it("resolves monitoring from per-wallet preferences with registry defaults", () => {
+    // No preferences: every plain collector is monitored.
+    expect(
+      floatingWalletItems([wallet(), wallet({ id: "deepseek" })]).map(
+        (item) => item.state,
+      ),
+    ).toEqual(["healthy", "healthy"]);
+    // The registered OpenAI placeholder defaults to paused.
+    const [openai] = floatingWalletItems([
+      wallet({ id: "openai", name: "OpenAI" }),
+    ]);
+    expect(openai.state).toBe("paused");
+    // An explicit off flag wins over the live health; an explicit on flag
+    // wins over nothing.
+    const items = floatingWalletItems(
+      [wallet(), wallet({ id: "deepseek", health: "stale" })],
+      {
+        monitored: { openrouter: false },
+        floatingBar: {},
+      },
+    );
+    expect(items[0].state).toBe("paused");
+    expect(items[1].state).toBe("stale");
+    const reenabled = floatingWalletItems([wallet()], {
+      monitored: { openrouter: true },
+      floatingBar: {},
+    });
+    expect(reenabled[0].state).toBe("healthy");
   });
 
   it("keeps a real zero balance as 0.00", () => {
@@ -1122,6 +1166,26 @@ describe("floating wallet presentation", () => {
         floatingWalletItem(wallet({ health: "unavailable" })),
       ]),
     ).toBe("unavailable");
+  });
+
+  it("ranks a paused wallet as muted and never as live", () => {
+    expect(
+      floatingWalletSlotState([floatingWalletItem(wallet(), false)]),
+    ).toBe("paused");
+    // A paused wallet is muted, so a stale sibling still owns the dot.
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet(), false),
+        floatingWalletItem(wallet({ id: "deepseek", health: "stale" }), true),
+      ]),
+    ).toBe("stale");
+    // And a paused slot never claims freshness for a live sibling.
+    expect(
+      floatingWalletSlotState([
+        floatingWalletItem(wallet(), true),
+        floatingWalletItem(wallet({ id: "deepseek" }), false),
+      ]),
+    ).toBe("paused");
   });
 
   it("speaks every wallet's amount with its own currency", () => {

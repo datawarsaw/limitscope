@@ -324,7 +324,6 @@ export function FloatingQuotaBar({
         <FloatingWalletsPopover
           items={activeWallets}
           pinned={pinned}
-          now={now}
           align={align}
           exiting={exiting}
           busy={walletBusy}

@@ -693,6 +693,12 @@ pub struct ProviderSpec {
 pub struct WalletSpec {
     pub id: &'static str,
     pub name: &'static str,
+    /// Whether this source is collected when no explicit wallet preference
+    /// exists for its id. Real collectors default to monitored; a registered
+    /// placeholder defaults to off (see the OpenAI entry below). The
+    /// settings lane's persisted monitor flags override this whenever they
+    /// carry an explicit entry for the id.
+    pub monitored_by_default: bool,
     pub fetch: WalletFetchFn,
     /// Resolves the deterministic binding of the credential currently stored
     /// for this wallet. Read-only and secret-free. `None` means the current
@@ -1520,13 +1526,22 @@ pub fn production_specs() -> Vec<ProviderSpec> {
     ]
 }
 
-/// The production wallet set. One entry for OpenRouter Phase 1; the registry
-/// shape lets a later wallet be added without touching the cycle machinery.
+/// The production wallet set. The registry shape lets a later wallet be
+/// added without touching the cycle machinery.
+///
+/// OpenAI is registered as a disabled-by-default placeholder, not a
+/// collector: the public OpenAI API documents organization usage and cost
+/// endpoints but no prepaid remaining-credit balance endpoint, and billing
+/// pages, browser sessions, and undocumented routes are out of bounds. The
+/// offline fetch below fails closed with a source-absent failure if it is
+/// ever invoked (its monitor default is off, so ordinary cycles never call
+/// it); nothing is estimated, scraped, or presented as a verified balance.
 pub fn production_wallets() -> Vec<WalletSpec> {
     vec![
         WalletSpec {
             id: "openrouter",
             name: "OpenRouter",
+            monitored_by_default: true,
             current_credential_binding: Arc::new(wallet::current_credential_binding),
             fetch: Arc::new(|| {
                 Box::pin(async {
@@ -1539,6 +1554,7 @@ pub fn production_wallets() -> Vec<WalletSpec> {
         WalletSpec {
             id: "deepseek",
             name: "DeepSeek",
+            monitored_by_default: true,
             current_credential_binding: Arc::new(crate::wallet_deepseek::current_credential_binding),
             fetch: Arc::new(|| {
                 Box::pin(async {
@@ -1548,7 +1564,43 @@ pub fn production_wallets() -> Vec<WalletSpec> {
                 })
             }),
         },
+        WalletSpec {
+            id: "openai",
+            name: "OpenAI",
+            monitored_by_default: false,
+            current_credential_binding: Arc::new(|| None),
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    Err(ProviderFailure {
+                        code: "credential_missing".to_string(),
+                        message: "OpenAI balance monitoring is unavailable: the public OpenAI API exposes usage and cost reporting, not a prepaid remaining balance.".to_string(),
+                        http_status: None,
+                        transient: Some(false),
+                        retry_after_ms: None,
+                        identity: None,
+                        credential_binding: None,
+                        transport_timeout: false,
+                    })
+                })
+            }),
+        },
     ]
+}
+
+/// Merges hydrated last-good wallet entries into the seeded placeholder
+/// list by wallet id. Hydration returns only wallets with valid persisted
+/// data, so replacing the seeded list wholesale would permanently drop
+/// every registered wallet with nothing persisted — a disabled monitor,
+/// the OpenAI placeholder — leaving it unconfigurable in the settings
+/// drawer. The merge keeps the full registry in spec order; a merged slot
+/// keeps its stale health, observation stamp, identity, and credential
+/// binding.
+fn merge_hydrated_wallets(seeded: &mut Vec<ApiWalletDto>, hydrated: Vec<ApiWalletDto>) {
+    for dto in hydrated {
+        if let Some(slot) = seeded.iter_mut().find(|wallet| wallet.id == dto.id) {
+            *slot = dto;
+        }
+    }
 }
 
 // ---------- retry, cadence, cooldown, and last-good constants ----------
@@ -1780,6 +1832,10 @@ struct RuntimeInner {
     /// A wallet refresh landed while a cycle was in flight; the coalesced
     /// follow-up cycle carries the force.
     wallet_force_requested: bool,
+    /// Explicit per-wallet monitor flags (the settings lane's persisted
+    /// mirror, loaded before the first cycle). A wallet absent from this map
+    /// falls back to its spec's `monitored_by_default`.
+    wallet_monitored: HashMap<&'static str, bool>,
     /// Active server-directed cooldowns by provider id (ephemeral).
     cooldowns: HashMap<&'static str, ProviderCooldown>,
     /// Last accepted automatic trigger per kind (burst dedupe).
@@ -1838,6 +1894,10 @@ pub struct RuntimeCore {
     notifications: Option<Arc<NotificationLane>>,
     /// Persisted normalized last-good provider state for v0.6 cold-start hydration.
     last_good_store: Option<Arc<ProviderLastGoodStore>>,
+    /// Persisted per-wallet monitor preferences (v0.8.17 wallet
+    /// configuration). Loaded before the first cycle, so a disabled wallet
+    /// is never polled — not even at startup.
+    wallet_prefs: Option<Arc<crate::wallet_prefs::WalletPrefsStore>>,
 }
 
 impl RuntimeCore {
@@ -1881,9 +1941,7 @@ impl RuntimeCore {
             let mut inner = self.inner.lock().unwrap();
             inner.usages = usages;
             inner.last_good = last_good;
-            if !wallets.is_empty() {
-                inner.wallets = wallets;
-            }
+            merge_hydrated_wallets(&mut inner.wallets, wallets);
             inner.wallet_last_good = wallet_last_good;
         }
         self.last_good_store = store;
@@ -1897,7 +1955,8 @@ impl RuntimeCore {
 
     /// Registers the prepaid wallet sources. The slots are visible in every
     /// snapshot from the start as `unknown` placeholders; hydrated last-good
-    /// entries replace them as `stale`.
+    /// entries are merged into them as `stale` by wallet id, so the
+    /// registered set never shrinks.
     pub fn with_wallets(mut self, specs: Vec<WalletSpec>) -> Self {
         self.wallet_specs = specs;
         {
@@ -1925,12 +1984,78 @@ impl RuntimeCore {
             let (wallets, wallet_last_good) =
                 store.hydrate_wallets(&self.wallet_specs, (self.now)());
             let mut inner = self.inner.lock().unwrap();
-            if !wallets.is_empty() {
-                inner.wallets = wallets;
-            }
+            merge_hydrated_wallets(&mut inner.wallets, wallets);
             inner.wallet_last_good = wallet_last_good;
         }
         self
+    }
+
+    /// Attaches the persisted per-wallet monitor preferences. The flags are
+    /// loaded into the runtime state immediately, so a wallet the user
+    /// turned off is never polled — the scheduler's startup cycle included.
+    pub fn with_wallet_preferences(
+        mut self,
+        store: Option<Arc<crate::wallet_prefs::WalletPrefsStore>>,
+    ) -> Self {
+        if let Some(store) = &store {
+            let monitored = store.monitored();
+            let mut inner = self.inner.lock().unwrap();
+            inner.wallet_monitored = monitored
+                .into_iter()
+                .filter_map(|(id, flag)| {
+                    self.wallet_specs
+                        .iter()
+                        .find(|spec| spec.id == id)
+                        .map(|spec| (spec.id, flag))
+                })
+                .collect();
+        }
+        self.wallet_prefs = store;
+        self
+    }
+
+    /// Whether this wallet's balance is collected. An explicit persisted
+    /// flag wins; otherwise the spec's own default applies.
+    fn wallet_monitored(&self, spec: &WalletSpec) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .wallet_monitored
+            .get(spec.id)
+            .copied()
+            .unwrap_or(spec.monitored_by_default)
+    }
+
+    /// Applies the settings lane's per-wallet monitor flags. Only known
+    /// wallet ids are kept — an id the registry does not know has no
+    /// collector to gate. Idempotent: an unchanged map rewrites nothing.
+    /// Returns whether the effective configuration changed, so the caller
+    /// can decide to trigger a fresh observation for a re-enabled wallet.
+    pub fn set_wallet_monitoring(&self, monitored: &HashMap<String, bool>) -> bool {
+        let effective: HashMap<&'static str, bool> = self
+            .wallet_specs
+            .iter()
+            .filter_map(|spec| {
+                monitored
+                    .get(spec.id)
+                    .map(|flag| (spec.id, *flag))
+            })
+            .collect();
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.wallet_monitored == effective {
+                return false;
+            }
+            inner.wallet_monitored = effective;
+        }
+        if let Some(store) = &self.wallet_prefs {
+            let persisted: HashMap<String, bool> = monitored
+                .iter()
+                .filter(|(id, _)| self.wallet_specs.iter().any(|spec| spec.id == *id))
+                .map(|(id, flag)| (id.clone(), *flag))
+                .collect();
+            let _ = store.set_monitored(&persisted);
+        }
+        true
     }
 
     pub fn with_injections(
@@ -1950,6 +2075,7 @@ impl RuntimeCore {
                 wallet_last_attempt_at: HashMap::new(),
                 wallet_force: false,
                 wallet_force_requested: false,
+                wallet_monitored: HashMap::new(),
                 cooldowns: HashMap::new(),
                 last_auto_trigger: HashMap::new(),
                 grok_last_result: None,
@@ -1977,6 +2103,7 @@ impl RuntimeCore {
             usage_intelligence: None,
             notifications: None,
             last_good_store: None,
+            wallet_prefs: None,
         }
     }
 
@@ -2111,8 +2238,15 @@ impl RuntimeCore {
         }
         // Wallets run as independent jobs in the same cycle: no daemon, no
         // second scheduler, and the provider jobs keep running beside them.
+        // A wallet with monitoring turned off is never collected: no job is
+        // spawned, so nothing — not even a cadence-cache read — touches its
+        // source, and its snapshot entry stays frozen at its last state
+        // (hydrated last-good included) until monitoring is re-enabled.
         let mut wallet_jobs = tokio::task::JoinSet::new();
         for (index, spec) in self.wallet_specs.iter().enumerate() {
+            if !self.wallet_monitored(spec) {
+                continue;
+            }
             let core = self.clone();
             let spec = spec.clone();
             wallet_jobs.spawn(async move { (index, core.run_wallet_job(&spec).await) });
@@ -2154,6 +2288,11 @@ impl RuntimeCore {
             if completed_wallets.contains(&index) {
                 continue;
             }
+            // A wallet skipped by configuration never ran, so the lost-task
+            // projection must not dress its frozen state up as a failure.
+            if !self.wallet_monitored(spec) {
+                continue;
+            }
             let failure = if lost_wallet_tasks == 1 {
                 failure_from_panic()
             } else {
@@ -2185,7 +2324,7 @@ impl RuntimeCore {
         results.sort_by_key(|(index, _)| *index);
 
         let mut usages: Vec<ProviderUsageDto> = results.into_iter().map(|(_, dto)| dto).collect();
-        let wallets: Vec<ApiWalletDto> =
+        let mut wallets: Vec<ApiWalletDto> =
             wallet_results.into_iter().map(|(_, dto)| dto).collect();
         // History recording (phase 2): one batch per completed cycle, from
         // the same normalized snapshot that is about to be broadcast.
@@ -2283,6 +2422,24 @@ impl RuntimeCore {
         }
         inner.last_cycle_completed_at = Some(completed_at);
         inner.usages = usages;
+        // A wallet skipped by configuration never ran this cycle, so its
+        // previous entry is carried forward untouched — the slot never
+        // disappears from the snapshot and the last known state keeps its
+        // stamp. The vec stays in spec order.
+        for spec in &self.wallet_specs {
+            if wallets.iter().any(|wallet| wallet.id == spec.id) {
+                continue;
+            }
+            if let Some(frozen) = inner.wallets.iter().find(|wallet| wallet.id == spec.id) {
+                wallets.push(frozen.clone());
+            }
+        }
+        wallets.sort_by_key(|wallet| {
+            self.wallet_specs
+                .iter()
+                .position(|spec| spec.id == wallet.id)
+                .unwrap_or(usize::MAX)
+        });
         inner.wallets = wallets;
         inner.seq += 1;
     }
@@ -3534,6 +3691,14 @@ impl RuntimeHandle {
         }
     }
 
+    /// Applies the settings lane's per-wallet monitor flags (see
+    /// [`RuntimeCore::set_wallet_monitoring`]). The wallet DTOs are
+    /// unchanged by this, so no snapshot event is needed: the windows sync
+    /// the preference through their own settings lane.
+    pub fn set_wallet_monitoring(&self, monitored: HashMap<String, bool>) {
+        self.core.set_wallet_monitoring(&monitored);
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.core.snapshot()
     }
@@ -3731,10 +3896,20 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
             dir.join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME),
         ))
     });
+    // Per-wallet monitor preferences (v0.8.17): one bounded JSON file,
+    // loaded before the scheduler's first cycle so a wallet the user turned
+    // off is never polled — the startup cycle included. An unresolvable
+    // data dir degrades to per-spec defaults instead of blocking startup.
+    let wallet_prefs = app.path().app_data_dir().ok().map(|dir| {
+        Arc::new(crate::wallet_prefs::WalletPrefsStore::open(
+            dir.join(crate::wallet_prefs::WALLET_PREFS_FILE_NAME),
+        ))
+    });
     let handle = RuntimeHandle {
         core: Arc::new(
             RuntimeCore::new(production_specs(), DEFAULT_INTERVAL_MINUTES)
                 .with_wallets(production_wallets())
+                .with_wallet_preferences(wallet_prefs.clone())
                 .with_last_good_store(last_good.clone())
                 .with_history_store(history.clone())
                 .with_usage_intelligence_store(usage_intelligence.clone())
@@ -3856,6 +4031,18 @@ pub fn set_refresh_interval(handle: tauri::State<RuntimeHandle>, minutes: u64) {
 #[tauri::command]
 pub fn set_quota_notifications_enabled(handle: tauri::State<RuntimeHandle>, enabled: bool) {
     handle.set_notifications_enabled(enabled);
+}
+
+/// The per-wallet monitor toggles (settings drawer). Forwards the persisted
+/// TS map on attach and on every change; the wallet-prefs store persists it
+/// itself, which covers the scheduler's immediate startup cycle before any
+/// window attaches. Unknown wallet ids are ignored at the gate.
+#[tauri::command]
+pub fn set_wallet_monitoring(
+    handle: tauri::State<RuntimeHandle>,
+    monitored: HashMap<String, bool>,
+) {
+    handle.set_wallet_monitoring(monitored);
 }
 
 // ---------- tests ----------
@@ -3983,12 +4170,44 @@ mod tests {
         WalletSpec {
             id,
             name,
+            monitored_by_default: true,
             current_credential_binding: Arc::new(move || credential.lock().unwrap().clone()),
             fetch: Arc::new(move || {
                 let calls = calls.clone();
                 let nth = calls.fetch_add(1, Ordering::SeqCst) + 1;
                 let result = outcome(nth);
                 Box::pin(async move { result }) as WalletFetchFuture
+            }),
+        }
+    }
+
+    /// The OpenAI-style placeholder: registered but disabled by default,
+    /// with a fail-closed fetch the runtime must never reach while the
+    /// monitor stays off. The counter proves the never-polled guarantee.
+    fn disabled_placeholder_wallet(
+        id: &'static str,
+        name: &'static str,
+        calls: Arc<AtomicUsize>,
+    ) -> WalletSpec {
+        WalletSpec {
+            id,
+            name,
+            monitored_by_default: false,
+            current_credential_binding: Arc::new(|| None),
+            fetch: Arc::new(move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Err(ProviderFailure {
+                        code: "credential_missing".to_string(),
+                        message: "placeholder fetch must never run".to_string(),
+                        http_status: None,
+                        transient: Some(false),
+                        retry_after_ms: None,
+                        identity: None,
+                        credential_binding: None,
+                        transport_timeout: false,
+                    })
+                }) as WalletFetchFuture
             }),
         }
     }
@@ -9784,6 +10003,7 @@ mod tests {
         let wallet = WalletSpec {
             id: "openrouter",
             name: "OpenRouter",
+            monitored_by_default: true,
             current_credential_binding: Arc::new(|| {
                 Some(WALLET_BINDING_A.to_string())
             }),
@@ -10335,6 +10555,7 @@ mod tests {
         let wallet = WalletSpec {
             id: "openrouter",
             name: "OpenRouter",
+            monitored_by_default: true,
             current_credential_binding: Arc::new(move || {
                 let nth = read_counter.fetch_add(1, Ordering::SeqCst);
                 Some(
@@ -10598,8 +10819,381 @@ mod tests {
     fn the_wallet_registration_carries_both_prepaid_sources() {
         let specs = production_wallets();
         let ids: Vec<&str> = specs.iter().map(|spec| spec.id).collect();
-        assert_eq!(ids, vec!["openrouter", "deepseek"]);
+        assert_eq!(ids, vec!["openrouter", "deepseek", "openai"]);
         assert_eq!(specs[0].name, "OpenRouter");
         assert_eq!(specs[1].name, "DeepSeek");
+        assert_eq!(specs[2].name, "OpenAI");
+        // The plain collectors are monitored by default; the OpenAI
+        // placeholder is a registered, collector-free entry that defaults
+        // to off, so a fresh install never sends it a request.
+        assert!(specs[0].monitored_by_default);
+        assert!(specs[1].monitored_by_default);
+        assert!(!specs[2].monitored_by_default);
+    }
+
+    #[test]
+    fn an_openai_observation_is_never_attempted_and_fails_closed_offline() {
+        // The placeholder's fetch is deliberately offline: if it is ever
+        // invoked (it is gated off by default and not toggleable in the
+        // UI), it answers with a source-absent failure — no network, no
+        // estimated balance.
+        let specs = production_wallets();
+        let openai = specs
+            .iter()
+            .find(|spec| spec.id == "openai")
+            .expect("openai placeholder registered");
+        let outcome = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(async { (openai.fetch)().await });
+        let failure = outcome.expect_err("the placeholder never resolves");
+        assert_eq!(failure.code, "credential_missing");
+        assert_eq!(
+            wallet_failure_health(&failure),
+            WalletHealth::Unavailable
+        );
+        assert_eq!(failure.http_status, None);
+    }
+
+    #[tokio::test]
+    async fn a_wallet_with_monitoring_off_is_never_polled_and_keeps_its_frozen_state() {
+        let openrouter_calls = Arc::new(AtomicUsize::new(0));
+        let deepseek_calls = Arc::new(AtomicUsize::new(0));
+        let openrouter = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            openrouter_calls.clone(),
+            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+        );
+        let deepseek = counting_wallet(
+            "deepseek",
+            "DeepSeek",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            deepseek_calls.clone(),
+            |nth| Ok(wallet_balance(100.0 + nth as f64, None, Some(WALLET_BINDING_A))),
+        );
+        let (core, clock) = manual_clock_core_with_wallets(vec![], vec![openrouter, deepseek]);
+
+        core.run_cycle().await;
+        assert_eq!(openrouter_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(deepseek_calls.load(Ordering::SeqCst), 1);
+
+        // Monitoring off for one wallet: the sibling has no explicit entry,
+        // so it keeps its spec default (monitored).
+        assert!(core
+            .set_wallet_monitoring(&HashMap::from([("openrouter".to_string(), false)])));
+
+        advance(&clock, 16 * 60_000);
+        core.run_cycle().await;
+        assert_eq!(
+            openrouter_calls.load(Ordering::SeqCst),
+            1,
+            "no fetch for an unmonitored wallet, cadence elapsed or not"
+        );
+        assert_eq!(
+            deepseek_calls.load(Ordering::SeqCst),
+            2,
+            "the monitored sibling keeps its own cadence"
+        );
+
+        // A manual force must not bypass the gate either: monitoring off
+        // means nothing is collected for that wallet, on any trigger.
+        assert!(core.try_begin_wallet_cycle());
+        core.run_cycle().await;
+        assert_eq!(
+            openrouter_calls.load(Ordering::SeqCst),
+            1,
+            "a manual refresh skips unmonitored wallets"
+        );
+        assert_eq!(
+            deepseek_calls.load(Ordering::SeqCst),
+            3,
+            "the manual refresh still forces the monitored wallet past its cadence cache"
+        );
+
+        // The unmonitored entry is frozen, never failed: the lost-task
+        // containment must not dress a configuration skip up as an error.
+        let frozen = core
+            .snapshot()
+            .wallets
+            .into_iter()
+            .find(|wallet| wallet.id == "openrouter")
+            .expect("the slot stays registered");
+        assert_eq!(frozen.health, WalletHealth::Live);
+        assert_eq!(frozen.remaining_usd, Some(1.0));
+        assert!(frozen.error.is_none());
+        assert!(frozen.error_category.is_none());
+    }
+
+    #[tokio::test]
+    async fn monitoring_preferences_persist_across_a_restart_and_disabling_keeps_the_last_good_balance() {
+        let prefs_path = wallet_store_path("prefs-restart");
+        let last_good_path = wallet_store_path("lastgood-restart");
+        {
+            let prefs =
+                Arc::new(crate::wallet_prefs::WalletPrefsStore::open(prefs_path.clone()));
+            let last_good = Arc::new(ProviderLastGoodStore::open_with_clock(
+                last_good_path.clone(),
+                Box::new(fixed_now),
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let wallet = counting_wallet(
+                "openrouter",
+                "OpenRouter",
+                wallet_credential(Some(WALLET_BINDING_A)),
+                calls.clone(),
+                |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+            );
+            let core = Arc::new(
+                RuntimeCore::with_injections(vec![], 5, Box::new(|| 0), Box::new(fixed_now))
+                    .with_wallets(vec![wallet])
+                    .with_wallet_preferences(Some(prefs))
+                    .with_last_good_store(Some(last_good.clone())),
+            );
+            core.run_cycle().await;
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            core.set_wallet_monitoring(&HashMap::from([(
+                "openrouter".to_string(),
+                false,
+            )]));
+            core.run_cycle().await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "the disabled wallet is not collected"
+            );
+            assert!(
+                last_good.get_persisted_wallet("openrouter").is_some(),
+                "disabling monitoring must not delete the persisted balance"
+            );
+        }
+        // Restart: the new runtime loads the persisted flags before its
+        // first cycle, so the disabled wallet is not polled at startup —
+        // and the hydrated last-good balance still surfaces, as stale.
+        {
+            let prefs =
+                Arc::new(crate::wallet_prefs::WalletPrefsStore::open(prefs_path.clone()));
+            assert_eq!(
+                prefs.monitored().get("openrouter"),
+                Some(&false),
+                "the flag survives the restart"
+            );
+            let last_good = Arc::new(ProviderLastGoodStore::open_with_clock(
+                last_good_path.clone(),
+                Box::new(fixed_now),
+            ));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let wallet = counting_wallet(
+                "openrouter",
+                "OpenRouter",
+                wallet_credential(Some(WALLET_BINDING_A)),
+                calls.clone(),
+                |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+            );
+            let core = Arc::new(
+                RuntimeCore::with_injections(vec![], 5, Box::new(|| 0), Box::new(fixed_now))
+                    .with_wallets(vec![wallet])
+                    .with_wallet_preferences(Some(prefs))
+                    .with_last_good_store(Some(last_good)),
+            );
+            core.run_cycle().await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "the startup cycle must not poll a wallet the user turned off"
+            );
+            let entry = core.snapshot().wallets.into_iter().next().unwrap();
+            assert_eq!(entry.health, WalletHealth::Stale);
+            assert_eq!(entry.remaining_usd, Some(1.0));
+        }
+        remove_wallet_store(&prefs_path);
+        remove_wallet_store(&last_good_path);
+    }
+
+    // Regression (P2): hydration used to replace the seeded placeholder
+    // list with the partial persisted result, so a wallet with nothing
+    // persisted — a disabled monitor, the OpenAI placeholder — vanished
+    // from the snapshot at restart and could not be re-enabled from the
+    // settings drawer. The merge keeps the full registry present.
+    #[tokio::test]
+    async fn restart_hydration_keeps_every_registered_wallet_present_and_configurable() {
+        let prefs_path = wallet_store_path("hydrate-complete-prefs");
+        let last_good_path = wallet_store_path("hydrate-complete-lastgood");
+        // Session 1: openrouter observes a balance; deepseek is switched
+        // off before any cycle (so it has no persisted data at all); the
+        // OpenAI placeholder stays off by its spec default.
+        {
+            let prefs =
+                Arc::new(crate::wallet_prefs::WalletPrefsStore::open(prefs_path.clone()));
+            let last_good = Arc::new(ProviderLastGoodStore::open_with_clock(
+                last_good_path.clone(),
+                Box::new(fixed_now),
+            ));
+            let openrouter_calls = Arc::new(AtomicUsize::new(0));
+            let deepseek_calls = Arc::new(AtomicUsize::new(0));
+            let openai_calls = Arc::new(AtomicUsize::new(0));
+            let core = Arc::new(
+                RuntimeCore::with_injections(vec![], 5, Box::new(|| 0), Box::new(fixed_now))
+                    .with_wallets(vec![
+                        counting_wallet(
+                            "openrouter",
+                            "OpenRouter",
+                            wallet_credential(Some(WALLET_BINDING_A)),
+                            openrouter_calls.clone(),
+                            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+                        ),
+                        counting_wallet(
+                            "deepseek",
+                            "DeepSeek",
+                            wallet_credential(Some(WALLET_BINDING_A)),
+                            deepseek_calls.clone(),
+                            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+                        ),
+                        disabled_placeholder_wallet("openai", "OpenAI", openai_calls.clone()),
+                    ])
+                    .with_wallet_preferences(Some(prefs))
+                    .with_last_good_store(Some(last_good.clone())),
+            );
+            assert!(core.set_wallet_monitoring(&HashMap::from([(
+                "deepseek".to_string(),
+                false,
+            )])));
+            core.run_cycle().await;
+            assert_eq!(openrouter_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                deepseek_calls.load(Ordering::SeqCst),
+                0,
+                "the disabled wallet is never polled"
+            );
+            assert_eq!(
+                openai_calls.load(Ordering::SeqCst),
+                0,
+                "the placeholder is never polled"
+            );
+            assert!(last_good.get_persisted_wallet("openrouter").is_some());
+            assert!(last_good.get_persisted_wallet("deepseek").is_none());
+            assert!(last_good.get_persisted_wallet("openai").is_none());
+        }
+        // Session 2 (restart): only openrouter has a persisted balance,
+        // yet every registered wallet must stay present — deepseek and
+        // the OpenAI placeholder as unknown placeholders — in registry
+        // order, through hydration and the startup cycle alike.
+        {
+            let prefs =
+                Arc::new(crate::wallet_prefs::WalletPrefsStore::open(prefs_path.clone()));
+            let last_good = Arc::new(ProviderLastGoodStore::open_with_clock(
+                last_good_path.clone(),
+                Box::new(fixed_now),
+            ));
+            let deepseek_calls = Arc::new(AtomicUsize::new(0));
+            let openai_calls = Arc::new(AtomicUsize::new(0));
+            let core = Arc::new(
+                RuntimeCore::with_injections(vec![], 5, Box::new(|| 0), Box::new(fixed_now))
+                    .with_wallets(vec![
+                        counting_wallet(
+                            "openrouter",
+                            "OpenRouter",
+                            wallet_credential(Some(WALLET_BINDING_A)),
+                            Arc::new(AtomicUsize::new(0)),
+                            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+                        ),
+                        counting_wallet(
+                            "deepseek",
+                            "DeepSeek",
+                            wallet_credential(Some(WALLET_BINDING_A)),
+                            deepseek_calls.clone(),
+                            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+                        ),
+                        disabled_placeholder_wallet("openai", "OpenAI", openai_calls.clone()),
+                    ])
+                    .with_wallet_preferences(Some(prefs))
+                    .with_last_good_store(Some(last_good)),
+            );
+            let wallets = core.snapshot().wallets;
+            assert_eq!(
+                wallets.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+                vec!["openrouter", "deepseek", "openai"],
+                "hydration keeps the full registry in spec order"
+            );
+            let openrouter = &wallets[0];
+            assert_eq!(openrouter.health, WalletHealth::Stale);
+            assert_eq!(openrouter.remaining_usd, Some(1.0));
+            assert_eq!(
+                openrouter.checked_at.as_deref(),
+                Some("2026-09-29T12:00:00.000Z"),
+                "the hydrated entry keeps its original observation stamp"
+            );
+            for placeholder in wallets.iter().skip(1) {
+                assert_eq!(placeholder.health, WalletHealth::Unknown);
+                assert!(placeholder.error.is_none());
+                assert!(placeholder.error_category.is_none());
+            }
+            // A vanished slot could not be re-enabled; the placeholder can.
+            assert!(core.set_wallet_monitoring(&HashMap::from([(
+                "deepseek".to_string(),
+                true,
+            )])));
+            // The startup cycle of the restart: the re-enabled wallet is
+            // polled again, the still-disabled placeholder is not — and it
+            // does not surface a fabricated error either.
+            core.run_cycle().await;
+            assert_eq!(
+                deepseek_calls.load(Ordering::SeqCst),
+                1,
+                "the re-enabled wallet is collected by the next cycle"
+            );
+            assert_eq!(
+                openai_calls.load(Ordering::SeqCst),
+                0,
+                "a disabled placeholder is not polled after restart either"
+            );
+            let wallets = core.snapshot().wallets;
+            assert_eq!(wallets.len(), 3);
+            assert_eq!(
+                wallets.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+                vec!["openrouter", "deepseek", "openai"]
+            );
+            let openai = wallets.iter().find(|w| w.id == "openai").unwrap();
+            assert_eq!(openai.health, WalletHealth::Unknown);
+            assert!(openai.error.is_none());
+            assert!(openai.error_category.is_none());
+            let deepseek = wallets.iter().find(|w| w.id == "deepseek").unwrap();
+            assert_eq!(deepseek.health, WalletHealth::Live);
+        }
+        remove_wallet_store(&prefs_path);
+        remove_wallet_store(&last_good_path);
+    }
+
+    #[tokio::test]
+    async fn set_wallet_monitoring_ignores_unknown_ids_and_is_idempotent() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let wallet = counting_wallet(
+            "openrouter",
+            "OpenRouter",
+            wallet_credential(Some(WALLET_BINDING_A)),
+            calls,
+            |nth| Ok(wallet_balance(nth as f64, None, Some(WALLET_BINDING_A))),
+        );
+        let (core, _clock) = manual_clock_core_with_wallets(vec![], vec![wallet]);
+
+        // An id the registry does not know has no collector to gate; the
+        // known id is applied.
+        assert!(core.set_wallet_monitoring(&HashMap::from([
+            ("openrouter".to_string(), false),
+            ("time-travel-wallet".to_string(), false),
+        ])));
+        // The same map again changes nothing.
+        assert!(!core.set_wallet_monitoring(&HashMap::from([
+            ("openrouter".to_string(), false),
+            ("time-travel-wallet".to_string(), false),
+        ])));
+        // Re-enabling is a change again, and the next cycle collects the
+        // wallet like any monitored one.
+        assert!(core
+            .set_wallet_monitoring(&HashMap::from([("openrouter".to_string(), true)])));
+        core.run_cycle().await;
+        let entry = core.snapshot().wallets.into_iter().next().unwrap();
+        assert_eq!(entry.health, WalletHealth::Live);
     }
 }

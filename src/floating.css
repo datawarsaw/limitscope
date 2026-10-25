@@ -391,6 +391,17 @@ html[data-window="floating"] body {
   background: var(--text-faint);
 }
 
+/* Monitoring off: the wallet is not collected, so its dot is the same muted
+   gray as an unavailable one and never pulses — a frozen reading must not
+   read as live. */
+.fq-wallet[data-state="paused"] .fq-wallet-dot {
+  background: var(--text-faint);
+}
+
+.fq-dock-wallet-dot[data-state="paused"] {
+  background: var(--text-faint);
+}
+
 .fq-wallet.is-refreshing .fq-wallet-dot {
   animation: fq-wallet-pulse 900ms ease-in-out infinite;
 }

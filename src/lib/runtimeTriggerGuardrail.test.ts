@@ -24,6 +24,9 @@ const ALLOWED_COMMANDS = new Set([
   "get_runtime_snapshot",
   "set_refresh_interval",
   "set_quota_notifications_enabled",
+  // Per-wallet monitor toggles (v0.8.17): the runtime gates collection on
+  // the persisted flags; TS never fetches.
+  "set_wallet_monitoring",
   "request_refresh",
   "request_refresh_on_reconnect",
   // Wallet refresh rides the same runtime: it asks the existing owner to

@@ -14,7 +14,7 @@ function item(extra: Partial<FloatingWalletItem> = {}): FloatingWalletItem {
     state: "healthy",
     balances: [{ currency: "USD", amount: 12.5 }],
     checkedAt: "2026-09-28T09:55:00.000Z",
-    statusLabel: "Live",
+    statusLabel: null,
     ...extra,
   };
 }
@@ -130,6 +130,21 @@ describe("FloatingWalletSlot", () => {
     expect(button.className).toContain("is-cooldown");
     expect(button.getAttribute("aria-label")).toBe(
       "API wallets, OpenRouter balance unavailable",
+    );
+  });
+
+  it("presents a monitoring-off wallet as paused, never as live", async () => {
+    await renderSlot({
+      items: [item({ state: "paused", statusLabel: "Monitoring off" })],
+    });
+    const button = slot();
+    expect(button.getAttribute("data-state")).toBe("paused");
+    expect(button.className).toContain("is-paused");
+    // The frozen balance is still spoken: paused keeps the last known data.
+    // The slot's label carries amounts, not state words — the card names the
+    // paused state.
+    expect(button.getAttribute("aria-label")).toBe(
+      "API wallets, OpenRouter USD 12.50 remaining",
     );
   });
 
