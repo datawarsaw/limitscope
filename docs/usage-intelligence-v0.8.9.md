@@ -60,18 +60,32 @@ conversation titles, task names, tool-call content.
   opened for writing, never locked, never checkpointed; `-shm` is never
   copied. A cheap (size, mtime) fingerprint skips the copy entirely when
   the source is unchanged since the last successful scan.
-- Cursor: `completed_at` watermark + 10-minute lookback, ordered by
-  `(completed_at, id)`, inclusive at the floor; id-dedup absorbs re-reads.
-  An immutable `baselineWatermarkMs` anchors the backlog boundary — the
-  lookback never reaches below it.
+- Cursor: `completed_at` watermark, ordered by `(completed_at, id)`. An
+  immutable `baselineWatermarkMs` anchors the backlog boundary — reads
+  never reach below it. Each incremental pass reads in two phases:
+  1. a **forward drain** of rows strictly after the persisted composite
+     `(completed_at, id)` batch position (from the baseline watermark on
+     the first scan), and
+  2. once drained, a **late-commit sweep** of the 10-minute lookback
+     band at-or-before that position (newest first), catching rows
+     committed after an earlier scan but stamped slightly behind it;
+     id-dedup absorbs the re-reads.
+- Scan bound: one scan commits at most 20,000 forward rows — a
+  deterministic prefix under the `(completed_at, id)` order. An
+  over-bound window commits that prefix (events stored, position
+  persisted), reports `scanCeiling` with a progress-bearing detail, and
+  continues from the exact next row on subsequent scans — including
+  through a tie group larger than one batch. Nothing is skipped and an
+  oversized backlog can never stall the collector (the v0.8.21 audit's
+  F1 fix). The watermark advances through every committed row —
+  accepted and rejected alike — so permanently malformed rows cannot
+  block progress; they stay revisitable only inside the lookback band,
+  then age out like late commits.
 - Completion predicate: `status = 'completed' AND completed_at IS NOT NULL`.
 - Fail-closed rows (rejected and counted, never guessed): blank
   provider/model, implausible timestamps, negative or NULL dimensions,
   `cache read + cache write > input`, `reasoning > output`, or
   `computed_total_tokens != input + output` (the verified live invariant).
-- Scan ceiling: 20,000 rows per window; an over-ceiling window is
-  abandoned whole (`scanCeiling`), cursor unmoved — nothing silently
-  skipped.
 
 ### Verified token semantics (2026-10-06, 28,873 completed rows)
 
@@ -103,13 +117,17 @@ total rejects the row.
   in-flight rows, and error rows (error payloads included) are never
   fetched or parsed. `finish` alone is no signal (the dominant live
   value is literally `"unknown"`).
-- Cursor: `time_updated` — the row's last-write stamp — with a
-  10-minute lookback, ordered by `(time_updated, id)`, floored at the
-  immutable baseline watermark. Completions, late usage writes, and
-  fork copies all bump it, so the window catches every newly-committed
-  accounting state regardless of request age. The watermark advances
-  through accepted rows and through all-zero rows dispositioned as
-  usage-not-reported; malformed rows never advance it.
+- Cursor: `time_updated` — the row's last-write stamp — ordered by
+  `(time_updated, id)`, floored at the immutable baseline watermark.
+  Completions, late usage writes, and fork copies all bump it, so every
+  newly-committed accounting state is caught regardless of request age.
+  Each incremental pass reads in two phases: a **forward drain** of
+  rows strictly after the persisted composite `(time_updated, id)`
+  batch position, and — once drained — a **late-commit sweep** of the
+  10-minute lookback band at-or-before that position (newest first).
+  The watermark advances through every committed row: accepted events,
+  all-zero rows dispositioned as usage-not-reported, and rejected rows
+  alike.
 - Token semantics (verified 428/428 live): the five dimensions
   (`input`, `output`, `reasoning`, `cache.read`, `cache.write`) are a
   **disjoint partition** — the total equals their sum, so they map to
@@ -132,8 +150,11 @@ total rejects the row.
   Residual risk (documented): two truly distinct requests sharing the
   full fingerprint — same millisecond, model, dimensions, cost —
   collapse into one event.
-- Scan ceiling: 20,000 rows per window, abandoned whole on overflow
-  (`scanCeiling`), cursor unmoved.
+- Scan bound: one scan commits at most 20,000 forward rows; an
+  over-bound backlog commits its deterministic prefix, reports
+  `scanCeiling` with a progress-bearing detail, and continues from the
+  persisted position on subsequent scans — nothing is skipped, nothing
+  stalls (the same bounded-batch contract as the ZCode reader).
 
 ## Local-data controls (docs/local-data-controls-v0.7.md §14)
 
@@ -144,6 +165,20 @@ total rejects the row.
 - **Backlog skip**: the first successful observation establishes the
   baseline at `MAX(completed_at) + 1` and imports nothing. The +1 keeps
   the inclusive incremental window from re-admitting the boundary row.
+- **Disable → re-enable (fresh baseline)**: usage completed while
+  Usage Intelligence was disabled is never silently imported. The
+  disable → enable transition marks every source cursor
+  `pendingRebaseline` (persisted, so it survives a quit before the next
+  pass); the next collection pass establishes a fresh baseline per
+  source at its then-current high-water mark — the same backlog skip as
+  a first enable. Already-collected events, the historical token
+  totals, and the `collected locally since` disclosure anchor are
+  preserved untouched; nothing is deleted. A re-enable that fails (the
+  source is missing, or its baseline high-water read fails) keeps the
+  pending flag, so a later pass retries the fresh baseline — the store
+  never resumes from the stale pre-disable watermark. The Codex reader
+  honors the same flag: its fresh baseline re-tracks every rollout file
+  at its current EOF.
 - **Read-only foreign ownership**: see the snapshot strategy above; the
   live proof asserts whole-file byte identity of the main database.
 - **Bounded retention**: 35 days by `eventAt` plus a 200k event hard cap;
@@ -154,6 +189,48 @@ total rejects the row.
 - **No silent cursor skip**: cursor movement happens only through
   successfully applied scans; failures leave it in place.
 
+## Partial scans, cursor guarantees, and known completeness limits
+
+- **Partial scans / backlog behavior**: one scan commits at most
+  20,000 eligible rows (ZCode/OpenCode; the Codex reader has analogous
+  per-cycle file/byte/event budgets). An oversized incremental backlog
+  — e.g. usage that piled up while the machine was off or the source
+  was idle for days — drains across scans: each scan commits its
+  deterministic prefix, persists the composite `(cursor-column, id)`
+  resume position, and reports `scanCeiling` with a detail carrying the
+  new watermark; the state heals to `ok` on the scan that drains the
+  window. The saved position means a batch ending mid-tie (thousands of
+  rows sharing one timestamp) resumes at the exact next row — nothing
+  is skipped, nothing re-blocks, and committed rows never refill later
+  batches as duplicates.
+- **Cursor and deduplication guarantees**: event identities are stable
+  and content-bound (`zcode:{row id}`, `opencode:{content address}`,
+  `codex:{source-native ids}`), so re-reading any overlap — restarts,
+  repeated scans, lookback sweeps — can never grow totals; the store
+  counts re-reads as duplicates instead. The watermark only ever
+  advances, only through successfully applied scans, and never reaches
+  below the immutable per-source baseline watermark. Source read errors
+  and unsupported schemas fail closed (no partial ingest, no cursor
+  movement).
+- **Known completeness limitations** (honest boundaries, all
+  documented in the reader modules):
+  - A disable → re-enable gap is never backfilled: usage completed
+    while collection was off is permanently absent from the plane (by
+    policy — see the fresh-baseline rule above).
+  - Late commits ride a 10-minute lookback: a row committed more than
+    10 minutes behind a watermark that has already moved past its
+    stamp is not re-read. While a backlog is mid-drain the lookback
+    sweep is skipped entirely; late rows then wait for the draining
+    scan that follows, within the same 10-minute honesty boundary.
+  - Permanently malformed rows (validation failures) are rejected and
+    counted, then age out of the 10-minute band; they are never
+    re-interpreted.
+  - The OpenCode content address can collapse two genuinely distinct
+    requests sharing the full accounting fingerprint (same
+    millisecond, model, dimensions, cost) into one event.
+  - The residual OpenCode fork-collision risk above; a SHA-256
+    collision, negligible at realistic store sizes.
+
 ## Aggregation API
 
 `get_usage_intelligence(query)` — `range: today | 7d | 30d` (+ the
@@ -162,7 +239,10 @@ webview's local `todayStartMs`, sanity-clamped server-side), grouped
 reasoning / total, with `collectionStartedAt`, `incompleteHistory`, the
 `enabled` flag, and per-source diagnostics (`disabled | collecting |
 sourceAbsent | schemaUnsupported | readFailure | scanCeiling | ok`, plus
-the last observation time). Phase 1 creates no notifications and no
+the last observation time). `scanCeiling` on the row-count-bounded
+readers means a bounded batch was committed and the remainder of an
+oversized backlog continues on subsequent scans — progress, not a
+failure. Phase 1 creates no notifications and no
 predictions from this data, and a source failure can never degrade
 quota-provider health.
 

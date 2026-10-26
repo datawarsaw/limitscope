@@ -248,11 +248,11 @@ pub fn collect(store: &UsageIntelligenceStore) -> CodexScanOutcome {
             return CodexScanOutcome::ReadFailure(detail);
         }
     };
-    let baselined = store
-        .cursor(USAGE_SOURCE_CODEX)
-        .map(|cursor| cursor.baselined)
-        .unwrap_or(false);
-    if !baselined {
+    // The baseline gate covers both the first observation and the
+    // disable → re-enable transition (a fresh baseline re-tracks every
+    // file at its current EOF and imports nothing from the disabled
+    // period, exactly like a first enable).
+    if store.cursor_needs_baseline(USAGE_SOURCE_CODEX) {
         establish_codex_baseline(store, &home, entries)
     } else {
         incremental_scan(store, &home, entries)
@@ -742,6 +742,9 @@ fn incremental_scan(
             rejected: budgets.rejected,
             usage_not_reported: 0,
             files,
+            // The Codex reader's resume position is its per-file byte
+            // cursors, not a composite row position.
+            batch_end: None,
         },
     );
     if bounded {
