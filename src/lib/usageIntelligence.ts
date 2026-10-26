@@ -48,6 +48,7 @@ export type UsageSourceDiagnostics = {
     | "schemaUnsupported"
     | "readFailure"
     | "scanCeiling"
+    | "collectionPaused"
     | "ok";
   watermarkAt: string;
   baselinedAt: string;
@@ -61,6 +62,25 @@ export type UsageSourceDiagnostics = {
      * usage the provider never reported; never stored as measured zero. */
     usageNotReported?: number;
   };
+};
+
+/** Per-source coverage of the selected range. */
+export type UsageSourceCoverage = {
+  source: string;
+  coverage: "complete" | "incomplete" | "uncertain";
+  reason?:
+    | "monitoringDisabled"
+    | "noBaseline"
+    | "pendingRebaseline"
+    | "lateBaseline"
+    | "sourceAbsent"
+    | "schemaUnsupported"
+    | "readFailure"
+    | "collectionPaused";
+  /** First instant continuously covered (late-baseline verdicts only). */
+  coveredFrom?: string;
+  /** Last successful observation; events after it may be missing. */
+  lastObservedAt?: string;
 };
 
 /**
@@ -92,6 +112,8 @@ export type UsageIntelligence = {
   collectionStartedAt?: string;
   incompleteHistory: boolean;
   sources: UsageSourceDiagnostics[];
+  /** Additive coverage verdicts, in the same order as `sources`. */
+  sourceCoverage?: UsageSourceCoverage[];
   /** One cell per local calendar day touched by the range; sums reconcile
    * with `totals` / `eventsInRange`. */
   daily: UsageDailyDay[];
@@ -184,6 +206,8 @@ export function usageSourceStateText(state: UsageSourceDiagnostics["state"]): st
       return "could not read source";
     case "scanCeiling":
       return "too many new rows to scan safely";
+    case "collectionPaused":
+      return "collection paused";
     case "disabled":
       return "off";
   }

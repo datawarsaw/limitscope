@@ -10,6 +10,7 @@ import {
   type UsageIntelligenceRange,
   type UsageModelBreakdown,
   type UsageSourceDiagnostics,
+  type UsageSourceCoverage,
 } from "../../lib/usageIntelligence";
 import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
 import { UsageDailyActivity } from "./UsageDailyActivity";
@@ -29,7 +30,9 @@ import { UsageDailyActivity } from "./UsageDailyActivity";
  * - an empty view states when local collection started rather than implying
  *   the range was measured and empty;
  * - a range reaching further back than collection itself discloses that
- *   ("less history than the range");
+ *   ("less history than the range"); per-source gaps (a late baseline, a
+ *   disabled period, a paused or failed source) name the source and its
+ *   coverage boundary instead of claiming the whole range is complete;
  * - only sources with collected data get provider groups; source failures
  *   and completions-without-reported-usage stay visible;
  * - the Daily activity heatmap renders the backend's per-local-day
@@ -118,6 +121,14 @@ export function UsageOverview({
     return [...data.groups].sort((a, b) => b.totalTokens - a.totalTokens);
   }, [data]);
 
+  const affectedCoverage = useMemo(
+    () =>
+      data?.sourceCoverage?.filter(
+        (coverage) => coverage.coverage !== "complete",
+      ) ?? [],
+    [data],
+  );
+
   // The naming contract makes `model` the normalized model identity and
   // keeps the provider qualifier on the separate provider axis (Codex splits
   // `xai/grok-4.6`; ZCode and OpenCode report the provider directly). The
@@ -135,6 +146,13 @@ export function UsageOverview({
 
   const rangeLabel =
     range === "today" ? "Today" : range === "7d" ? "7 days" : "30 days";
+
+  // Both instants are canonical RFC-3339 UTC strings of the same shape, so
+  // the comparison is exact: the range reaches before collection only when
+  // the first global baseline is later than the selected range start.
+  const rangePredatesCollection =
+    data?.collectionStartedAt !== undefined &&
+    data.collectionStartedAt > data.rangeStart;
 
   if (!enabled) {
     return (
@@ -212,6 +230,23 @@ export function UsageOverview({
         </div>
       ) : null}
 
+      {affectedCoverage.length > 0 ? (
+        <p
+          className="usage-subtitle"
+          role="note"
+          aria-label="History coverage"
+        >
+          <strong>History coverage:</strong>{" "}
+          {affectedCoverage
+            .map(
+              (coverage) =>
+                `${sourceLabel(coverage.source)} — ${coverageDetail(coverage)}`,
+            )
+            .join("; ")}
+          . Reported totals show what was collected, not the full period.
+        </p>
+      ) : null}
+
       {data !== null && providerRows.length === 0 ? (
         <div className="usage-panel usage-empty">
           <p>No locally collected token usage yet.</p>
@@ -237,7 +272,9 @@ export function UsageOverview({
               ? ` since ${formatSinceDate(data.collectionStartedAt)}`
               : ""}
             {data.incompleteHistory
-              ? ` — less history than the ${rangeLabel} range`
+              ? rangePredatesCollection
+                ? ` — less history than the ${rangeLabel} range`
+                : " — some source history is incomplete for this range"
               : ""}
           </p>
 
@@ -276,7 +313,9 @@ export function UsageOverview({
               </span>
               <span className="usage-kpi-sub">
                 {data.incompleteHistory
-                  ? `range reaches before collection started`
+                  ? rangePredatesCollection
+                    ? "range reaches before collection started"
+                    : "history is incomplete for this range"
                   : `covers the ${rangeLabel} range`}
               </span>
             </div>
@@ -483,6 +522,33 @@ function sourceLabel(source: string): string {
   if (source === "codex") return "Codex";
   if (source === "opencode") return "OpenCode";
   return source;
+}
+
+function coverageDetail(coverage: UsageSourceCoverage): string {
+  switch (coverage.reason) {
+    case "lateBaseline":
+      return coverage.coveredFrom
+        ? `history is only covered since ${formatSinceDate(coverage.coveredFrom)}`
+        : "history starts partway through this range";
+    case "monitoringDisabled":
+      return "collection is off; history while off is missing";
+    case "pendingRebaseline":
+      return "history while collection was off is missing";
+    case "noBaseline":
+      return "no history collected yet";
+    case "sourceAbsent":
+    case "schemaUnsupported":
+    case "readFailure":
+      return coverage.lastObservedAt
+        ? `may be missing events after ${formatSinceDate(coverage.lastObservedAt)}`
+        : "recent events may be missing";
+    case "collectionPaused":
+      return coverage.lastObservedAt
+        ? `collection is paused — events after ${formatSinceDate(coverage.lastObservedAt)} may be missing`
+        : "collection is paused — recent events may be missing";
+    default:
+      return "history coverage is incomplete";
+  }
 }
 
 function formatSinceDate(iso: string): string {

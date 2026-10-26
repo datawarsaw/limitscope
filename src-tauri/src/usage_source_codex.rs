@@ -74,9 +74,10 @@
 //!   reads only each file's first line (identity + format policy, in
 //!   bounded stages up to [`FIRST_LINE_CAP`]) and is capped by
 //!   [`BASELINE_FILE_CEILING`] — exceeding it fails closed rather than
-//!   silently skipping files. Zero-byte files (created before their first
-//!   write) are left untracked; they become ordinary new files once they
-//!   grow.
+//!   silently skipping files, reported as `collectionPaused` rather than
+//!   the bounded-progress `scanCeiling`. Zero-byte files (created before
+//!   their first write) are left untracked; they become ordinary new files
+//!   once they grow.
 //! - A persistent per-file cursor (byte offset + size/mtime witnesses +
 //!   identity witness + a bounded tail of recent turn contexts) survives
 //!   restarts inside the shared store. Files appearing after the baseline
@@ -225,7 +226,7 @@ pub fn collect(store: &UsageIntelligenceStore) -> CodexScanOutcome {
         Err(WalkError::TooManyFiles(found)) => {
             store.mark_source_state(
                 USAGE_SOURCE_CODEX,
-                SourceState::ScanCeiling,
+                SourceState::CollectionPaused,
                 Some(format!(
                     "the rollout tree holds {found} files above the {BASELINE_FILE_CEILING} ceiling; collection is paused fail-closed"
                 )),
@@ -235,7 +236,7 @@ pub fn collect(store: &UsageIntelligenceStore) -> CodexScanOutcome {
         Err(WalkError::DepthLimit) => {
             store.mark_source_state(
                 USAGE_SOURCE_CODEX,
-                SourceState::ScanCeiling,
+                SourceState::CollectionPaused,
                 Some("the rollout tree is nested too deeply to walk safely".to_string()),
             );
             return CodexScanOutcome::CeilingExceeded;

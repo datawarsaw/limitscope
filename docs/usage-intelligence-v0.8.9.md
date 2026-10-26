@@ -216,7 +216,29 @@ total rejects the row.
   documented in the reader modules):
   - A disable → re-enable gap is never backfilled: usage completed
     while collection was off is permanently absent from the plane (by
-    policy — see the fresh-baseline rule above).
+    policy — see the fresh-baseline rule above). The disable instant is
+    not persisted, so the gap's extent is unknowable; per-source coverage
+    reports it as incomplete/uncertain rather than complete.
+  - A source that has never established a baseline (failure-only cursor,
+    or no collection pass yet) has no known coverage. Its range coverage
+    is uncertain; an empty result from it is missing history, never a
+    confirmed zero.
+  - Sources remain invisible to `sourceCoverage` until their first
+    cursor exists. The daily projection remains anchored to the first
+    global collection start; it is not re-anchored per source.
+  - `sources` and `sourceCoverage` are in the same order within one
+    response, but that order is not guaranteed across responses: the
+    store iterates a `HashMap`. Consumers must join entries by source id.
+  - For a source that baselined but has not completed a scan yet,
+    `lastObservedAt` equals the baseline moment (pre-existing field
+    semantics). Coverage wording treats it as "events after this instant
+    may be missing", which stays true.
+  - If the Tauri app-data directory cannot be resolved, the command falls
+    back to a degenerate empty payload (`incompleteHistory: false`, empty
+    `daily` / `sources` / `sourceCoverage`). The view renders no
+    completeness claim there because the KPI block requires at least one
+    provider row; this is a pre-existing degenerate path, not a coverage
+    verdict.
   - Late commits ride a 10-minute lookback: a row committed more than
     10 minutes behind a watermark that has already moved past its
     stamp is not re-read. While a backlog is mid-drain the lookback
@@ -237,14 +259,57 @@ total rejects the row.
 webview's local `todayStartMs`, sanity-clamped server-side), grouped
 `provider -> model`, summing input / cache read / cache write / output /
 reasoning / total, with `collectionStartedAt`, `incompleteHistory`, the
-`enabled` flag, and per-source diagnostics (`disabled | collecting |
-sourceAbsent | schemaUnsupported | readFailure | scanCeiling | ok`, plus
-the last observation time). `scanCeiling` on the row-count-bounded
-readers means a bounded batch was committed and the remainder of an
-oversized backlog continues on subsequent scans — progress, not a
-failure. Phase 1 creates no notifications and no
+`enabled` flag, per-source diagnostics (`disabled | collecting |
+sourceAbsent | schemaUnsupported | readFailure | scanCeiling |
+collectionPaused | ok`, plus the last observation time), and the additive
+`sourceCoverage` array. `scanCeiling` on the row-count-bounded readers
+means a bounded batch was committed and the remainder of an oversized
+backlog continues on subsequent scans — progress, not a failure.
+`collectionPaused` is the fail-closed enumeration pause (the Codex
+rollout tree above its file ceiling or nested too deeply): the scan
+stops before reading anything, so no prefix was committed and coverage
+cannot be called complete. Phase 1 creates no notifications and no
 predictions from this data, and a source failure can never degrade
 quota-provider health.
+
+### Per-source coverage (`sourceCoverage`)
+
+`sourceCoverage` contains one verdict per existing source cursor — the
+same source universe and order as `sources`. It is always present and may
+be empty. Each entry has `source`, `coverage` (`complete | incomplete |
+uncertain`), and optional `reason`, `coveredFrom` (ISO-8601), and
+`lastObservedAt` (ISO-8601).
+
+| Persisted condition | Coverage | Reason | Detail |
+|---|---|---|---|
+| monitoring disabled | `uncertain` | `monitoringDisabled` | Usage during the disabled period was never imported; the gap extent is unknown. |
+| enabled, no baseline (failure-only cursor) | `uncertain` | `noBaseline` | Nothing has ever been collected; never imply zero usage. |
+| enabled, baselined, pending re-baseline | `incomplete` | `pendingRebaseline` | Usage while collection was off is missing; no `coveredFrom`. |
+| enabled, baselined, coverage start later than range start | `incomplete` | `lateBaseline` | Coverage is continuous from `coveredFrom = max(baselinedAt, baselineWatermark)`. |
+| enabled, baselined at or before range start, state `ok` or `scanCeiling` | `complete` | — | `scanCeiling` is committed progress, not a gap. |
+| enabled, baselined at or before range start, state `collectionPaused` | `uncertain` | `collectionPaused` | The scan stopped fail-closed before reading anything; `lastObservedAt` is included and later events may be missing. |
+| enabled, baselined at or before range start, state `sourceAbsent`, `schemaUnsupported`, or `readFailure` | `uncertain` | the wire state string | `lastObservedAt` is included; later events may be missing. |
+
+The coverage boundary is the later of the store-clock baseline instant
+(`baselinedAt`) and the authoritative source-time watermark
+(`baselineWatermark`). Taking the maximum is conservative under clock
+skew in either direction: a source watermark ahead of the store clock
+means the source itself had not reached the range start at baseline
+time, even when `baselinedAt` says it had.
+
+Equality is covered: a coverage start equal to `rangeStart` is
+complete-eligible.
+`incompleteHistory` is now the union of the original global-anchor test
+(`collectionStartedAt > rangeStart`), the enabled-without-anchor case,
+and any per-source verdict other than `complete`. A disabled plane with
+no cursors and no anchor keeps `incompleteHistory = false`, preserving
+the existing empty-state behavior.
+
+The rules stay conservative: never-baselined sources are uncertain,
+disabled periods are uncertain, paused collection is uncertain, and the
+extent of a disable → re-enable gap is unknowable because the disable
+instant is not persisted. No token, dedup, ingestion, retention,
+persistence, cursor, or daily projection behavior changes.
 
 ### Daily activity projection (`daily`, added in the v0.9 Usage view)
 

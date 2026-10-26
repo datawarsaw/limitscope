@@ -50,6 +50,7 @@ describe("usageIntelligence helpers", () => {
     expect(usageSourceStateText("schemaUnsupported")).toBe("source schema not supported");
     expect(usageSourceStateText("readFailure")).toBe("could not read source");
     expect(usageSourceStateText("scanCeiling")).toBe("too many new rows to scan safely");
+    expect(usageSourceStateText("collectionPaused")).toBe("collection paused");
     expect(usageSourceStateText("collecting")).toBe("collecting now");
   });
 });
