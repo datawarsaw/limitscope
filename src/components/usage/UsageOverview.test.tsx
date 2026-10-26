@@ -317,7 +317,13 @@ describe("UsageOverview", () => {
 
   it("discloses incomplete history when the range predates collection", async () => {
     renderOverview(
-      loaderWith((range) => payload({ range, incompleteHistory: true })),
+      loaderWith((range) =>
+        payload({
+          range,
+          rangeStart: "2026-10-10T00:00:00.000Z",
+          incompleteHistory: true,
+        }),
+      ),
     );
     fireEvent.click(screen.getByRole("button", { name: "7d" }));
     expect(
@@ -326,6 +332,30 @@ describe("UsageOverview", () => {
     expect(
       screen.getByText(/range reaches before collection started/),
     ).toBeTruthy();
+  });
+
+  it("uses generic incompleteness copy when collection predates the range", async () => {
+    renderOverview(
+      loaderWith((range) =>
+        payload({
+          range,
+          rangeStart: "2026-10-20T00:00:00.000Z",
+          incompleteHistory: true,
+          sourceCoverage: [
+            { source: "codex", coverage: "incomplete", reason: "pendingRebaseline" },
+          ],
+        }),
+      ),
+    );
+    expect(
+      await screen.findByText(/some source history is incomplete for this range/),
+    ).toBeTruthy();
+    const kpis = screen.getByLabelText("Usage summary");
+    expect(
+      within(kpis).getByText("history is incomplete for this range"),
+    ).toBeTruthy();
+    expect(screen.queryByText(/less history than the/)).toBeNull();
+    expect(screen.queryByText(/range reaches before collection started/)).toBeNull();
   });
 
   it("discloses per-source coverage gaps with names and dates", async () => {
@@ -389,6 +419,71 @@ describe("UsageOverview", () => {
     expect(
       screen.queryByRole("note", { name: "History coverage" }),
     ).toBeNull();
+  });
+
+  it("distinguishes a disabled source from a pending re-baseline and a pause", async () => {
+    const lastObserved = "2026-10-23T20:00:00.000Z";
+    renderOverview(
+      loaderWith(() =>
+        payload({
+          incompleteHistory: true,
+          sourceCoverage: [
+            {
+              source: "zcode",
+              coverage: "uncertain",
+              reason: "monitoringDisabled",
+            },
+            {
+              source: "codex",
+              coverage: "uncertain",
+              reason: "collectionPaused",
+              lastObservedAt: lastObserved,
+            },
+          ],
+        }),
+      ),
+    );
+    const disclosure = await screen.findByRole("note", {
+      name: "History coverage",
+    });
+    expect(disclosure.textContent).toContain(
+      "ZCode — collection is off; history while off is missing",
+    );
+    expect(disclosure.textContent).toContain(
+      `Codex — collection is paused — events after ${sinceDate(lastObserved)} may be missing`,
+    );
+  });
+
+  it("discloses coverage gaps on the empty-data path", async () => {
+    renderOverview(
+      loaderWith(() =>
+        payload({
+          groups: [],
+          totals: {
+            events: 0,
+            inputTokens: 0,
+            cacheReadTokens: 0,
+            cacheWriteTokens: 0,
+            outputTokens: 0,
+            reasoningTokens: 0,
+            totalTokens: 0,
+          },
+          incompleteHistory: true,
+          sourceCoverage: [
+            { source: "codex", coverage: "uncertain", reason: "noBaseline" },
+          ],
+        }),
+      ),
+    );
+    expect(
+      await screen.findByText("No locally collected token usage yet."),
+    ).toBeTruthy();
+    const disclosure = screen.getByRole("note", { name: "History coverage" });
+    expect(disclosure.textContent).toContain("Codex — no history collected yet");
+    expect(disclosure.textContent).toContain(
+      "Reported totals show what was collected, not the full period.",
+    );
+    expect(screen.queryByLabelText("Usage summary")).toBeNull();
   });
 
   it("keeps failed sources and unreported usage visible", async () => {

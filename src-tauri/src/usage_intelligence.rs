@@ -46,6 +46,11 @@
 //!   the deferral through the source's `scanCeiling` diagnostics, and
 //!   continues from the saved position on subsequent scans — nothing is
 //!   skipped and the cursor never stalls on an oversized backlog.
+//! - A source can instead stop before reading anything (the Codex rollout
+//!   tree above its file ceiling or nested too deeply). That fail-closed
+//!   pause is a separate `collectionPaused` state, never `scanCeiling`: no
+//!   new events are collected, so its range coverage is uncertain rather
+//!   than complete.
 //! - Re-ingesting an overlap is idempotent: events dedup by their stable
 //!   owned identity, so re-running a collector can never grow totals.
 //! - Retention is bounded (35 days, plus a hard event cap) and only ever
@@ -244,6 +249,12 @@ pub enum SourceState {
     /// remainder to subsequent scans. Progress continues; nothing is
     /// skipped.
     ScanCeiling,
+    /// The source could not be enumerated safely and the scan stopped
+    /// before reading anything (e.g. the Codex rollout tree exceeds its
+    /// file ceiling or walk-depth limit). Collection is paused fail-closed:
+    /// unlike `ScanCeiling`, no prefix was committed and no progress is
+    /// being made, so range coverage is uncertain until a clean pass.
+    CollectionPaused,
     /// The last scan completed successfully (at `last_observed_at`).
     Ok,
 }
@@ -1287,6 +1298,7 @@ fn rendered_source_state(persisted: SourceState, enabled: bool, collecting: bool
             SourceState::SchemaUnsupported => "schemaUnsupported".to_string(),
             SourceState::ReadFailure => "readFailure".to_string(),
             SourceState::ScanCeiling => "scanCeiling".to_string(),
+            SourceState::CollectionPaused => "collectionPaused".to_string(),
             SourceState::Ok => "ok".to_string(),
         }
     }
@@ -1298,7 +1310,15 @@ fn rendered_source_state(persisted: SourceState, enabled: bool, collecting: bool
 /// observation at all, and a pending re-baseline spans an unknowable gap
 /// while collection was off. Only a baseline at or before the range start
 /// can support a complete verdict; a later baseline is continuous from its
-/// own instant, while a failed last scan may have missed later events.
+/// own instant, while a paused or failed last scan may have missed later
+/// events.
+///
+/// The coverage boundary is the later of the store-clock baseline instant
+/// and the source-time baseline watermark. Taking the maximum is
+/// conservative under clock skew in either direction: a source watermark
+/// ahead of the store clock means the source itself had not reached the
+/// range start at baseline time, even though `baselined_at` (the store
+/// clock) says it had.
 fn source_coverage_for(
     cursor: &SourceCursor,
     enabled: bool,
@@ -1331,12 +1351,13 @@ fn source_coverage_for(
             last_observed_at: None,
         };
     }
-    if cursor.baselined_at > range_start {
+    let coverage_start = cursor.baselined_at.max(cursor.baseline_watermark_ms);
+    if coverage_start > range_start {
         return SourceCoverageDto {
             source: cursor.source.clone(),
             coverage: "incomplete".to_string(),
             reason: Some("lateBaseline".to_string()),
-            covered_from: Some(canonical_timestamp(cursor.baselined_at)),
+            covered_from: Some(canonical_timestamp(coverage_start)),
             last_observed_at: None,
         };
     }
@@ -1354,6 +1375,7 @@ fn source_coverage_for(
         SourceState::SourceAbsent => "sourceAbsent",
         SourceState::SchemaUnsupported => "schemaUnsupported",
         SourceState::ReadFailure => "readFailure",
+        SourceState::CollectionPaused => "collectionPaused",
     };
     SourceCoverageDto {
         source: cursor.source.clone(),
@@ -1422,7 +1444,8 @@ pub struct TotalsDto {
 pub struct SourceDiagnosticsDto {
     pub source: String,
     /// Derived wire state: disabled | collecting | sourceAbsent |
-    /// schemaUnsupported | readFailure | scanCeiling | ok.
+    /// schemaUnsupported | readFailure | scanCeiling | collectionPaused |
+    /// ok.
     pub state: String,
     pub watermark_at: String,
     pub baselined_at: String,
@@ -2180,6 +2203,121 @@ mod tests {
     }
 
     #[test]
+    fn paused_collection_after_an_old_baseline_is_uncertain() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-paused", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
+        let baseline = store.cursor(USAGE_SOURCE_CODEX).unwrap();
+        *now.lock().unwrap() = NOW_MS;
+        // The Codex reader pauses fail-closed when the rollout tree cannot
+        // be enumerated safely. An old baseline must not turn that into a
+        // completeness claim.
+        store.mark_source_state(
+            USAGE_SOURCE_CODEX,
+            SourceState::CollectionPaused,
+            Some("the rollout tree holds too many files; collection is paused fail-closed"
+                .to_string()),
+        );
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let coverage = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        assert_eq!(coverage.coverage, "uncertain");
+        assert_eq!(coverage.reason.as_deref(), Some("collectionPaused"));
+        assert_eq!(
+            coverage.last_observed_at,
+            Some(canonical_timestamp(baseline.last_observed_at))
+        );
+        assert!(dto.incomplete_history);
+        let diagnostics = dto
+            .sources
+            .iter()
+            .find(|source| source.source == USAGE_SOURCE_CODEX)
+            .unwrap();
+        assert_eq!(diagnostics.state, "collectionPaused");
+
+        // A bounded-progress ceiling stays complete: it committed a prefix
+        // and continues on the next scan. Only the fail-closed pause is a
+        // coverage gap.
+        store.mark_source_state(USAGE_SOURCE_CODEX, SourceState::ScanCeiling, None);
+        let progressing = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(
+            dto_coverage(&progressing, USAGE_SOURCE_CODEX).coverage,
+            "complete"
+        );
+        assert!(!progressing.incomplete_history);
+    }
+
+    #[test]
+    fn persisted_source_states_remain_backward_compatible() {
+        // The new variant is additive: blobs written by older code can only
+        // contain the pre-existing states, which keep their wire spelling.
+        assert_eq!(BLOB_VERSION, 1);
+        let old: SourceState = serde_json::from_str("\"scanCeiling\"").unwrap();
+        assert_eq!(old, SourceState::ScanCeiling);
+        let ok: SourceState = serde_json::from_str("\"ok\"").unwrap();
+        assert_eq!(ok, SourceState::Ok);
+        let paused: SourceState = serde_json::from_str("\"collectionPaused\"").unwrap();
+        assert_eq!(paused, SourceState::CollectionPaused);
+    }
+
+    #[test]
+    fn legacy_blob_without_the_paused_variant_still_loads() {
+        // A blob written before `collectionPaused` existed carries only the
+        // old states. The additive variant must not bump BLOB_VERSION nor
+        // disturb deserialization of the envelope.
+        let dir = tempdir::temp_dir("legacy-blob");
+        let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let baseline = NOW_MS - 10 * DAY_MS;
+        let watermark = NOW_MS - 9 * DAY_MS;
+        // Envelope fields are snake_case (the nested cursors are camelCase);
+        // this is the exact shape an older build persisted.
+        let legacy = format!(
+            r#"{{"version":1,"enabled":true,"collection_started_at":{baseline},"events":[],"cursors":[{{"source":"codex","watermarkMs":{watermark},"baselineWatermarkMs":{watermark},"baselined":true,"baselinedAt":{baseline},"lastObservedAt":{watermark},"state":"scanCeiling"}}]}}"#
+        );
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = UsageIntelligenceStore::open_with(path, fixed_clock(), Box::new(|| None));
+        assert_eq!(store.collection_started_at(), Some(baseline));
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let diagnostics = dto
+            .sources
+            .iter()
+            .find(|source| source.source == USAGE_SOURCE_CODEX)
+            .unwrap();
+        assert_eq!(diagnostics.state, "scanCeiling");
+        // A bounded-progress ceiling keeps its meaning under the new rules.
+        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_CODEX).coverage, "complete");
+        assert!(!dto.incomplete_history);
+    }
+
+    #[test]
+    fn source_watermark_ahead_of_the_store_clock_bounds_coverage() {
+        let range_start = NOW_MS - 7 * DAY_MS;
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-skew", clock);
+        store.set_enabled(true);
+        // The source clock is ahead of the store clock: the baseline instant
+        // looks early, but the authoritative source watermark says the
+        // source itself had not reached the range start yet.
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * DAY_MS, None);
+        let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        assert!(cursor.baselined_at <= range_start);
+        assert!(cursor.baseline_watermark_ms > range_start);
+        *now.lock().unwrap() = NOW_MS;
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let coverage = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
+        assert_eq!(coverage.coverage, "incomplete");
+        assert_eq!(coverage.reason.as_deref(), Some("lateBaseline"));
+        assert_eq!(
+            coverage.covered_from,
+            Some(canonical_timestamp(NOW_MS - 3 * DAY_MS))
+        );
+        assert!(dto.incomplete_history);
+    }
+
+    #[test]
     fn disable_reenable_then_rebaseline_reports_the_unknown_gap() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-reenable", clock);
@@ -2238,6 +2376,11 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&after.groups).unwrap(),
             serde_json::to_value(&before.groups).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(&after.daily).unwrap(),
+            serde_json::to_value(&before.daily).unwrap(),
+            "coverage verdicts must not re-anchor the daily projection"
         );
         assert_eq!(
             dto_coverage(&after, USAGE_SOURCE_CODEX).coverage,

@@ -48,6 +48,7 @@ export type UsageSourceDiagnostics = {
     | "schemaUnsupported"
     | "readFailure"
     | "scanCeiling"
+    | "collectionPaused"
     | "ok";
   watermarkAt: string;
   baselinedAt: string;
@@ -74,7 +75,8 @@ export type UsageSourceCoverage = {
     | "lateBaseline"
     | "sourceAbsent"
     | "schemaUnsupported"
-    | "readFailure";
+    | "readFailure"
+    | "collectionPaused";
   /** First instant continuously covered (late-baseline verdicts only). */
   coveredFrom?: string;
   /** Last successful observation; events after it may be missing. */
@@ -204,6 +206,8 @@ export function usageSourceStateText(state: UsageSourceDiagnostics["state"]): st
       return "could not read source";
     case "scanCeiling":
       return "too many new rows to scan safely";
+    case "collectionPaused":
+      return "collection paused";
     case "disabled":
       return "off";
   }

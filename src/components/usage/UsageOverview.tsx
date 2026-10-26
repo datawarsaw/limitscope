@@ -30,7 +30,9 @@ import { UsageDailyActivity } from "./UsageDailyActivity";
  * - an empty view states when local collection started rather than implying
  *   the range was measured and empty;
  * - a range reaching further back than collection itself discloses that
- *   ("less history than the range");
+ *   ("less history than the range"); per-source gaps (a late baseline, a
+ *   disabled period, a paused or failed source) name the source and its
+ *   coverage boundary instead of claiming the whole range is complete;
  * - only sources with collected data get provider groups; source failures
  *   and completions-without-reported-usage stay visible;
  * - the Daily activity heatmap renders the backend's per-local-day
@@ -144,6 +146,13 @@ export function UsageOverview({
 
   const rangeLabel =
     range === "today" ? "Today" : range === "7d" ? "7 days" : "30 days";
+
+  // Both instants are canonical RFC-3339 UTC strings of the same shape, so
+  // the comparison is exact: the range reaches before collection only when
+  // the first global baseline is later than the selected range start.
+  const rangePredatesCollection =
+    data?.collectionStartedAt !== undefined &&
+    data.collectionStartedAt > data.rangeStart;
 
   if (!enabled) {
     return (
@@ -263,7 +272,9 @@ export function UsageOverview({
               ? ` since ${formatSinceDate(data.collectionStartedAt)}`
               : ""}
             {data.incompleteHistory
-              ? ` — less history than the ${rangeLabel} range`
+              ? rangePredatesCollection
+                ? ` — less history than the ${rangeLabel} range`
+                : " — some source history is incomplete for this range"
               : ""}
           </p>
 
@@ -302,7 +313,9 @@ export function UsageOverview({
               </span>
               <span className="usage-kpi-sub">
                 {data.incompleteHistory
-                  ? `range reaches before collection started`
+                  ? rangePredatesCollection
+                    ? "range reaches before collection started"
+                    : "history is incomplete for this range"
                   : `covers the ${rangeLabel} range`}
               </span>
             </div>
@@ -518,6 +531,7 @@ function coverageDetail(coverage: UsageSourceCoverage): string {
         ? `history is only covered since ${formatSinceDate(coverage.coveredFrom)}`
         : "history starts partway through this range";
     case "monitoringDisabled":
+      return "collection is off; history while off is missing";
     case "pendingRebaseline":
       return "history while collection was off is missing";
     case "noBaseline":
@@ -528,6 +542,10 @@ function coverageDetail(coverage: UsageSourceCoverage): string {
       return coverage.lastObservedAt
         ? `may be missing events after ${formatSinceDate(coverage.lastObservedAt)}`
         : "recent events may be missing";
+    case "collectionPaused":
+      return coverage.lastObservedAt
+        ? `collection is paused — events after ${formatSinceDate(coverage.lastObservedAt)} may be missing`
+        : "collection is paused — recent events may be missing";
     default:
       return "history coverage is incomplete";
   }
