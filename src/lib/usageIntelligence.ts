@@ -63,6 +63,24 @@ export type UsageSourceDiagnostics = {
   };
 };
 
+/** Per-source coverage of the selected range. */
+export type UsageSourceCoverage = {
+  source: string;
+  coverage: "complete" | "incomplete" | "uncertain";
+  reason?:
+    | "monitoringDisabled"
+    | "noBaseline"
+    | "pendingRebaseline"
+    | "lateBaseline"
+    | "sourceAbsent"
+    | "schemaUnsupported"
+    | "readFailure";
+  /** First instant continuously covered (late-baseline verdicts only). */
+  coveredFrom?: string;
+  /** Last successful observation; events after it may be missing. */
+  lastObservedAt?: string;
+};
+
 /**
  * One local calendar day of the Daily activity projection. A day without
  * recorded events is `observed: false` and carries no `totalTokens` — the
@@ -92,6 +110,8 @@ export type UsageIntelligence = {
   collectionStartedAt?: string;
   incompleteHistory: boolean;
   sources: UsageSourceDiagnostics[];
+  /** Additive coverage verdicts, in the same order as `sources`. */
+  sourceCoverage?: UsageSourceCoverage[];
   /** One cell per local calendar day touched by the range; sums reconcile
    * with `totals` / `eventsInRange`. */
   daily: UsageDailyDay[];

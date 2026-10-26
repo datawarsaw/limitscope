@@ -328,6 +328,69 @@ describe("UsageOverview", () => {
     ).toBeTruthy();
   });
 
+  it("discloses per-source coverage gaps with names and dates", async () => {
+    const lateBaseline = "2026-10-20T08:00:00.000Z";
+    const lastObserved = "2026-10-23T20:00:00.000Z";
+    renderOverview(
+      loaderWith(() =>
+        payload({
+          incompleteHistory: true,
+          sourceCoverage: [
+            {
+              source: "zcode",
+              coverage: "uncertain",
+              reason: "readFailure",
+              lastObservedAt: lastObserved,
+            },
+            {
+              source: "codex",
+              coverage: "incomplete",
+              reason: "lateBaseline",
+              coveredFrom: lateBaseline,
+            },
+            {
+              source: "opencode",
+              coverage: "incomplete",
+              reason: "pendingRebaseline",
+            },
+          ],
+        }),
+      ),
+    );
+    const disclosure = await screen.findByRole("note", {
+      name: "History coverage",
+    });
+    expect(disclosure.textContent).toContain(
+      `Codex — history is only covered since ${sinceDate(lateBaseline)}`,
+    );
+    expect(disclosure.textContent).toContain(
+      `ZCode — may be missing events after ${sinceDate(lastObserved)}`,
+    );
+    expect(disclosure.textContent).toContain(
+      "OpenCode — history while collection was off is missing",
+    );
+    expect(disclosure.textContent).toContain(
+      "Reported totals show what was collected, not the full period.",
+    );
+  });
+
+  it("shows no coverage disclosure when every source is complete", async () => {
+    renderOverview(
+      loaderWith(() =>
+        payload({
+          sourceCoverage: [
+            { source: "zcode", coverage: "complete" },
+            { source: "opencode", coverage: "complete" },
+          ],
+        }),
+      ),
+    );
+    await screen.findByLabelText("Usage summary");
+    expect(
+      screen.queryByRole("note", { name: "History coverage" }),
+    ).toBeNull();
+  });
+
   it("keeps failed sources and unreported usage visible", async () => {
     const partial = payload({
       sources: [

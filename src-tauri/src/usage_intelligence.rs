@@ -1037,6 +1037,14 @@ impl UsageIntelligenceStore {
                 .then_with(|| a.provider.cmp(&b.provider))
         });
 
+        // Per-source coverage uses the exact cursor universe shown in
+        // diagnostics. A source with no cursor yet stays invisible: nothing
+        // has been collected from it, so there is no persisted fact to
+        // qualify (the first collection pass creates its cursor).
+        let source_coverage: Vec<SourceCoverageDto> = cursors
+            .iter()
+            .map(|cursor| source_coverage_for(cursor, enabled, range_start))
+            .collect();
         let sources = cursors
             .into_iter()
             .map(|cursor| SourceDiagnosticsDto {
@@ -1055,6 +1063,18 @@ impl UsageIntelligenceStore {
             .collect();
 
         let daily = build_daily_days(&in_range, range_start, now_ms, collection_started_at);
+
+        // The range is complete only when the original collection anchor
+        // covers it AND every visible source reports complete coverage.
+        // Before any baseline, an enabled plane is conservatively
+        // incomplete; a disabled empty plane keeps the historical false
+        // empty-state verdict (nothing was ever claimed to be collected).
+        let incomplete_history = collection_started_at
+            .map(|started| started > range_start)
+            .unwrap_or(enabled)
+            || source_coverage
+                .iter()
+                .any(|coverage| coverage.coverage != "complete");
 
         UsageIntelligenceDto {
             schema_version: USAGE_INTELLIGENCE_SCHEMA_VERSION,
@@ -1075,12 +1095,9 @@ impl UsageIntelligenceStore {
                 total_tokens: totals.total,
             },
             collection_started_at: collection_started_at.map(canonical_timestamp),
-            // Honest range semantics: the selected range reaches further
-            // back than local collection itself does.
-            incomplete_history: collection_started_at
-                .map(|started| started > range_start)
-                .unwrap_or(false),
+            incomplete_history,
             sources,
+            source_coverage,
             daily,
             semantics: "reportedTokenUsageCollectedLocally",
         }
@@ -1275,6 +1292,79 @@ fn rendered_source_state(persisted: SourceState, enabled: bool, collecting: bool
     }
 }
 
+/// The honest coverage verdict for one source over `[range_start, now]`.
+///
+/// A disabled plane cannot collect, a source without a baseline has no
+/// observation at all, and a pending re-baseline spans an unknowable gap
+/// while collection was off. Only a baseline at or before the range start
+/// can support a complete verdict; a later baseline is continuous from its
+/// own instant, while a failed last scan may have missed later events.
+fn source_coverage_for(
+    cursor: &SourceCursor,
+    enabled: bool,
+    range_start: i64,
+) -> SourceCoverageDto {
+    if !enabled {
+        return SourceCoverageDto {
+            source: cursor.source.clone(),
+            coverage: "uncertain".to_string(),
+            reason: Some("monitoringDisabled".to_string()),
+            covered_from: None,
+            last_observed_at: None,
+        };
+    }
+    if !cursor.baselined {
+        return SourceCoverageDto {
+            source: cursor.source.clone(),
+            coverage: "uncertain".to_string(),
+            reason: Some("noBaseline".to_string()),
+            covered_from: None,
+            last_observed_at: None,
+        };
+    }
+    if cursor.pending_rebaseline {
+        return SourceCoverageDto {
+            source: cursor.source.clone(),
+            coverage: "incomplete".to_string(),
+            reason: Some("pendingRebaseline".to_string()),
+            covered_from: None,
+            last_observed_at: None,
+        };
+    }
+    if cursor.baselined_at > range_start {
+        return SourceCoverageDto {
+            source: cursor.source.clone(),
+            coverage: "incomplete".to_string(),
+            reason: Some("lateBaseline".to_string()),
+            covered_from: Some(canonical_timestamp(cursor.baselined_at)),
+            last_observed_at: None,
+        };
+    }
+
+    let reason = match cursor.state {
+        SourceState::Ok | SourceState::ScanCeiling => {
+            return SourceCoverageDto {
+                source: cursor.source.clone(),
+                coverage: "complete".to_string(),
+                reason: None,
+                covered_from: None,
+                last_observed_at: None,
+            };
+        }
+        SourceState::SourceAbsent => "sourceAbsent",
+        SourceState::SchemaUnsupported => "schemaUnsupported",
+        SourceState::ReadFailure => "readFailure",
+    };
+    SourceCoverageDto {
+        source: cursor.source.clone(),
+        coverage: "uncertain".to_string(),
+        reason: Some(reason.to_string()),
+        covered_from: None,
+        last_observed_at: (cursor.last_observed_at > 0)
+            .then(|| canonical_timestamp(cursor.last_observed_at)),
+    }
+}
+
 // ---------- aggregation DTOs (camelCase on the wire) ----------
 
 /// Supported aggregation ranges.
@@ -1344,6 +1434,23 @@ pub struct SourceDiagnosticsDto {
     pub last_scan: Option<ScanStats>,
 }
 
+/// Per-source range coverage. Additive to the original single-anchor
+/// `incomplete_history`; a missing baseline, a disabled collection period,
+/// and a failed last scan are all distinct from measured zero usage.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceCoverageDto {
+    pub source: String,
+    /// `complete` | `incomplete` | `uncertain`.
+    pub coverage: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covered_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_observed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageIntelligenceDto {
@@ -1360,6 +1467,9 @@ pub struct UsageIntelligenceDto {
     pub collection_started_at: Option<String>,
     pub incomplete_history: bool,
     pub sources: Vec<SourceDiagnosticsDto>,
+    /// One verdict per existing source cursor, using the same source
+    /// universe and order as `sources`. Always present; possibly empty.
+    pub source_coverage: Vec<SourceCoverageDto>,
     /// One cell per local calendar day touched by the selected range,
     /// bucketing the same events the totals aggregate — the daily sums
     /// always reconcile with `totals` and `events_in_range`.
@@ -1486,6 +1596,7 @@ pub fn get_usage_intelligence(
             collection_started_at: None,
             incomplete_history: false,
             sources: Vec::new(),
+            source_coverage: Vec::new(),
             daily: Vec::new(),
             semantics: "reportedTokenUsageCollectedLocally",
         },
@@ -1526,6 +1637,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NOW_MS: i64 = 1_791_288_000_000; // 2026-10-06T12:00:00.000Z
+    const DAY_MS: i64 = 24 * 60 * 60_000;
 
     fn fixed_clock() -> Box<dyn Fn() -> i64 + Send + Sync> {
         Box::new(|| NOW_MS)
@@ -1635,6 +1747,13 @@ mod tests {
             files: Vec::new(),
             batch_end: None,
         }
+    }
+
+    fn dto_coverage<'a>(dto: &'a UsageIntelligenceDto, source: &str) -> &'a SourceCoverageDto {
+        dto.source_coverage
+            .iter()
+            .find(|coverage| coverage.source == source)
+            .unwrap_or_else(|| panic!("missing coverage for {source}"))
     }
 
     // 1. serialization roundtrip: a persisted store reopens with the same
@@ -1910,6 +2029,339 @@ mod tests {
             "7d reaches further back than collection"
         );
         let today = store.aggregate(UsageRange::Today, Some(NOW_MS - 8 * 60 * 60_000));
+        assert!(!today.incomplete_history);
+    }
+
+    #[test]
+    fn enabled_plane_without_a_baseline_does_not_claim_complete_history() {
+        let (_now, clock) = manual_clock(NOW_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-never-started", clock);
+        store.set_enabled(true);
+
+        let waiting = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(waiting.collection_started_at, None);
+        assert!(waiting.source_coverage.is_empty());
+        assert_eq!(waiting.events_in_range, 0);
+        assert!(
+            waiting.incomplete_history,
+            "enabled collection without a baseline has no known coverage"
+        );
+
+        // The disabled empty plane keeps the historical empty-state verdict.
+        store.set_enabled(false);
+        let off = store.aggregate(UsageRange::SevenDays, None);
+        assert!(!off.incomplete_history);
+        assert!(off.source_coverage.is_empty());
+    }
+
+    #[test]
+    fn per_source_coverage_is_complete_when_every_baseline_covers_the_range() {
+        let range_start = NOW_MS - 7 * DAY_MS;
+        let (now, clock) = manual_clock(range_start - DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-complete", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(dto.source_coverage.len(), 2);
+        for source in [USAGE_SOURCE_ZCODE, USAGE_SOURCE_CODEX] {
+            let coverage = dto_coverage(&dto, source);
+            assert_eq!(coverage.coverage, "complete");
+            assert_eq!(coverage.reason, None);
+            assert_eq!(coverage.covered_from, None);
+        }
+        assert!(!dto.incomplete_history);
+
+        // A bounded scan is documented progress, not a coverage gap.
+        store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ScanCeiling, None);
+        let ceiling = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(
+            dto_coverage(&ceiling, USAGE_SOURCE_ZCODE).coverage,
+            "complete"
+        );
+        assert!(!ceiling.incomplete_history);
+    }
+
+    #[test]
+    fn later_source_baseline_is_incomplete_from_its_baseline_instant() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-late", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS - 3 * DAY_MS;
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 4 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(
+                vec![event("zcode:late", "zai", "GLM-5.3", NOW_MS - DAY_MS)],
+                NOW_MS - DAY_MS,
+            ),
+        );
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let zcode = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
+        let codex = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        assert_eq!(zcode.coverage, "complete");
+        assert_eq!(codex.coverage, "incomplete");
+        assert_eq!(codex.reason.as_deref(), Some("lateBaseline"));
+        assert_eq!(
+            codex.covered_from,
+            Some(canonical_timestamp(NOW_MS - 3 * DAY_MS))
+        );
+        assert!(dto.incomplete_history);
+        assert_eq!(dto.events_in_range, 1);
+        assert_eq!(dto.totals.total_tokens, 380);
+    }
+
+    #[test]
+    fn global_anchor_before_range_does_not_hide_a_later_source_baseline() {
+        let range_start = NOW_MS - 7 * DAY_MS;
+        let (now, clock) = manual_clock(NOW_MS - 12 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-regression", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 12 * DAY_MS, None);
+        let global_start = store.collection_started_at().unwrap();
+        assert!(global_start < range_start);
+        *now.lock().unwrap() = NOW_MS - 2 * DAY_MS;
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 3 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(
+            dto.collection_started_at,
+            Some(canonical_timestamp(global_start))
+        );
+        assert!(dto.incomplete_history);
+        let late = dto_coverage(&dto, USAGE_SOURCE_OPENCODE);
+        assert_eq!(late.coverage, "incomplete");
+        assert_eq!(late.reason.as_deref(), Some("lateBaseline"));
+    }
+
+    #[test]
+    fn failure_only_source_has_no_baseline_and_is_uncertain() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-no-baseline", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+        store.mark_source_state(USAGE_SOURCE_CODEX, SourceState::ReadFailure, None);
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let codex = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        assert_eq!(codex.coverage, "uncertain");
+        assert_eq!(codex.reason.as_deref(), Some("noBaseline"));
+        assert_eq!(codex.covered_from, None);
+        assert_eq!(codex.last_observed_at, None);
+        assert!(dto.incomplete_history);
+    }
+
+    #[test]
+    fn baselined_failure_is_uncertain_with_its_last_observed_anchor() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-failure", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        let baseline = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        *now.lock().unwrap() = NOW_MS;
+        store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let zcode = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
+        assert_eq!(zcode.coverage, "uncertain");
+        assert_eq!(zcode.reason.as_deref(), Some("sourceAbsent"));
+        assert_eq!(
+            zcode.last_observed_at,
+            Some(canonical_timestamp(baseline.last_observed_at))
+        );
+        assert!(dto.incomplete_history);
+    }
+
+    #[test]
+    fn disable_reenable_then_rebaseline_reports_the_unknown_gap() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-reenable", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS - 5 * DAY_MS;
+        store.set_enabled(false);
+        *now.lock().unwrap() = NOW_MS - 3 * DAY_MS;
+        store.set_enabled(true);
+
+        let pending = store.aggregate(UsageRange::SevenDays, None);
+        let coverage = dto_coverage(&pending, USAGE_SOURCE_ZCODE);
+        assert_eq!(coverage.coverage, "incomplete");
+        assert_eq!(coverage.reason.as_deref(), Some("pendingRebaseline"));
+        assert_eq!(coverage.covered_from, None);
+        assert!(pending.incomplete_history);
+
+        *now.lock().unwrap() = NOW_MS - 2 * DAY_MS;
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * DAY_MS, None);
+        let rebaselined = store.aggregate(UsageRange::SevenDays, None);
+        let coverage = dto_coverage(&rebaselined, USAGE_SOURCE_ZCODE);
+        assert_eq!(coverage.coverage, "incomplete");
+        assert_eq!(coverage.reason.as_deref(), Some("lateBaseline"));
+        assert_eq!(
+            coverage.covered_from,
+            Some(canonical_timestamp(NOW_MS - 2 * DAY_MS))
+        );
+        assert!(rebaselined.incomplete_history);
+    }
+
+    #[test]
+    fn source_coverage_never_changes_observed_token_totals() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-totals", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(
+                vec![
+                    event("zcode:a", "zai", "GLM-5.3", NOW_MS - DAY_MS),
+                    event("zcode:b", "zai", "GLM-5.3", NOW_MS - 1_000),
+                ],
+                NOW_MS - 1_000,
+            ),
+        );
+        let before = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(before.events_in_range, 2);
+        assert_eq!(before.totals.total_tokens, 760);
+
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - DAY_MS, None);
+        let after = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(after.events_in_range, before.events_in_range);
+        assert_eq!(after.totals.total_tokens, before.totals.total_tokens);
+        assert_eq!(
+            serde_json::to_value(&after.groups).unwrap(),
+            serde_json::to_value(&before.groups).unwrap()
+        );
+        assert_eq!(
+            dto_coverage(&after, USAGE_SOURCE_CODEX).coverage,
+            "incomplete"
+        );
+        assert!(after.incomplete_history);
+    }
+
+    #[test]
+    fn missing_history_is_not_measured_zero_usage() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-missing-zero", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+
+        let complete = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(complete.totals.events, 0);
+        assert_eq!(
+            dto_coverage(&complete, USAGE_SOURCE_ZCODE).coverage,
+            "complete"
+        );
+        assert!(!complete.incomplete_history);
+
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - DAY_MS, None);
+        let incomplete = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(incomplete.totals.events, 0);
+        assert_eq!(
+            dto_coverage(&incomplete, USAGE_SOURCE_CODEX).coverage,
+            "incomplete"
+        );
+        assert!(
+            incomplete.incomplete_history,
+            "a zero-event uncovered source is missing history, not confirmed zero usage"
+        );
+    }
+
+    #[test]
+    fn disabled_sources_are_uncertain_even_with_an_old_global_anchor() {
+        let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-disabled", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+        store.set_enabled(false);
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        let coverage = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
+        assert_eq!(coverage.coverage, "uncertain");
+        assert_eq!(coverage.reason.as_deref(), Some("monitoringDisabled"));
+        assert!(dto.incomplete_history);
+    }
+
+    #[test]
+    fn dto_compatibility_boundaries_and_additive_coverage_wire_shape() {
+        let range_start = NOW_MS - 7 * DAY_MS;
+        let today_start = NOW_MS - 8 * 60 * 60_000;
+        let (now, clock) = manual_clock(range_start - DAY_MS);
+        let (store, _dir) = temp_store_with_clock("coverage-wire", clock);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = range_start;
+        // Equality is covered from the range start.
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
+        *now.lock().unwrap() = NOW_MS;
+
+        let dto = store.aggregate(UsageRange::SevenDays, None);
+        assert_eq!(dto.range_start, canonical_timestamp(range_start));
+        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_CODEX).coverage, "complete");
+        assert!(!dto.incomplete_history);
+
+        let wire = serde_json::to_value(&dto).unwrap();
+        for key in [
+            "schemaVersion",
+            "range",
+            "rangeStart",
+            "rangeEnd",
+            "generatedAt",
+            "enabled",
+            "eventsInRange",
+            "groups",
+            "totals",
+            "collectionStartedAt",
+            "incompleteHistory",
+            "sources",
+            "daily",
+            "semantics",
+            "sourceCoverage",
+        ] {
+            assert!(wire.get(key).is_some(), "missing wire field {key}");
+        }
+        assert!(wire["groups"].is_array());
+        assert!(wire["daily"].is_array());
+        assert!(wire["sources"].is_array());
+        for key in [
+            "events",
+            "inputTokens",
+            "cacheReadTokens",
+            "cacheWriteTokens",
+            "outputTokens",
+            "reasoningTokens",
+            "totalTokens",
+        ] {
+            assert!(
+                wire["totals"].get(key).is_some(),
+                "missing totals field {key}"
+            );
+        }
+        for source in wire["sources"].as_array().unwrap() {
+            for key in ["source", "state", "watermarkAt", "baselinedAt"] {
+                assert!(source.get(key).is_some(), "missing source field {key}");
+            }
+        }
+        let coverage = wire["sourceCoverage"].as_array().unwrap();
+        assert_eq!(coverage.len(), 2);
+        for entry in coverage {
+            assert_eq!(entry["coverage"], "complete");
+            assert!(entry.get("reason").is_none());
+            assert!(entry.get("coveredFrom").is_none());
+            assert!(entry.get("lastObservedAt").is_none());
+        }
+
+        let today = store.aggregate(UsageRange::Today, Some(today_start));
+        assert_eq!(today.range_start, canonical_timestamp(today_start));
         assert!(!today.incomplete_history);
     }
 

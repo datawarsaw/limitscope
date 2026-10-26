@@ -10,6 +10,7 @@ import {
   type UsageIntelligenceRange,
   type UsageModelBreakdown,
   type UsageSourceDiagnostics,
+  type UsageSourceCoverage,
 } from "../../lib/usageIntelligence";
 import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
 import { UsageDailyActivity } from "./UsageDailyActivity";
@@ -118,6 +119,14 @@ export function UsageOverview({
     return [...data.groups].sort((a, b) => b.totalTokens - a.totalTokens);
   }, [data]);
 
+  const affectedCoverage = useMemo(
+    () =>
+      data?.sourceCoverage?.filter(
+        (coverage) => coverage.coverage !== "complete",
+      ) ?? [],
+    [data],
+  );
+
   // The naming contract makes `model` the normalized model identity and
   // keeps the provider qualifier on the separate provider axis (Codex splits
   // `xai/grok-4.6`; ZCode and OpenCode report the provider directly). The
@@ -210,6 +219,23 @@ export function UsageOverview({
         <div className="usage-loading" role="status">
           Loading token usage…
         </div>
+      ) : null}
+
+      {affectedCoverage.length > 0 ? (
+        <p
+          className="usage-subtitle"
+          role="note"
+          aria-label="History coverage"
+        >
+          <strong>History coverage:</strong>{" "}
+          {affectedCoverage
+            .map(
+              (coverage) =>
+                `${sourceLabel(coverage.source)} — ${coverageDetail(coverage)}`,
+            )
+            .join("; ")}
+          . Reported totals show what was collected, not the full period.
+        </p>
       ) : null}
 
       {data !== null && providerRows.length === 0 ? (
@@ -483,6 +509,28 @@ function sourceLabel(source: string): string {
   if (source === "codex") return "Codex";
   if (source === "opencode") return "OpenCode";
   return source;
+}
+
+function coverageDetail(coverage: UsageSourceCoverage): string {
+  switch (coverage.reason) {
+    case "lateBaseline":
+      return coverage.coveredFrom
+        ? `history is only covered since ${formatSinceDate(coverage.coveredFrom)}`
+        : "history starts partway through this range";
+    case "monitoringDisabled":
+    case "pendingRebaseline":
+      return "history while collection was off is missing";
+    case "noBaseline":
+      return "no history collected yet";
+    case "sourceAbsent":
+    case "schemaUnsupported":
+    case "readFailure":
+      return coverage.lastObservedAt
+        ? `may be missing events after ${formatSinceDate(coverage.lastObservedAt)}`
+        : "recent events may be missing";
+    default:
+      return "history coverage is incomplete";
+  }
 }
 
 function formatSinceDate(iso: string): string {
