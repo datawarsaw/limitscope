@@ -36,7 +36,16 @@
 //!   still enabled) the collector establishes a baseline cursor at the
 //!   source's current high-water mark and imports nothing; only rows
 //!   completed after that point are ever ingested. The baseline writes no
-//!   fake zero usage.
+//!   fake zero usage. Re-enabling after a disable re-establishes a fresh
+//!   baseline per source the same way: usage completed while collection
+//!   was disabled is never silently imported, while already-collected
+//!   events and totals are preserved.
+//! - An incremental window larger than one scan's row bound is processed
+//!   in bounded, deterministic batches: each scan commits its prefix
+//!   (persisting the composite `(stamp, id)` resume position), surfaces
+//!   the deferral through the source's `scanCeiling` diagnostics, and
+//!   continues from the saved position on subsequent scans — nothing is
+//!   skipped and the cursor never stalls on an oversized backlog.
 //! - Re-ingesting an overlap is idempotent: events dedup by their stable
 //!   owned identity, so re-running a collector can never grow totals.
 //! - Retention is bounded (35 days, plus a hard event cap) and only ever
@@ -229,8 +238,11 @@ pub enum SourceState {
     /// The read failed (I/O, locked, corrupt). Display-safe detail rides
     /// separately.
     ReadFailure,
-    /// The incremental window held more rows than the scan ceiling; the
-    /// scan was abandoned whole and the cursor did not move.
+    /// The incremental window held more rows than one scan's bound; the
+    /// scan committed a bounded, deterministic prefix (its events are
+    /// stored and its resume position persisted) and deferred the
+    /// remainder to subsequent scans. Progress continues; nothing is
+    /// skipped.
     ScanCeiling,
     /// The last scan completed successfully (at `last_observed_at`).
     Ok,
@@ -247,6 +259,20 @@ pub struct SourceFingerprint {
     pub wal_size: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wal_mtime_ms: Option<i64>,
+}
+
+/// The composite read position of the last row of a committed batch: the
+/// row's cursor-column stamp plus its id, defining a lexicographic
+/// `(stamp, id)` order over eligible rows. A scan window admits every row
+/// from its floor forward except the already-processed prefix at exactly
+/// `(stamp_ms, id <= id)`, so a batch that ends mid-tie (thousands of rows
+/// sharing one stamp) still resumes at the exact next row instead of
+/// re-reading — or skipping — the tie group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceBatchEnd {
+    pub stamp_ms: i64,
+    pub id: String,
 }
 
 /// Per-source incremental cursor + diagnostics, persisted in the owned
@@ -278,6 +304,21 @@ pub struct SourceCursor {
     /// source. False only for failure-only cursor records.
     #[serde(default)]
     pub baselined: bool,
+    /// Set by the disable → re-enable transition: usage completed while
+    /// collection was disabled must not be silently imported, so the next
+    /// collection pass must establish a fresh baseline at the source's
+    /// then-current high-water mark before any incremental read. Cleared
+    /// only by that successful re-baseline; failures leave it set so a
+    /// later pass retries the fresh baseline — never a stale watermark.
+    #[serde(default)]
+    pub pending_rebaseline: bool,
+    /// The composite `(stamp, id)` end of the last committed batch
+    /// (row-count-bounded sources: ZCode, OpenCode). `None` while every
+    /// scan so far drained its whole window (the inclusive lookback floor
+    /// alone resumes correctly) or for file-based sources (Codex tracks
+    /// per-file byte cursors instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_end: Option<SourceBatchEnd>,
     /// When the baseline (backlog skip) was established, epoch ms. Also
     /// anchors the "collected locally since" disclosure.
     pub baselined_at: i64,
@@ -396,6 +437,10 @@ pub struct SourceScan {
     /// only; empty for the ZCode reader). Replaces the cursor's file
     /// list wholesale so deletions are reflected.
     pub files: Vec<SourceFileCursor>,
+    /// The committed batch's composite end position (row-count-bounded
+    /// sources). `None` leaves the cursor's position untouched (empty
+    /// window, or a file-based source).
+    pub batch_end: Option<SourceBatchEnd>,
 }
 
 // ---------- persisted envelope ----------
@@ -534,6 +579,14 @@ impl UsageIntelligenceStore {
     /// Sets the opt-in flag and persists it. Enabling does not itself
     /// collect; the caller (command or cycle hook) triggers collection so
     /// the first enable baselines exactly once, deliberately.
+    ///
+    /// Re-enabling after a disable marks every source cursor
+    /// `pending_rebaseline`: usage completed while collection was disabled
+    /// must not be silently imported, so the next pass establishes a fresh
+    /// baseline at each source's then-current high-water mark (the same
+    /// backlog skip as a first enable) instead of incrementally importing
+    /// the disabled period. Already-collected events, totals, and the
+    /// disclosure anchor are untouched.
     pub fn set_enabled(&self, enabled: bool) {
         let changed = {
             let mut state = self.state.lock().unwrap();
@@ -541,6 +594,11 @@ impl UsageIntelligenceStore {
                 false
             } else {
                 state.enabled = enabled;
+                if enabled {
+                    for cursor in state.cursors.values_mut() {
+                        cursor.pending_rebaseline = true;
+                    }
+                }
                 state.revision += 1;
                 true
             }
@@ -563,6 +621,22 @@ impl UsageIntelligenceStore {
     /// The persisted cursor of one source, when a baseline exists.
     pub fn cursor(&self, source: &str) -> Option<SourceCursor> {
         self.state.lock().unwrap().cursors.get(source).cloned()
+    }
+
+    /// Whether the next collection pass for this source must (re-)establish
+    /// its backlog-skipping baseline before any incremental read: true when
+    /// no cursor exists yet, when the cursor only ever carried a failure,
+    /// or when a disable → re-enable transition marked the source for a
+    /// fresh baseline. Collectors gate their baseline branch on this, not
+    /// on `baselined` alone.
+    pub fn cursor_needs_baseline(&self, source: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .cursors
+            .get(source)
+            .map(|cursor| !cursor.baselined || cursor.pending_rebaseline)
+            .unwrap_or(true)
     }
 
     /// The owned events, oldest first (canonical store order). Read-only
@@ -657,12 +731,19 @@ impl UsageIntelligenceStore {
         let now_ms = self.now_ms();
         let changed = {
             let mut state = self.state.lock().unwrap();
-            let already_baselined = state
-                .cursors
-                .get(source)
+            let existing = state.cursors.get(source);
+            let already_baselined = existing
                 .map(|cursor| cursor.baselined)
                 .unwrap_or(false);
-            if already_baselined {
+            let pending_rebaseline = existing
+                .map(|cursor| cursor.pending_rebaseline)
+                .unwrap_or(false);
+            // An ordinary baselined cursor is never re-anchored
+            // (idempotence); a pending-rebaseline cursor (marked by the
+            // disable → re-enable transition) is replaced by the fresh
+            // baseline at the current high-water mark, importing nothing
+            // from the disabled period.
+            if already_baselined && !pending_rebaseline {
                 false
             } else {
                 state.cursors.insert(
@@ -672,6 +753,8 @@ impl UsageIntelligenceStore {
                         watermark_ms,
                         baseline_watermark_ms: watermark_ms,
                         baselined: true,
+                        pending_rebaseline: false,
+                        batch_end: None,
                         baselined_at: now_ms,
                         last_observed_at: now_ms,
                         state: SourceState::Ok,
@@ -714,6 +797,8 @@ impl UsageIntelligenceStore {
                     watermark_ms: 0,
                     baseline_watermark_ms: 0,
                     baselined: false,
+                    pending_rebaseline: false,
+                    batch_end: None,
                     baselined_at: now_ms,
                     last_observed_at: 0,
                     state: SourceState::Ok,
@@ -749,16 +834,14 @@ impl UsageIntelligenceStore {
         let now_ms = self.now_ms();
         let cutoff = now_ms - USAGE_EVENT_RETENTION_MS;
         let mut batch: Vec<UsageEvent> = Vec::new();
+        let mut batch_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut rejected = scan.rejected;
         for event in scan.events {
             match UsageEvent::validated(event, now_ms) {
                 Some(valid_event) => {
                     // Dedup inside the batch too, so `accepted` counts
                     // real insertions even when a scan overlaps itself.
-                    if !batch
-                        .iter()
-                        .any(|existing: &UsageEvent| existing.id == valid_event.id)
-                    {
+                    if batch_ids.insert(valid_event.id.clone()) {
                         batch.push(valid_event);
                     }
                 }
@@ -798,6 +881,11 @@ impl UsageIntelligenceStore {
             if let Some(cursor) = state.cursors.get_mut(source) {
                 if cursor.baselined {
                     cursor.watermark_ms = cursor.watermark_ms.max(scan.watermark_ms);
+                    // The committed batch's composite end position — the
+                    // resume point for a bounded (deferred) backlog.
+                    if let Some(end) = scan.batch_end.take() {
+                        cursor.batch_end = Some(end);
+                    }
                     // File-based sources report their full tracked-file
                     // state; replacing wholesale also reflects deletions.
                     cursor.files = std::mem::take(&mut scan.files);
@@ -1545,6 +1633,7 @@ mod tests {
             usage_not_reported: 0,
             events,
             files: Vec::new(),
+            batch_end: None,
         }
     }
 
@@ -1971,6 +2060,7 @@ mod tests {
                 usage_not_reported: 0,
                 events: Vec::new(),
                 files: updated,
+                batch_end: None,
             },
         );
         assert_eq!(stats.accepted, 0);
@@ -2039,6 +2129,144 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    // ---------- disable → re-enable (fresh-baseline) semantics ----------
+
+    // 19. the disable → re-enable transition marks every existing
+    //     cursor for a fresh baseline; a first enable (no cursors) and
+    //     the disable itself mark nothing; the fresh baseline replaces
+    //     the pending cursor, clears the flag, and keeps the disclosure
+    //     anchor; an ordinary baselined cursor stays idempotent.
+    #[test]
+    fn reenable_marks_existing_cursors_pending_rebaseline() {
+        let (store, _dir) = temp_store("pending");
+        store.set_enabled(true);
+        assert!(
+            store.cursor_needs_baseline(USAGE_SOURCE_ZCODE),
+            "no cursor yet: the first pass must baseline"
+        );
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
+        assert!(!store.cursor_needs_baseline(USAGE_SOURCE_ZCODE));
+        assert!(!store.cursor(USAGE_SOURCE_ZCODE).unwrap().pending_rebaseline);
+
+        store.set_enabled(false);
+        assert!(
+            !store
+                .cursor(USAGE_SOURCE_ZCODE)
+                .unwrap()
+                .pending_rebaseline,
+            "disabling alone does not mark anything"
+        );
+        store.set_enabled(false); // idempotent: still no transition
+        store.set_enabled(true); // the transition marks every cursor
+        assert!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().pending_rebaseline);
+        assert!(store.cursor_needs_baseline(USAGE_SOURCE_ZCODE));
+
+        // The fresh baseline replaces the pending cursor, clears the
+        // flag, and keeps the original disclosure anchor.
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 5_000, None);
+        let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        assert!(!cursor.pending_rebaseline);
+        assert_eq!(cursor.watermark_ms, NOW_MS - 5_000);
+        assert_eq!(cursor.baseline_watermark_ms, NOW_MS - 5_000);
+        assert_eq!(store.collection_started_at(), Some(NOW_MS));
+
+        // An ordinary baselined cursor is still never re-anchored.
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 1_000, None);
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_ZCODE).unwrap().watermark_ms,
+            NOW_MS - 5_000
+        );
+    }
+
+    // 20. the pending re-baseline survives a persisted restart: the flag
+    //     roundtrips through disk, so a quit between re-enable and the
+    //     first pass still skips the disabled period later.
+    #[test]
+    fn pending_rebaseline_survives_restart() {
+        let (store, dir) = temp_store("pending-restart");
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
+        store.set_enabled(false);
+        store.set_enabled(true);
+        drop(store);
+
+        let reopened =
+            UsageIntelligenceStore::open_with(dir.path().join(USAGE_INTELLIGENCE_FILE_NAME), fixed_clock(), Box::new(|| None));
+        assert!(reopened.enabled());
+        assert!(reopened.cursor_needs_baseline(USAGE_SOURCE_ZCODE));
+        assert!(reopened.cursor(USAGE_SOURCE_ZCODE).unwrap().pending_rebaseline);
+    }
+
+    // 21. batch positions: a scan's committed end position persists on
+    //     the cursor, survives restart, is left untouched by scans
+    //     without one, and is replaced by a later batch's position.
+    #[test]
+    fn batch_positions_apply_and_roundtrip_through_disk() {
+        let (store, dir) = temp_store("batch-pos");
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
+        let first = SourceBatchEnd {
+            stamp_ms: NOW_MS - 30_000,
+            id: "row-a".to_string(),
+        };
+        store.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            SourceScan {
+                watermark_ms: NOW_MS - 30_000,
+                fingerprint: None,
+                rejected: 0,
+                usage_not_reported: 0,
+                events: vec![event("zcode:row-a", "zai", "GLM-5.3", NOW_MS - 30_000)],
+                files: Vec::new(),
+                batch_end: Some(first.clone()),
+            },
+        );
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_ZCODE).unwrap().batch_end,
+            Some(first.clone())
+        );
+        drop(store);
+
+        let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let reopened =
+            UsageIntelligenceStore::open_with(path, fixed_clock(), Box::new(|| None));
+        assert_eq!(
+            reopened.cursor(USAGE_SOURCE_ZCODE).unwrap().batch_end,
+            Some(first),
+            "the resume position survives restart"
+        );
+
+        // A scan without a batch end (idle or file-based) leaves the
+        // stored position untouched.
+        reopened.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            scan_from(vec![event("zcode:row-b", "zai", "GLM-5.3", NOW_MS - 10_000)], NOW_MS - 10_000),
+        );
+        assert!(reopened.cursor(USAGE_SOURCE_ZCODE).unwrap().batch_end.is_some());
+
+        // A later committed batch replaces the position.
+        let second = SourceBatchEnd {
+            stamp_ms: NOW_MS - 10_000,
+            id: "row-b".to_string(),
+        };
+        reopened.apply_scan(
+            USAGE_SOURCE_ZCODE,
+            SourceScan {
+                watermark_ms: NOW_MS - 10_000,
+                fingerprint: None,
+                rejected: 0,
+                usage_not_reported: 0,
+                events: Vec::new(),
+                files: Vec::new(),
+                batch_end: Some(second.clone()),
+            },
+        );
+        assert_eq!(
+            reopened.cursor(USAGE_SOURCE_ZCODE).unwrap().batch_end,
+            Some(second)
+        );
     }
 
     // ---------- daily activity projection ----------

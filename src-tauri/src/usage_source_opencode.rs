@@ -42,30 +42,48 @@
 //! - First successful observation establishes a baseline at the current
 //!   high-water mark (`MAX(time_updated)` over assistant rows, plus one
 //!   millisecond) and imports nothing — no historical backlog, no fake
-//!   zero usage.
+//!   zero usage. Re-enabling after a disable re-establishes a fresh
+//!   baseline the same way: usage completed while collection was
+//!   disabled is never silently imported.
 //! - The cursor column is `time_updated` — the row's last-write stamp.
 //!   That is the commit-tracking column: a completion, a late usage
-//!   write, or a fork copy each bump it, so the window
-//!   `time_updated >= watermark - LOOKBACK` (inclusive at the floor,
-//!   ordered by `(time_updated, id)`, capped at `SCAN_CEILING + 1` rows)
-//!   catches every newly-committed accounting state regardless of how old
-//!   the request itself is. `time_created` (the request-start stamp,
-//!   preserved verbatim by forks) is deliberately not the cursor: a long
-//!   request committing far behind younger rows would otherwise fall
-//!   through the floor. Message ids are not monotonic (one id-ordered
-//!   timestamp inversion per ~2,900 live rows), so the composite
-//!   `(time_updated, id)` ordering is used; ids never gate the window.
-//! - Hitting the ceiling fails closed: the whole scan is abandoned, the
-//!   cursor does not move, and the source state reports `scanCeiling`.
-//!   Nothing is silently skipped.
-//! - The watermark advances only through **dispositioned** rows: accepted
-//!   events, and all-zero rows dispositioned as usage-not-reported (a
-//!   deterministic, content-bound verdict — re-reading them can never
-//!   change it). Rows rejected as malformed never advance it; the
-//!   lookback keeps them revisitable. Boundary honesty: accounting
-//!   re-written more than one lookback behind a watermark that has already
-//!   moved past it is not re-read — the earlier disposition stands (the
-//!   same bounded boundary the ZCode reader documents for late commits).
+//!   write, or a fork copy each bump it, so newly-committed accounting
+//!   states are always caught regardless of how old the request itself
+//!   is. `time_created` (the request-start stamp, preserved verbatim by
+//!   forks) is deliberately not the cursor: a long request committing
+//!   far behind younger rows would otherwise fall through the floor.
+//!   Message ids are not monotonic (one id-ordered timestamp inversion
+//!   per ~2,900 live rows), so the composite `(time_updated, id)`
+//!   ordering is used; ids never gate the window.
+//! - Later passes read in two phases. The forward drain reads rows
+//!   strictly after the persisted composite `(time_updated, id)`
+//!   position (from the baseline watermark on the first scan), ordered
+//!   `(time_updated, id)`. Once drained, a late-commit sweep re-reads
+//!   the bounded `LOOKBACK` band behind the position (newest first) —
+//!   id-dedup absorbs the re-reads and collapses fork copies onto
+//!   their executed request — and the floor never reaches below the
+//!   immutable baseline watermark.
+//! - One scan commits at most `SCAN_CEILING` forward rows — a
+//!   deterministic prefix under the `(time_updated, id)` order. An
+//!   over-bound window commits that prefix (events stored, position
+//!   persisted) and defers the remainder to subsequent scans, surfacing
+//!   the deferral as `scanCeiling` in the source state (the Codex
+//!   reader's bounded pattern). The composite resume position means a
+//!   batch ending mid-tie resumes at the exact next row: nothing is
+//!   skipped, nothing re-blocks, and committed rows never refill the
+//!   batch as duplicates. While a backlog is deferred the late-commit
+//!   sweep is skipped: a late row rides the lookback band until the
+//!   draining scan sweeps it, or ages out (the documented boundary
+//!   honesty).
+//! - The watermark advances through **every row of the committed
+//!   batch** — accepted events, all-zero rows dispositioned as
+//!   usage-not-reported (a deterministic, content-bound verdict), and
+//!   rejected rows alike. Validation is a pure function of the row, so
+//!   a permanently malformed row can never pin the window; rejected
+//!   rows stay revisitable only inside the lookback, then age out.
+//!   Boundary honesty: accounting re-written more than one lookback
+//!   behind a watermark that has already moved past it is not re-read —
+//!   the earlier disposition stands.
 //!
 //! # Completion predicate (verified against the live corpus 2026-10-06)
 //!
@@ -108,8 +126,8 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::usage_intelligence::{
-    SourceFingerprint, SourceScan, SourceState, UsageEvent, UsageIntelligenceStore,
-    EVENT_EPOCH_FLOOR_MS, EVENT_FUTURE_TOLERANCE_MS, USAGE_SOURCE_OPENCODE,
+    SourceBatchEnd, SourceFingerprint, SourceScan, SourceState, UsageEvent,
+    UsageIntelligenceStore, EVENT_EPOCH_FLOOR_MS, EVENT_FUTURE_TOLERANCE_MS, USAGE_SOURCE_OPENCODE,
 };
 
 /// Columns this reader requires on the `message` table. The verified live
@@ -121,9 +139,10 @@ const REQUIRED_COLUMNS: &[&str] = &["id", "time_created", "time_updated", "data"
 /// The one table this reader understands (the canonical accounting layer).
 const USAGE_TABLE: &str = "message";
 
-/// Maximum rows one incremental window may hold. Fetching one more than
-/// the ceiling detects the overflow; an over-ceiling window abandons the
-/// scan whole (fail closed) rather than chunking silently.
+/// Maximum rows one scan may commit. Fetching one more than the bound
+/// detects a deferred remainder; an over-bound window commits its
+/// deterministic `SCAN_CEILING`-row prefix and continues from the saved
+/// position on the next scan — never a silent skip, never a stall.
 pub const SCAN_CEILING: usize = 20_000;
 
 /// How far behind the watermark the window still reads, absorbing rows
@@ -148,6 +167,17 @@ pub enum OpencodeScanOutcome {
         usage_not_reported: usize,
         watermark_ms: i64,
     },
+    /// An incremental window held more rows than one scan commits; the
+    /// bounded prefix was committed (stored and position-persisted) and
+    /// the remainder is deferred to subsequent scans, surfacing as
+    /// `scanCeiling` until the backlog drains.
+    Bounded {
+        accepted: usize,
+        duplicates: usize,
+        rejected: usize,
+        usage_not_reported: usize,
+        watermark_ms: i64,
+    },
     /// The source fingerprint is unchanged since the last successful
     /// scan; the snapshot copy was skipped.
     Unchanged,
@@ -155,9 +185,6 @@ pub enum OpencodeScanOutcome {
     Absent,
     /// The database exists but the schema is not understood.
     SchemaUnsupported,
-    /// The incremental window exceeded the scan ceiling; nothing was
-    /// ingested and the cursor did not move.
-    CeilingExceeded { rows: usize },
     /// The read failed; the detail is display-safe.
     ReadFailure(String),
 }
@@ -186,10 +213,13 @@ pub fn collect(store: &UsageIntelligenceStore) -> OpencodeScanOutcome {
 
     // Cheap change detection: an unchanged, previously-healthy source
     // costs no snapshot copy. Only a fingerprint from a successful scan
-    // is trusted, so a failed pass always retries.
+    // is trusted, so a failed pass always retries — and a pending
+    // re-baseline (disable → re-enable) always re-reads to anchor its
+    // fresh baseline, even against an unchanged fingerprint.
     let fingerprint = fingerprint_of(&db_meta, wal_meta.as_ref());
     if let Some(cursor) = store.cursor(USAGE_SOURCE_OPENCODE) {
         if cursor.baselined
+            && !cursor.pending_rebaseline
             && cursor.state == SourceState::Ok
             && cursor.fingerprint.as_ref() == Some(&fingerprint)
         {
@@ -235,23 +265,21 @@ fn collect_from_live(
         return OpencodeScanOutcome::SchemaUnsupported;
     }
 
-    // Baseline first: no cursor (or a failure-only record) means this is
-    // the first successful observation — establish the backlog skip. The
-    // watermark sits one millisecond ABOVE the current high-water mark
-    // (the newest assistant row's last-write stamp), so every row already
-    // in the database — including any sharing the max stamp — is strictly
+    // Baseline first: no cursor (or a failure-only record, or a cursor
+    // marked for a fresh baseline by the disable → re-enable transition)
+    // means this pass must establish the backlog skip. The watermark
+    // sits one millisecond ABOVE the current high-water mark (the newest
+    // assistant row's last-write stamp), so every row already in the
+    // database — including any sharing the max stamp — is strictly
     // backlog and never imported; the +1 keeps the incremental window's
     // inclusive floor from re-admitting them on the next scan.
-    let baselined = store
-        .cursor(USAGE_SOURCE_OPENCODE)
-        .map(|cursor| cursor.baselined)
-        .unwrap_or(false);
-    if !baselined {
+    if store.cursor_needs_baseline(USAGE_SOURCE_OPENCODE) {
         // An empty source (Ok(None)) is a valid zero-history baseline; a
         // failed query is not. A MAX error must never read as empty and
         // anchor the baseline at zero — that would admit the whole backlog
         // as history on the next pass. Fail closed: record ReadFailure,
-        // leave the cursor unbaselined, and let a later pass retry.
+        // leave the cursor unbaselined (a pending re-baseline stays
+        // pending), and let a later pass retry.
         let max_updated: Option<i64> = match connection.query_row(
             &format!(
                 "SELECT MAX(time_updated) FROM {USAGE_TABLE} \
@@ -276,28 +304,56 @@ fn collect_from_live(
         return OpencodeScanOutcome::Baseline { watermark_ms };
     }
 
-    // Incremental window over the commit-tracking column. The floor
-    // re-reads a bounded lookback behind the watermark but never reaches
-    // below the immutable baseline watermark — rows written before the
-    // baseline are pre-enable backlog and stay unimported. The WHERE
-    // clause applies the verified completion predicate in SQL, so user
-    // rows, in-flight rows, and error rows (error payload included) are
-    // never fetched or parsed.
+    // Incremental read, two phases.
+    //
+    // 1. Forward drain: rows strictly after the persisted composite
+    //    position (or from the baseline watermark when no position is
+    //    recorded yet — the first scan after a baseline), ordered by
+    //    `(time_updated, id)`, fetched one past the scan bound. An
+    //    over-bound backlog commits its first SCAN_CEILING rows here and
+    //    defers the remainder: the saved position makes the next scan
+    //    resume at the exact next row — through equal-stamp ties and
+    //    malformed rows alike — so an oversized backlog drains across
+    //    scans without committed rows ever refilling the batch as
+    //    duplicates.
+    // 2. Late-commit sweep: once the forward window is drained, the
+    //    bounded lookback band behind the position is re-read (newest
+    //    first) for rows committed after an earlier scan but stamped
+    //    slightly behind it; the content-addressed id-dedup absorbs
+    //    re-reads (and collapses fork copies onto their executed
+    //    request). The sweep is skipped while a backlog is deferred — a
+    //    late row then rides the band until the draining scan that
+    //    follows sweeps it, or ages out beyond the lookback (the same
+    //    boundary honesty a fail-closed window had). The floor never
+    //    reaches below the immutable baseline watermark.
+    //
+    // Both queries apply the verified completion predicate in SQL, so
+    // user rows, in-flight rows, and error rows (error payload included)
+    // are never fetched or parsed.
     let cursor = store.cursor(USAGE_SOURCE_OPENCODE);
     let watermark_ms = cursor.as_ref().map(|cursor| cursor.watermark_ms).unwrap_or(0);
-    let window_start = cursor
+    let baseline_watermark_ms = cursor
         .as_ref()
-        .map(|cursor| (watermark_ms.saturating_sub(LOOKBACK_MS)).max(cursor.baseline_watermark_ms))
+        .map(|cursor| cursor.baseline_watermark_ms)
         .unwrap_or(0);
+    let position = cursor
+        .as_ref()
+        .and_then(|cursor| cursor.batch_end.clone());
+    // With no recorded position, forward starts at the baseline
+    // watermark (the exclusion bindings then match no real row).
+    let (pos_stamp, pos_id) = match &position {
+        Some(end) => (end.stamp_ms, end.id.clone()),
+        None => (baseline_watermark_ms, String::new()),
+    };
     let mut statement = match connection.prepare(&format!(
         "SELECT id, time_created, time_updated, data FROM {USAGE_TABLE} \
-         WHERE time_updated >= ?1 \
+         WHERE (time_updated > ?1 OR (time_updated = ?1 AND id > ?2)) \
            AND json_extract(data, '$.role') = 'assistant' \
            AND json_extract(data, '$.time.completed') IS NOT NULL \
            AND json_extract(data, '$.error') IS NULL \
            AND json_extract(data, '$.finish') IS NOT NULL \
          ORDER BY time_updated ASC, id ASC \
-         LIMIT ?2"
+         LIMIT ?3"
     )) {
         Ok(statement) => statement,
         Err(error) => {
@@ -307,82 +363,105 @@ fn collect_from_live(
         }
     };
     let rows = statement.query_map(
-        rusqlite::params![window_start, (SCAN_CEILING + 1) as i64],
-        |row| {
-            Ok(RawMessageRow {
-                id: row.get(0)?,
-                time_created: row.get(1)?,
-                time_updated: row.get(2)?,
-                data: row.get(3)?,
-            })
-        },
+        rusqlite::params![pos_stamp, pos_id, (SCAN_CEILING + 1) as i64],
+        map_raw_message_row,
     );
-    let rows = match rows {
+    let mut forward = match collect_rows(rows) {
         Ok(rows) => rows,
-        Err(error) => {
-            let detail = format!("could not query the snapshot: {error}");
+        Err(detail) => {
             store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
             return OpencodeScanOutcome::ReadFailure(read_failure_detail());
         }
     };
 
-    let mut raw_rows = Vec::new();
-    let mut query_error: Option<String> = None;
-    for row in rows {
-        match row {
-            Ok(raw) => raw_rows.push(raw),
+    // Bounded batch: an over-bound forward window commits its first
+    // SCAN_CEILING rows — a deterministic prefix under the
+    // `(time_updated, id)` order — and defers the remainder (the
+    // fetched one-extra row only flags the deferral; the true remainder
+    // is discovered as later scans continue). Nothing is skipped.
+    let bounded = forward.len() > SCAN_CEILING;
+    if bounded {
+        forward.truncate(SCAN_CEILING);
+    }
+    let forward_last = forward
+        .last()
+        .map(|last| (last.time_updated, last.id.clone()));
+
+    let mut raw_rows = forward;
+    if !bounded && position.is_some() {
+        let window_start = (watermark_ms.saturating_sub(LOOKBACK_MS)).max(baseline_watermark_ms);
+        let mut sweep = match connection.prepare(&format!(
+            "SELECT id, time_created, time_updated, data FROM {USAGE_TABLE} \
+             WHERE time_updated >= ?1 \
+               AND (time_updated < ?2 OR (time_updated = ?2 AND id <= ?3)) \
+               AND json_extract(data, '$.role') = 'assistant' \
+               AND json_extract(data, '$.time.completed') IS NOT NULL \
+               AND json_extract(data, '$.error') IS NULL \
+               AND json_extract(data, '$.finish') IS NOT NULL \
+             ORDER BY time_updated DESC, id DESC \
+             LIMIT ?4"
+        )) {
+            Ok(statement) => statement,
             Err(error) => {
-                query_error = Some(format!("{error}"));
-                break;
+                let detail = format!("could not prepare the sweep: {error}");
+                store.mark_source_state(
+                    USAGE_SOURCE_OPENCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return OpencodeScanOutcome::ReadFailure(read_failure_detail());
+            }
+        };
+        let rows = sweep.query_map(
+            rusqlite::params![window_start, pos_stamp, pos_id, SCAN_CEILING as i64],
+            map_raw_message_row,
+        );
+        match collect_rows(rows) {
+            // The sweep re-reads already-committed rows by design; the
+            // two windows are disjoint (strictly after vs at-or-before
+            // the position), so one scan never processes a row twice.
+            Ok(swept) => raw_rows.extend(swept),
+            Err(detail) => {
+                store.mark_source_state(
+                    USAGE_SOURCE_OPENCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return OpencodeScanOutcome::ReadFailure(read_failure_detail());
             }
         }
     }
-    if let Some(error) = query_error {
-        let detail = format!("could not read a row: {error}");
-        store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
-        return OpencodeScanOutcome::ReadFailure(read_failure_detail());
-    }
 
-    // Fail closed on the scan ceiling: an over-ceiling window is
-    // abandoned whole — no partial ingest, no cursor movement.
-    if raw_rows.len() > SCAN_CEILING {
-        store.mark_source_state(
-            USAGE_SOURCE_OPENCODE,
-            SourceState::ScanCeiling,
-            Some(format!(
-                "incremental window held {} rows above the {} row ceiling",
-                raw_rows.len(),
-                SCAN_CEILING
-            )),
-        );
-        return OpencodeScanOutcome::CeilingExceeded {
-            rows: raw_rows.len(),
-        };
-    }
+    // The committed batch's end position and the watermark it earned.
+    // The position is always the last committed forward row itself
+    // (bounded or drained alike): the next scan's forward window
+    // resumes strictly after it — through equal-stamp ties — while the
+    // late-commit sweep re-admits everything at-or-before it inside the
+    // lookback band. The watermark advances through every committed row
+    // — accepted, usage-not-reported, and rejected alike; dispositions
+    // are deterministic functions of the row, so a permanently
+    // malformed row can never pin the window (it stays revisitable only
+    // inside the lookback band, then ages out). The watermark never
+    // regresses.
+    let (new_watermark, batch_end) = match forward_last {
+        None => (watermark_ms, position),
+        Some((last_stamp, last_id)) => (
+            watermark_ms.max(last_stamp),
+            Some(SourceBatchEnd {
+                stamp_ms: last_stamp,
+                id: last_id,
+            }),
+        ),
+    };
 
     let now_ms = store.now_ms();
     let mut events = Vec::with_capacity(raw_rows.len());
     let mut rejected = 0usize;
     let mut usage_not_reported = 0usize;
-    let mut new_watermark = watermark_ms;
     for raw in raw_rows {
-        // The watermark tracks the source's own commit stamps (the
-        // cursor column), not the events. Event rows and
-        // usage-not-reported rows are terminal, deterministic
-        // dispositions: their commit stamps may gate later reads.
-        // Malformed rows never advance the watermark — their data was
-        // not understood, so the lookback keeps them revisitable until
-        // they age out.
-        let commit_stamp = raw.time_updated;
         match raw.disposition(now_ms) {
-            RowDisposition::Event(event) => {
-                new_watermark = new_watermark.max(commit_stamp);
-                events.push(event);
-            }
-            RowDisposition::UsageNotReported => {
-                usage_not_reported += 1;
-                new_watermark = new_watermark.max(commit_stamp);
-            }
+            RowDisposition::Event(event) => events.push(event),
+            RowDisposition::UsageNotReported => usage_not_reported += 1,
             RowDisposition::Rejected => rejected += 1,
         }
     }
@@ -396,14 +475,72 @@ fn collect_from_live(
             usage_not_reported,
             events,
             files: Vec::new(),
+            batch_end,
         },
     );
+    if bounded {
+        // Surface the deferred remainder through the existing source
+        // diagnostics; the state heals to `ok` on the scan that drains
+        // the window (apply_scan), and progress is observable through
+        // the advancing watermark.
+        store.mark_source_state(
+            USAGE_SOURCE_OPENCODE,
+            SourceState::ScanCeiling,
+            Some(format!(
+                "backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch \
+                 (watermark now {new_watermark}) and continue on the next scan"
+            )),
+        );
+        return OpencodeScanOutcome::Bounded {
+            accepted: stats.accepted,
+            duplicates: stats.duplicates,
+            rejected: stats.rejected,
+            usage_not_reported: stats.usage_not_reported,
+            watermark_ms: new_watermark,
+        };
+    }
     OpencodeScanOutcome::Collected {
         accepted: stats.accepted,
         duplicates: stats.duplicates,
         rejected: stats.rejected,
         usage_not_reported: stats.usage_not_reported,
         watermark_ms: new_watermark,
+    }
+}
+
+/// The closed SELECT list, as a `query_map` row mapper shared by the
+/// forward drain and the late-commit sweep.
+fn map_raw_message_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow> {
+    Ok(RawMessageRow {
+        id: row.get(0)?,
+        time_created: row.get(1)?,
+        time_updated: row.get(2)?,
+        data: row.get(3)?,
+    })
+}
+
+/// Reads a mapped row iterator to the end; the first error fails the
+/// whole scan closed (a torn read must never half-advance a cursor).
+fn collect_rows(
+    rows: rusqlite::Result<
+        rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawMessageRow>>,
+    >,
+) -> Result<Vec<RawMessageRow>, String> {
+    let mut rows = rows.map_err(|error| format!("could not query the snapshot: {error}"))?;
+    let mut collected = Vec::new();
+    let mut query_error: Option<String> = None;
+    for row in rows.by_ref() {
+        match row {
+            Ok(raw) => collected.push(raw),
+            Err(error) => {
+                query_error = Some(format!("could not read a row: {error}"));
+                break;
+            }
+        }
+    }
+    match query_error {
+        Some(detail) => Err(detail),
+        None => Ok(collected),
     }
 }
 
@@ -1708,55 +1845,424 @@ mod tests {
         assert!(reopened.events().iter().any(|event| event.id == stored_id));
     }
 
-    // 15. the scan ceiling fails closed: an over-ceiling window ingests
-    //     nothing and does not move the cursor.
+    // 15. bounded batches: an oversized backlog commits a deterministic
+    //     prefix per scan and continues on subsequent scans — no stall,
+    //     no skip, exact-once accumulation, healing to ok when drained
+    //     (the F1 regression).
     #[test]
-    fn over_ceiling_window_fails_closed() {
+    fn oversized_backlog_drains_in_bounded_batches_exact_once() {
         let fix = fixture("ceiling");
         seed_old(&fix);
         let (store, _dir) = store_at("ceiling-store", Some(fix.path()));
         enable(&store);
         assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        // 1.5x the scan bound, unique commit stamps and unique creation
+        // stamps (the content-addressed identity discriminates by
+        // time_created, so every row must carry its own).
+        let total = SCAN_CEILING + SCAN_CEILING / 2;
         fix.connection.execute_batch("BEGIN").unwrap();
-        for index in 0..=(SCAN_CEILING as i64) {
+        for index in 0..total as i64 {
             fix.insert_assistant(
-                &format!("msg-flood-{index}"),
+                &format!("msg-flood-{index:07}"),
                 "ses",
                 NOW_MS - 30 * MIN + index,
                 &AssistantFixture::completed(NOW_MS - 31 * MIN + index),
             );
         }
         fix.connection.execute_batch("COMMIT").unwrap();
+
+        // Scan 1: over-bound — commits exactly the first SCAN_CEILING
+        // rows, defers the rest, surfaces scanCeiling, moves the cursor.
         let outcome = collect(&store);
-        let OpencodeScanOutcome::CeilingExceeded { rows } = outcome else {
-            panic!("expected a ceiling failure, got {outcome:?}");
+        let OpencodeScanOutcome::Bounded {
+            accepted, watermark_ms: wm1, ..
+        } = outcome
+        else {
+            panic!("expected a bounded batch, got {outcome:?}");
         };
-        assert_eq!(rows, SCAN_CEILING + 1);
-        assert_eq!(
-            store.aggregate(UsageRange::ThirtyDays, None).events_in_range,
-            0,
-            "nothing from the over-ceiling window was stored"
-        );
+        assert_eq!(accepted, SCAN_CEILING);
+        assert_eq!(store.events().len(), SCAN_CEILING);
+        assert!(wm1 > 0, "the cursor moved through the committed prefix");
         assert_eq!(
             store.cursor(USAGE_SOURCE_OPENCODE).map(|c| c.state),
             Some(SourceState::ScanCeiling)
         );
-        // Recovery: shrinking the window below the ceiling heals the
-        // source without losing the baseline.
-        fix.connection
-            .execute("DELETE FROM message WHERE id LIKE 'msg-flood-%'", [])
-            .unwrap();
-        fix.insert_assistant(
-            "msg-after-ceiling",
-            "ses",
-            NOW_MS - 5 * MIN,
-            &AssistantFixture::completed(NOW_MS - 9 * MIN),
+        assert!(
+            store
+                .cursor(USAGE_SOURCE_OPENCODE)
+                .is_some_and(|c| c.batch_end.is_some()),
+            "the resume position is persisted"
         );
+
+        // Scan 2: the unchanged fingerprint must NOT short-circuit a
+        // deferred backlog; the remainder drains and the state heals.
         let outcome = collect(&store);
         let OpencodeScanOutcome::Collected { accepted, .. } = outcome else {
-            panic!("expected a collection, got {outcome:?}");
+            panic!("expected the drained remainder, got {outcome:?}");
         };
-        assert_eq!(accepted, 1);
+        assert_eq!(accepted, total - SCAN_CEILING);
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_OPENCODE).map(|c| c.state),
+            Some(SourceState::Ok)
+        );
+
+        // Exact-once: every flood row is stored once (1,850 tokens each,
+        // the verified disjoint-partition fixture).
+        assert_eq!(store.events().len(), total);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            total as u64 * 1_850
+        );
+
+        // Repeated scans of the now-idle source never grow totals.
+        let _ = collect(&store);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            total as u64 * 1_850
+        );
+    }
+
+    // 15a. a restart between bounded scans resumes from the persisted
+    //      position: no loss, no duplication, exact-once totals.
+    #[test]
+    fn restart_mid_backlog_resumes_from_the_persisted_position() {
+        let fix = fixture("restart-batch");
+        seed_old(&fix);
+        let path = fix.path();
+        let (store, dir) = store_at("restart-batch-store", Some(path.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        let total = SCAN_CEILING + 5_000;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            fix.insert_assistant(
+                &format!("msg-flood-{index:07}"),
+                "ses",
+                NOW_MS - 30 * MIN + index,
+                &AssistantFixture::completed(NOW_MS - 31 * MIN + index),
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Bounded { .. }
+        ));
+        let stored_before_restart = store.events().len();
+        drop(store);
+
+        let reopened = UsageIntelligenceStore::open_with(
+            dir.path().join(USAGE_INTELLIGENCE_FILE_NAME),
+            fixed_clock(),
+            Box::new(|| None),
+        )
+        .with_codex_home_resolver(Box::new(|| None))
+        .with_opencode_db_resolver(Box::new(move || Some(path.clone())));
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the backlog must drain in a few scans");
+            match collect(&reopened) {
+                OpencodeScanOutcome::Bounded { .. } => continue,
+                OpencodeScanOutcome::Collected { .. } => break,
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+        }
+        assert_eq!(stored_before_restart, SCAN_CEILING);
+        assert_eq!(reopened.events().len(), total);
+        assert_eq!(
+            reopened
+                .aggregate(UsageRange::ThirtyDays, None)
+                .totals
+                .total_tokens,
+            total as u64 * 1_850,
+            "each row is stored exactly once across the restart"
+        );
+    }
+
+    // 15b. equal commit stamps spanning the batch boundary: a tie group
+    //      larger than one batch drains across scans with every row
+    //      stored exactly once (the boundary-tie regression).
+    #[test]
+    fn equal_timestamps_across_batch_boundaries_drain_completely() {
+        let fix = fixture("tie-batch");
+        seed_old(&fix);
+        let (store, _dir) = store_at("tie-batch-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        let tie = NOW_MS - 30 * MIN;
+        let total = SCAN_CEILING + 500;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            // Distinct creation stamps keep the content-addressed ids
+            // distinct; the shared commit stamp makes the whole group
+            // one tie, ordered by id across the batch boundary.
+            fix.insert_assistant(
+                &format!("msg-tie-{index:07}"),
+                "ses",
+                tie,
+                &AssistantFixture::completed(tie - (total as i64) * 1_000 + index * 1_000),
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the tie group must drain in a few scans");
+            match collect(&store) {
+                OpencodeScanOutcome::Bounded { .. } => continue,
+                OpencodeScanOutcome::Collected { .. } => break,
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+        }
+        assert_eq!(scans, 2, "a tie group needs one bounded batch plus one drain");
+        assert_eq!(
+            store.events().len(),
+            total,
+            "every same-stamp row is stored exactly once"
+        );
+    }
+
+    // 15c. permanently malformed rows never block progress: the batch
+    //      position advances through rejected rows, the drain completes,
+    //      and every valid row lands exactly once.
+    #[test]
+    fn malformed_rows_never_block_batch_progress() {
+        let fix = fixture("malformed-batch");
+        seed_old(&fix);
+        let (store, _dir) = store_at("malformed-batch-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        let invalid = 10_000usize;
+        let valid = SCAN_CEILING + 5_000;
+        let total = invalid + valid;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            let mut row = AssistantFixture::completed(NOW_MS - 31 * MIN + index);
+            if (index as usize) < invalid {
+                row.total = Some(999); // disagrees with the disjoint sum
+            }
+            fix.insert_assistant(
+                &format!("msg-row-{index:07}"),
+                "ses",
+                NOW_MS - 30 * MIN + index,
+                &row,
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the flood must drain in a few scans");
+            match collect(&store) {
+                OpencodeScanOutcome::Bounded { .. } | OpencodeScanOutcome::Collected { .. } => {}
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+            let drained = store
+                .cursor(USAGE_SOURCE_OPENCODE)
+                .map(|c| c.state == SourceState::Ok)
+                .unwrap_or(false);
+            if drained {
+                break;
+            }
+        }
+        assert_eq!(
+            store.events().len(),
+            valid,
+            "every valid row is stored, no malformed row is"
+        );
+        let last_commit_stamp = NOW_MS - 30 * MIN + (total as i64 - 1);
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_OPENCODE).map(|c| c.watermark_ms),
+            Some(last_commit_stamp),
+            "the watermark advanced past the malformed tail"
+        );
+    }
+
+    // 15d. disable → re-enable: usage completed while collection was
+    //      disabled is never silently imported; the fresh baseline skips
+    //      it, previously collected history is preserved untouched.
+    #[test]
+    fn disable_reenable_rebaselines_without_importing_disabled_period() {
+        let fix = fixture("reenable");
+        seed_old(&fix);
+        let (store, _dir) = store_at("reenable-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        fix.insert_assistant(
+            "msg-before-disable",
+            "ses",
+            NOW_MS - 30 * MIN,
+            &AssistantFixture::completed(NOW_MS - 34 * MIN),
+        );
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Collected { accepted: 1, .. }
+        ));
+        let history_tokens = store
+            .aggregate(UsageRange::ThirtyDays, None)
+            .totals
+            .total_tokens;
+        assert_eq!(history_tokens, 1_850);
+        let collection_started_at = store.collection_started_at().unwrap();
+
+        // Disabled: rows committed now must never be imported later.
+        store.set_enabled(false);
+        for index in 0..3 {
+            fix.insert_assistant(
+                &format!("msg-gap-{index}"),
+                "ses",
+                NOW_MS - 20 * MIN + index,
+                &AssistantFixture::completed(NOW_MS - 24 * MIN + index),
+            );
+        }
+
+        // Re-enable: the next pass re-baselines at the current
+        // high-water mark and imports nothing from the disabled period.
+        store.set_enabled(true);
+        assert!(
+            store
+                .cursor(USAGE_SOURCE_OPENCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "the re-enable transition marks the source for a fresh baseline"
+        );
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected a fresh baseline on re-enable, got {outcome:?}");
+        };
+        assert_eq!(
+            watermark_ms,
+            NOW_MS - 20 * MIN + 2 + 1,
+            "the fresh baseline sits one millisecond above the disabled-period tail"
+        );
+        assert_eq!(
+            store.events().len(),
+            1,
+            "no disabled-period row was imported"
+        );
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            history_tokens,
+            "historical totals are preserved"
+        );
+        assert_eq!(
+            store.collection_started_at(),
+            Some(collection_started_at),
+            "the disclosure anchor keeps the original collection start"
+        );
+        assert!(
+            !store
+                .cursor(USAGE_SOURCE_OPENCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "the successful re-baseline cleared the pending flag"
+        );
+
+        // Post-re-enable usage resumes normal incremental accounting.
+        fix.insert_assistant(
+            "msg-after-reenable",
+            "ses",
+            NOW_MS - 10 * MIN,
+            &AssistantFixture::completed(NOW_MS - 14 * MIN),
+        );
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Collected { accepted: 1, .. }
+        ));
+        assert_eq!(store.events().len(), 2);
+    }
+
+    // 15e. a re-enable whose source is missing keeps the pending
+    //      re-baseline until the source returns — the gap is still
+    //      never imported (missing-source recovery).
+    #[test]
+    fn pending_rebaseline_survives_source_absence() {
+        let src_dir = tempdir::temp_dir("reenable-absent-src");
+        let db = src_dir.path().join("opencode.db");
+        {
+            let fix = fixture("reenable-absent-src-inner");
+            seed_old(&fix);
+            let _ = fs::copy(fix.path(), &db);
+        }
+        let (store, _store_dir) = store_at("reenable-absent-store", Some(db.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        store.set_enabled(false);
+        fs::remove_file(&db).unwrap();
+        store.set_enabled(true);
+        assert_eq!(collect(&store), OpencodeScanOutcome::Absent);
+        let cursor = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
+        assert_eq!(cursor.state, SourceState::SourceAbsent);
+        assert!(
+            cursor.pending_rebaseline,
+            "absence does not clear the pending re-baseline"
+        );
+
+        // The source returns carrying a disabled-period row: the next
+        // pass performs the fresh baseline and skips it whole.
+        {
+            let fix = fixture("reenable-absent-src-back");
+            fix.insert_assistant(
+                "msg-gap",
+                "ses",
+                NOW_MS - 20 * MIN,
+                &AssistantFixture::completed(NOW_MS - 24 * MIN),
+            );
+            let _ = fs::copy(fix.path(), &db);
+        }
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected the deferred fresh baseline, got {outcome:?}");
+        };
+        assert_eq!(watermark_ms, NOW_MS - 20 * MIN + 1);
+        assert!(
+            store.events().is_empty(),
+            "the gap row was never imported"
+        );
+    }
+
+    // 15f. a re-enable whose baseline read fails keeps the pending flag
+    //      (no stale-watermark resume); the recovered pass still skips
+    //      the whole disabled period (failed-baseline recovery).
+    #[test]
+    fn pending_rebaseline_survives_a_failed_baseline_read() {
+        let fix = fixture("reenable-failure");
+        seed_old(&fix);
+        let (store, _dir) = store_at("reenable-failure-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
+        store.set_enabled(false);
+        fix.insert_corrupt_time_updated("msg-corrupt");
+        fix.insert_assistant(
+            "msg-gap",
+            "ses",
+            NOW_MS - 20 * MIN,
+            &AssistantFixture::completed(NOW_MS - 24 * MIN),
+        );
+        store.set_enabled(true);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::ReadFailure(_)
+        ));
+        assert!(
+            store
+                .cursor(USAGE_SOURCE_OPENCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "a failed re-baseline stays pending"
+        );
+
+        fix.connection
+            .execute("DELETE FROM message WHERE id = 'msg-corrupt'", [])
+            .unwrap();
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected the retried fresh baseline, got {outcome:?}");
+        };
+        assert_eq!(watermark_ms, NOW_MS - 20 * MIN + 1);
+        assert!(
+            store.events().is_empty(),
+            "the disabled-period gap was never imported"
+        );
     }
 
     // 16. unexpected schema (a required column gone) fails closed with

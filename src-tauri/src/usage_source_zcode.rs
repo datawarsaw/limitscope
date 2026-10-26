@@ -30,15 +30,34 @@
 //! - First successful observation establishes a baseline at the current
 //!   high-water mark (`MAX(completed_at)` over completed rows) and
 //!   imports nothing — no historical backlog, no fake zero usage.
-//! - Later passes read the bounded window
-//!   `completed_at >= watermark - LOOKBACK` (inclusive at the boundary),
-//!   ordered by `(completed_at, id)`, capped at `SCAN_CEILING + 1` rows.
-//!   The inclusive boundary plus id-dedup tolerates rows sharing a
-//!   timestamp, restarts, and duplicate reads; the lookback absorbs
-//!   late-committing rows stamped slightly behind the watermark.
-//! - Hitting the ceiling fails closed: the whole scan is abandoned, the
-//!   cursor does not move, and the source state reports `scanCeiling`.
-//!   Nothing is silently skipped.
+//!   Re-enabling after a disable re-establishes a fresh baseline the
+//!   same way: usage completed while collection was disabled is never
+//!   silently imported.
+//! - Later passes read in two phases. The forward drain reads rows
+//!   strictly after the persisted composite `(completed_at, id)`
+//!   position (from the baseline watermark on the first scan), ordered
+//!   `(completed_at, id)`. Once drained, a late-commit sweep re-reads
+//!   the bounded `LOOKBACK` band behind the position (newest first) for
+//!   rows committed after an earlier scan but stamped slightly behind
+//!   it — id-dedup absorbs the re-reads, and the floor never reaches
+//!   below the immutable baseline watermark into pre-enable backlog.
+//! - One scan commits at most `SCAN_CEILING` forward rows — a
+//!   deterministic prefix under the `(completed_at, id)` order. An
+//!   over-bound window commits that prefix (events stored, position
+//!   persisted) and defers the remainder to subsequent scans, surfacing
+//!   the deferral as `scanCeiling` in the source state (the Codex
+//!   reader's bounded pattern). The composite resume position means a
+//!   batch ending mid-tie — any number of rows sharing one timestamp —
+//!   resumes at the exact next row: nothing is skipped, nothing
+//!   re-blocks, and committed rows never refill the batch as
+//!   duplicates. While a backlog is deferred the late-commit sweep is
+//!   skipped: a late row rides the lookback band until the draining
+//!   scan sweeps it, or ages out (the documented boundary honesty).
+//! - The watermark advances through every row of the committed batch —
+//!   accepted and rejected alike. Validation is a deterministic
+//!   function of the row's content, so a permanently malformed row can
+//!   never pin the window; rejected rows stay revisitable only inside
+//!   the lookback, then age out exactly like late commits.
 //! - Only `status = 'completed'` rows with a non-null `completed_at` are
 //!   candidates. Rows failing validation (blank provider/model,
 //!   implausible timestamps, negative dimensions, an overlap-invariant
@@ -58,8 +77,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::usage_intelligence::{
-    SourceFingerprint, SourceScan, SourceState, UsageEvent, UsageIntelligenceStore,
-    USAGE_SOURCE_ZCODE,
+    SourceBatchEnd, SourceFingerprint, SourceScan, SourceState, UsageEvent,
+    UsageIntelligenceStore, USAGE_SOURCE_ZCODE,
 };
 
 /// Columns this reader requires. The verified live schema carries many
@@ -83,9 +102,10 @@ const REQUIRED_COLUMNS: &[&str] = &[
 /// The one table this reader understands.
 const USAGE_TABLE: &str = "model_usage";
 
-/// Maximum rows one incremental window may hold. Fetching one more than
-/// the ceiling detects the overflow; an over-ceiling window abandons the
-/// scan whole (fail closed) rather than chunking silently.
+/// Maximum rows one scan may commit. Fetching one more than the bound
+/// detects a deferred remainder; an over-bound window commits its
+/// deterministic `SCAN_CEILING`-row prefix and continues from the saved
+/// position on the next scan — never a silent skip, never a stall.
 pub const SCAN_CEILING: usize = 20_000;
 
 /// How far behind the watermark the window still reads, absorbing rows
@@ -107,6 +127,16 @@ pub enum ZcodeScanOutcome {
         rejected: usize,
         watermark_ms: i64,
     },
+    /// An incremental window held more rows than one scan commits; the
+    /// bounded prefix was committed (stored and position-persisted) and
+    /// the remainder is deferred to subsequent scans, surfacing as
+    /// `scanCeiling` until the backlog drains.
+    Bounded {
+        accepted: usize,
+        duplicates: usize,
+        rejected: usize,
+        watermark_ms: i64,
+    },
     /// The source fingerprint is unchanged since the last successful
     /// scan; the snapshot copy was skipped.
     Unchanged,
@@ -114,9 +144,6 @@ pub enum ZcodeScanOutcome {
     Absent,
     /// The database exists but the schema is not understood.
     SchemaUnsupported,
-    /// The incremental window exceeded the scan ceiling; nothing was
-    /// ingested and the cursor did not move.
-    CeilingExceeded { rows: usize },
     /// The read failed; the detail is display-safe.
     ReadFailure(String),
 }
@@ -145,10 +172,13 @@ pub fn collect(store: &UsageIntelligenceStore) -> ZcodeScanOutcome {
 
     // Cheap change detection: an unchanged, previously-healthy source
     // costs no snapshot copy. Only a fingerprint from a successful scan
-    // is trusted, so a failed pass always retries.
+    // is trusted, so a failed pass always retries — and a pending
+    // re-baseline (disable → re-enable) always re-reads to anchor its
+    // fresh baseline, even against an unchanged fingerprint.
     let fingerprint = fingerprint_of(&db_meta, wal_meta.as_ref());
     if let Some(cursor) = store.cursor(USAGE_SOURCE_ZCODE) {
         if cursor.baselined
+            && !cursor.pending_rebaseline
             && cursor.state == SourceState::Ok
             && cursor.fingerprint.as_ref() == Some(&fingerprint)
         {
@@ -195,23 +225,21 @@ fn collect_from_live(
         return ZcodeScanOutcome::SchemaUnsupported;
     }
 
-    // Baseline first: no cursor (or a failure-only record) means this is
-    // the first successful observation — establish the backlog skip. The
-    // watermark sits one millisecond ABOVE the current high-water mark, so
-    // rows completed at or before the baseline instant (including every
-    // row sharing the max timestamp) are strictly backlog and never
+    // Baseline first: no cursor (or a failure-only record, or a cursor
+    // marked for a fresh baseline by the disable → re-enable transition)
+    // means this pass must establish the backlog skip. The watermark
+    // sits one millisecond ABOVE the current high-water mark, so rows
+    // completed at or before the baseline instant (including every row
+    // sharing the max timestamp) are strictly backlog and never
     // imported; the +1 keeps the incremental window's inclusive boundary
     // from re-admitting them on the next scan.
-    let baselined = store
-        .cursor(USAGE_SOURCE_ZCODE)
-        .map(|cursor| cursor.baselined)
-        .unwrap_or(false);
-    if !baselined {
+    if store.cursor_needs_baseline(USAGE_SOURCE_ZCODE) {
         // An empty source (Ok(None)) is a valid zero-history baseline; a
         // failed query is not. A MAX error must never read as empty and
         // anchor the baseline at zero — that would admit the whole backlog
         // as history on the next pass. Fail closed: record ReadFailure,
-        // leave the cursor unbaselined, and let a later pass retry.
+        // leave the cursor unbaselined (a pending re-baseline stays
+        // pending), and let a later pass retry.
         let max_completed: Option<i64> = match connection.query_row(
             &format!(
                 "SELECT MAX(completed_at) FROM {USAGE_TABLE} \
@@ -236,28 +264,55 @@ fn collect_from_live(
         return ZcodeScanOutcome::Baseline { watermark_ms };
     }
 
-    // Incremental window. The floor re-reads a bounded lookback behind the
-    // watermark (absorbing late commits and boundary-timestamp ties, with
-    // id-dedup absorbing the re-reads) but never reaches below the
-    // immutable baseline watermark — rows completed before the baseline
-    // are pre-enable backlog and stay unimported.
+    // Incremental read, two phases.
+    //
+    // 1. Forward drain: rows strictly after the persisted composite
+    //    position (or from the baseline watermark when no position is
+    //    recorded yet — the first scan after a baseline), ordered by
+    //    `(completed_at, id)`, fetched one past the scan bound. An
+    //    over-bound backlog commits its first SCAN_CEILING rows here and
+    //    defers the remainder: the saved position makes the next scan
+    //    resume at the exact next row — through equal-timestamp ties and
+    //    malformed rows alike — so an oversized backlog drains across
+    //    scans without committed rows ever refilling the batch as
+    //    duplicates.
+    // 2. Late-commit sweep: once the forward window is drained, the
+    //    bounded lookback band behind the position is re-read (newest
+    //    first) for rows committed after an earlier scan but stamped
+    //    slightly behind it; id-dedup absorbs the re-reads. The sweep is
+    //    skipped while a backlog is deferred — a late row then rides the
+    //    band until the draining scan that follows sweeps it, or ages
+    //    out beyond the lookback (the same boundary honesty a
+    //    fail-closed window had). The floor never reaches below the
+    //    immutable baseline watermark: rows completed before the
+    //    baseline are pre-enable backlog and stay unimported.
     let cursor = store.cursor(USAGE_SOURCE_ZCODE);
     let watermark_ms = cursor
         .as_ref()
         .map(|cursor| cursor.watermark_ms)
         .unwrap_or(0);
-    let window_start = cursor
+    let baseline_watermark_ms = cursor
         .as_ref()
-        .map(|cursor| (watermark_ms.saturating_sub(LOOKBACK_MS)).max(cursor.baseline_watermark_ms))
+        .map(|cursor| cursor.baseline_watermark_ms)
         .unwrap_or(0);
+    let position = cursor
+        .as_ref()
+        .and_then(|cursor| cursor.batch_end.clone());
+    // With no recorded position, forward starts at the baseline
+    // watermark (the exclusion bindings then match no real row).
+    let (pos_stamp, pos_id) = match &position {
+        Some(end) => (end.stamp_ms, end.id.clone()),
+        None => (baseline_watermark_ms, String::new()),
+    };
     let mut statement = match connection.prepare(&format!(
         "SELECT id, provider_id, model_id, completed_at, \
                 input_tokens, output_tokens, reasoning_tokens, \
                 cache_creation_input_tokens, cache_read_input_tokens, computed_total_tokens \
          FROM {USAGE_TABLE} \
-         WHERE status = 'completed' AND completed_at IS NOT NULL AND completed_at >= ?1 \
+         WHERE status = 'completed' AND completed_at IS NOT NULL \
+           AND (completed_at > ?1 OR (completed_at = ?1 AND id > ?2)) \
          ORDER BY completed_at ASC, id ASC \
-         LIMIT ?2"
+         LIMIT ?3"
     )) {
         Ok(statement) => statement,
         Err(error) => {
@@ -267,79 +322,102 @@ fn collect_from_live(
         }
     };
     let rows = statement.query_map(
-        rusqlite::params![window_start, (SCAN_CEILING + 1) as i64],
-        |row| {
-            Ok(RawUsageRow {
-                id: row.get(0)?,
-                provider_id: row.get(1)?,
-                model_id: row.get(2)?,
-                completed_at: row.get(3)?,
-                input_tokens: row.get(4)?,
-                output_tokens: row.get(5)?,
-                reasoning_tokens: row.get(6)?,
-                cache_creation_input_tokens: row.get(7)?,
-                cache_read_input_tokens: row.get(8)?,
-                computed_total_tokens: row.get(9)?,
-            })
-        },
+        rusqlite::params![pos_stamp, pos_id, (SCAN_CEILING + 1) as i64],
+        map_raw_usage_row,
     );
-    let rows = match rows {
+    let mut forward = match collect_rows(rows) {
         Ok(rows) => rows,
-        Err(error) => {
-            let detail = format!("could not query the snapshot: {error}");
+        Err(detail) => {
             store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
             return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
         }
     };
 
-    let mut raw_rows = Vec::new();
-    let mut query_error: Option<String> = None;
-    for row in rows {
-        match row {
-            Ok(raw) => raw_rows.push(raw),
+    // Bounded batch: an over-bound forward window commits its first
+    // SCAN_CEILING rows — a deterministic prefix under the
+    // `(completed_at, id)` order — and defers the remainder (the fetched
+    // one-extra row only flags the deferral; the true remainder is
+    // discovered as later scans continue). Nothing is skipped.
+    let bounded = forward.len() > SCAN_CEILING;
+    if bounded {
+        forward.truncate(SCAN_CEILING);
+    }
+    let forward_last = forward
+        .last()
+        .map(|last| (last.completed_at.unwrap_or(0), last.id.clone()));
+
+    let mut raw_rows = forward;
+    if !bounded && position.is_some() {
+        let window_start = (watermark_ms.saturating_sub(LOOKBACK_MS)).max(baseline_watermark_ms);
+        let mut sweep = match connection.prepare(&format!(
+            "SELECT id, provider_id, model_id, completed_at, \
+                    input_tokens, output_tokens, reasoning_tokens, \
+                    cache_creation_input_tokens, cache_read_input_tokens, computed_total_tokens \
+             FROM {USAGE_TABLE} \
+             WHERE status = 'completed' AND completed_at IS NOT NULL \
+               AND completed_at >= ?1 \
+               AND (completed_at < ?2 OR (completed_at = ?2 AND id <= ?3)) \
+             ORDER BY completed_at DESC, id DESC \
+             LIMIT ?4"
+        )) {
+            Ok(statement) => statement,
             Err(error) => {
-                query_error = Some(format!("{error}"));
-                break;
+                let detail = format!("could not prepare the sweep: {error}");
+                store.mark_source_state(
+                    USAGE_SOURCE_ZCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
+            }
+        };
+        let rows = sweep.query_map(
+            rusqlite::params![window_start, pos_stamp, pos_id, SCAN_CEILING as i64],
+            map_raw_usage_row,
+        );
+        match collect_rows(rows) {
+            // The sweep re-reads already-committed rows by design; the
+            // two windows are disjoint (strictly after vs at-or-before
+            // the position), so one scan never processes a row twice.
+            Ok(swept) => raw_rows.extend(swept),
+            Err(detail) => {
+                store.mark_source_state(
+                    USAGE_SOURCE_ZCODE,
+                    SourceState::ReadFailure,
+                    Some(detail),
+                );
+                return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
             }
         }
     }
-    if let Some(error) = query_error {
-        let detail = format!("could not read a row: {error}");
-        store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
-        return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
-    }
 
-    // Fail closed on the scan ceiling: an over-ceiling window is
-    // abandoned whole — no partial ingest, no cursor movement.
-    if raw_rows.len() > SCAN_CEILING {
-        store.mark_source_state(
-            USAGE_SOURCE_ZCODE,
-            SourceState::ScanCeiling,
-            Some(format!(
-                "incremental window held {} rows above the {} row ceiling",
-                raw_rows.len(),
-                SCAN_CEILING
-            )),
-        );
-        return ZcodeScanOutcome::CeilingExceeded {
-            rows: raw_rows.len(),
-        };
-    }
+    // The committed batch's end position and the watermark it earned.
+    // The position is always the last committed forward row itself
+    // (bounded or drained alike): the next scan's forward window
+    // resumes strictly after it — through equal-timestamp ties — while
+    // the late-commit sweep re-admits everything at-or-before it inside
+    // the lookback band. The watermark advances through every committed
+    // row — accepted and rejected alike; validation is a deterministic
+    // function of the row, so a permanently malformed row can never pin
+    // the window (it stays revisitable only inside the lookback band,
+    // then ages out). The watermark never regresses.
+    let (new_watermark, batch_end) = match forward_last {
+        None => (watermark_ms, position),
+        Some((last_stamp, last_id)) => (
+            watermark_ms.max(last_stamp),
+            Some(SourceBatchEnd {
+                stamp_ms: last_stamp,
+                id: last_id,
+            }),
+        ),
+    };
 
     let now_ms = store.now_ms();
     let mut events = Vec::with_capacity(raw_rows.len());
     let mut rejected = 0usize;
-    let mut new_watermark = watermark_ms;
     for raw in raw_rows {
-        // The watermark can only move through rows we actually hand to
-        // the store; rejected rows never advance it (their data was not
-        // trusted, so their timestamp must not gate later reads either —
-        // the lookback keeps them revisitable until they age out).
         match raw.into_event(now_ms) {
-            Some(event) => {
-                new_watermark = new_watermark.max(event.event_at);
-                events.push(event);
-            }
+            Some(event) => events.push(event),
             None => rejected += 1,
         }
     }
@@ -353,13 +431,76 @@ fn collect_from_live(
             usage_not_reported: 0,
             events,
             files: Vec::new(),
+            batch_end,
         },
     );
+    if bounded {
+        // Surface the deferred remainder through the existing source
+        // diagnostics; the state heals to `ok` on the scan that drains
+        // the window (apply_scan), and progress is observable through
+        // the advancing watermark.
+        store.mark_source_state(
+            USAGE_SOURCE_ZCODE,
+            SourceState::ScanCeiling,
+            Some(format!(
+                "backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch \
+                 (watermark now {new_watermark}) and continue on the next scan"
+            )),
+        );
+        return ZcodeScanOutcome::Bounded {
+            accepted: stats.accepted,
+            duplicates: stats.duplicates,
+            rejected: stats.rejected,
+            watermark_ms: new_watermark,
+        };
+    }
     ZcodeScanOutcome::Collected {
         accepted: stats.accepted,
         duplicates: stats.duplicates,
         rejected: stats.rejected,
         watermark_ms: new_watermark,
+    }
+}
+
+/// The closed SELECT list, as a `query_map` row mapper shared by the
+/// forward drain and the late-commit sweep.
+fn map_raw_usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawUsageRow> {
+    Ok(RawUsageRow {
+        id: row.get(0)?,
+        provider_id: row.get(1)?,
+        model_id: row.get(2)?,
+        completed_at: row.get(3)?,
+        input_tokens: row.get(4)?,
+        output_tokens: row.get(5)?,
+        reasoning_tokens: row.get(6)?,
+        cache_creation_input_tokens: row.get(7)?,
+        cache_read_input_tokens: row.get(8)?,
+        computed_total_tokens: row.get(9)?,
+    })
+}
+
+/// Reads a mapped row iterator to the end; the first error fails the
+/// whole scan closed (a torn read must never half-advance a cursor).
+fn collect_rows(
+    rows: rusqlite::Result<
+        rusqlite::MappedRows<'_, impl FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<RawUsageRow>>,
+    >,
+) -> Result<Vec<RawUsageRow>, String> {
+    let mut rows = rows.map_err(|error| format!("could not query the snapshot: {error}"))?;
+    let mut collected = Vec::new();
+    let mut query_error: Option<String> = None;
+    for row in rows.by_ref() {
+        match row {
+            Ok(raw) => collected.push(raw),
+            Err(error) => {
+                query_error = Some(format!("could not read a row: {error}"));
+                break;
+            }
+        }
+    }
+    match query_error {
+        Some(detail) => Err(detail),
+        None => Ok(collected),
     }
 }
 
@@ -1410,21 +1551,24 @@ mod tests {
         rusqlite::Connection::open(path).unwrap()
     }
 
-    // 10. the scan ceiling fails closed: an over-ceiling window ingests
-    //     nothing and does not move the cursor.
+    // 10. bounded batches: an oversized backlog (1.5x the scan bound)
+    //     commits a deterministic prefix per scan and continues on
+    //     subsequent scans — no stall, no skip, exact-once accumulation,
+    //     healing to ok when drained (the F1 regression).
     #[test]
-    fn over_ceiling_window_fails_closed() {
+    fn oversized_backlog_drains_in_bounded_batches_exact_once() {
         let fix = fixture("ceiling");
         insert_completed(&fix.connection, "old");
         let (store, _dir) = store_at("ceiling-store", Some(fix.path()));
         enable(&store);
         assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
-        // Fill the window beyond the ceiling (baseline watermark is the
-        // fixture row's completion; every inserted row lands in-window).
-        for index in 0..=(SCAN_CEILING as i64) {
+        // 1.5x the scan bound, all in-window, unique ascending stamps.
+        let total = SCAN_CEILING + SCAN_CEILING / 2;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
             insert(
                 &fix.connection,
-                &format!("flood-{index}"),
+                &format!("flood-{index:07}"),
                 "account:zai-individual-coding-plan",
                 "GLM-5.3",
                 "completed",
@@ -1437,19 +1581,544 @@ mod tests {
                 2,
             );
         }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        // Scan 1: over-bound — commits exactly the first SCAN_CEILING
+        // rows, defers the rest, surfaces scanCeiling, moves the cursor.
         let outcome = collect(&store);
-        let ZcodeScanOutcome::CeilingExceeded { rows } = outcome else {
-            panic!("expected a ceiling failure, got {outcome:?}");
+        let ZcodeScanOutcome::Bounded {
+            accepted, watermark_ms: wm1, ..
+        } = outcome
+        else {
+            panic!("expected a bounded batch, got {outcome:?}");
         };
-        assert_eq!(rows, SCAN_CEILING + 1);
-        let dto = store.aggregate(UsageRange::ThirtyDays, None);
-        assert_eq!(
-            dto.events_in_range, 0,
-            "nothing from the over-ceiling window was stored"
-        );
+        assert_eq!(accepted, SCAN_CEILING);
+        assert_eq!(store.events().len(), SCAN_CEILING);
+        assert!(wm1 > 0, "the cursor moved through the committed prefix");
         assert_eq!(
             store.cursor(USAGE_SOURCE_ZCODE).map(|c| c.state),
             Some(SourceState::ScanCeiling)
+        );
+        let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        assert!(
+            cursor.batch_end.is_some(),
+            "the resume position is persisted"
+        );
+
+        // Scan 2: the unchanged fingerprint must NOT short-circuit a
+        // deferred backlog; the remainder drains and the state heals.
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Collected { accepted, .. } = outcome else {
+            panic!("expected the drained remainder, got {outcome:?}");
+        };
+        assert_eq!(accepted, total - SCAN_CEILING);
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_ZCODE).map(|c| c.state),
+            Some(SourceState::Ok)
+        );
+
+        // Exact-once: every flood row is stored once, totals reconcile.
+        assert_eq!(store.events().len(), total);
+        let dto = store.aggregate(UsageRange::ThirtyDays, None);
+        assert_eq!(dto.events_in_range, total);
+        assert_eq!(dto.totals.total_tokens, total as u64 * 2);
+
+        // Repeated scans of the now-idle source never grow totals.
+        let _ = collect(&store);
+        assert_eq!(store.events().len(), total);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            total as u64 * 2
+        );
+    }
+
+    // 10a. a restart between bounded scans resumes from the persisted
+    //      position: no loss, no duplication, exact-once totals.
+    #[test]
+    fn restart_mid_backlog_resumes_from_the_persisted_position() {
+        let fix = fixture("restart-batch");
+        insert_completed(&fix.connection, "old");
+        let path = fix.path();
+        let (store, dir) = store_at("restart-batch-store", Some(path.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        let total = SCAN_CEILING + 5_000;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            insert(
+                &fix.connection,
+                &format!("flood-{index:07}"),
+                "account:zai-individual-coding-plan",
+                "GLM-5.3",
+                "completed",
+                Some(NOW_MS - 30_000 + index),
+                1,
+                1,
+                0,
+                0,
+                0,
+                2,
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::Bounded { .. }
+        ));
+        let stored_before_restart = store.events().len();
+        drop(store);
+
+        // Reopen the persisted store: the scanCeiling state prevents the
+        // fingerprint short-circuit and the position resumes the drain.
+        let reopened = crate::usage_intelligence::UsageIntelligenceStore::open_with(
+            dir.path()
+                .join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME),
+            fixed_clock(),
+            Box::new(move || Some(path.clone())),
+        );
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the backlog must drain in a few scans");
+            match collect(&reopened) {
+                ZcodeScanOutcome::Bounded { .. } => continue,
+                ZcodeScanOutcome::Collected { .. } => break,
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+        }
+        assert_eq!(reopened.events().len(), total);
+        assert!(stored_before_restart == SCAN_CEILING);
+        assert_eq!(
+            reopened
+                .aggregate(UsageRange::ThirtyDays, None)
+                .totals
+                .total_tokens,
+            total as u64 * 2,
+            "each row is stored exactly once across the restart"
+        );
+    }
+
+    // 10b. equal timestamps spanning the batch boundary: a tie group
+    //      larger than one batch drains across scans with every row
+    //      stored exactly once (the boundary-tie regression).
+    #[test]
+    fn equal_timestamps_across_batch_boundaries_drain_completely() {
+        let fix = fixture("tie-batch");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("tie-batch-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        // Every flood row shares one stamp; the ordering is by id.
+        let tie = NOW_MS - 30_000;
+        let total = SCAN_CEILING + 500;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            insert(
+                &fix.connection,
+                &format!("tie-{index:07}"),
+                "account:zai-individual-coding-plan",
+                "GLM-5.3",
+                "completed",
+                Some(tie),
+                1,
+                1,
+                0,
+                0,
+                0,
+                2,
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the tie group must drain in a few scans");
+            match collect(&store) {
+                ZcodeScanOutcome::Bounded { .. } => continue,
+                ZcodeScanOutcome::Collected { .. } => break,
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+        }
+        assert_eq!(scans, 2, "a tie group needs one bounded batch plus one drain");
+        assert_eq!(
+            store.events().len(),
+            total,
+            "every same-timestamp row is stored exactly once"
+        );
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            total as u64 * 2
+        );
+    }
+
+    // 10c. permanently malformed rows never block progress: the batch
+    //      position advances through rejected rows, the drain completes,
+    //      and every valid row lands exactly once.
+    #[test]
+    fn malformed_rows_never_block_batch_progress() {
+        let fix = fixture("malformed-batch");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("malformed-batch-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        // The first half of the flood is permanently invalid (totals
+        // disagreeing with input + output); the second half is healthy.
+        let invalid = 10_000usize;
+        let valid = SCAN_CEILING + 5_000;
+        let total = invalid + valid;
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..total as i64 {
+            let bad = (index as usize) < invalid;
+            insert(
+                &fix.connection,
+                &format!("row-{index:07}"),
+                "account:zai-individual-coding-plan",
+                "GLM-5.3",
+                "completed",
+                Some(NOW_MS - 30_000 + index),
+                1,
+                1,
+                0,
+                0,
+                0,
+                if bad { 999 } else { 2 },
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        let mut scans = 0usize;
+        loop {
+            scans += 1;
+            assert!(scans < 10, "the flood must drain in a few scans");
+            match collect(&store) {
+                ZcodeScanOutcome::Bounded { .. } | ZcodeScanOutcome::Collected { .. } => {}
+                other => panic!("unexpected outcome mid-drain: {other:?}"),
+            }
+            let drained = store.cursor(USAGE_SOURCE_ZCODE)
+                .map(|c| c.state == SourceState::Ok)
+                .unwrap_or(false);
+            if drained {
+                break;
+            }
+        }
+        assert_eq!(
+            store.events().len(),
+            valid,
+            "every valid row is stored, no malformed row is"
+        );
+        let last_valid_stamp = NOW_MS - 30_000 + (total as i64 - 1);
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_ZCODE).map(|c| c.watermark_ms),
+            Some(last_valid_stamp),
+            "the watermark advanced past the malformed tail"
+        );
+    }
+
+    // 10d. source changes during incremental collection: rows landing
+    //      between scans — ahead of the position and stamped behind it
+    //      (late commits inside the lookback) — are both ingested.
+    #[test]
+    fn source_changes_between_scans_are_ingested_forward_and_late() {
+        let fix = fixture("mid-collection");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("mid-collection-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        insert(
+            &fix.connection,
+            "first",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 30_000),
+            10,
+            5,
+            0,
+            0,
+            0,
+            15,
+        );
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::Collected { accepted: 1, .. }
+        ));
+        // A late commit stamped BEHIND the newest ingested row (inside
+        // the lookback band) and an ordinary newer row after it.
+        insert(
+            &fix.connection,
+            "late",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 30_500),
+            7,
+            3,
+            0,
+            0,
+            0,
+            10,
+        );
+        insert(
+            &fix.connection,
+            "newer",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 20_000),
+            1,
+            1,
+            0,
+            0,
+            0,
+            2,
+        );
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Collected { accepted, .. } = outcome else {
+            panic!("expected a collection, got {outcome:?}");
+        };
+        assert_eq!(accepted, 2, "the late row and the newer row both land");
+        assert_eq!(store.events().len(), 3);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            15 + 10 + 2
+        );
+    }
+
+    // 10e. disable → re-enable: usage completed while collection was
+    //      disabled is never silently imported; the fresh baseline skips
+    //      it, previously collected history is preserved untouched.
+    #[test]
+    fn disable_reenable_rebaselines_without_importing_disabled_period() {
+        let fix = fixture("reenable");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("reenable-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        insert(
+            &fix.connection,
+            "before-disable",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 30_000),
+            10,
+            5,
+            0,
+            0,
+            0,
+            15,
+        );
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::Collected { accepted: 1, .. }
+        ));
+        let history_tokens = store
+            .aggregate(UsageRange::ThirtyDays, None)
+            .totals
+            .total_tokens;
+        assert_eq!(history_tokens, 15);
+        let collection_started_at = store.collection_started_at().unwrap();
+
+        // Disabled: rows completed now must never be imported later.
+        store.set_enabled(false);
+        for index in 0..3 {
+            insert(
+                &fix.connection,
+                &format!("gap-{index}"),
+                "account:zai-individual-coding-plan",
+                "GLM-5.3",
+                "completed",
+                Some(NOW_MS - 20_000 + index),
+                100,
+                100,
+                0,
+                0,
+                0,
+                200,
+            );
+        }
+
+        // Re-enable: the next pass re-baselines at the current
+        // high-water mark and imports nothing from the disabled period.
+        store.set_enabled(true);
+        assert!(
+            store
+                .cursor(USAGE_SOURCE_ZCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "the re-enable transition marks the source for a fresh baseline"
+        );
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected a fresh baseline on re-enable, got {outcome:?}");
+        };
+        assert_eq!(
+            watermark_ms,
+            NOW_MS - 20_000 + 2 + 1,
+            "the fresh baseline sits one millisecond above the disabled-period tail"
+        );
+        assert_eq!(
+            store.events().len(),
+            1,
+            "no disabled-period row was imported"
+        );
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            history_tokens,
+            "historical totals are preserved"
+        );
+        assert_eq!(
+            store.collection_started_at(),
+            Some(collection_started_at),
+            "the disclosure anchor keeps the original collection start"
+        );
+        assert!(
+            !store
+                .cursor(USAGE_SOURCE_ZCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "the successful re-baseline cleared the pending flag"
+        );
+
+        // Post-re-enable usage resumes normal incremental accounting.
+        insert(
+            &fix.connection,
+            "after-reenable",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 10_000),
+            1,
+            1,
+            0,
+            0,
+            0,
+            2,
+        );
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::Collected { accepted: 1, .. }
+        ));
+        assert_eq!(store.events().len(), 2);
+    }
+
+    // 10f. a re-enable whose source is missing keeps the pending
+    //      re-baseline until the source returns — the gap is still
+    //      never imported (missing-source recovery).
+    #[test]
+    fn pending_rebaseline_survives_source_absence() {
+        let dir = tempdir::temp_dir("reenable-absent-src");
+        let db = dir.path().join("db.sqlite");
+        {
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            connection.execute_batch(FIXTURE_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, \
+                     model_id, status, started_at, completed_at, input_tokens, output_tokens, \
+                     reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens, \
+                     provider_total_tokens, computed_total_tokens) \
+                     VALUES ('old', 'old', 's', 'account:zai-individual-coding-plan', \
+                     'GLM-5.3', 'completed', 0, ?1, 10000, 2000, 0, 0, 8000, 12000, 12000)",
+                    rusqlite::params![NOW_MS - 60_000],
+                )
+                .unwrap();
+        }
+        let (store, _store_dir) = store_at("reenable-absent-store", Some(db.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        store.set_enabled(false);
+        // The source disappears (usage piles up elsewhere), then the
+        // user re-enables.
+        fs::remove_file(&db).unwrap();
+        store.set_enabled(true);
+        assert_eq!(collect(&store), ZcodeScanOutcome::Absent);
+        let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        assert_eq!(cursor.state, SourceState::SourceAbsent);
+        assert!(
+            cursor.pending_rebaseline,
+            "absence does not clear the pending re-baseline"
+        );
+
+        // The source returns carrying disabled-period rows: the next
+        // pass performs the fresh baseline and skips all of them.
+        {
+            let connection = rusqlite::Connection::open(&db).unwrap();
+            connection.execute_batch(FIXTURE_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO model_usage (id, logical_request_id, session_id, provider_id, \
+                     model_id, status, started_at, completed_at, input_tokens, output_tokens, \
+                     reasoning_tokens, cache_creation_input_tokens, cache_read_input_tokens, \
+                     provider_total_tokens, computed_total_tokens) \
+                     VALUES ('gap', 'gap', 's', 'account:zai-individual-coding-plan', \
+                     'GLM-5.3', 'completed', 0, ?1, 500, 500, 0, 0, 0, 1000, 1000)",
+                    rusqlite::params![NOW_MS - 20_000],
+                )
+                .unwrap();
+        }
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected the deferred fresh baseline, got {outcome:?}");
+        };
+        assert_eq!(watermark_ms, NOW_MS - 20_000 + 1);
+        assert!(
+            store.events().is_empty(),
+            "the gap row was never imported"
+        );
+    }
+
+    // 10g. a re-enable whose baseline read fails keeps the pending flag
+    //      (no stale-watermark resume); the recovered pass still skips
+    //      the whole disabled period (failed-baseline recovery).
+    #[test]
+    fn pending_rebaseline_survives_a_failed_baseline_read() {
+        let fix = fixture("reenable-failure");
+        insert_completed(&fix.connection, "old");
+        let (store, _dir) = store_at("reenable-failure-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        store.set_enabled(false);
+        insert_corrupt_completed_at(&fix.connection, "corrupt");
+        insert(
+            &fix.connection,
+            "gap",
+            "account:zai-individual-coding-plan",
+            "GLM-5.3",
+            "completed",
+            Some(NOW_MS - 20_000),
+            500,
+            500,
+            0,
+            0,
+            0,
+            1_000,
+        );
+        store.set_enabled(true);
+        // The corrupt row breaks the high-water query: fail closed, and
+        // the pending flag must survive so a later pass retries the
+        // fresh baseline rather than incrementally importing the gap.
+        assert!(matches!(
+            collect(&store),
+            ZcodeScanOutcome::ReadFailure(_)
+        ));
+        assert!(
+            store
+                .cursor(USAGE_SOURCE_ZCODE)
+                .is_some_and(|c| c.pending_rebaseline),
+            "a failed re-baseline stays pending"
+        );
+
+        fix.connection
+            .execute("DELETE FROM model_usage WHERE id = 'corrupt'", [])
+            .unwrap();
+        let outcome = collect(&store);
+        let ZcodeScanOutcome::Baseline { watermark_ms } = outcome else {
+            panic!("expected the retried fresh baseline, got {outcome:?}");
+        };
+        assert_eq!(watermark_ms, NOW_MS - 20_000 + 1);
+        assert!(
+            store.events().is_empty(),
+            "the disabled-period gap was never imported"
         );
     }
 
