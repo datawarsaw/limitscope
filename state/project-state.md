@@ -43,6 +43,15 @@
   marker; the expanded card names the account. No merge, push, release or
   version surface is touched. See `docs/codex-multi-account.md` and
   `docs/floating-island-design-d-comparison.md`.
+- Secondary-result attribution correction (2026-10-28): the Codex normalizer
+  now takes the registered account kind instead of hard-coding the primary
+  provider id. This fixes duplicate `openai-codex` success entries while
+  preserving `openai-codex:secondary` through retained failures and snapshot
+  publication. The bounded fix continues the accepted `d56571b0` candidate
+  on the same feature branch; the installed application is unchanged.
+  See the production-path trace and regression scope in
+  `docs/codex-multi-account.md`. Authenticated two-account verification remains
+  an operator-owned release check; deterministic fixtures do not establish it.
 
 ## Architecture and boundaries
 

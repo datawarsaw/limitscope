@@ -898,6 +898,7 @@ fn base_usage(
 }
 
 fn normalize_codex(
+    kind: ProviderKind,
     result: Result<CodexUsage, ProviderError>,
     now_ms: i64,
 ) -> Result<ProviderUsageDto, ProviderFailure> {
@@ -919,7 +920,9 @@ fn normalize_codex(
             // The credit capability rides the same account-bound observation
             // as the windows: quota Live with credits unavailable is the
             // normal independent-failure projection, never a quota error.
-            let mut dto = base_usage(ProviderKind::Codex, health, limits);
+            // The registered account owns the provider id; the shared Codex
+            // payload describes usage, not which configured slot requested it.
+            let mut dto = base_usage(kind, health, limits);
             dto.account = build_codex_attribution(usage.account.as_ref());
             dto.plan_type = usage.plan_type.and_then(|p| {
                 let trimmed = p.trim().to_lowercase();
@@ -1492,6 +1495,18 @@ pub fn production_specs_for_accounts(accounts: &[CodexAccountConfig]) -> Vec<Pro
 /// returned windows belong to that account alone. Nothing is shared between
 /// accounts and no window is ever combined across them.
 fn codex_specs(accounts: &[CodexAccountConfig]) -> Vec<ProviderSpec> {
+    codex_specs_with_fetch(accounts, |codex_home| async move {
+        codex::get_codex_usage_for(codex_home.as_deref()).await
+    })
+}
+
+// Keep registration and normalization on the production path while allowing
+// tests to supply raw collector outcomes without reading local credentials.
+fn codex_specs_with_fetch<F, Fut>(accounts: &[CodexAccountConfig], fetch: F) -> Vec<ProviderSpec>
+where
+    F: Fn(Option<String>) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<CodexUsage, ProviderError>> + Send + 'static,
+{
     let mut specs = Vec::new();
     for account in accounts {
         if !account.is_configured() {
@@ -1501,14 +1516,17 @@ fn codex_specs(accounts: &[CodexAccountConfig]) -> Vec<ProviderSpec> {
             continue;
         };
         let codex_home = account.codex_home_option().map(str::to_string);
+        let fetch = fetch.clone();
         specs.push(ProviderSpec {
             kind,
             fetch: Arc::new(move || {
                 let codex_home = codex_home.clone();
+                let fetch = fetch.clone();
                 Box::pin(async move {
                     let now_ms = Utc::now().timestamp_millis();
                     normalize_codex(
-                        codex::get_codex_usage_for(codex_home.as_deref()).await,
+                        kind,
+                        fetch(codex_home).await,
                         now_ms,
                     )
                 })
@@ -4426,6 +4444,9 @@ pub fn set_codex_accounts(
 // ---------- tests ----------
 
 #[cfg(test)]
+mod codex_attribution_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::zcode_reset::{ZCodeResetCard, ZCodeResetTarget};
@@ -4861,6 +4882,7 @@ mod tests {
     fn normalize_codex_carries_account_bound_credits() {
         let checked_at = fixed_now().to_rfc3339_opts(SecondsFormat::Secs, true);
         let dto = normalize_codex(
+            ProviderKind::Codex,
             Ok(codex_success_with_credits(3, Some(0), &checked_at, "ab12")),
             fixed_now().timestamp_millis(),
         )
@@ -4887,7 +4909,7 @@ mod tests {
             "ab12",
         );
         usage.reset_credits = None;
-        let dto = normalize_codex(Ok(usage), fixed_now().timestamp_millis())
+        let dto = normalize_codex(ProviderKind::Codex, Ok(usage), fixed_now().timestamp_millis())
             .expect("codex success must normalize");
         assert_eq!(dto.health, ProviderHealth::Live);
         assert_eq!(dto.reset_credits, None);
@@ -4900,6 +4922,7 @@ mod tests {
         let stale_at = (now - chrono::Duration::minutes(16))
             .to_rfc3339_opts(SecondsFormat::Secs, true);
         let mut fresh = normalize_codex(
+            ProviderKind::Codex,
             Ok(codex_success_with_credits(3, Some(0), &fresh_at, "ab12")),
             fixed_now().timestamp_millis(),
         )
@@ -4911,6 +4934,7 @@ mod tests {
             "fresh credits must survive retention"
         );
         let mut stale = normalize_codex(
+            ProviderKind::Codex,
             Ok(codex_success_with_credits(3, Some(0), &stale_at, "ab12")),
             fixed_now().timestamp_millis(),
         )
@@ -6497,6 +6521,7 @@ mod tests {
     #[tokio::test]
     async fn other_providers_never_carry_a_fallback_cause() {
         let codex = normalize_codex(
+            ProviderKind::Codex,
             Ok(CodexUsage {
                 limits: vec![crate::codex::CodexLimitWindow {
                     label: "Weekly".to_string(),
@@ -7823,7 +7848,7 @@ mod tests {
             account: None,
             reset_credits: None,
         };
-        let dto = normalize_codex(Ok(usage), fixed_now().timestamp_millis())
+        let dto = normalize_codex(ProviderKind::Codex, Ok(usage), fixed_now().timestamp_millis())
             .expect("normalized codex usage");
         assert_eq!(dto.plan_type.as_deref(), Some("team"));
 
@@ -7836,7 +7861,7 @@ mod tests {
             account: None,
             reset_credits: None,
         };
-        let dto_empty = normalize_codex(Ok(empty_plan), fixed_now().timestamp_millis())
+        let dto_empty = normalize_codex(ProviderKind::Codex, Ok(empty_plan), fixed_now().timestamp_millis())
             .expect("normalized codex usage");
         assert_eq!(dto_empty.plan_type, None);
         let wire_empty = serde_json::to_string(&dto_empty).expect("serialized dto");
@@ -8173,7 +8198,7 @@ mod tests {
             account: None,
             reset_credits: None,
         };
-        let mut dto = normalize_codex(Ok(usage), fixed_now().timestamp_millis())
+        let mut dto = normalize_codex(ProviderKind::Codex, Ok(usage), fixed_now().timestamp_millis())
             .expect("codex success must normalize");
         assert_eq!(dto.health, ProviderHealth::Live, "the window stays live");
         assert_eq!(dto.limits[0].used_percent, 42.0, "the data survives");
@@ -9534,6 +9559,7 @@ mod tests {
     #[tokio::test]
     async fn empty_window_success_publishes_unknown_and_never_claims_cycle_success() {
         let payload = normalize_codex(
+            ProviderKind::Codex,
             Ok(CodexUsage {
                 limits: Vec::new(),
                 plan_type: None,

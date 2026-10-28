@@ -86,3 +86,79 @@ guessed at.
 - The number of accounts is fixed at two. A third slot is an additive
   change: one provider kind, one account id and one config entry.
 
+## Secondary-result attribution correction (2026-10-28)
+
+The accepted Floating Island D candidate `d56571b08d58caeb725ff7d630ed1c6658a60e84`
+registered the secondary account correctly, but `normalize_codex` constructed
+every successful DTO with `base_usage(ProviderKind::Codex, ...)`. The result
+therefore carried `openai-codex` even when its collector belonged to
+`openai-codex:secondary`. Failures without last-good used the correct kind;
+retained failures could carry the incorrect id copied from a prior success.
+
+The registration closure now passes its captured `ProviderKind` into
+`normalize_codex`. This is the boundary that constructs the provider DTO:
+the slot identity comes from registration, independently of optional masked
+account hints in the payload. The primary retains its historical id.
+
+The production path is:
+
+1. `runtime::start` builds `RuntimeCore` with `production_specs` and
+   `with_codex_accounts`. `codex_specs` registers configured accounts, maps
+   each id through `codex_kind_for`, and captures its own Codex home and kind.
+2. `get_codex_usage_for` → `fetch_codex_usage` → `fetch_usage_for_auth` reads
+   the configured source and requests usage for that account. The existing
+   `parse_usage_response` returns `CodexUsage` with windows, plan and masked
+   attribution; failures retain the existing attempted-account hint.
+3. The registered closure calls `normalize_codex(kind, outcome, now_ms)`.
+   `run_provider_job` applies success/failure and cooldown transitions using
+   the same registered kind. In-memory last-good is keyed by `kind.id()`;
+   the stored DTO now agrees with that key.
+4. `run_cycle` joins independent provider jobs and records history from
+   normalized entries. `observations_from_usages` uses the full DTO id and
+   account hint; failure/cooldown/stale observations are excluded. Paused
+   accounts are not collected or recorded and keep their own prior entry.
+5. `ProviderLastGoodStore::record_success` persists live readings by
+   `kind.id()`. On restart, `hydrate` resolves each registered id separately
+   and returns stale readings. Errors and cooldowns do not replace the cache.
+6. `snapshot` projects account aliases/monitoring flags by full id.
+   `run_chain` publishes that snapshot through `runtime://snapshot`; the
+   pull command returns the same DTO. `useProviderUsage` consumes snapshots
+   with a sequence guard. `floatingQuotaItems` deduplicates by full id, and
+   `FloatingQuotaBar` / `FloatingDockStrip` use that id as their React key.
+   Previously the duplicate primary id made this deduplication drop one
+   account. `baseProviderId` remains only a provider-family presentation lookup.
+
+Regression coverage in `runtime/codex_attribution_tests.rs` injects raw
+`CodexUsage` / `ProviderError` outcomes at the collector boundary of the
+production registration factory. It executes the real normalizer, runtime
+jobs, snapshot publication, history and disk-cache round trip. It covers
+single-account compatibility, missing payload account hints, bare failures,
+both concurrent completion orders, retained failure, cooldown, pause/resume,
+and stale hydration, in both account directions. The frontend consumer test
+passes both account ids through snapshot events and the real floating-bar
+projection for retained error, cooldown, stale and paused states.
+
+These are fixture-based regressions, not authenticated multi-account
+verification. A live read of both independently configured accounts remains
+an operator-owned release check. This correction changes no visuals,
+authentication, credentials, installed application, or release/version surface.
+
+Validation on 2026-10-28:
+
+- New native production-path regressions: 5 PASS. Negative control restoring
+  only the old hard-coded primary kind: 4 FAIL with the expected
+  `openai-codex` versus `openai-codex:secondary` mismatch; the primary-only
+  regression still passed. The fixed source was restored byte-for-byte.
+- `cargo test --locked -- --quiet`: 1036 PASS, 18 intentionally ignored
+  live probes, 0 FAIL.
+- `npm test`: 79 files / 1365 tests PASS, including 4 new account-state
+  consumer cases and the existing source/updater security guardrails.
+- `npm run build`: PASS (TypeScript and Vite).
+- `cargo check --locked --all-targets --features custom-protocol`: PASS;
+  three dead-code warnings in unchanged `usage_intelligence`, `zcode_plans`
+  and `zcode_reset` code.
+- Existing `scripts/secret-scan.mjs` patterns: PASS over 9 files (built
+  frontend, Tauri config and all five changed files). The signing-key
+  needle call was disabled in memory for this run, so no local signing
+  key was read. The tracked scanner itself was not changed.
+

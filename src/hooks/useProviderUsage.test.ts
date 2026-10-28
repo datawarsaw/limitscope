@@ -2,7 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act } from "react";
 import { cleanup, renderHook, waitFor } from "@testing-library/react";
-import type { RuntimeSnapshot } from "../types";
+import type { ProviderUsage, RuntimeSnapshot } from "../types";
+import { floatingQuotaItems } from "../lib/floatingQuota";
 
 /**
  * Consumer-contract tests for the shared-runtime hook: the hook must only
@@ -130,6 +131,44 @@ describe("useProviderUsage (shared runtime consumer)", () => {
     emitSnapshot(snapshotWith({ seq: 2, cycleSucceeded: true }));
     expect(result.current.refreshOverdue).toBe(true);
   });
+
+  it.each(["error", "cooldown", "stale", "paused"] as const)(
+    "keeps each Codex account's retained reading isolated through a %s snapshot",
+    async (state) => {
+      const { result } = renderHook(() => useProviderUsage(5));
+      await waitFor(() => expect(result.current.loading).toBe(false));
+      const ids = ["openai-codex", "openai-codex:secondary"];
+      for (const affected of [0, 1]) {
+        const providers: ProviderUsage[] = ids.map((id, index) => ({
+          id,
+          name: "OpenAI / Codex",
+          status: "ok",
+          health: "live",
+          checkedAt: `2026-10-28T12:0${index}:00.000Z`,
+          limits: [{ label: "Weekly", usedPercent: [14, 81][index] }],
+          accountAlias: ["Personal", "Work"][index],
+          account: { label: `Account ${index}`, identity: `chatgpt:fixture-${index}` },
+        }));
+        Object.assign(providers[affected], state === "paused"
+          ? { monitoringPaused: true }
+          : {
+              health: state,
+              status: state === "stale" ? "stale" : "error",
+              ...(state === "stale"
+                ? { dataFreshness: "stale" }
+                : { error: "Refresh failed: fixture", errorHttpStatus: 429 }),
+            });
+        emitSnapshot(snapshotWith({ seq: affected + 2, providers }));
+        expect(result.current.usages).toEqual(providers);
+        const items = floatingQuotaItems(result.current.usages);
+        expect(items.map((item) => item.providerId)).toEqual(ids);
+        expect(items.map((item) => item.percent)).toEqual([14, 81]);
+        expect(items.map((item) => item.accountAlias)).toEqual(["Personal", "Work"]);
+        expect(items[affected].state).toBe(state === "cooldown" ? "error" : state);
+        expect(items[1 - affected].state).toBe("healthy");
+      }
+    },
+  );
 
   it("refresh requests go to the runtime, not to provider adapters", async () => {
     const { result } = renderHook(() => useProviderUsage(5));
