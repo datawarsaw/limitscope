@@ -281,6 +281,17 @@ html[data-window="floating"] body {
   opacity: 0.72;
 }
 
+/* A paused account: the segment stays and keeps its last known reading,
+   but it is dimmed and its value is muted, so a frozen number never wears
+   the color of a live one. */
+.fq-item.is-paused {
+  opacity: 0.6;
+}
+
+.fq-item.is-paused .fq-percent {
+  color: var(--text-faint);
+}
+
 .fq-item.is-unavailable .fq-percent,
 .fq-item.is-error .fq-percent:empty {
   color: var(--text-faint);
@@ -550,6 +561,22 @@ html[data-window="floating"] body {
 
 .fq-status.status-error {
   color: var(--red);
+}
+
+/* A paused account is not a failure: it is muted, not alarmed. */
+.fq-status.status-paused {
+  color: var(--text-dim);
+}
+
+/* The account name on the expanded card. It is deliberately not a badge
+   on the collapsed bar: the compact bar carries no account marker. */
+.fq-account-alias {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-dim);
+  font-size: 11px;
 }
 
 

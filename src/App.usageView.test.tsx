@@ -32,6 +32,17 @@ vi.mock("./hooks/useSettings", () => ({
       quotaPerspective: "used",
       providerPreferences: { order: [], hidden: [] },
       usageIntelligence: mocks.usageIntelligence,
+      codexAccounts: {
+        accounts: [
+          { accountId: "openai-codex", alias: "", codexHome: "", monitored: true },
+          {
+            accountId: "openai-codex:secondary",
+            alias: "",
+            codexHome: "",
+            monitored: true,
+          },
+        ],
+      },
     },
     setLaunchAtStartup: vi.fn(),
     setRefreshInterval: vi.fn(),
@@ -41,6 +52,7 @@ vi.mock("./hooks/useSettings", () => ({
     setProviderHidden: vi.fn(),
     moveProvider: vi.fn(),
     setQuotaPerspective: vi.fn(),
+    setCodexAccount: vi.fn(),
     resetPreferences: vi.fn(),
     startupPending: false,
     startupError: null,

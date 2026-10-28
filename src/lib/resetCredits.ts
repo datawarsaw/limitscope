@@ -1,4 +1,5 @@
 import type { CodexResetCredits, ProviderUsage } from "../types";
+import { baseProviderId, CODEX_PROVIDER_ID } from "./providerIds";
 
 /**
  * Display contract for the Codex banked reset-credit capability (v0.7).
@@ -19,8 +20,10 @@ import type { CodexResetCredits, ProviderUsage } from "../types";
 /** Freshness budget mirroring RESET_CREDITS_TTL_SECS in src-tauri/src/codex.rs. */
 export const RESET_CREDITS_TTL_MS = 15 * 60 * 1000;
 
-/** The one provider allowed to carry a banked-credit observation. */
-export const CODEX_PROVIDER_ID = "openai-codex";
+/** The one provider allowed to carry a banked-credit observation. Every
+ * configured account of it carries its own balance, so the check is by
+ * base provider id. */
+export { CODEX_PROVIDER_ID };
 
 /** Clock-skew tolerance mirroring the Rust freshness check (5 minutes). */
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
@@ -61,7 +64,7 @@ export function formatResetCredits(
   usage: ProviderUsage,
   nowMs: number = Date.now(),
 ): ResetCreditLines | null {
-  if (usage.id !== CODEX_PROVIDER_ID) return null;
+  if (baseProviderId(usage.id) !== CODEX_PROVIDER_ID) return null;
   const credits: CodexResetCredits | undefined = usage.resetCredits;
   if (!credits) return null;
   if (!isValidCount(credits.bankedCredits)) return null;

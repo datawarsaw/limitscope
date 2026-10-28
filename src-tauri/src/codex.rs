@@ -318,6 +318,32 @@ fn codex_dir() -> Result<std::path::PathBuf, ProviderError> {
     Ok(codex_home_dir(std::env::var("CODEX_HOME").ok().as_deref(), &home))
 }
 
+/// The Codex home one account reads its credential from.
+///
+/// An explicit account home wins: it is that account's own credential
+/// reference, set by the operator who logged that account in with
+/// `codex login` inside its own `CODEX_HOME`. Without one the process falls
+/// back to the ambient `CODEX_HOME` and then to `~/.codex` — the single-login
+/// behavior this adapter has always had.
+///
+/// A configured home that does not exist is an error, not a silent fallback:
+/// falling back would read the primary account's credential under the second
+/// account's name, which is exactly the identity mix-up the per-account
+/// model exists to prevent.
+pub fn resolve_codex_home(explicit: Option<&str>) -> Result<std::path::PathBuf, ProviderError> {
+    if let Some(home) = explicit.map(str::trim).filter(|home| !home.is_empty()) {
+        let path = std::path::PathBuf::from(home);
+        if !path.is_dir() {
+            return Err(ProviderError::new(
+                "codex_home_missing",
+                format!("The configured Codex home does not exist: {home}"),
+            ));
+        }
+        return Ok(path);
+    }
+    codex_dir()
+}
+
 /// Resolves the Codex home the adapter reads auth state from. A standard
 /// `CODEX_HOME` override wins when it names a usable (existing) directory;
 /// anything else — unset, empty, or unusable — keeps the default `~/.codex`.
@@ -509,8 +535,8 @@ fn parse_usage_response(
 
 // ---------- fetch + command ----------
 
-async fn fetch_codex_usage() -> Result<CodexUsage, ProviderError> {
-    let dir = codex_dir()?;
+async fn fetch_codex_usage(codex_home: Option<&str>) -> Result<CodexUsage, ProviderError> {
+    let dir = resolve_codex_home(codex_home)?;
     let auth = load_auth(&dir)?;
     // The attempted account is known as soon as auth.json is resolved; every
     // failure after this point carries its masked identity so the runtime can
@@ -589,7 +615,17 @@ async fn fetch_usage_for_auth(
 
 #[tauri::command]
 pub async fn get_codex_usage() -> Result<CodexUsage, ProviderError> {
-    fetch_codex_usage().await
+    fetch_codex_usage(None).await
+}
+
+/// The usage read for one explicitly configured account.
+///
+/// The account's own Codex home is the only thing that differs from
+/// `get_codex_usage`: the credential, the request scope and therefore the
+/// quota windows are that account's own. Nothing is shared between two
+/// accounts and no limit is ever combined.
+pub async fn get_codex_usage_for(codex_home: Option<&str>) -> Result<CodexUsage, ProviderError> {
+    fetch_codex_usage(codex_home).await
 }
 
 // ---------- tests ----------
@@ -1125,7 +1161,7 @@ mod tests {
     #[test]
     #[ignore = "live test: requires a real local Codex login and network access"]
     fn live_fetch_returns_windows() {
-        let usage = tauri::async_runtime::block_on(fetch_codex_usage()).expect("live fetch");
+        let usage = tauri::async_runtime::block_on(fetch_codex_usage(None)).expect("live fetch");
         println!("plan_type: {:?}", usage.plan_type);
         if let Some(account) = &usage.account {
             println!("account: chatgpt:{}", account.account_hint);

@@ -1,5 +1,6 @@
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import { floatingItemLabel, FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
+import { baseProviderId } from "../lib/providerIds";
 import {
   floatingQuotaPresentation,
   quotaColorLevel,
@@ -14,14 +15,18 @@ import {
  * pinned cards carry the same identity as the segment they expand.
  */
 export function ProviderMark({ id }: { id: string }) {
-  if (id === "opendesign") return <span className="fq-mark-fallback">OD</span>;
-  if (id === "minimax-token-plan") {
+  // An account-scoped id (a second OpenAI/Codex account) names the same
+  // provider, so it wears the same mark: the mark identifies the provider,
+  // never the account.
+  const provider = baseProviderId(id);
+  if (provider === "opendesign") return <span className="fq-mark-fallback">OD</span>;
+  if (provider === "minimax-token-plan") {
     // The MiniMax mark reduced to a two-letter monogram: the brand's own
     // wordmark is not licensed into the app, and the single-letter fallback
     // would be indistinguishable from other providers at 16px.
     return <span className="fq-mark-fallback">MM</span>;
   }
-  if (id === "openai-codex") {
+  if (provider === "openai-codex") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path
@@ -31,7 +36,7 @@ export function ProviderMark({ id }: { id: string }) {
       </svg>
     );
   }
-  if (id === "zai") {
+  if (provider === "zai") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path
@@ -41,14 +46,14 @@ export function ProviderMark({ id }: { id: string }) {
       </svg>
     );
   }
-  if (id === "opencode-go") {
+  if (provider === "opencode-go") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path fill="currentColor" d="M22 24H2V0h20zM17 4.8H7v14.4h10z" />
       </svg>
     );
   }
-  if (id === "antigravity") {
+  if (provider === "antigravity") {
     return (
       <svg viewBox="0 0 16 16" aria-hidden="true">
         <path
@@ -58,7 +63,7 @@ export function ProviderMark({ id }: { id: string }) {
       </svg>
     );
   }
-  if (id === "grok") {
+  if (provider === "grok") {
     // The Grok slash: the app-tile silhouette with the diagonal slash cut
     // out, reduced from the published mark so it stays crisp at 16px.
     return (
@@ -71,7 +76,7 @@ export function ProviderMark({ id }: { id: string }) {
       </svg>
     );
   }
-  return <span className="fq-mark-fallback">{id.slice(0, 1).toUpperCase()}</span>;
+  return <span className="fq-mark-fallback">{provider.slice(0, 1).toUpperCase()}</span>;
 }
 
 export function FloatingProviderItem({
@@ -121,7 +126,11 @@ export function FloatingProviderItem({
       </span>
       <span className="fq-readout">
         <span className="fq-percent">{percent}</span>
-        {item.state === "error" ? (
+        {/* The "!" badge marks a degraded READING, so it belongs over a
+            value. A provider with no reading at all — still loading, or
+            whose local source is unavailable — shows a bare em dash, and
+            the expanded card states the reason. */}
+        {item.state === "error" && item.percent !== null ? (
           <span className="fq-warn" aria-hidden="true">
             !
           </span>

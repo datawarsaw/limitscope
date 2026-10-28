@@ -1086,3 +1086,124 @@ describe("FloatingQuotaBar persistent bar", () => {
     ).toBe("critical"); // 5% remaining
   });
 });
+
+describe("FloatingQuotaBar with two OpenAI/Codex accounts", () => {
+  const PRIMARY = "openai-codex";
+  const SECONDARY = "openai-codex:secondary";
+
+  const primary = item({
+    providerId: PRIMARY,
+    name: "OpenAI / Codex",
+    percent: 44,
+    usedPercent: 44,
+    accountAlias: "Personal",
+    windows: [{ label: "Weekly", usedPercent: 44, resetAt: RESET_AT }],
+  });
+  const secondary = item({
+    providerId: SECONDARY,
+    name: "OpenAI / Codex",
+    percent: 86,
+    usedPercent: 86,
+    accountAlias: "Work",
+    windows: [{ label: "Weekly", usedPercent: 86, resetAt: RESET_AT }],
+  });
+
+  const segmentOf = (id: string) =>
+    container.querySelector('[data-provider-id="' + id + '"]')!;
+
+  it("renders both accounts as their own segments", async () => {
+    await renderBar({ items: [primary, secondary, HEALTHY] });
+    expect(container.querySelectorAll("[data-provider-id]").length).toBe(3);
+    expect(segmentOf(PRIMARY)).not.toBeNull();
+    expect(segmentOf(SECONDARY)).not.toBeNull();
+  });
+
+  it("keeps the provider mark on both accounts and no account letter", async () => {
+    await renderBar({ items: [primary, secondary] });
+    for (const id of [PRIMARY, SECONDARY]) {
+      const segment = segmentOf(id);
+      // The provider mark is the OpenAI glyph, not the letter fallback a
+      // second account would wear if its id were not resolved to its
+      // provider.
+      expect(segment.querySelector(".fq-mark svg")).not.toBeNull();
+      expect(segment.querySelector(".fq-mark-fallback")).toBeNull();
+    }
+  });
+
+  it("shows no account marker beside the compact percentages", async () => {
+    await renderBar({ items: [primary, secondary] });
+    for (const id of [PRIMARY, SECONDARY]) {
+      const segment = segmentOf(id);
+      // The compact readout is the percentage and nothing else: no initial,
+      // no account badge, no numeric account id.
+      expect(segment.querySelector(".fq-readout")!.textContent).toBe(
+        id === PRIMARY ? "56%" : "14%",
+      );
+      expect(segment.querySelector(".fq-account-alias")).toBeNull();
+      expect(segment.textContent).not.toContain("Personal");
+      expect(segment.textContent).not.toContain("Work");
+    }
+  });
+
+  it("names the account on the expanded card", async () => {
+    await renderBar({
+      items: [primary, secondary],
+      detailId: SECONDARY,
+      pinned: true,
+    });
+    const card = container.querySelector('[role="dialog"] .fq-card')!;
+    expect(card.querySelector(".fq-account-alias")!.textContent).toBe("Work");
+  });
+
+  it("reads a paused account as frozen, not live", async () => {
+    const paused = item({
+      providerId: SECONDARY,
+      name: "OpenAI / Codex",
+      percent: 86,
+      usedPercent: 86,
+      state: "paused",
+      statusLabel: "Monitoring off",
+      statusClass: "paused",
+    });
+    await renderBar({ items: [primary, paused] });
+    const segment = segmentOf(SECONDARY);
+    expect(segment.className).toContain("is-paused");
+    expect(segment.querySelector(".fq-percent")!.textContent).toBe("14%");
+  });
+
+  it("badges a degraded reading and leaves an absent one bare", async () => {
+    // An expired session that retained a reading: the "!" marks the value.
+    const expired = item({
+      providerId: "antigravity",
+      name: "Google Antigravity",
+      state: "error",
+      percent: 31,
+      usedPercent: 31,
+      statusLabel: "Refresh failed",
+      statusClass: "error",
+      error: "Session expired — sign in again to refresh quotas.",
+    });
+    // A provider whose local source is unavailable: no reading at all, so
+    // the segment is a bare em dash and the card carries the reason.
+    const unavailable = item({
+      providerId: "opencode-go",
+      name: "OpenCode Go",
+      state: "error",
+      percent: null,
+      usedPercent: null,
+      windowLabel: null,
+      resetAt: null,
+      windows: [],
+      primaryReset: null,
+      statusLabel: "Unavailable",
+      statusClass: "error",
+      error: "Provider data unavailable",
+    });
+    await renderBar({ items: [expired, unavailable] });
+    expect(segmentOf("antigravity").querySelector(".fq-warn")).not.toBeNull();
+    expect(segmentOf("opencode-go").querySelector(".fq-warn")).toBeNull();
+    expect(segmentOf("opencode-go").querySelector(".fq-percent")!.textContent).toBe(
+      "—",
+    );
+  });
+});

@@ -238,6 +238,21 @@ export type ProviderUsage = {
    * states so the card keeps naming its account. */
   account?: AccountAttribution;
   /**
+   * The user-facing alias of the monitored account, when that account
+   * carries one (multi-account OpenAI/Codex).
+   *
+   * Display only: it never appears beside the compact bar's percentages,
+   * and the expanded account card is where the account is named.
+   */
+  accountAlias?: string;
+  /**
+   * Whether collection for this entry is paused by the user.
+   *
+   * The runtime stopped polling this account, so its reading is frozen at
+   * the last known value. Nothing may read that value as live.
+   */
+  monitoringPaused?: boolean;
+  /**
    * Plan type or subscription tier (e.g. "team", "plus", "pro") explicitly
    * returned by the provider backend. Never guessed or inferred from model names.
    */

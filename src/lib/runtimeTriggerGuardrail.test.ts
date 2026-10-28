@@ -27,6 +27,10 @@ const ALLOWED_COMMANDS = new Set([
   // Per-wallet monitor toggles (v0.8.17): the runtime gates collection on
   // the persisted flags; TS never fetches.
   "set_wallet_monitoring",
+  // The OpenAI/Codex account configuration is a runtime-owned setting: the
+  // settings lane forwards it and the runtime decides which accounts are
+  // registered and which are still polled. TS never fetches.
+  "set_codex_accounts",
   "request_refresh",
   "request_refresh_on_reconnect",
   // Wallet refresh rides the same runtime: it asks the existing owner to

@@ -34,6 +34,15 @@
   horizon correction and the MiniMax `AuthStore` redaction as two separate
   commits. No version surface, release manifest or tag is touched.
 - Historical dirty checkout `C:/AI/Token_Monitor` is outside the mutation scope.
+- Multi-account OpenAI/Codex candidate (not released): branch
+  `codex/floating-island-d`, worktree
+  `C:/AI/Token_Monitor/.worktrees/floating-island-d`, based on `origin/main`
+  `32397dd3cf7c66df4a4c7b55607899fb70769f43`. It implements the accepted
+  "D — Complete Floating Island" design and adds two independently
+  monitored OpenAI/Codex accounts. The compact bar carries no account
+  marker; the expanded card names the account. No merge, push, release or
+  version surface is touched. See `docs/codex-multi-account.md` and
+  `docs/floating-island-design-d-comparison.md`.
 
 ## Architecture and boundaries
 
@@ -79,6 +88,21 @@
   observation — the same one the main dashboard renders — so both surfaces
   describe one pool from one source. The manual accessibility read stays the
   explicit fallback and never displaces a live passive reading.
+- The OpenAI/Codex account id IS the provider id: the primary account keeps
+  the historical `openai-codex` id, the second account uses the
+  account-scoped `openai-codex:secondary`. Every provider-keyed subsystem
+  (last-good, history, cooldowns, notification state) therefore isolates
+  the two accounts for free, and one account's failure, expiry or cooldown
+  can never invalidate the other account's data. Account aliases are display
+  only and never appear beside the compact bar's percentages.
+- Each Codex account reads its own Codex home, which holds the account's own
+  `auth.json`. The app only reads that file: it never performs a login, never
+  writes, copies or shares a credential, and never scrapes a browser
+  session. The account owner performs the login themselves.
+- The floating bar's "!" badge marks a degraded READING and is therefore
+  drawn only over a value. A provider with no reading at all — still
+  loading, or whose local source is unavailable — shows a bare em dash, and
+  the expanded card states the reason.
 
 ## Evidence and limits
 

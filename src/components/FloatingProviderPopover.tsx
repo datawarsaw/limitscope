@@ -175,6 +175,12 @@ export function FloatingProviderPopover({
             <ProviderMark id={item.providerId} />
           </span>
           <strong>{item.name}</strong>
+          {/* The account is named here, on the expanded card, and never on
+             the collapsed bar: the compact bar stays a clean quota readout
+             with no account badge beside its percentages. */}
+          {item.accountAlias ? (
+            <span className="fq-account-alias">{item.accountAlias}</span>
+          ) : null}
           {/* The healthy "Live" chip is clutter; degraded statuses still badge. */}
           {item.statusClass !== "ok" ? (
             <span className={"fq-status status-" + item.statusClass}>

@@ -71,7 +71,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -85,6 +85,9 @@ use crate::history::{QuotaHistoryStore, QuotaObservation};
 use crate::last_good::ProviderLastGoodStore;
 use crate::usage_intelligence::UsageIntelligenceStore;
 use crate::codex::{self, CodexResetCredits, CodexUsage};
+use crate::codex_accounts::{
+    self, CodexAccountConfig, CodexAccountStore, PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID,
+};
 use crate::cursor_grok_bot::{self, GrokBotUsage};
 use crate::diagnostics::{
     ErrorDiagnosticSource, ProviderDiagnosticSource, RuntimeDiagnosticSource,
@@ -418,6 +421,22 @@ pub struct ProviderUsageDto {
     /// Other providers never set it.
     #[serde(skip)]
     pub fallback_failure: Option<ProviderFailure>,
+    /// The user-facing name of the monitored account, when that account
+    /// carries one (multi-account OpenAI/Codex).
+    ///
+    /// Display only. It is never a credential, never an identifier the
+    /// runtime keys state by, and it never appears beside the compact bar's
+    /// percentages — the expanded account card is where an account is
+    /// named.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_alias: Option<String>,
+    /// Whether collection for this entry is paused by the user.
+    ///
+    /// A paused entry keeps its last known reading and its segment, but
+    /// nothing may read that reading as live. The runtime is the only
+    /// authority on this flag: it knows whether it is still polling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub monitoring_paused: Option<bool>,
 }
 
 /// Full runtime state pulled by `get_runtime_snapshot` and pushed after
@@ -600,6 +619,15 @@ pub(crate) fn failure_health(failure: &ProviderFailure) -> ProviderHealth {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderKind {
     Codex,
+    /// The second, independently authenticated OpenAI/Codex account.
+    ///
+    /// A separate kind rather than a second instance of `Codex`: the kind is
+    /// the single source of a provider's id, and the id is what keys
+    /// last-good retention, history, cooldowns and notification state. Two
+    /// kinds with two ids give the two accounts two isolated scopes for
+    /// free — one account's failure, expiry or cooldown can never touch
+    /// the other account's data.
+    CodexSecondary,
     Zai,
     OpenCodeGo,
     Antigravity,
@@ -612,7 +640,8 @@ pub enum ProviderKind {
 impl ProviderKind {
     pub(crate) fn id(self) -> &'static str {
         match self {
-            ProviderKind::Codex => "openai-codex",
+            ProviderKind::Codex => PRIMARY_ACCOUNT_ID,
+            ProviderKind::CodexSecondary => SECONDARY_ACCOUNT_ID,
             ProviderKind::Zai => "zai",
             ProviderKind::OpenCodeGo => "opencode-go",
             ProviderKind::Antigravity => "antigravity",
@@ -626,6 +655,7 @@ impl ProviderKind {
     pub(crate) fn name(self) -> &'static str {
         match self {
             ProviderKind::Codex => "OpenAI / Codex",
+            ProviderKind::CodexSecondary => "OpenAI / Codex",
             ProviderKind::Zai => "Z.ai",
             ProviderKind::OpenCodeGo => "OpenCode Go",
             ProviderKind::Antigravity => "Google Antigravity",
@@ -638,7 +668,8 @@ impl ProviderKind {
 
     pub(crate) fn from_id(id: &str) -> Option<Self> {
         match id {
-            "openai-codex" => Some(ProviderKind::Codex),
+            PRIMARY_ACCOUNT_ID => Some(ProviderKind::Codex),
+            SECONDARY_ACCOUNT_ID => Some(ProviderKind::CodexSecondary),
             "zai" => Some(ProviderKind::Zai),
             "opencode-go" => Some(ProviderKind::OpenCodeGo),
             "antigravity" => Some(ProviderKind::Antigravity),
@@ -653,6 +684,7 @@ impl ProviderKind {
     fn fallback_error(self) -> &'static str {
         match self {
             ProviderKind::Codex => "OpenAI / Codex usage could not be fetched.",
+            ProviderKind::CodexSecondary => "OpenAI / Codex usage could not be fetched.",
             ProviderKind::Zai => "Z.ai usage could not be fetched.",
             ProviderKind::OpenCodeGo => "OpenCode Go usage could not be fetched.",
             ProviderKind::Antigravity => "Google Antigravity usage could not be fetched.",
@@ -668,6 +700,17 @@ impl ProviderKind {
     pub(crate) fn is_manual_only(self) -> bool {
         matches!(self, ProviderKind::OpenDesign)
     }
+}
+
+/// Whether a provider id belongs to the OpenAI/Codex provider family,
+/// whichever configured account it names.
+///
+/// Provider-scoped behavior (the reset-credit freshness guard, the
+/// primary-window label, the provider mark) is a property of the
+/// provider, not of one account: both accounts answer the same Codex
+/// quota contract and must be read the same way.
+pub(crate) fn is_codex_provider_id(id: &str) -> bool {
+    id == ProviderKind::Codex.id() || id == ProviderKind::CodexSecondary.id()
 }
 
 pub type FetchFuture = Pin<Box<dyn Future<Output = Result<ProviderUsageDto, ProviderFailure>> + Send>>;
@@ -849,6 +892,8 @@ fn base_usage(
         zcode_plans: None,
         grok_bot: None,
         fallback_failure: None,
+        account_alias: None,
+        monitoring_paused: None,
     }
 }
 
@@ -904,7 +949,7 @@ fn build_codex_attribution(account: Option<&codex::CodexAccount>) -> Option<Acco
     Some(AccountAttributionDto {
         label: format!("account \u{2022}\u{2022}{hint}"),
         note: Some(
-            "Only the single local Codex login (~/.codex/auth.json) is shown; other ChatGPT accounts are not included."
+            "This account's own local Codex login. Accounts are read separately and their limits are never combined."
                 .to_string(),
         ),
         identity: Some(format!("chatgpt:{hint}")),
@@ -916,7 +961,7 @@ fn build_codex_attribution(account: Option<&codex::CodexAccount>) -> Option<Acco
 /// within its TTL. A stale count is dropped so it can never read as a
 /// current balance; the quota windows themselves are unaffected.
 fn trim_stale_reset_credits(dto: &mut ProviderUsageDto, now: DateTime<Utc>) {
-    if dto.id != ProviderKind::Codex.id() {
+    if !is_codex_provider_id(&dto.id) {
         return;
     }
     let fresh = dto
@@ -1420,22 +1465,98 @@ fn opendesign_windows_dto(
 }
 
 /// The production provider set — the exact registry the TS `registry.ts`
-/// pinned (same ids, same order, no simulated providers). Order is wire
-/// order: the frontend renders and summarizes in this order.
+/// pinned (same ids, same order, no simulated providers) for the default
+/// single-account configuration. Order is wire order: the frontend renders
+/// and summarizes in this order.
 pub fn production_specs() -> Vec<ProviderSpec> {
+    production_specs_for_accounts(&codex_accounts::default_accounts())
+}
+
+/// The provider set for one effective account configuration.
+///
+/// The configured OpenAI/Codex accounts come first, in account order, so the
+/// account segments sit side by side at the head of the bar. Every other
+/// provider is unchanged. An account that is not configured contributes no
+/// spec at all: it is not registered, so it appears in no rail, no
+/// diagnostics and no export.
+pub fn production_specs_for_accounts(accounts: &[CodexAccountConfig]) -> Vec<ProviderSpec> {
+    let mut specs = codex_specs(accounts);
+    specs.extend(other_production_specs());
+    specs
+}
+
+/// One spec per configured OpenAI/Codex account.
+///
+/// Each account reads its own credential reference, so each fetch is scoped
+/// to its own identity: the request, the account header and therefore the
+/// returned windows belong to that account alone. Nothing is shared between
+/// accounts and no window is ever combined across them.
+fn codex_specs(accounts: &[CodexAccountConfig]) -> Vec<ProviderSpec> {
+    let mut specs = Vec::new();
+    for account in accounts {
+        if !account.is_configured() {
+            continue;
+        }
+        let Some(kind) = codex_kind_for(&account.account_id) else {
+            continue;
+        };
+        let codex_home = account.codex_home_option().map(str::to_string);
+        specs.push(ProviderSpec {
+            kind,
+            fetch: Arc::new(move || {
+                let codex_home = codex_home.clone();
+                Box::pin(async move {
+                    let now_ms = Utc::now().timestamp_millis();
+                    normalize_codex(
+                        codex::get_codex_usage_for(codex_home.as_deref()).await,
+                        now_ms,
+                    )
+                })
+            }),
+        });
+    }
+    specs
+}
+
+/// The provider kind of one configured account.
+fn codex_kind_for(account_id: &str) -> Option<ProviderKind> {
+    match account_id {
+        PRIMARY_ACCOUNT_ID => Some(ProviderKind::Codex),
+        SECONDARY_ACCOUNT_ID => Some(ProviderKind::CodexSecondary),
+        _ => None,
+    }
+}
+
+/// Which accounts the runtime still polls, keyed by provider id.
+///
+/// The keys are the account ids, so this map is exactly the set of
+/// accounts a cycle may skip.
+fn monitored_map(accounts: &[CodexAccountConfig]) -> HashMap<&'static str, bool> {
+    accounts
+        .iter()
+        .filter(|account| account.is_configured())
+        .filter_map(|account| {
+            codex_kind_for(&account.account_id).map(|kind| (kind.id(), account.monitored))
+        })
+        .collect()
+}
+
+/// The part of the configuration the registered providers depend on: which
+/// accounts exist and which credential each one reads.
+fn spec_identity(accounts: &[CodexAccountConfig]) -> Vec<(String, String)> {
+    accounts
+        .iter()
+        .filter(|account| account.is_configured())
+        .map(|account| (account.account_id.clone(), account.codex_home.clone()))
+        .collect()
+}
+
+/// Every provider that is not an OpenAI/Codex account.
+fn other_production_specs() -> Vec<ProviderSpec> {
     // Each closure stamps the fetch-time clock for the reset plausibility
     // gate inside the normalizer — the gate evaluates bounds against the
     // moment the provider actually answered.
     vec![
-        ProviderSpec {
-            kind: ProviderKind::Codex,
-            fetch: Arc::new(|| {
-                Box::pin(async {
-                    let now_ms = Utc::now().timestamp_millis();
-                    normalize_codex(codex::get_codex_usage().await, now_ms)
-                })
-            }),
-        },
         ProviderSpec {
             kind: ProviderKind::Zai,
             fetch: Arc::new(|| {
@@ -1601,6 +1722,35 @@ fn merge_hydrated_wallets(seeded: &mut Vec<ApiWalletDto>, hydrated: Vec<ApiWalle
             *slot = dto;
         }
     }
+}
+
+/// Projects the effective account configuration onto one snapshot entry.
+///
+/// The alias and the monitoring state are runtime facts, not provider
+/// facts: the runtime knows which account an entry belongs to and whether
+/// it is still polling it. Applying them on the way out keeps both
+/// webviews, the export and the diagnostics on one truth — and keeps a
+/// hydrated (last-good) entry, which carries no alias of its own, in step
+/// with the account it belongs to.
+fn project_account_state(
+    usage: &ProviderUsageDto,
+    accounts: &[CodexAccountConfig],
+) -> ProviderUsageDto {
+    let Some(account) = accounts.iter().find(|account| account.account_id == usage.id)
+    else {
+        return usage.clone();
+    };
+    let mut usage = usage.clone();
+    // Both fields are set explicitly, never left over from an earlier
+    // projection: an account that lost its alias must not keep showing it,
+    // and an account that was resumed must not keep reading as paused.
+    usage.account_alias = if account.alias.is_empty() {
+        None
+    } else {
+        Some(account.alias.clone())
+    };
+    usage.monitoring_paused = Some(!account.monitored);
+    usage
 }
 
 // ---------- retry, cadence, cooldown, and last-good constants ----------
@@ -1836,6 +1986,14 @@ struct RuntimeInner {
     /// mirror, loaded before the first cycle). A wallet absent from this map
     /// falls back to its spec's `monitored_by_default`.
     wallet_monitored: HashMap<&'static str, bool>,
+    /// The effective OpenAI/Codex account configuration. Applied to the
+    /// snapshot on the way out, so every consumer sees the same alias and
+    /// the same monitoring state for an account.
+    codex_accounts: Vec<CodexAccountConfig>,
+    /// Which Codex accounts the runtime still polls, keyed by provider id.
+    /// A paused account is never collected: its reading freezes at the
+    /// last known value instead of pretending to be current.
+    codex_monitored: HashMap<&'static str, bool>,
     /// Active server-directed cooldowns by provider id (ephemeral).
     cooldowns: HashMap<&'static str, ProviderCooldown>,
     /// Last accepted automatic trigger per kind (burst dedupe).
@@ -1878,7 +2036,10 @@ pub enum RuntimeEvent {
 
 pub struct RuntimeCore {
     inner: Mutex<RuntimeInner>,
-    specs: Vec<ProviderSpec>,
+    /// The registered providers. Replaceable: the OpenAI/Codex account
+    /// configuration changes which accounts exist, and an account that
+    /// stops being configured leaves the registry entirely.
+    specs: RwLock<Arc<Vec<ProviderSpec>>>,
     wallet_specs: Vec<WalletSpec>,
     retry_delay_ms: Box<dyn Fn() -> u64 + Send + Sync>,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
@@ -1898,6 +2059,10 @@ pub struct RuntimeCore {
     /// configuration). Loaded before the first cycle, so a disabled wallet
     /// is never polled — not even at startup.
     wallet_prefs: Option<Arc<crate::wallet_prefs::WalletPrefsStore>>,
+    /// The Rust-owned mirror of the OpenAI/Codex account configuration.
+    /// Loaded before the first cycle, so a configured second account is
+    /// collected from the startup cycle on.
+    codex_accounts_store: Option<Arc<CodexAccountStore>>,
 }
 
 impl RuntimeCore {
@@ -1935,7 +2100,8 @@ impl RuntimeCore {
         store: Option<Arc<ProviderLastGoodStore>>,
     ) -> Self {
         if let Some(store) = &store {
-            let (usages, last_good) = store.hydrate(&self.specs, (self.now)());
+            let specs = self.specs_snapshot();
+            let (usages, last_good) = store.hydrate(&specs, (self.now)());
             let (wallets, wallet_last_good) =
                 store.hydrate_wallets(&self.wallet_specs, (self.now)());
             let mut inner = self.inner.lock().unwrap();
@@ -1946,6 +2112,115 @@ impl RuntimeCore {
         }
         self.last_good_store = store;
         self
+    }
+
+    /// The registered providers as one snapshot. A snapshot is taken per
+    /// use so the read lock is never held across an await, and so the
+    /// provider set can be replaced without invalidating a running cycle.
+    fn specs_snapshot(&self) -> Arc<Vec<ProviderSpec>> {
+        self.specs.read().unwrap().clone()
+    }
+
+    /// Attaches the persisted OpenAI/Codex account configuration.
+    ///
+    /// The accounts are loaded before the first cycle, so a configured
+    /// second account is collected from the startup cycle on, and an
+    /// account that is not configured contributes no provider at all.
+    pub fn with_codex_accounts(
+        mut self,
+        store: Option<Arc<CodexAccountStore>>,
+    ) -> Self {
+        if let Some(store) = &store {
+            let accounts = store.accounts();
+            {
+                let mut inner = self.inner.lock().unwrap();
+                inner.codex_accounts = accounts.clone();
+                inner.codex_monitored = monitored_map(&accounts);
+            }
+            self.replace_codex_specs(&accounts);
+        }
+        self.codex_accounts_store = store;
+        self
+    }
+
+    /// Applies a new OpenAI/Codex account configuration.
+    ///
+    /// The provider set is rebuilt: an account that was just configured
+    /// joins the registry with its own credential reference, and one that
+    /// was removed leaves it together with its last-good, cooldown and
+    /// failure state — a removed account must not keep influencing the
+    /// accounts that remain.
+    ///
+    /// Returns whether the effective configuration changed, so the caller
+    /// can decide to trigger a fresh cycle.
+    pub fn set_codex_accounts(&self, accounts: &[CodexAccountConfig]) -> bool {
+        let normalized = codex_accounts::normalize_accounts(accounts);
+        let specs_changed;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if inner.codex_accounts == normalized {
+                return false;
+            }
+            // Only the accounts themselves — which exist and which
+            // credential each one reads — decide the registered providers.
+            // An alias or a monitor flag changes no provider, so it must not
+            // rebuild the collectors.
+            specs_changed =
+                spec_identity(&inner.codex_accounts) != spec_identity(&normalized);
+            inner.codex_accounts = normalized.clone();
+            inner.codex_monitored = monitored_map(&normalized);
+        }
+        if !specs_changed {
+            if let Some(store) = &self.codex_accounts_store {
+                let _ = store.set_accounts(&normalized);
+            }
+            return true;
+        }
+        self.replace_codex_specs(&normalized);
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let registered: Vec<&'static str> = normalized
+                .iter()
+                .filter(|account| account.is_configured())
+                .filter_map(|account| codex_kind_for(&account.account_id))
+                .map(|kind| kind.id())
+                .collect();
+            let still_registered =
+                |id: &str| !is_codex_provider_id(id) || registered.contains(&id);
+            inner.usages.retain(|usage| still_registered(&usage.id));
+            inner.last_good.retain(|id, _| still_registered(id));
+            inner.cooldowns.retain(|id, _| still_registered(id));
+            inner.last_failures.retain(|id, _| still_registered(id));
+            inner.last_successes.retain(|id, _| still_registered(id));
+        }
+        if let Some(store) = &self.codex_accounts_store {
+            let _ = store.set_accounts(&normalized);
+        }
+        true
+    }
+
+    /// Rebuilds the OpenAI/Codex slots from the effective configuration.
+    fn replace_codex_specs(&self, accounts: &[CodexAccountConfig]) {
+        self.set_codex_specs(codex_specs(accounts));
+    }
+
+    /// Replaces the OpenAI/Codex slots in the registered provider set and
+    /// leaves every other provider exactly where it was.
+    ///
+    /// The account slots stay at the head of the registry, so the account
+    /// segments sit side by side at the head of the bar.
+    fn set_codex_specs(&self, codex_specs: Vec<ProviderSpec>) {
+        let base: Vec<ProviderSpec> = self
+            .specs
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|spec| !is_codex_provider_id(spec.kind.id()))
+            .cloned()
+            .collect();
+        let mut next = codex_specs;
+        next.extend(base);
+        *self.specs.write().unwrap() = Arc::new(next);
     }
 
     pub fn with_notification_lane(mut self, lane: Option<Arc<NotificationLane>>) -> Self {
@@ -2025,6 +2300,11 @@ impl RuntimeCore {
             .unwrap_or(spec.monitored_by_default)
     }
 
+    /// The effective OpenAI/Codex account configuration.
+    pub fn codex_accounts(&self) -> Vec<CodexAccountConfig> {
+        self.inner.lock().unwrap().codex_accounts.clone()
+    }
+
     /// Applies the settings lane's per-wallet monitor flags. Only known
     /// wallet ids are kept — an id the registry does not know has no
     /// collector to gate. Idempotent: an unchanged map rewrites nothing.
@@ -2076,6 +2356,8 @@ impl RuntimeCore {
                 wallet_force: false,
                 wallet_force_requested: false,
                 wallet_monitored: HashMap::new(),
+                codex_accounts: codex_accounts::default_accounts(),
+                codex_monitored: HashMap::new(),
                 cooldowns: HashMap::new(),
                 last_auto_trigger: HashMap::new(),
                 grok_last_result: None,
@@ -2095,7 +2377,7 @@ impl RuntimeCore {
                 pending_confirmations: HashMap::new(),
                 opendesign_manual_revision: 0,
             }),
-            specs,
+            specs: RwLock::new(Arc::new(specs)),
             wallet_specs: Vec::new(),
             retry_delay_ms,
             now,
@@ -2104,6 +2386,7 @@ impl RuntimeCore {
             notifications: None,
             last_good_store: None,
             wallet_prefs: None,
+            codex_accounts_store: None,
         }
     }
 
@@ -2225,13 +2508,26 @@ impl RuntimeCore {
     /// the former `Promise.all`), then updates the shared state under one
     /// lock. Provider order in the snapshot is always the spec order.
     pub async fn run_cycle(self: &Arc<Self>) {
-        let cycle_opendesign_revision = {
+        let specs = self.specs_snapshot();
+        let (cycle_opendesign_revision, paused_ids) = {
             let mut inner = self.inner.lock().unwrap();
             inner.last_cycle_started_at = Some(self.now());
-            inner.opendesign_manual_revision
+            let paused = inner
+                .codex_monitored
+                .iter()
+                .filter(|(_, monitored)| !**monitored)
+                .map(|(id, _)| *id)
+                .collect::<HashSet<&'static str>>();
+            (inner.opendesign_manual_revision, paused)
         };
         let mut jobs = tokio::task::JoinSet::new();
-        for (index, spec) in self.specs.iter().enumerate() {
+        for (index, spec) in specs.iter().enumerate() {
+            // A paused account is never collected: no job is spawned, so
+            // nothing — not even a credential read — touches its source,
+            // and its reading stays frozen at the last known value.
+            if paused_ids.contains(spec.kind.id()) {
+                continue;
+            }
             let core = self.clone();
             let spec = spec.clone();
             jobs.spawn(async move { (index, core.run_provider_job(&spec).await) });
@@ -2309,8 +2605,13 @@ impl RuntimeCore {
         // exactly like any failed refresh; a provider can never silently
         // disappear.
         let completed: HashSet<usize> = results.iter().map(|(index, _)| *index).collect();
-        for (index, spec) in self.specs.iter().enumerate() {
+        for (index, spec) in specs.iter().enumerate() {
             if completed.contains(&index) {
+                continue;
+            }
+            // A paused account never ran, so the lost-task projection must
+            // not dress its frozen state up as a failure.
+            if paused_ids.contains(spec.kind.id()) {
                 continue;
             }
             let failure = if lost_task_panics == 1 {
@@ -2421,6 +2722,24 @@ impl RuntimeCore {
             inner.last_updated_at = Some(completed_at);
         }
         inner.last_cycle_completed_at = Some(completed_at);
+        // A paused account never ran this cycle, so its previous entry is
+        // carried forward untouched — the segment never disappears from
+        // the snapshot and the last known reading keeps its stamp. The vec
+        // stays in spec order.
+        for spec in specs.iter() {
+            if !paused_ids.contains(spec.kind.id()) {
+                continue;
+            }
+            if let Some(frozen) = inner.usages.iter().find(|usage| usage.id == spec.kind.id()) {
+                usages.push(frozen.clone());
+            }
+        }
+        usages.sort_by_key(|usage| {
+            specs
+                .iter()
+                .position(|spec| spec.kind.id() == usage.id)
+                .unwrap_or(usize::MAX)
+        });
         inner.usages = usages;
         // A wallet skipped by configuration never ran this cycle, so its
         // previous entry is carried forward untouched — the slot never
@@ -3166,7 +3485,10 @@ impl RuntimeCore {
             // A structurally successful refresh stores last-good data —
             // even an "unknown" one (the TS adapters stored whatever the
             // success produced).
-            ProviderKind::Codex | ProviderKind::Zai | ProviderKind::OpenCodeGo
+            ProviderKind::Codex
+            | ProviderKind::CodexSecondary
+            | ProviderKind::Zai
+            | ProviderKind::OpenCodeGo
             | ProviderKind::Antigravity
             | ProviderKind::QwenTokenPlan
             | ProviderKind::MiniMaxTokenPlan => {
@@ -3382,7 +3704,11 @@ impl RuntimeCore {
         }
         RuntimeSnapshot {
             seq: inner.seq,
-            providers: inner.usages.clone(),
+            providers: inner
+                .usages
+                .iter()
+                .map(|usage| project_account_state(usage, &inner.codex_accounts))
+                .collect(),
             wallets,
             last_updated_at: inner
                 .last_updated_at
@@ -3427,19 +3753,19 @@ impl RuntimeCore {
         {
             *existing = dto;
         } else {
-            let open_design_order = self
-                .specs
+            let specs = self.specs_snapshot();
+            let open_design_order = specs
                 .iter()
                 .position(|spec| spec.kind == ProviderKind::OpenDesign)
-                .unwrap_or(self.specs.len());
+                .unwrap_or(specs.len());
             let insert_at = inner
                 .usages
                 .iter()
                 .position(|usage| {
-                    self.specs
+                    specs
                         .iter()
                         .position(|spec| spec.kind.id() == usage.id)
-                        .unwrap_or(self.specs.len())
+                        .unwrap_or(specs.len())
                         > open_design_order
                 })
                 .unwrap_or(inner.usages.len());
@@ -3455,8 +3781,8 @@ impl RuntimeCore {
     /// response payloads are never retained here and cannot cross this API.
     pub fn diagnostic_source(&self, now: DateTime<Utc>) -> RuntimeDiagnosticSource {
         let inner = self.inner.lock().unwrap();
-        let providers = self
-            .specs
+        let specs = self.specs_snapshot();
+        let providers = specs
             .iter()
             .map(|spec| {
                 let id = spec.kind.id();
@@ -3699,6 +4025,18 @@ impl RuntimeHandle {
         self.core.set_wallet_monitoring(&monitored);
     }
 
+    /// The effective OpenAI/Codex account configuration.
+    pub fn codex_accounts(&self) -> Vec<CodexAccountConfig> {
+        self.core.codex_accounts()
+    }
+
+    /// Applies a new OpenAI/Codex account configuration. The provider set
+    /// is rebuilt and the configuration is persisted, so a restart keeps
+    /// the same accounts.
+    pub fn set_codex_accounts(&self, accounts: Vec<CodexAccountConfig>) -> bool {
+        self.core.set_codex_accounts(&accounts)
+    }
+
     pub fn snapshot(&self) -> RuntimeSnapshot {
         self.core.snapshot()
     }
@@ -3905,9 +4243,20 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
             dir.join(crate::wallet_prefs::WALLET_PREFS_FILE_NAME),
         ))
     });
+    // Per-account OpenAI/Codex configuration: one bounded JSON file,
+    // loaded before the scheduler's first cycle so a configured second
+    // account is collected from the startup cycle on. An unresolvable data
+    // dir degrades to the default single-account configuration instead of
+    // blocking startup.
+    let codex_accounts = app.path().app_data_dir().ok().map(|dir| {
+        Arc::new(crate::codex_accounts::CodexAccountStore::open(
+            dir.join(crate::codex_accounts::CODEX_ACCOUNTS_FILE_NAME),
+        ))
+    });
     let handle = RuntimeHandle {
         core: Arc::new(
             RuntimeCore::new(production_specs(), DEFAULT_INTERVAL_MINUTES)
+                .with_codex_accounts(codex_accounts.clone())
                 .with_wallets(production_wallets())
                 .with_wallet_preferences(wallet_prefs.clone())
                 .with_last_good_store(last_good.clone())
@@ -4043,6 +4392,35 @@ pub fn set_wallet_monitoring(
     monitored: HashMap<String, bool>,
 ) {
     handle.set_wallet_monitoring(monitored);
+}
+
+/// The configured OpenAI/Codex accounts (settings drawer). The Rust side
+/// owns the effective configuration, so the drawer reads it from here
+/// instead of assuming its own copy is the one in force.
+#[tauri::command]
+pub fn get_codex_accounts(handle: tauri::State<RuntimeHandle>) -> Vec<CodexAccountConfig> {
+    handle.codex_accounts()
+}
+
+/// Applies the OpenAI/Codex account configuration (settings drawer).
+///
+/// Forwards the persisted configuration on attach and on every change; the
+/// account store persists it itself, which covers the scheduler's immediate
+/// startup cycle before any window attaches. An account that is not
+/// configured contributes no provider at all.
+#[tauri::command]
+pub fn set_codex_accounts(
+    handle: tauri::State<RuntimeHandle>,
+    accounts: Vec<CodexAccountConfig>,
+) -> bool {
+    let changed = handle.set_codex_accounts(accounts);
+    if changed {
+        // A newly configured account has no reading yet, and a resumed one
+        // has a frozen reading: one cycle refreshes both without waiting for
+        // the next scheduled interval.
+        handle.request_refresh();
+    }
+    changed
 }
 
 // ---------- tests ----------
@@ -4254,6 +4632,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -7546,6 +7926,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -11196,4 +11578,228 @@ mod tests {
         let entry = core.snapshot().wallets.into_iter().next().unwrap();
         assert_eq!(entry.health, WalletHealth::Live);
     }
+
+    // ---------- multi-account OpenAI/Codex ----------
+
+    fn codex_account(
+        account_id: &str,
+        alias: &str,
+        home: &str,
+        monitored: bool,
+    ) -> CodexAccountConfig {
+        CodexAccountConfig {
+            account_id: account_id.to_string(),
+            alias: alias.to_string(),
+            codex_home: home.to_string(),
+            monitored,
+        }
+    }
+
+    #[test]
+    fn the_two_codex_accounts_have_distinct_stable_ids() {
+        assert_eq!(ProviderKind::Codex.id(), PRIMARY_ACCOUNT_ID);
+        assert_eq!(ProviderKind::CodexSecondary.id(), SECONDARY_ACCOUNT_ID);
+        assert_ne!(
+            ProviderKind::Codex.id(),
+            ProviderKind::CodexSecondary.id(),
+            "two accounts must never share one provider id"
+        );
+        assert_eq!(
+            ProviderKind::from_id(PRIMARY_ACCOUNT_ID),
+            Some(ProviderKind::Codex)
+        );
+        assert_eq!(
+            ProviderKind::from_id(SECONDARY_ACCOUNT_ID),
+            Some(ProviderKind::CodexSecondary)
+        );
+        // Both accounts name the same provider: the scope suffix is dropped
+        // wherever only the provider matters.
+        assert!(is_codex_provider_id(PRIMARY_ACCOUNT_ID));
+        assert!(is_codex_provider_id(SECONDARY_ACCOUNT_ID));
+        assert!(!is_codex_provider_id("zai"));
+    }
+
+    #[test]
+    fn a_configured_second_account_joins_the_registry_and_an_unconfigured_one_does_not() {
+        let mut accounts = codex_accounts::default_accounts();
+        let specs = production_specs_for_accounts(&accounts);
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| is_codex_provider_id(spec.kind.id()))
+                .count(),
+            1,
+            "an unconfigured second account contributes no provider at all"
+        );
+
+        accounts[1].codex_home = "C:\\codex-home-second".to_string();
+        let specs = production_specs_for_accounts(&accounts);
+        let codex_ids: Vec<&str> = specs
+            .iter()
+            .filter(|spec| is_codex_provider_id(spec.kind.id()))
+            .map(|spec| spec.kind.id())
+            .collect();
+        assert_eq!(codex_ids, vec![PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+        // Every other provider is untouched by the account configuration.
+        assert!(specs.iter().any(|spec| spec.kind == ProviderKind::Zai));
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| !is_codex_provider_id(spec.kind.id()))
+                .count(),
+            7,
+            "the other providers keep their exact set"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_paused_account_is_never_collected_and_keeps_its_last_reading() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let secondary_calls = Arc::new(AtomicUsize::new(0));
+        let core = test_core(vec![
+            counting_spec(
+                ProviderKind::Codex,
+                primary_calls.clone(),
+                |_| Ok(ok_usage(PRIMARY_ACCOUNT_ID, "OpenAI / Codex", 44.0)),
+            ),
+            counting_spec(
+                ProviderKind::CodexSecondary,
+                secondary_calls.clone(),
+                |_| Ok(ok_usage(SECONDARY_ACCOUNT_ID, "OpenAI / Codex", 86.0)),
+            ),
+        ]);
+        let configure = |core: &Arc<RuntimeCore>, monitored: bool| {
+            let mut inner = core.inner.lock().unwrap();
+            inner.codex_accounts = vec![
+                codex_account(PRIMARY_ACCOUNT_ID, "Personal", "", true),
+                codex_account(SECONDARY_ACCOUNT_ID, "Work", "C:\\home", monitored),
+            ];
+            inner.codex_monitored = monitored_map(&inner.codex_accounts.clone());
+        };
+
+        // The first cycle collects both accounts.
+        configure(&core, true);
+        core.run_cycle().await;
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(secondary_calls.load(Ordering::SeqCst), 1);
+
+        // The second account is paused: it is never fetched again, and its
+        // last known reading survives frozen.
+        configure(&core, false);
+        core.run_cycle().await;
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            secondary_calls.load(Ordering::SeqCst),
+            1,
+            "a paused account is never collected"
+        );
+
+        let snapshot = core.snapshot();
+        let primary = snapshot
+            .providers
+            .iter()
+            .find(|usage| usage.id == PRIMARY_ACCOUNT_ID)
+            .expect("the monitored account keeps its reading");
+        let secondary = snapshot
+            .providers
+            .iter()
+            .find(|usage| usage.id == SECONDARY_ACCOUNT_ID)
+            .expect("the paused account keeps its frozen reading");
+        assert_eq!(primary.monitoring_paused, Some(false));
+        assert_eq!(secondary.monitoring_paused, Some(true));
+        assert_eq!(
+            secondary.limits.len(),
+            1,
+            "the frozen reading keeps its window"
+        );
+        assert_eq!(
+            secondary.limits[0].used_percent, 86.0,
+            "the frozen reading is the account's own last value"
+        );
+        // The alias names the account on the surfaces that may name it.
+        assert_eq!(primary.account_alias.as_deref(), Some("Personal"));
+        assert_eq!(secondary.account_alias.as_deref(), Some("Work"));
+    }
+
+    #[tokio::test]
+    async fn one_accounts_failure_never_invalidates_the_other_accounts_data() {
+        let core = test_core(vec![
+            counting_spec(
+                ProviderKind::Codex,
+                Arc::new(AtomicUsize::new(0)),
+                |_| Ok(ok_usage(PRIMARY_ACCOUNT_ID, "OpenAI / Codex", 44.0)),
+            ),
+            counting_spec(
+                ProviderKind::CodexSecondary,
+                Arc::new(AtomicUsize::new(0)),
+                |_| Err(transient_failure("auth_expired")),
+            ),
+        ]);
+        core.run_cycle().await;
+
+        let snapshot = core.snapshot();
+        let primary = snapshot
+            .providers
+            .iter()
+            .find(|usage| usage.id == PRIMARY_ACCOUNT_ID)
+            .expect("the healthy account is present");
+        let secondary = snapshot
+            .providers
+            .iter()
+            .find(|usage| usage.id == SECONDARY_ACCOUNT_ID)
+            .expect("the failed account is present");
+        assert_eq!(
+            primary.health,
+            ProviderHealth::Live,
+            "one account's failure never invalidates the other's data"
+        );
+        assert_eq!(primary.limits[0].used_percent, 44.0);
+        assert_eq!(
+            secondary.health,
+            ProviderHealth::Unavailable,
+            "an expired session leaves that account unavailable, not failed data"
+        );
+        assert!(secondary.error.is_some());
+        assert!(
+            secondary.limits.is_empty(),
+            "the failed account never borrows the other account's windows"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_alias_or_a_monitor_flag_never_rebuilds_the_collectors() {
+        let core = test_core(vec![]);
+        let accounts = vec![
+            codex_account(PRIMARY_ACCOUNT_ID, "Personal", "", true),
+            codex_account(SECONDARY_ACCOUNT_ID, "Work", "C:\\home", true),
+        ];
+        assert!(core.set_codex_accounts(&accounts));
+        let specs = core.specs_snapshot();
+        let codex_ids: Vec<&str> = specs
+            .iter()
+            .filter(|spec| is_codex_provider_id(spec.kind.id()))
+            .map(|spec| spec.kind.id())
+            .collect();
+        assert_eq!(codex_ids, vec![PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+
+        // The same accounts with a different alias and a paused flag: the
+        // registered providers are untouched, so no collector is rebuilt.
+        let mut changed = accounts.clone();
+        changed[0].alias = "Personal account".to_string();
+        changed[1].monitored = false;
+        assert!(core.set_codex_accounts(&changed));
+        let specs = core.specs_snapshot();
+        let codex_ids: Vec<&str> = specs
+            .iter()
+            .filter(|spec| is_codex_provider_id(spec.kind.id()))
+            .map(|spec| spec.kind.id())
+            .collect();
+        assert_eq!(codex_ids, vec![PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID]);
+        assert_eq!(
+            core.codex_accounts()[1].monitored,
+            false,
+            "the paused flag is applied to the account configuration"
+        );
+    }
+
 }

@@ -1,4 +1,4 @@
-import type { ProviderUsage } from "../types";
+import type { ApiWallet, ProviderUsage } from "../types";
 import {
   QUOTA_PERSPECTIVES,
   THEMES,
@@ -45,6 +45,8 @@ const HOUR = 60 * MINUTE;
 export type DevFixture = {
   name: string;
   usages: ProviderUsage[];
+  /** Prepaid balances for the floating API Wallets slot (dev only). */
+  wallets?: ApiWallet[];
   loader: (query: UsageAnalyticsQuery) => Promise<UsageAnalytics>;
   /** v0.9 Usage-first overview: force the opt-in state for a screenshot. */
   usageIntelligenceEnabled?: boolean;
@@ -318,6 +320,35 @@ function usage(
   };
 }
 
+/** A floating-bar fixture entry: the same shape, with the extra fields the
+ * bar reads (an account alias, a paused flag, a degraded health). */
+function barUsage(
+  id: string,
+  name: string,
+  limits: Array<{ label: string; usedPercent: number; resetAt?: string }>,
+  extra: Partial<ProviderUsage> = {},
+): ProviderUsage {
+  return { ...usage(id, name, limits), ...extra };
+}
+
+/** One prepaid wallet for the shared API Wallets slot. */
+function wallet(
+  id: string,
+  name: string,
+  currency: string,
+  amount: number,
+): ApiWallet {
+  return {
+    id,
+    name,
+    health: "live",
+    checkedAt: iso(Date.now()),
+    balances: [{ currency, amount }],
+  };
+}
+
+
+
 /** Rises to the day's peak, one cycle, ending "now". */
 function rising(
   startMs: number,
@@ -507,11 +538,131 @@ function buildFixtures(): Record<string, DevFixture> {
     },
   };
 
+
+  // Floating-bar visual acceptance fixtures. The percentages mirror the
+  // accepted "D — Complete Floating Island" frames, so a screenshot can be
+  // compared with the design frame by frame.
+  const floatingNow = Date.now();
+  const floatingReset = iso(floatingNow + 3 * 24 * HOUR);
+  const openRouter = wallet("openrouter", "OpenRouter", "USD", 12.48);
+  const fiveProviders: ProviderUsage[] = [
+    barUsage("openai-codex", "OpenAI / Codex", [
+      { label: "Weekly", usedPercent: 56, resetAt: floatingReset },
+    ]),
+    barUsage("zai", "Z.ai", [
+      { label: "Weekly", usedPercent: 58, resetAt: floatingReset },
+    ]),
+    barUsage("opencode-go", "OpenCode Go", [
+      { label: "30-day", usedPercent: 0, resetAt: floatingReset },
+    ]),
+    barUsage("antigravity", "Google Antigravity", [
+      { label: "Gemini Weekly", usedPercent: 69, resetAt: floatingReset },
+    ]),
+    barUsage("grok", "Grok (xAI)", [
+      { label: "Weekly credits", usedPercent: 29, resetAt: floatingReset },
+    ]),
+  ];
+  const twoAccounts: ProviderUsage[] = [
+    barUsage(
+      "openai-codex",
+      "OpenAI / Codex",
+      [{ label: "Weekly", usedPercent: 56, resetAt: floatingReset }],
+      {
+        accountAlias: "Personal",
+        account: {
+          label: "account ••3f9c21a4",
+          note: "This account's own local Codex login.",
+        },
+      },
+    ),
+    barUsage(
+      "openai-codex:secondary",
+      "OpenAI / Codex",
+      [{ label: "Weekly", usedPercent: 14, resetAt: floatingReset }],
+      {
+        accountAlias: "Work — WG",
+        account: {
+          label: "account ••7d10b6e8",
+          note: "This account's own local Codex login.",
+        },
+      },
+    ),
+    barUsage("zai", "Z.ai", [
+      { label: "Weekly", usedPercent: 58, resetAt: floatingReset },
+    ]),
+    barUsage("opencode-go", "OpenCode Go", [
+      { label: "30-day", usedPercent: 0, resetAt: floatingReset },
+    ]),
+    barUsage("antigravity", "Google Antigravity", [
+      { label: "Gemini Weekly", usedPercent: 69, resetAt: floatingReset },
+    ]),
+    barUsage("grok", "Grok (xAI)", [
+      { label: "Weekly credits", usedPercent: 29, resetAt: floatingReset },
+    ]),
+  ];
+  const accountStates: ProviderUsage[] = [
+    barUsage(
+      "openai-codex",
+      "OpenAI / Codex",
+      [{ label: "Weekly", usedPercent: 56, resetAt: floatingReset }],
+      { health: "stale", status: "stale", dataFreshness: "stale" },
+    ),
+    barUsage("zai", "Z.ai", []),
+    barUsage("opencode-go", "OpenCode Go", [], {
+      health: "unavailable",
+      status: "error",
+      error: "Provider data unavailable",
+    }),
+    barUsage(
+      "antigravity",
+      "Google Antigravity",
+      [{ label: "Gemini Weekly", usedPercent: 69, resetAt: floatingReset }],
+      {
+        health: "error",
+        status: "error",
+        error: "Session expired — sign in again to refresh quotas.",
+        errorCategory: "auth_expired",
+      },
+    ),
+    barUsage("grok", "Grok (xAI)", [
+      { label: "Weekly credits", usedPercent: 29, resetAt: floatingReset },
+    ]),
+  ];
+  // The same six-segment bar with the second account paused: the segment
+  // stays, the reading is frozen, and the bar keeps its width.
+  const pausedAccount: ProviderUsage[] = twoAccounts.map((entry) =>
+    entry.id === "openai-codex:secondary"
+      ? { ...entry, monitoringPaused: true }
+      : entry,
+  );
+  Object.assign(byName, {
+    "floating-five-providers": {
+      usages: fiveProviders,
+      byRange: { "24h": e, "7d": e7 },
+    },
+    "floating-two-accounts": {
+      usages: twoAccounts,
+      byRange: { "24h": e, "7d": e7 },
+    },
+    "floating-account-states": {
+      usages: accountStates,
+      byRange: { "24h": e, "7d": e7 },
+    },
+    "floating-paused-account": {
+      usages: pausedAccount,
+      byRange: { "24h": e, "7d": e7 },
+    },
+  });
+
   const built: Record<string, DevFixture> = {};
   for (const [name, fixture] of Object.entries(byName)) {
     built[name] = {
       name,
       usages: fixture.usages,
+      wallets:
+        name === "floating-two-accounts" || name === "floating-paused-account"
+          ? [openRouter]
+          : undefined,
       loader: async (query: UsageAnalyticsQuery) => {
         const base = fixture.byRange[query.range ?? "24h"];
         if (!query.providerId && !query.windowLabel) return base;
@@ -791,6 +942,7 @@ function intelligenceFixtures(now: number): Record<string, DevFixture> {
       },
     },
   };
+
 
   const built: Record<string, DevFixture> = {};
   for (const [name, fixture] of Object.entries(byName)) {

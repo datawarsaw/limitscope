@@ -923,6 +923,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -951,6 +953,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }

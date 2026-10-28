@@ -158,6 +158,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             error: None,
             error_category: None,
             error_http_status: None,

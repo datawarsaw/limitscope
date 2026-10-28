@@ -5,6 +5,7 @@ import type {
   ProviderUsage,
 } from "../types";
 import { grokBotFor } from "./grokBot";
+import { baseProviderId } from "./providerIds";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import { isWalletMonitored, type WalletPreferences } from "./walletPreferences";
 import {
@@ -24,7 +25,13 @@ export const FLOATING_WINDOW_HEIGHT = 64;
 
 export type FloatingOverlay = "none" | "detail" | "menu";
 
-export type FloatingQuotaState = "healthy" | "stale" | "error" | "unavailable";
+export type FloatingQuotaState =
+  | "healthy"
+  | "stale"
+  | "error"
+  | "unavailable"
+  /** Collection is paused by the user: the reading is frozen, not live. */
+  | "paused";
 
 /** One usable quota window, as the expanded popover lists it. */
 export type FloatingQuotaWindowRow = {
@@ -69,6 +76,16 @@ export type FloatingQuotaItem = {
    * keeps it muted on its own bottom line.
    */
   accountLabel?: string;
+  /**
+   * The user-facing alias of the monitored account, when that account
+   * carries one.
+   *
+   * It names the account on the expanded card and in the spoken label, and
+   * it never appears beside the compact bar's percentages: the compact bar
+   * stays a clean quota readout, and the account is identified where the
+   * detail is shown.
+   */
+  accountAlias?: string;
   /**
    * The Grok Bot (X Premium+) supplemental weekly observation the runtime
    * already collected for this provider, when the provider carries one.
@@ -394,6 +411,9 @@ export function floatingItemLabel(item: FloatingQuotaItem): string {
     ? `${presentation.severityLabel} · ${presentation.label}`
     : presentation.label;
   const parts = [item.name];
+  // The spoken label names the account when it has an alias, so two
+  // accounts of one provider are distinguishable without a visible badge.
+  if (item.accountAlias) parts.push(item.accountAlias);
   parts.push(value);
   if (item.windowLabel) parts.push(item.windowLabel);
   if (item.state === "error") parts.push("error");
@@ -514,7 +534,10 @@ function isPreferredLabel(
 export function floatingPrimaryWindow(
   usage: ProviderUsage,
 ): LimitWindow | undefined {
-  const preferred = FLOATING_PRIMARY_LABELS[usage.id];
+  // Account-scoped ids (a second OpenAI/Codex account) resolve to their
+  // base provider: both accounts answer the same Codex quota contract, so
+  // the designated long-term window is the provider's, not the account's.
+  const preferred = FLOATING_PRIMARY_LABELS[baseProviderId(usage.id)];
   let fallback: LimitWindow | undefined;
   let fallbackPeriod = -1;
   for (const limit of usage.limits) {
@@ -553,7 +576,11 @@ function isStaleSnapshot(usage: ProviderUsage): boolean {
 function stateFor(
   status: ProviderStatusPresentation,
   hasWindow: boolean,
+  paused: boolean,
 ): FloatingQuotaState {
+  // A paused account keeps its last known reading and its segment, but
+  // nothing about it may read as live — the value is frozen, not current.
+  if (paused) return "paused";
   if (!hasWindow) {
     return status.className === "error" ? "error" : "unavailable";
   }
@@ -603,7 +630,7 @@ export function floatingQuotaItems(
     items.push({
       providerId: usage.id,
       name: usage.name,
-      state: stateFor(status, hasWindow),
+      state: stateFor(status, hasWindow, usage.monitoringPaused === true),
       percent: hasWindow ? Math.round(primary.usedPercent) : null,
       usedPercent: hasWindow ? primary.usedPercent : null,
       windowLabel: hasWindow ? primary.label.trim() : null,
@@ -612,6 +639,7 @@ export function floatingQuotaItems(
       windows,
       primaryReset: primaryResetTarget(usage),
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),
+      ...(usage.accountAlias ? { accountAlias: usage.accountAlias } : {}),
       ...(grokBot ? { grokBot } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,

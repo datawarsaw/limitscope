@@ -32,6 +32,11 @@ import {
   isWalletMonitored,
   walletRegistryNote,
 } from "../../lib/walletPreferences";
+import {
+  isCodexAccountConfigured,
+  type CodexAccountSettings,
+} from "../../lib/codexAccounts";
+import { CODEX_PROVIDER_ID } from "../../lib/providerIds";
 import type { ApiWallet, ProviderUsage } from "../../types";
 import type { ReleaseNote, SafeUpdateError, UpdatePhase } from "../../lib/updater";
 import type { LocalDataClearResult } from "../../lib/localData";
@@ -69,6 +74,14 @@ export type SettingsViewProps = {
   setWalletMonitored: (walletId: string, monitored: boolean) => void;
   /** Per-wallet floating-bar visibility; presentation only. */
   setWalletInFloatingBar: (walletId: string, visible: boolean) => void;
+  /** One OpenAI/Codex account: its alias, its own Codex home, or whether
+   * it is still monitored. */
+  setCodexAccount: (
+    accountId: string,
+    patch: Partial<
+      Pick<CodexAccountSettings, "alias" | "codexHome" | "monitored">
+    >,
+  ) => void;
   resetPreferences: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   startupPending: boolean;
   startupError: string | null;
@@ -105,6 +118,7 @@ export function SettingsView({
   moveProvider,
   setWalletMonitored,
   setWalletInFloatingBar,
+  setCodexAccount,
   resetPreferences,
   startupPending,
   startupError,
@@ -449,6 +463,100 @@ export function SettingsView({
             </>
           )}
         </div>
+        <div className="codex-accounts" role="group" aria-label="OpenAI / Codex accounts">
+          <span className="setting-label">OpenAI / Codex accounts</span>
+          <p className="providers-prefs-note">
+            Each account reads its own local Codex login. To add a second one,
+            create a folder, run "codex login --device-auth" with CODEX_HOME
+            pointing at it, then enter that folder below. LimitScope only reads
+            the login file — it never writes it, never copies it and never
+            shares one account's login with another. Every account's quota is
+            read separately; limits are never combined.
+          </p>
+          <ul className="providers-prefs-list">
+            {settings.codexAccounts.accounts.map((account) => {
+              const configured = isCodexAccountConfigured(account);
+              const fallbackName =
+                account.accountId === CODEX_PROVIDER_ID
+                  ? "Primary account"
+                  : "Second account";
+              const name = account.alias.trim() || fallbackName;
+              const status = !configured
+                ? "Not configured — point this account at its own Codex home to add it."
+                : !account.monitored
+                  ? "Monitoring off — the last known reading is kept, collection is stopped."
+                  : account.codexHome.trim()
+                    ? "Monitored — this account's own Codex login, read separately."
+                    : "Monitored — the default Codex login.";
+              return (
+                <li key={account.accountId} className="codex-account">
+                  <div className="codex-account-head">
+                    <span className="provider-prefs-name">{name}</span>
+                    <label className="provider-prefs-visibility">
+                      <input
+                        type="checkbox"
+                        role="switch"
+                        aria-label={
+                          "Monitor the " + name + " OpenAI / Codex account"
+                        }
+                        checked={account.monitored}
+                        onChange={(event) =>
+                          setCodexAccount(account.accountId, {
+                            monitored: event.target.checked,
+                          })
+                        }
+                      />
+                    </label>
+                  </div>
+                  <label className="setting-row codex-account-field">
+                    <span className="setting-copy">
+                      <span className="setting-label">Name</span>
+                    </span>
+                    <input
+                      type="text"
+                      className="codex-account-input"
+                      value={account.alias}
+                      placeholder={fallbackName}
+                      aria-label={
+                        "Name of the " + name + " OpenAI / Codex account"
+                      }
+                      onChange={(event) =>
+                        setCodexAccount(account.accountId, {
+                          alias: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <label className="setting-row codex-account-field">
+                    <span className="setting-copy">
+                      <span className="setting-label">Codex home</span>
+                    </span>
+                    <input
+                      type="text"
+                      className="codex-account-input"
+                      value={account.codexHome}
+                      placeholder={
+                        account.accountId === CODEX_PROVIDER_ID
+                          ? "default Codex home"
+                          : "not configured"
+                      }
+                      aria-label={
+                        "Codex home of the " + name + " OpenAI / Codex account"
+                      }
+                      onChange={(event) =>
+                        setCodexAccount(account.accountId, {
+                          codexHome: event.target.value,
+                        })
+                      }
+                    />
+                  </label>
+                  <p className="setting-note">{status}</p>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+
       </section>
 
       <section

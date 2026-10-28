@@ -1208,3 +1208,123 @@ describe("floating wallet presentation", () => {
     expect(label).not.toContain("122.50");
   });
 });
+
+describe("two OpenAI/Codex accounts", () => {
+  const PRIMARY = "openai-codex";
+  const SECONDARY = "openai-codex:secondary";
+
+  it("render as two distinct segments with their own windows", () => {
+    const items = floatingQuotaItems([
+      usage(PRIMARY, [limit("Weekly", 44)], { name: "OpenAI / Codex" }),
+      usage(SECONDARY, [limit("Weekly", 86)], { name: "OpenAI / Codex" }),
+    ]);
+    expect(items.map((item) => item.providerId)).toEqual([PRIMARY, SECONDARY]);
+    expect(items[0].percent).toBe(44);
+    expect(items[1].percent).toBe(86);
+  });
+
+  it("read the same designated Codex window as the primary account", () => {
+    // The designated long-term window is the provider's, not the account's:
+    // the second account resolves "Weekly" exactly like the first one, even
+    // when another window declares a longer period.
+    const limits = [limit("Weekly", 44), limit("30-day", 10)];
+    const primary = floatingPrimaryWindow(
+      usage(PRIMARY, limits, { name: "OpenAI / Codex" }),
+    );
+    const secondary = floatingPrimaryWindow(
+      usage(SECONDARY, limits, { name: "OpenAI / Codex" }),
+    );
+    expect(primary?.label).toBe("Weekly");
+    expect(secondary?.label).toBe("Weekly");
+    expect(secondary?.usedPercent).toBe(44);
+  });
+
+  it("never combine or sum the two accounts' limits", () => {
+    const items = floatingQuotaItems([
+      usage(PRIMARY, [limit("Weekly", 44)], { name: "OpenAI / Codex" }),
+      usage(SECONDARY, [limit("Weekly", 86)], { name: "OpenAI / Codex" }),
+    ]);
+    const percents = items.map((item) => item.percent);
+    expect(percents).toEqual([44, 86]);
+    expect(percents).not.toContain(130);
+  });
+
+  it("keep the account alias on the item, where the card may name it", () => {
+    const items = floatingQuotaItems([
+      usage(PRIMARY, [limit("Weekly", 44)], {
+        name: "OpenAI / Codex",
+        accountAlias: "Personal",
+      }),
+      usage(SECONDARY, [limit("Weekly", 86)], {
+        name: "OpenAI / Codex",
+        accountAlias: "Work",
+      }),
+    ]);
+    expect(items[0].accountAlias).toBe("Personal");
+    expect(items[1].accountAlias).toBe("Work");
+    // The spoken label names the account, so two accounts of one provider
+    // are distinguishable without a visible badge on the bar.
+    expect(floatingItemLabel(items[0])).toContain("Personal");
+    expect(floatingItemLabel(items[1])).toContain("Work");
+  });
+
+  it("read a paused account as frozen, never as live", () => {
+    const items = floatingQuotaItems([
+      usage(PRIMARY, [limit("Weekly", 44)], { name: "OpenAI / Codex" }),
+      usage(SECONDARY, [limit("Weekly", 86)], {
+        name: "OpenAI / Codex",
+        monitoringPaused: true,
+      }),
+    ]);
+    expect(items[0].state).toBe("healthy");
+    expect(items[0].statusLabel).toBe("Live");
+    expect(items[1].state).toBe("paused");
+    expect(items[1].statusLabel).toBe("Monitoring off");
+    // The frozen reading is still the account's own last value.
+    expect(items[1].percent).toBe(86);
+  });
+
+  it("keep one account's failure away from the other account's data", () => {
+    const items = floatingQuotaItems([
+      usage(PRIMARY, [limit("Weekly", 44)], { name: "OpenAI / Codex" }),
+      usage(SECONDARY, [], {
+        name: "OpenAI / Codex",
+        health: "unavailable",
+        status: "error",
+        error: "Session expired — sign in again to refresh quotas.",
+      }),
+    ]);
+    expect(items[0].state).toBe("healthy");
+    expect(items[0].percent).toBe(44);
+    expect(items[1].state).toBe("error");
+    expect(items[1].percent).toBeNull();
+  });
+
+  it("show an unavailable provider as a bare em dash, not as a failure", () => {
+    const items = floatingQuotaItems([
+      usage("opencode-go", [], {
+        name: "OpenCode Go",
+        health: "unavailable",
+        status: "error",
+        error: "Provider data unavailable",
+      }),
+    ]);
+    // Nothing to flag: the reading is absent, so the segment shows no
+    // number — the card states the reason.
+    expect(items[0].state).toBe("error");
+    expect(items[0].percent).toBeNull();
+  });
+
+  it("keep the badge on a failed refresh that retained a reading", () => {
+    const items = floatingQuotaItems([
+      usage("antigravity", [limit("Gemini Weekly", 69)], {
+        name: "Google Antigravity",
+        health: "error",
+        status: "error",
+        error: "Refresh failed: session expired",
+      }),
+    ]);
+    expect(items[0].state).toBe("error");
+    expect(items[0].percent).toBe(69);
+  });
+});

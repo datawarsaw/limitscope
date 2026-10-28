@@ -3,6 +3,7 @@
 
 mod antigravity;
 mod codex;
+mod codex_accounts;
 mod cursor_grok_bot;
 #[cfg(test)]
 mod diagnostic_report;
@@ -163,6 +164,8 @@ fn main() {
             runtime::set_refresh_interval,
             runtime::set_quota_notifications_enabled,
             runtime::set_wallet_monitoring,
+            runtime::get_codex_accounts,
+            runtime::set_codex_accounts,
             history::get_history,
             history::get_history_range,
             usage_analytics::get_usage_analytics,
