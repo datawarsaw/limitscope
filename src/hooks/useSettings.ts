@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { disable, enable, isEnabled } from "@tauri-apps/plugin-autostart";
 import { isRunningInTauri } from "../lib/runtime";
 import {
@@ -32,6 +33,7 @@ import {
 } from "../lib/codexAccounts";
 
 
+type OperationalSettings = { revision: number; quotaNotifications: boolean; monitored: Record<string, boolean> };
 export function useSettings() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const settingsRef = useRef(settings);
@@ -42,6 +44,35 @@ export function useSettings() {
   const usageEdit = useRef(0);
   const accountWrites = useRef<Promise<void>>(Promise.resolve());
   const usageWrites = useRef<Promise<void>>(Promise.resolve());
+
+  const operationalRevision = useRef(-1);
+  const operationalWrites = useRef<Promise<void>>(Promise.resolve());
+  const applyOperational = useCallback((value: OperationalSettings) => {
+    if (!value || !Number.isFinite(value.revision) || value.revision < operationalRevision.current) return;
+    operationalRevision.current = value.revision;
+    setSettings(prev => ({
+      ...prev, quotaNotifications: value.quotaNotifications,
+      walletPreferences: { ...prev.walletPreferences, monitored: value.monitored },
+    }));
+  }, []);
+  const writeOperational = useCallback((command: string, args: Record<string, unknown>) => {
+    operationalWrites.current = operationalWrites.current.then(async () => {
+      const value = await invoke<OperationalSettings>(command, args);
+      applyOperational(value);
+      setStartupError(null);
+    }).catch(() => setStartupError("The preference could not be saved. Please retry."));
+  }, [applyOperational]);
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+    let cancelled = false;
+    const subscription = listen<OperationalSettings>("operational-settings-changed", event => {
+      if (!cancelled) applyOperational(event.payload);
+    });
+    void subscription.then(() => invoke<OperationalSettings>("get_operational_settings"))
+      .then(value => { if (!cancelled) applyOperational(value); })
+      .catch(() => { if (!cancelled) setStartupError(prev => prev ?? "Could not load saved monitoring preferences."); });
+    return () => { cancelled = true; void subscription.then(unlisten => unlisten()).catch(() => {}); };
+  }, [applyOperational]);
 
   // Rust loads these stores before the scheduler starts. The WebView copy
   // is only a cache: attaching a window must never push it back into Rust.
@@ -111,6 +142,8 @@ export function useSettings() {
               ...cached,
               codexAccounts: prev.codexAccounts,
               usageIntelligence: prev.usageIntelligence,
+              quotaNotifications: prev.quotaNotifications,
+              walletPreferences: { ...cached.walletPreferences, monitored: prev.walletPreferences.monitored },
             }
           : cached,
       );
@@ -180,16 +213,17 @@ export function useSettings() {
   }, []);
 
   const setQuotaNotifications = useCallback((quotaNotifications: boolean) => {
+    if (isRunningInTauri()) { writeOperational("set_quota_notifications_enabled", { enabled: quotaNotifications }); return; }
     setSettings((prev) => {
       if (prev.quotaNotifications === quotaNotifications) return prev;
       const next = { ...prev, quotaNotifications };
       saveSettings(next);
       return next;
     });
-  }, []);
+  }, [writeOperational]);
 
   const setUsageIntelligence = useCallback((usageIntelligence: boolean) => {
-    usageEdit.current += 1;
+    const edit = ++usageEdit.current;
     setSettings((prev) => {
       if (prev.usageIntelligence === usageIntelligence) return prev;
       const next = { ...prev, usageIntelligence };
@@ -204,6 +238,9 @@ export function useSettings() {
         }))
         .catch((error) => {
           console.error("Failed to sync the Usage Intelligence setting", error);
+          setStartupError("Usage Intelligence preference could not be saved. Please retry.");
+          void invoke<{ enabled: boolean }>("get_usage_intelligence", { query: { range: "today" } })
+            .then(value => { if (edit === usageEdit.current) setSettings(prev => ({ ...prev, usageIntelligence: value.enabled })); }).catch(() => {});
         });
     }
   }, []);
@@ -219,8 +256,9 @@ export function useSettings() {
 
   const setWalletPreferences = useCallback(
     (walletPreferences: WalletPreferences) => {
+      if (isRunningInTauri()) writeOperational("set_wallet_monitoring", { monitored: walletPreferences.monitored });
       setSettings((prev) => {
-        const next = { ...prev, walletPreferences };
+        const next = { ...prev, walletPreferences: isRunningInTauri() ? { ...walletPreferences, monitored: prev.walletPreferences.monitored } : walletPreferences };
         saveSettings(next);
         return next;
       });
@@ -235,6 +273,7 @@ export function useSettings() {
    * never loses historical data.
    */
   const setWalletMonitored = useCallback((walletId: string, monitored: boolean) => {
+    if (isRunningInTauri()) { writeOperational("set_wallet_monitoring", { monitored: { [walletId]: monitored } }); return; }
     setSettings((prev) => {
       const next = {
         ...prev,
@@ -247,7 +286,7 @@ export function useSettings() {
       saveSettings(next);
       return next;
     });
-  }, []);
+  }, [writeOperational]);
 
   /**
    * Shows or hides one wallet in the floating API Wallets card.
@@ -317,6 +356,10 @@ export function useSettings() {
         })
         .catch((error) => {
           console.error("Failed to sync the OpenAI/Codex account settings", error);
+          setStartupError("Account settings could not be saved. Please retry.");
+          void invoke<CodexAccountSettings[]>("get_codex_accounts").then(accounts => {
+            if (edit === accountsEdit.current) setSettings(prev => ({ ...prev, codexAccounts: { accounts } }));
+          }).catch(() => {});
         });
     },
     [],
@@ -415,7 +458,7 @@ export function useSettings() {
       setStartupPending(false);
     }
     try {
-      await Promise.all([accountWrites.current, usageWrites.current]);
+      await Promise.all([accountWrites.current, usageWrites.current, operationalWrites.current]);
       // The runtime persists two of these preferences itself (the
       // notification lane's enabled flag and the refresh interval), so the
       // reset is mirrored into it. Both setters are idempotent, which makes
@@ -439,34 +482,6 @@ export function useSettings() {
     }
     return { ok: true, removed: true };
   }, []);
-
-  // The runtime's notification lane is the single evaluation point, so the
-  // toggle is only forwarded to Rust (on attach and on every change, like
-  // the refresh interval). The lane persists the flag itself, which covers
-  // the scheduler's immediate startup cycle before any window attaches.
-  useEffect(() => {
-    if (!isRunningInTauri()) return;
-    void invoke("set_quota_notifications_enabled", {
-      enabled: settings.quotaNotifications,
-    }).catch((error) => {
-      console.error("Failed to sync the quota notification setting", error);
-    });
-  }, [settings.quotaNotifications]);
-
-  // The runtime gates wallet collection on these flags (v0.8.17), so the
-  // monitor map is forwarded to Rust on attach and on every change, like
-  // the notification lane. The wallet-prefs store persists it itself,
-  // which covers the scheduler's immediate startup cycle before any window
-  // attaches. `withWalletMonitored` replaces the record on every change,
-  // so the effect fires exactly when a wallet flag moves.
-  useEffect(() => {
-    if (!isRunningInTauri()) return;
-    void invoke("set_wallet_monitoring", {
-      monitored: settings.walletPreferences.monitored,
-    }).catch((error) => {
-      console.error("Failed to sync the wallet monitoring settings", error);
-    });
-  }, [settings.walletPreferences.monitored]);
 
   return {
     settings,

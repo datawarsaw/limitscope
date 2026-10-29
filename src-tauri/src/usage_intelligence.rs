@@ -88,9 +88,8 @@
 //!
 //! One bounded JSON file (`usage-intelligence-v1.json`) in the Tauri
 //! app-data directory, written temp-then-rename like the sibling stores.
-//! A corrupt or foreign-version file degrades to the empty defaults —
-//! including `enabled: false`, the fail-closed direction for an opt-in
-//! flag — and the sanitized state is written back.
+//! Malformed supported data is preserved before recovery. Unknown schemas
+//! remain untouched and write-blocked, with collection disabled.
 //!
 //! # Daily activity projection
 //!
@@ -472,7 +471,7 @@ struct UsageIntelligenceEnvelope {
     cursors: Vec<SourceCursor>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct StoreState {
     enabled: bool,
     collection_started_at: Option<i64>,
@@ -505,6 +504,12 @@ pub type OpencodeDbResolver = Box<dyn Fn() -> Option<PathBuf> + Send + Sync>;
 /// holds the lock.
 pub struct UsageIntelligenceStore {
     state: Mutex<StoreState>,
+    operation: Mutex<()>,
+    completion: Option<Box<dyn Fn(u64) + Send + Sync>>,
+    committed: Mutex<StoreState>,
+    generation: std::sync::atomic::AtomicU64,
+    writable: std::sync::atomic::AtomicBool,
+    last_write_ok: std::sync::atomic::AtomicBool,
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
@@ -537,6 +542,12 @@ impl UsageIntelligenceStore {
     ) -> Self {
         let store = Self {
             state: Mutex::new(StoreState::default()),
+            committed: Mutex::new(StoreState::default()),
+            operation: Mutex::new(()),
+            completion: None,
+            generation: std::sync::atomic::AtomicU64::new(0),
+            writable: std::sync::atomic::AtomicBool::new(true),
+            last_write_ok: std::sync::atomic::AtomicBool::new(true),
             path,
             now_ms,
             zcode_db,
@@ -545,6 +556,7 @@ impl UsageIntelligenceStore {
             collecting: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_from_disk();
+        *store.committed.lock().unwrap() = store.state.lock().unwrap().clone();
         store
     }
 
@@ -561,6 +573,10 @@ impl UsageIntelligenceStore {
     pub fn with_opencode_db_resolver(mut self, resolver: OpencodeDbResolver) -> Self {
         self.opencode_db = resolver;
         self
+    }
+
+    pub fn with_completion(mut self, completion: Box<dyn Fn(u64) + Send + Sync>) -> Self {
+        self.completion = Some(completion); self
     }
 
     pub fn now_ms(&self) -> i64 {
@@ -606,7 +622,13 @@ impl UsageIntelligenceStore {
     /// backlog skip as a first enable) instead of incrementally importing
     /// the disabled period. Already-collected events, totals, and the
     /// disclosure anchor are untouched.
-    pub fn set_enabled(&self, enabled: bool) {
+    pub fn set_enabled(&self, enabled: bool) -> Result<(), String> {
+        if !self.writable.load(std::sync::atomic::Ordering::SeqCst) {
+            self.last_write_ok.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err("Usage Intelligence storage schema is unsupported or unavailable".into());
+        }
+        let _operation = self.operation.lock().unwrap();
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let changed = {
             let mut state = self.state.lock().unwrap();
             if state.enabled == enabled {
@@ -622,10 +644,15 @@ impl UsageIntelligenceStore {
                 true
             }
         };
-        if changed {
-            self.persist_current();
+        if changed || !self.last_write_succeeded() {
+            if !self.persist_current() { return Err("Could not persist Usage Intelligence preference".into()); }
         }
+        Ok(())
     }
+
+    pub fn generation(&self) -> u64 { self.generation.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn last_write_succeeded(&self) -> bool { self.last_write_ok.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn generation_current(&self, generation: u64) -> bool { self.enabled() && self.generation() == generation }
 
     /// The revision, broadcast through the runtime snapshot.
     pub fn revision(&self) -> u64 {
@@ -691,15 +718,27 @@ impl UsageIntelligenceStore {
     /// flag — and the sanitized state is written back. Never crashes
     /// startup.
     fn load_from_disk(&self) {
-        let Ok(raw) = fs::read_to_string(&self.path) else {
-            return;
+        let raw = match fs::read_to_string(&self.path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound { self.writable.store(false, std::sync::atomic::Ordering::SeqCst); }
+                return;
+            }
         };
+        if serde_json::from_str::<serde_json::Value>(&raw).ok()
+            .is_some_and(|value| value.get("version").and_then(serde_json::Value::as_u64) != Some(BLOB_VERSION as u64)) {
+            self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let Ok(parsed) = serde_json::from_str::<UsageIntelligenceEnvelope>(&raw) else {
-            self.persist_current();
+            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+            if crate::durable_file::replace(&backup, raw.as_bytes()).is_err() {
+                self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             return;
         };
         if parsed.version != BLOB_VERSION {
-            self.persist_current();
+            self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
             return;
         }
         let now_ms = self.now_ms();
@@ -709,13 +748,14 @@ impl UsageIntelligenceStore {
                 cursors.insert(cursor.source.clone(), cursor);
             }
         }
-        let mut events = Vec::with_capacity(parsed.events.len());
+        let original_event_count = parsed.events.len();
+        let mut events = Vec::with_capacity(original_event_count);
         for event in parsed.events {
             if let Some(valid) = UsageEvent::validated(event, now_ms) {
                 events.push(valid);
             }
         }
-        let total_events = events.len();
+        let total_events = original_event_count;
         let deduped = dedup_and_sort(events);
         let degraded = deduped.len() != total_events;
         {
@@ -727,7 +767,10 @@ impl UsageIntelligenceStore {
             state.revision += 1;
         }
         if degraded {
-            self.persist_current();
+            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+            if crate::durable_file::replace(&backup, raw.as_bytes()).is_err() {
+                self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
         }
     }
 
@@ -753,7 +796,7 @@ impl UsageIntelligenceStore {
     /// also persists the initial per-file cursors (for the Codex reader:
     /// every existing rollout tracked at its current EOF, zero events
     /// imported).
-    pub fn establish_baseline_with_files(
+    fn establish_baseline_with_files_inner(
         &self,
         source: &str,
         watermark_ms: i64,
@@ -815,7 +858,7 @@ impl UsageIntelligenceStore {
 
     /// Marks a non-ok source state (absent / schema / read failure /
     /// ceiling), preserving the watermark and baseline anchors.
-    pub fn mark_source_state(&self, source: &str, state: SourceState, detail: Option<String>) {
+    fn mark_source_state_inner(&self, source: &str, state: SourceState, detail: Option<String>) {
         let now_ms = self.now_ms();
         let changed = {
             let mut locked = self.state.lock().unwrap();
@@ -855,6 +898,34 @@ impl UsageIntelligenceStore {
         }
     }
 
+    pub fn establish_baseline_with_files(&self, source: &str, watermark: i64, fingerprint: Option<SourceFingerprint>, files: Vec<SourceFileCursor>) {
+        let _operation = self.operation.lock().unwrap();
+        self.establish_baseline_with_files_inner(source, watermark, fingerprint, files);
+    }
+    pub fn establish_baseline_at(&self, generation: u64, source: &str, watermark: i64, fingerprint: Option<SourceFingerprint>) {
+        let _operation = self.operation.lock().unwrap();
+        if self.generation_current(generation) { self.establish_baseline_with_files_inner(source, watermark, fingerprint, Vec::new()); }
+    }
+    pub fn mark_source_state(&self, source: &str, state: SourceState, detail: Option<String>) {
+        let _operation = self.operation.lock().unwrap();
+        self.mark_source_state_inner(source, state, detail);
+    }
+    pub fn mark_source_state_at(&self, generation: u64, source: &str, state: SourceState, detail: Option<String>) {
+        let _operation = self.operation.lock().unwrap();
+        if self.generation_current(generation) { self.mark_source_state_inner(source, state, detail); }
+    }
+    pub fn apply_scan(&self, source: &str, scan: SourceScan) -> ScanStats {
+        let _operation = self.operation.lock().unwrap();
+        self.apply_scan_inner(source, scan)
+    }
+    pub fn apply_scan_at(&self, generation: u64, source: &str, scan: SourceScan) -> Result<ScanStats, String> {
+        let _operation = self.operation.lock().unwrap();
+        if !self.generation_current(generation) { return Err("Collection invalidated".into()); }
+        let stats = self.apply_scan_inner(source, scan);
+        if !self.last_write_succeeded() { return Err("Collection could not be persisted; cursor retained".into()); }
+        Ok(stats)
+    }
+
     // ---- scan application ----
 
     /// Applies one successful scan: validates and dedups the events,
@@ -862,7 +933,7 @@ impl UsageIntelligenceStore {
     /// and persists. Returns the applied stats (accepted counts only
     /// newly stored events; duplicates were already present — in the store
     /// or earlier in the same batch).
-    pub fn apply_scan(&self, source: &str, mut scan: SourceScan) -> ScanStats {
+    fn apply_scan_inner(&self, source: &str, mut scan: SourceScan) -> ScanStats {
         let now_ms = self.now_ms();
         let cutoff = now_ms - USAGE_EVENT_RETENTION_MS;
         let mut batch: Vec<UsageEvent> = Vec::new();
@@ -883,17 +954,20 @@ impl UsageIntelligenceStore {
 
         let stats = {
             let mut state = self.state.lock().unwrap();
+            state.events.retain(|event| event.event_at >= cutoff);
             let existing: std::collections::HashSet<&str> =
                 state.events.iter().map(|e| e.id.as_str()).collect();
             let mut accepted = 0;
             let mut duplicates = 0;
             let mut merged = state.events.clone();
+            let mut capacity_limited = false;
             for event in batch {
                 if existing.contains(event.id.as_str()) {
                     duplicates += 1;
                     continue;
                 }
                 if merged.len() >= USAGE_EVENT_MAX {
+                    capacity_limited = true;
                     break;
                 }
                 merged.push(event);
@@ -911,7 +985,7 @@ impl UsageIntelligenceStore {
             };
             state.events = retained;
             if let Some(cursor) = state.cursors.get_mut(source) {
-                if cursor.baselined {
+                if cursor.baselined && !capacity_limited {
                     cursor.watermark_ms = cursor.watermark_ms.max(scan.watermark_ms);
                     // The committed batch's composite end position — the
                     // resume point for a bounded (deferred) backlog.
@@ -923,9 +997,9 @@ impl UsageIntelligenceStore {
                     cursor.files = std::mem::take(&mut scan.files);
                 }
                 cursor.last_observed_at = now_ms;
-                cursor.state = SourceState::Ok;
-                cursor.detail = None;
-                cursor.fingerprint = scan.fingerprint;
+                cursor.state = if capacity_limited { SourceState::ScanCeiling } else { SourceState::Ok };
+                cursor.detail = capacity_limited.then(|| "Event capacity reached; uncommitted backlog retained at source".to_string());
+                cursor.fingerprint = if capacity_limited { None } else { scan.fingerprint };
                 cursor.last_scan = Some(stats);
             }
             state.revision += 1;
@@ -942,7 +1016,9 @@ impl UsageIntelligenceStore {
     /// deliberately preserved — clearing data is not disabling the
     /// feature; while still enabled, the next collection re-baselines at
     /// the source's current high-water mark and does not backfill.
-    pub fn clear_owned(&self) -> bool {
+    pub fn clear_owned(&self) -> Result<bool, String> {
+        let _operation = self.operation.lock().unwrap();
+        self.generation.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let (changed, had_data) = {
             let mut state = self.state.lock().unwrap();
             let had_data = !state.events.is_empty()
@@ -955,11 +1031,10 @@ impl UsageIntelligenceStore {
             (true, had_data)
         };
         if changed {
-            if !self.persist_current() {
-                let _ = fs::remove_file(&self.path);
-            }
+            self.persist_current();
         }
-        had_data
+        if !self.last_write_succeeded() { return Err("Could not durably clear Usage Intelligence".into()); }
+        Ok(had_data)
     }
 
     // ---- aggregation ----
@@ -1119,6 +1194,8 @@ impl UsageIntelligenceStore {
 
         UsageIntelligenceDto {
             schema_version: USAGE_INTELLIGENCE_SCHEMA_VERSION,
+            persistence_available: self.writable.load(std::sync::atomic::Ordering::SeqCst),
+            last_write_succeeded: self.last_write_succeeded(),
             range: range_label.to_string(),
             range_start: canonical_timestamp(range_start),
             range_end: canonical_timestamp(now_ms),
@@ -1170,13 +1247,18 @@ impl UsageIntelligenceStore {
         let Ok(json) = serde_json::to_string(&envelope) else {
             return false;
         };
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let persisted = self.writable.load(std::sync::atomic::Ordering::SeqCst)
+            && crate::durable_file::replace(&self.path, json.as_bytes()).is_ok();
+        self.last_write_ok.store(persisted, std::sync::atomic::Ordering::SeqCst);
+        if persisted {
+            *self.committed.lock().unwrap() = self.state.lock().unwrap().clone();
+        } else {
+            let mut state = self.state.lock().unwrap();
+            let revision = state.revision;
+            *state = self.committed.lock().unwrap().clone();
+            state.revision = revision;
         }
-        fs::write(&temp_path, json)
-            .and_then(|()| fs::rename(&temp_path, &self.path))
-            .is_ok()
+        persisted
     }
 }
 
@@ -1393,7 +1475,7 @@ fn source_coverage_for(
     }
 
     let reason = match cursor.state {
-        SourceState::Ok | SourceState::ScanCeiling => {
+        SourceState::Ok => {
             return SourceCoverageDto {
                 source: cursor.source.clone(),
                 coverage: "complete".to_string(),
@@ -1402,6 +1484,7 @@ fn source_coverage_for(
                 last_observed_at: None,
             };
         }
+        SourceState::ScanCeiling => "scanCeiling",
         SourceState::SourceAbsent => "sourceAbsent",
         SourceState::SchemaUnsupported => "schemaUnsupported",
         SourceState::ReadFailure => "readFailure",
@@ -1508,6 +1591,8 @@ pub struct SourceCoverageDto {
 #[serde(rename_all = "camelCase")]
 pub struct UsageIntelligenceDto {
     pub schema_version: u32,
+    pub persistence_available: bool,
+    pub last_write_succeeded: bool,
     pub range: String,
     pub range_start: String,
     pub range_end: String,
@@ -1583,8 +1668,23 @@ pub fn collect_zcode(
 /// are isolated — one failing never blocks the other. Blocking filesystem
 /// work — call from `spawn_blocking` off the async runtime.
 pub fn run_collection_pass(store: &UsageIntelligenceStore) {
-    let _ = collect_zcode(store);
-    let _ = crate::usage_source_opencode::collect(store);
+    if store.collecting.compare_exchange(false, true, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return; }
+    let _reset = CollectionReset(store);
+    collect_generation(store, store.generation());
+}
+
+struct CollectionReset<'a>(&'a UsageIntelligenceStore);
+impl Drop for CollectionReset<'_> {
+    fn drop(&mut self) {
+        self.0.collecting.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Some(completion) = &self.0.completion { completion(self.0.revision()); }
+    }
+}
+fn collect_generation(store: &UsageIntelligenceStore, generation: u64) {
+    let _ = crate::usage_source_zcode::collect_at(store, generation);
+    if store.generation_current(generation) {
+        let _ = crate::usage_source_opencode::collect_at(store, generation);
+    }
 }
 
 /// Spawns one detached collection pass (used by the runtime cycle and the
@@ -1597,17 +1697,12 @@ pub fn run_collection_pass(store: &UsageIntelligenceStore) {
 /// panics ("there is no reactor running") and the unwind aborts the whole
 /// process across the FFI boundary.
 pub fn spawn_collection(store: std::sync::Arc<UsageIntelligenceStore>) {
-    if !store.enabled() {
-        return;
-    }
+    if !store.enabled() || store.collecting.compare_exchange(false, true,
+        std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst).is_err() { return; }
+    let generation = store.generation();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        store
-            .collecting
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        run_collection_pass(&store);
-        store
-            .collecting
-            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let _reset = CollectionReset(&store);
+        if store.generation_current(generation) { collect_generation(&store, generation); }
     });
 }
 
@@ -1625,6 +1720,8 @@ pub fn get_usage_intelligence(
         Some(store) => store.aggregate(query.range, query.today_start_ms),
         None => UsageIntelligenceDto {
             schema_version: USAGE_INTELLIGENCE_SCHEMA_VERSION,
+            persistence_available: false,
+            last_write_succeeded: false,
             range: match query.range {
                 UsageRange::Today => "today",
                 UsageRange::SevenDays => "7d",
@@ -1662,8 +1759,8 @@ pub fn get_usage_intelligence(
 /// the first baseline is established without waiting for a cycle;
 /// disabling stops all probing.
 #[tauri::command]
-pub fn set_usage_intelligence_enabled(handle: tauri::State<RuntimeHandle>, enabled: bool) {
-    handle.set_usage_intelligence_enabled(enabled);
+pub fn set_usage_intelligence_enabled(handle: tauri::State<RuntimeHandle>, enabled: bool) -> Result<(), String> {
+    handle.set_usage_intelligence_enabled(enabled)
 }
 
 /// Clears everything Usage Intelligence owns (events, cursors, disclosure
@@ -1671,15 +1768,10 @@ pub fn set_usage_intelligence_enabled(handle: tauri::State<RuntimeHandle>, enabl
 /// enabled, the next collection re-baselines at the current high-water
 /// mark — old usage does not reappear.
 #[tauri::command]
-pub fn clear_usage_intelligence(handle: tauri::State<RuntimeHandle>) -> LocalDataClearOutcome {
-    let removed = handle
-        .usage_intelligence_store()
-        .map(|store| store.clear_owned())
-        .unwrap_or(false);
-    LocalDataClearOutcome {
-        category: USAGE_INTELLIGENCE_CATEGORY,
-        removed,
-    }
+pub fn clear_usage_intelligence(handle: tauri::State<RuntimeHandle>) -> Result<LocalDataClearOutcome, String> {
+    let store = handle.usage_intelligence_store().ok_or("Usage Intelligence persistence unavailable")?;
+    let removed = store.clear_owned()?;
+    Ok(LocalDataClearOutcome { category: USAGE_INTELLIGENCE_CATEGORY, removed })
 }
 
 // ---------- tests ----------
@@ -1811,11 +1903,129 @@ mod tests {
 
     // 1. serialization roundtrip: a persisted store reopens with the same
     //    events, cursors, enabled flag, and disclosure anchor.
+    #[tokio::test]
+    async fn coordinator_bounds_work_and_quota_finishes_while_scan_is_blocked() {
+        let dir = tempdir::temp_dir("coordinator");
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let store = std::sync::Arc::new(UsageIntelligenceStore::open_with(
+            dir.path().join(USAGE_INTELLIGENCE_FILE_NAME), fixed_clock(), Box::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5));
+                None
+            })).with_opencode_db_resolver(Box::new(|| None)));
+        store.set_enabled(true).unwrap();
+        spawn_collection(store.clone());
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        for _ in 0..8 { spawn_collection(store.clone()); }
+        let core = std::sync::Arc::new(crate::runtime::RuntimeCore::with_injections(
+            Vec::new(), 5, Box::new(|| 0), Box::new(|| chrono::DateTime::from_timestamp_millis(NOW_MS).unwrap()))
+            .with_usage_intelligence_store(Some(store.clone())));
+        let quota = tokio::time::timeout(std::time::Duration::from_secs(1), core.run_cycle()).await;
+        store.clear_owned().unwrap();
+        store.set_enabled(false).unwrap();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while store.is_collecting() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        }).await.unwrap();
+        assert!(quota.is_ok(), "quota publication must not await the blocked collector");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(store.cursor(USAGE_SOURCE_ZCODE).is_none());
+        assert!(store.cursor(USAGE_SOURCE_OPENCODE).is_none());
+    }
+
+    #[test]
+    fn invalidated_scan_cannot_restore_cleared_or_disabled_state() {
+        let (store, _dir) = temp_store("generation-fence");
+        store.set_enabled(true).unwrap();
+        store.establish_baseline(USAGE_SOURCE_ZCODE, 0, None);
+        let generation = store.generation();
+        store.clear_owned().unwrap();
+        assert!(store.apply_scan_at(generation, USAGE_SOURCE_ZCODE, scan_from(vec![event("zcode:late", "zai", "model", NOW_MS)], NOW_MS)).is_err());
+        store.establish_baseline_at(generation, USAGE_SOURCE_ZCODE, NOW_MS, None);
+        assert!(store.cursor(USAGE_SOURCE_ZCODE).is_none());
+        assert!(store.events().is_empty());
+        let generation = store.generation();
+        store.set_enabled(false).unwrap();
+        assert!(store.apply_scan_at(generation, USAGE_SOURCE_ZCODE, scan_from(vec![], NOW_MS)).is_err());
+    }
+
+    #[test]
+    fn failed_scan_rolls_back_cursor_and_retry_commits_identical_batch() {
+        let (store, dir) = temp_store("retry-scan");
+        store.set_enabled(true).unwrap();
+        store.establish_baseline(USAGE_SOURCE_ZCODE, 0, None);
+        let backup = dir.path().join("saved.json");
+        fs::rename(&store.path, &backup).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        let scan = || scan_from(vec![event("zcode:retry", "zai", "model", NOW_MS)], NOW_MS);
+        assert!(store.apply_scan_at(store.generation(), USAGE_SOURCE_ZCODE, scan()).is_err());
+        assert_eq!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().watermark_ms, 0);
+        assert!(store.events().is_empty());
+        fs::remove_dir(&store.path).unwrap();
+        fs::rename(backup, &store.path).unwrap();
+        assert_eq!(store.apply_scan_at(store.generation(), USAGE_SOURCE_ZCODE, scan()).unwrap().accepted, 1);
+        assert_eq!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().watermark_ms, NOW_MS);
+    }
+
+    #[test]
+    fn capacity_retains_backlog_then_retention_releases_it() {
+        let (clock, now) = manual_clock(NOW_MS);
+        let (store, _dir) = temp_store_with_clock("capacity", now);
+        store.set_enabled(true).unwrap();
+        store.establish_baseline(USAGE_SOURCE_ZCODE, 0, None);
+        store.state.lock().unwrap().events = (0..USAGE_EVENT_MAX).map(|i| event(&format!("zcode:full-{i}"), "zai", "model", NOW_MS-USAGE_EVENT_RETENTION_MS)).collect();
+        let batch = || scan_from(vec![event("zcode:backlog", "zai", "model", NOW_MS)], NOW_MS);
+        assert_eq!(store.apply_scan(USAGE_SOURCE_ZCODE, batch()).accepted, 0);
+        let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
+        assert_eq!(cursor.watermark_ms, 0);
+        assert_eq!(cursor.state, SourceState::ScanCeiling);
+        *clock.lock().unwrap() += 1;
+        assert_eq!(store.apply_scan(USAGE_SOURCE_ZCODE, batch()).accepted, 1);
+        assert_eq!(store.events().len(), 1);
+        assert_eq!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().watermark_ms, NOW_MS);
+    }
+
+    #[test]
+    fn invalid_supported_event_is_backed_up_before_later_save() {
+        let (store, dir) = temp_store("invalid-event-recovery");
+        store.set_enabled(true).unwrap();
+        store.establish_baseline(USAGE_SOURCE_ZCODE, 0, None);
+        store.apply_scan(USAGE_SOURCE_ZCODE, scan_from(vec![event("zcode:valid", "zai", "model", NOW_MS)], NOW_MS));
+        let mut blob: serde_json::Value = serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        blob["events"][0]["id"] = serde_json::json!("");
+        let raw = serde_json::to_vec(&blob).unwrap();
+        fs::write(&store.path, &raw).unwrap();
+        let reopened = UsageIntelligenceStore::open_with(store.path.clone(), fixed_clock(), Box::new(|| None));
+        assert!(reopened.events().is_empty());
+        reopened.set_enabled(false).unwrap();
+        assert!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok).any(|entry| {
+            entry.file_name().to_string_lossy().contains("recovery-") && fs::read(entry.path()).unwrap() == raw
+        }));
+    }
+
+    #[test]
+    fn future_schema_survives_every_mutation_attempt() {
+        let (store, _dir) = temp_store("future-preserved");
+        let raw = r#"{"version":999,"enabled":true,"events":[],"cursors":[],"future":"keep"}"#;
+        fs::write(&store.path, raw).unwrap();
+        let reopened = UsageIntelligenceStore::open_with(store.path.clone(), fixed_clock(), Box::new(|| None));
+        assert!(!reopened.enabled());
+        assert!(reopened.set_enabled(true).is_err());
+        assert!(reopened.clear_owned().is_err());
+        assert!(!reopened.last_write_succeeded());
+        assert_eq!(fs::read_to_string(&store.path).unwrap(), raw);
+    }
+
     #[test]
     fn persisted_state_roundtrips_through_disk() {
         let (store, dir) = temp_store("roundtrip");
         let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
         let stats = store.apply_scan(
             USAGE_SOURCE_ZCODE,
@@ -1899,7 +2109,7 @@ mod tests {
     #[test]
     fn clear_owned_data_keeps_the_opt_in_and_rebaselines_cleanly() {
         let (store, _dir) = temp_store("clear");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
         store.apply_scan(
             USAGE_SOURCE_ZCODE,
@@ -1908,7 +2118,7 @@ mod tests {
                 NOW_MS - 30_000,
             ),
         );
-        assert!(store.clear_owned());
+        assert!(store.clear_owned().unwrap());
         assert!(
             store.enabled(),
             "clearing data does not disable the feature"
@@ -1932,8 +2142,8 @@ mod tests {
     #[test]
     fn clear_empty_store_is_an_idempotent_success() {
         let (store, _dir) = temp_store("clear-empty");
-        assert!(!store.clear_owned());
-        assert!(!store.clear_owned());
+        assert!(!store.clear_owned().unwrap());
+        assert!(!store.clear_owned().unwrap());
     }
 
     // 6. corrupt owned store: degrade to empty defaults — and the
@@ -1951,7 +2161,7 @@ mod tests {
         );
         assert_eq!(store.collection_started_at(), None);
         // The store still functions afterwards.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
         assert!(store.cursor(USAGE_SOURCE_ZCODE).is_some());
         drop(store);
@@ -1983,7 +2193,7 @@ mod tests {
     #[test]
     fn pre_baseline_failure_does_not_become_a_baseline() {
         let (store, _dir) = temp_store("baseline-after-failure");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
         let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
         assert!(!cursor.baselined, "a failure record carries no baseline");
@@ -2002,7 +2212,7 @@ mod tests {
         // complete; events arrive across the window afterwards.
         let (now, clock) = manual_clock(NOW_MS - 31 * 24 * 60 * 60_000);
         let (store, _dir) = temp_store_with_clock("aggregate", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 31 * 24 * 60 * 60_000, None);
         *now.lock().unwrap() = NOW_MS;
         let midnight = NOW_MS - 8 * 60 * 60_000;
@@ -2066,7 +2276,7 @@ mod tests {
         // back than that, the Today view does not.
         let (now, clock) = manual_clock(NOW_MS - 3 * 24 * 60 * 60_000);
         let (store, _dir) = temp_store_with_clock("incomplete", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
         *now.lock().unwrap() = NOW_MS;
         store.apply_scan(
@@ -2089,7 +2299,7 @@ mod tests {
     fn enabled_plane_without_a_baseline_does_not_claim_complete_history() {
         let (_now, clock) = manual_clock(NOW_MS);
         let (store, _dir) = temp_store_with_clock("coverage-never-started", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
 
         let waiting = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(waiting.collection_started_at, None);
@@ -2101,7 +2311,7 @@ mod tests {
         );
 
         // The disabled empty plane keeps the historical empty-state verdict.
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         let off = store.aggregate(UsageRange::SevenDays, None);
         assert!(!off.incomplete_history);
         assert!(off.source_coverage.is_empty());
@@ -2112,7 +2322,7 @@ mod tests {
         let range_start = NOW_MS - 7 * DAY_MS;
         let (now, clock) = manual_clock(range_start - DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-complete", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
@@ -2132,16 +2342,16 @@ mod tests {
         let ceiling = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(
             dto_coverage(&ceiling, USAGE_SOURCE_ZCODE).coverage,
-            "complete"
+            "uncertain"
         );
-        assert!(!ceiling.incomplete_history);
+        assert!(ceiling.incomplete_history);
     }
 
     #[test]
     fn later_source_baseline_is_incomplete_from_its_baseline_instant() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-late", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS - 3 * DAY_MS;
         store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 4 * DAY_MS, None);
@@ -2174,7 +2384,7 @@ mod tests {
         let range_start = NOW_MS - 7 * DAY_MS;
         let (now, clock) = manual_clock(NOW_MS - 12 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-regression", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 12 * DAY_MS, None);
         let global_start = store.collection_started_at().unwrap();
         assert!(global_start < range_start);
@@ -2197,7 +2407,7 @@ mod tests {
     fn failure_only_source_has_no_baseline_and_is_uncertain() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-no-baseline", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
         store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, None);
@@ -2215,7 +2425,7 @@ mod tests {
     fn baselined_failure_is_uncertain_with_its_last_observed_anchor() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-failure", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         let baseline = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
         *now.lock().unwrap() = NOW_MS;
@@ -2236,7 +2446,7 @@ mod tests {
     fn paused_collection_after_an_old_baseline_is_uncertain() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-paused", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 10 * DAY_MS, None);
         let baseline = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
         *now.lock().unwrap() = NOW_MS;
@@ -2266,16 +2476,16 @@ mod tests {
             .unwrap();
         assert_eq!(diagnostics.state, "collectionPaused");
 
-        // A bounded-progress ceiling stays complete: it committed a prefix
+        // A bounded-progress ceiling is uncertain: it committed only a prefix
         // and continues on the next scan. Only the fail-closed pause is a
         // coverage gap.
         store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ScanCeiling, None);
         let progressing = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(
             dto_coverage(&progressing, USAGE_SOURCE_OPENCODE).coverage,
-            "complete"
+            "uncertain"
         );
-        assert!(!progressing.incomplete_history);
+        assert!(progressing.incomplete_history);
     }
 
     #[test]
@@ -2317,8 +2527,8 @@ mod tests {
             .unwrap();
         assert_eq!(diagnostics.state, "scanCeiling");
         // A bounded-progress ceiling keeps its meaning under the new rules.
-        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_OPENCODE).coverage, "complete");
-        assert!(!dto.incomplete_history);
+        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_OPENCODE).coverage, "uncertain");
+        assert!(dto.incomplete_history);
     }
 
     #[test]
@@ -2326,7 +2536,7 @@ mod tests {
         let range_start = NOW_MS - 7 * DAY_MS;
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-skew", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         // The source clock is ahead of the store clock: the baseline instant
         // looks early, but the authoritative source watermark says the
         // source itself had not reached the range start yet.
@@ -2351,12 +2561,12 @@ mod tests {
     fn disable_reenable_then_rebaseline_reports_the_unknown_gap() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-reenable", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS - 5 * DAY_MS;
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         *now.lock().unwrap() = NOW_MS - 3 * DAY_MS;
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
 
         let pending = store.aggregate(UsageRange::SevenDays, None);
         let coverage = dto_coverage(&pending, USAGE_SOURCE_ZCODE);
@@ -2382,7 +2592,7 @@ mod tests {
     fn source_coverage_never_changes_observed_token_totals() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-totals", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
         store.apply_scan(
@@ -2423,7 +2633,7 @@ mod tests {
     fn missing_history_is_not_measured_zero_usage() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-missing-zero", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
 
@@ -2452,10 +2662,10 @@ mod tests {
     fn disabled_sources_are_uncertain_even_with_an_old_global_anchor() {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-disabled", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
         let coverage = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
@@ -2470,7 +2680,7 @@ mod tests {
         let today_start = NOW_MS - 8 * 60 * 60_000;
         let (now, clock) = manual_clock(range_start - DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-wire", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = range_start;
         // Equality is covered from the range start.
@@ -2633,7 +2843,7 @@ mod tests {
     fn file_cursors_roundtrip_through_disk() {
         let (store, dir) = temp_store("file-cursors");
         let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         let files = vec![
             SourceFileCursor {
                 path: "sessions/2026/10/06/rollout-a.jsonl".to_string(),
@@ -2715,7 +2925,7 @@ mod tests {
                 .with_codex_home_resolver(Box::new(|| None))
                 .with_opencode_db_resolver(Box::new(|| None)),
         );
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
 
         // The enable command executes on a plain thread outside any Tokio
         // runtime; reproduce exactly that context. The join asserts the
@@ -2766,7 +2976,7 @@ mod tests {
     #[test]
     fn reenable_marks_existing_cursors_pending_rebaseline() {
         let (store, _dir) = temp_store("pending");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert!(
             store.cursor_needs_baseline(USAGE_SOURCE_ZCODE),
             "no cursor yet: the first pass must baseline"
@@ -2775,7 +2985,7 @@ mod tests {
         assert!(!store.cursor_needs_baseline(USAGE_SOURCE_ZCODE));
         assert!(!store.cursor(USAGE_SOURCE_ZCODE).unwrap().pending_rebaseline);
 
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         assert!(
             !store
                 .cursor(USAGE_SOURCE_ZCODE)
@@ -2783,8 +2993,8 @@ mod tests {
                 .pending_rebaseline,
             "disabling alone does not mark anything"
         );
-        store.set_enabled(false); // idempotent: still no transition
-        store.set_enabled(true); // the transition marks every cursor
+        store.set_enabled(false).unwrap(); // idempotent: still no transition
+        store.set_enabled(true).unwrap(); // the transition marks every cursor
         assert!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().pending_rebaseline);
         assert!(store.cursor_needs_baseline(USAGE_SOURCE_ZCODE));
 
@@ -2811,10 +3021,10 @@ mod tests {
     #[test]
     fn pending_rebaseline_survives_restart() {
         let (store, dir) = temp_store("pending-restart");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
-        store.set_enabled(false);
-        store.set_enabled(true);
+        store.set_enabled(false).unwrap();
+        store.set_enabled(true).unwrap();
         drop(store);
 
         let reopened =
@@ -2830,7 +3040,7 @@ mod tests {
     #[test]
     fn batch_positions_apply_and_roundtrip_through_disk() {
         let (store, dir) = temp_store("batch-pos");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
         let first = SourceBatchEnd {
             stamp_ms: NOW_MS - 30_000,
@@ -2921,7 +3131,7 @@ mod tests {
     fn daily_buckets_events_by_local_midnight_and_reconciles_with_totals() {
         let midnight = local_midnight_ms(NOW_MS);
         let (store, _dir) = temp_store("daily-midnight");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
         store.apply_scan(
             USAGE_SOURCE_ZCODE,
@@ -2977,7 +3187,7 @@ mod tests {
     fn daily_missing_days_are_not_observed_and_flag_before_collection() {
         let (now, clock) = manual_clock(NOW_MS - 3 * 24 * 60 * 60_000);
         let (store, _dir) = temp_store_with_clock("daily-missing", clock);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 3 * 24 * 60 * 60_000, None);
         // A second source failed today — its failure must not invent data.
         store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, None);
@@ -3035,7 +3245,7 @@ mod tests {
     fn daily_is_idempotent_under_overlapping_scans() {
         let midnight = local_midnight_ms(NOW_MS);
         let (store, _dir) = temp_store("daily-dedup");
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 120_000, None);
         let events = vec![
             event("zcode:a", "zai", "GLM-5.3", midnight - 1),
@@ -3114,7 +3324,7 @@ mod tests {
             None
         }))
         .with_opencode_db_resolver(Box::new(|| None));
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
 
         run_collection_pass(&store);
 
@@ -3127,7 +3337,7 @@ mod tests {
     fn legacy_codex_events_remain_persisted_but_are_absent_from_aggregates() {
         let (store, dir) = temp_store("legacy-codex-filter");
         let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 120_000, None);
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 120_000, None);
 

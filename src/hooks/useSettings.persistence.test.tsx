@@ -10,6 +10,7 @@ import { SettingsView } from "../components/settings/SettingsView";
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   isEnabled: vi.fn().mockResolvedValue(false),
   enable: vi.fn().mockResolvedValue(undefined),

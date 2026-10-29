@@ -7,16 +7,10 @@
 //!
 //! # Read-only access (the hard boundary)
 //!
-//! The live database and its `-wal` / `-shm` sidecars are never opened by
-//! this module. Every collection pass copies the database plus its `-wal`
-//! sidecar into a fresh temporary directory and queries only the copy —
-//! the same snapshot pattern `cursor_grok_bot.rs` uses for Cursor's state
-//! database. The source files are only ever touched by the copy calls
-//! themselves (read handles), never locked, never written, never
-//! checkpointed; the `-shm` is a transient index the copy rebuilds for
-//! itself. A WAL copied mid-append is designed by SQLite to replay only
-//! the committed, checksummed prefix, so the snapshot is a coherent
-//! committed state.
+//! SQLite Online Backup reads the live source in read-only mode, with normal
+//! reader/WAL coordination, into a bounded in-memory destination. No SQL
+//! writes, migrations or checkpoint commands target the source. A deadline,
+//! size ceiling and quick_check reject unusable snapshots before cursor commits.
 //!
 //! # Opt-in and probing
 //!
@@ -151,11 +145,15 @@ pub enum ZcodeScanOutcome {
 /// Runs one collection pass. The disabled gate is first: a disabled store
 /// returns without resolving the source path.
 pub fn collect(store: &UsageIntelligenceStore) -> ZcodeScanOutcome {
+    collect_at(store, store.generation())
+}
+pub(crate) fn collect_at(store: &UsageIntelligenceStore, generation: u64) -> ZcodeScanOutcome {
+    if !store.generation_current(generation) { return ZcodeScanOutcome::Disabled; }
     if !store.enabled() {
         return ZcodeScanOutcome::Disabled;
     }
     let Some(db_path) = (store.zcode_db_resolver())() else {
-        store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
+        store.mark_source_state_at(generation, USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
         return ZcodeScanOutcome::Absent;
     };
     // Existence check (the first and only probe, post opt-in): a missing
@@ -163,7 +161,7 @@ pub fn collect(store: &UsageIntelligenceStore) -> ZcodeScanOutcome {
     let db_meta = match fs::metadata(&db_path) {
         Ok(meta) => meta,
         Err(_) => {
-            store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
+            store.mark_source_state_at(generation, USAGE_SOURCE_ZCODE, SourceState::SourceAbsent, None);
             return ZcodeScanOutcome::Absent;
         }
     };
@@ -188,36 +186,27 @@ pub fn collect(store: &UsageIntelligenceStore) -> ZcodeScanOutcome {
 
     let fingerprint = current_fingerprint(&db_path, &wal_path);
 
-    let outcome = collect_from_live(&db_path, &wal_path, store, fingerprint);
+    let outcome = collect_from_live(&db_path, &wal_path, store, fingerprint, generation);
     outcome
 }
 
-/// Snapshot-copies the database (plus WAL) and runs the baseline or
-/// incremental read against the copy.
+/// Takes a consistent in-memory snapshot and reads its baseline or increment.
 fn collect_from_live(
     db_path: &Path,
-    wal_path: &Path,
+    _wal_path: &Path,
     store: &UsageIntelligenceStore,
     fingerprint: Option<SourceFingerprint>,
+    generation: u64,
 ) -> ZcodeScanOutcome {
-    let guard = match snapshot_database(db_path, wal_path) {
-        Ok(guard) => guard,
-        Err(detail) => {
-            store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
-            return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
-        }
-    };
-    let snapshot_db = guard.path.join("db.sqlite");
-    let connection = match rusqlite::Connection::open(&snapshot_db) {
+    let connection = match crate::sqlite_snapshot::snapshot(db_path) {
         Ok(connection) => connection,
-        Err(error) => {
-            let detail = format!("could not open the snapshot: {error}");
-            store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
-            return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
+        Err(detail) => {
+            store.mark_source_state_at(generation, USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail.clone()));
+            return ZcodeScanOutcome::ReadFailure(detail);
         }
     };
     if let Err(detail) = verify_schema(&connection) {
-        store.mark_source_state(
+        store.mark_source_state_at(generation,
             USAGE_SOURCE_ZCODE,
             SourceState::SchemaUnsupported,
             Some(detail),
@@ -251,7 +240,7 @@ fn collect_from_live(
             Ok(max) => max,
             Err(error) => {
                 let detail = format!("baseline high-water query failed: {error}");
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_ZCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -260,7 +249,10 @@ fn collect_from_live(
             }
         };
         let watermark_ms = max_completed.map(|max| max + 1).unwrap_or(0);
-        store.establish_baseline(USAGE_SOURCE_ZCODE, watermark_ms, fingerprint);
+        store.establish_baseline_at(generation, USAGE_SOURCE_ZCODE, watermark_ms, fingerprint);
+        if !store.generation_current(generation) || !store.last_write_succeeded() {
+            return ZcodeScanOutcome::ReadFailure("Baseline not committed".into());
+        }
         return ZcodeScanOutcome::Baseline { watermark_ms };
     }
 
@@ -317,7 +309,7 @@ fn collect_from_live(
         Ok(statement) => statement,
         Err(error) => {
             let detail = format!("could not prepare the scan: {error}");
-            store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
+            store.mark_source_state_at(generation, USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
             return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
         }
     };
@@ -328,7 +320,7 @@ fn collect_from_live(
     let mut forward = match collect_rows(rows) {
         Ok(rows) => rows,
         Err(detail) => {
-            store.mark_source_state(USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
+            store.mark_source_state_at(generation, USAGE_SOURCE_ZCODE, SourceState::ReadFailure, Some(detail));
             return ZcodeScanOutcome::ReadFailure(read_failure_detail(db_path));
         }
     };
@@ -363,7 +355,7 @@ fn collect_from_live(
             Ok(statement) => statement,
             Err(error) => {
                 let detail = format!("could not prepare the sweep: {error}");
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_ZCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -381,7 +373,7 @@ fn collect_from_live(
             // the position), so one scan never processes a row twice.
             Ok(swept) => raw_rows.extend(swept),
             Err(detail) => {
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_ZCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -422,7 +414,7 @@ fn collect_from_live(
         }
     }
 
-    let stats = store.apply_scan(
+    let stats = match store.apply_scan_at(generation,
         USAGE_SOURCE_ZCODE,
         SourceScan {
             watermark_ms: new_watermark,
@@ -433,13 +425,19 @@ fn collect_from_live(
             files: Vec::new(),
             batch_end,
         },
-    );
+    ) { Ok(stats) => stats, Err(detail) => return ZcodeScanOutcome::ReadFailure(detail) };
+    if store.cursor(USAGE_SOURCE_ZCODE).is_some_and(|cursor| cursor.state == SourceState::ScanCeiling) {
+        return ZcodeScanOutcome::Bounded {
+            accepted: stats.accepted, duplicates: stats.duplicates, rejected: stats.rejected,
+            watermark_ms: store.cursor(USAGE_SOURCE_ZCODE).map(|cursor| cursor.watermark_ms).unwrap_or(0),
+        };
+    }
     if bounded {
         // Surface the deferred remainder through the existing source
         // diagnostics; the state heals to `ok` on the scan that drains
         // the window (apply_scan), and progress is observable through
         // the advancing watermark.
-        store.mark_source_state(
+        store.mark_source_state_at(generation,
             USAGE_SOURCE_ZCODE,
             SourceState::ScanCeiling,
             Some(format!(
@@ -609,39 +607,6 @@ fn normalize_provider(raw: &str) -> Option<String> {
         return None;
     }
     Some(family.to_string())
-}
-
-/// Removes the snapshot directory whatever happens to the read.
-struct SnapshotDirGuard {
-    path: PathBuf,
-}
-
-impl Drop for SnapshotDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Copies the database and its `-wal` sidecar into a fresh temporary
-/// directory. The source files are only ever opened for reading by the
-/// copy calls themselves. The `-shm` sidecar is deliberately not copied:
-/// it is a transient shared-memory index the copy rebuilds from the
-/// copied WAL.
-fn snapshot_database(db_path: &Path, wal_path: &Path) -> Result<SnapshotDirGuard, String> {
-    let dir = std::env::temp_dir().join(format!(
-        "limitscope-zcode-usage-snapshot-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not prepare a snapshot directory: {error}"))?;
-    let guard = SnapshotDirGuard { path: dir };
-    fs::copy(db_path, guard.path.join("db.sqlite"))
-        .map_err(|error| format!("could not copy the database: {error}"))?;
-    if wal_path.exists() {
-        fs::copy(wal_path, guard.path.join("db.sqlite-wal"))
-            .map_err(|error| format!("could not copy the database WAL: {error}"))?;
-    }
-    Ok(guard)
 }
 
 /// Verifies the snapshot carries a `model_usage` table with every column
@@ -896,7 +861,7 @@ mod tests {
     }
 
     fn enable(store: &crate::usage_intelligence::UsageIntelligenceStore) {
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
     }
 
     // 1. disabled = zero probes: the resolver is never even called.
@@ -1921,7 +1886,7 @@ mod tests {
         let collection_started_at = store.collection_started_at().unwrap();
 
         // Disabled: rows completed now must never be imported later.
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         for index in 0..3 {
             insert(
                 &fix.connection,
@@ -1941,7 +1906,7 @@ mod tests {
 
         // Re-enable: the next pass re-baselines at the current
         // high-water mark and imports nothing from the disabled period.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert!(
             store
                 .cursor(USAGE_SOURCE_ZCODE)
@@ -2026,11 +1991,11 @@ mod tests {
         let (store, _store_dir) = store_at("reenable-absent-store", Some(db.clone()));
         enable(&store);
         assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         // The source disappears (usage piles up elsewhere), then the
         // user re-enables.
         fs::remove_file(&db).unwrap();
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert_eq!(collect(&store), ZcodeScanOutcome::Absent);
         let cursor = store.cursor(USAGE_SOURCE_ZCODE).unwrap();
         assert_eq!(cursor.state, SourceState::SourceAbsent);
@@ -2077,7 +2042,7 @@ mod tests {
         let (store, _dir) = store_at("reenable-failure-store", Some(fix.path()));
         enable(&store);
         assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         insert_corrupt_completed_at(&fix.connection, "corrupt");
         insert(
             &fix.connection,
@@ -2093,7 +2058,7 @@ mod tests {
             0,
             1_000,
         );
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         // The corrupt row breaks the high-water query: fail closed, and
         // the pending flag must survive so a later pass retries the
         // fresh baseline rather than incrementally importing the gap.
@@ -2273,7 +2238,7 @@ mod tests {
             .unwrap_or(0);
 
         // The explicit enable exists ONLY inside this test path.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         let outcome = collect(&store);
         let ZcodeScanOutcome::Baseline { watermark_ms } = outcome else {
             panic!("expected a baseline on the live source, got {outcome:?}");
@@ -2339,6 +2304,33 @@ mod tests {
     //     cycle — and a disabled store's cycle performs no probe at all
     //     (for either source).
     #[tokio::test]
+    async fn large_fixture_collection_does_not_delay_quota_completion() {
+        use crate::runtime::RuntimeCore;
+        let fix = fixture("large-isolation");
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for i in 0..60_000 { insert_completed(&fix.connection, &format!("large-{i}")); }
+        fix.connection.execute_batch("COMMIT").unwrap();
+        let (store, _dir) = store_at("large-isolation-store", Some(fix.path()));
+        let store = std::sync::Arc::new(store.with_opencode_db_resolver(Box::new(|| None)));
+        store.set_enabled(true).unwrap();
+        let started = std::time::Instant::now();
+        crate::usage_intelligence::run_collection_pass(&store);
+        let synchronous = started.elapsed();
+        store.clear_owned().unwrap();
+        let core = std::sync::Arc::new(RuntimeCore::with_injections(Vec::new(), 5, Box::new(|| 0),
+            Box::new(|| chrono::DateTime::from_timestamp_millis(NOW_MS).unwrap()))
+            .with_usage_intelligence_store(Some(store.clone())));
+        let started = std::time::Instant::now();
+        core.run_cycle().await;
+        let quota_completion = started.elapsed();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.is_collecting() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        }).await.unwrap();
+        assert!(store.cursor(USAGE_SOURCE_ZCODE).unwrap().baselined);
+        println!("60k SQLite rows: synchronous scan {:?}; detached quota completion {:?}; total completion {:?}", synchronous, quota_completion, started.elapsed());
+    }
+
+    #[tokio::test]
     async fn runtime_cycle_collects_enabled_and_never_probes_disabled() {
         use crate::runtime::RuntimeCore;
         use chrono::{DateTime, Utc};
@@ -2359,6 +2351,8 @@ mod tests {
             .with_codex_home_resolver(Box::new(move || Some(codex_home.clone())))
             .with_opencode_db_resolver(Box::new(|| None));
         enable(&store);
+        let store = std::sync::Arc::new(store);
+        let observed_store = store.clone();
         let core = std::sync::Arc::new(
             RuntimeCore::with_injections(
                 Vec::new(),
@@ -2366,9 +2360,12 @@ mod tests {
                 Box::new(|| 0),
                 Box::new(move || fixed_now),
             )
-            .with_usage_intelligence_store(Some(std::sync::Arc::new(store))),
+            .with_usage_intelligence_store(Some(store)),
         );
         core.run_cycle().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while observed_store.is_collecting() { tokio::time::sleep(std::time::Duration::from_millis(5)).await; }
+        }).await.unwrap();
         // The store moved into the runtime; observe the persisted state by
         // reopening the same file.
         let path = _dir

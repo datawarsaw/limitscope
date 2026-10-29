@@ -1482,7 +1482,7 @@ mod tests {
     }
 
     fn enable(store: &UsageIntelligenceStore) {
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
     }
 
     fn cursor_files(store: &UsageIntelligenceStore) -> Vec<SourceFileCursor> {
@@ -2699,7 +2699,7 @@ mod tests {
         ));
         assert_eq!(store.stored_events().len(), 1);
         let bytes_before = std::fs::read(&path).unwrap();
-        assert!(store.clear_owned());
+        assert!(store.clear_owned().unwrap());
         assert!(store.stored_events().is_empty());
         assert_eq!(store.collection_started_at(), None);
         // The next cycle re-baselines at the CURRENT EOF: the record
@@ -2978,7 +2978,7 @@ mod tests {
         );
 
         // The explicit enable exists ONLY inside this test path.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         let outcome = collect(&store);
         let CodexScanOutcome::Baseline { tracked, refused } = outcome else {
             panic!("expected a baseline on the live source, got {outcome:?}");

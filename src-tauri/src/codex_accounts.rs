@@ -158,6 +158,7 @@ struct PersistedCodexAccountsEnvelope {
 /// honors the configured accounts) and rewritten on every applied change
 /// from the settings lane.
 pub struct CodexAccountStore {
+    writable: bool,
     path: PathBuf,
     accounts: Mutex<Vec<CodexAccountConfig>>,
 }
@@ -165,6 +166,10 @@ pub struct CodexAccountStore {
 impl CodexAccountStore {
     pub fn open(path: PathBuf) -> Self {
         let store = Self {
+            writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
+                let normalized = serde_json::to_value(parse_envelope(&value.to_string())).ok();
+                value.get("accounts") == normalized.as_ref()
+            }),
             path,
             accounts: Mutex::new(default_accounts()),
         };
@@ -182,32 +187,19 @@ impl CodexAccountStore {
     /// a restart falls back to the defaults rather than to a stale file
     /// silently contradicting the UI.
     pub fn set_accounts(&self, accounts: &[CodexAccountConfig]) -> Result<(), io::Error> {
+        if !self.writable { return Err(io::Error::other("Unsupported or unavailable account store")); }
         let normalized = normalize_accounts(accounts);
-        {
-            let mut state = self.accounts.lock().unwrap();
-            if *state == normalized {
-                return Ok(());
-            }
-            *state = normalized;
-        }
-        self.persist()
-    }
-
-    fn persist(&self) -> Result<(), io::Error> {
+        let mut state = self.accounts.lock().unwrap();
         let envelope = PersistedCodexAccountsEnvelope {
             version: SCHEMA_VERSION,
-            accounts: serde_json::to_value(self.accounts())
-                .ok()
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default(),
+            accounts: serde_json::to_value(&normalized)?.as_array().cloned().unwrap_or_default(),
         };
-        let json = serde_json::to_string_pretty(&envelope)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let json = serde_json::to_vec(&envelope)?;
+        if fs::read(&self.path).ok().as_deref() != Some(json.as_slice()) {
+            crate::durable_file::replace(&self.path, &json)?;
         }
-        fs::write(&temp_path, json.as_bytes()).and_then(|()| fs::rename(&temp_path, &self.path))
+        *state = normalized;
+        Ok(())
     }
 
     fn load_from_disk(&self) {
@@ -290,6 +282,39 @@ mod tests {
     fn remove_store(path: &PathBuf) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn applying_defaults_after_semantic_corruption_really_repairs_disk() {
+        let path = store_path("defaults-after-corruption");
+        fs::write(&path, r#"{"version":1,"accounts":"broken"}"#).unwrap();
+        let store = CodexAccountStore::open(path.clone());
+        store.set_accounts(&store.accounts()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(value["accounts"].is_array());
+        // Remove only this fixture's preserved recovery copies.
+        for entry in fs::read_dir(path.parent().unwrap()).unwrap().filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{}.recovery-", path.file_stem().unwrap().to_string_lossy())) {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        remove_store(&path);
+    }
+
+    #[test]
+    fn failed_write_does_not_change_memory_and_identical_retry_succeeds() {
+        let path = store_path("failed-retry");
+        let store = CodexAccountStore::open(path.clone());
+        let before = store.accounts();
+        let mut accounts = before.clone();
+        accounts[0].alias = "Retry".into();
+        fs::create_dir(&path).unwrap();
+        assert!(store.set_accounts(&accounts).is_err());
+        assert_eq!(store.accounts(), before);
+        fs::remove_dir(&path).unwrap();
+        store.set_accounts(&accounts).unwrap();
+        assert_eq!(CodexAccountStore::open(path.clone()).accounts(), accounts);
+        remove_store(&path);
     }
 
     #[test]

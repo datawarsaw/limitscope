@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: async () => () => {} }));
 
 vi.mock("@tauri-apps/plugin-autostart", () => ({
   isEnabled: vi.fn().mockResolvedValue(false),
@@ -26,7 +27,9 @@ function simulateTauri(): void {
 }
 
 beforeEach(() => {
-  mocks.invoke.mockImplementation(async (command) => {
+  mocks.invoke.mockImplementation(async (command, args) => {
+    if (command === "get_operational_settings") return { revision: 0, quotaNotifications: false, monitored: {} };
+    if (command === "set_quota_notifications_enabled") return { revision: 1, quotaNotifications: args.enabled, monitored: {} };
     if (command === "get_codex_accounts") return DEFAULT_SETTINGS.codexAccounts.accounts;
     if (command === "get_usage_intelligence") return { enabled: false };
   });
@@ -40,45 +43,23 @@ afterEach(() => {
 });
 
 describe("useSettings quota notification forwarding", () => {
-  it("forwards the persisted toggle to the runtime lane on attach", async () => {
+  it("hydrates Rust notification preference without writing stale WebView settings", async () => {
     simulateTauri();
-    window.localStorage.setItem(
-      SETTINGS_STORAGE_KEY,
-      JSON.stringify({ ...DEFAULT_SETTINGS, quotaNotifications: true }),
-    );
-    renderHook(() => useSettings());
-    await waitFor(() => {
-      expect(mocks.invoke).toHaveBeenCalledWith(
-        "set_quota_notifications_enabled",
-        { enabled: true },
-      );
-    });
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({ ...DEFAULT_SETTINGS, quotaNotifications: true }));
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("get_operational_settings"));
+    await waitFor(() => expect(result.current.settings.quotaNotifications).toBe(false));
+    expect(mocks.invoke.mock.calls.some(([command]) => command === "set_quota_notifications_enabled")).toBe(false);
   });
 
-  it("forwards every toggle change and persists it", async () => {
+  it("persists an explicit notification change through the Rust owner", async () => {
     simulateTauri();
     const { result } = renderHook(() => useSettings());
-    await waitFor(() => {
-      expect(mocks.invoke).toHaveBeenCalledWith(
-        "set_quota_notifications_enabled",
-        { enabled: false },
-      );
-    });
+    await waitFor(() => expect(mocks.invoke).toHaveBeenCalledWith("get_operational_settings"));
     act(() => result.current.setQuotaNotifications(true));
-    await waitFor(() => {
-      expect(mocks.invoke).toHaveBeenCalledWith(
-        "set_quota_notifications_enabled",
-        { enabled: true },
-      );
-    });
-    expect(
-      JSON.parse(window.localStorage.getItem(SETTINGS_STORAGE_KEY)!)
-        .quotaNotifications,
-    ).toBe(true);
-    const notificationCalls = mocks.invoke.mock.calls.filter(
-      ([command]) => command === "set_quota_notifications_enabled",
-    );
-    expect(notificationCalls).toHaveLength(2);
+    await waitFor(() => expect(result.current.settings.quotaNotifications).toBe(true));
+    expect(mocks.invoke).toHaveBeenCalledWith("set_quota_notifications_enabled", { enabled: true });
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "set_quota_notifications_enabled")).toHaveLength(1);
   });
 
   it("reads the Usage Intelligence opt-in on attach and writes only an explicit change", async () => {

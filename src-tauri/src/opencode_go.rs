@@ -55,6 +55,8 @@ pub struct OpenCodeGoLimitWindow {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenCodeGoAccount {
+    #[serde(skip)]
+    pub identity: Option<String>,
     pub key_hint: String,
 }
 
@@ -424,7 +426,7 @@ pub(crate) fn key_tail(key: &str) -> Option<String> {
 }
 
 fn account_hint(key: &str) -> Option<OpenCodeGoAccount> {
-    key_tail(key).map(|key_hint| OpenCodeGoAccount { key_hint })
+    key_tail(key).map(|key_hint| OpenCodeGoAccount { identity: Some(crate::credential_identity::fingerprint("opencode-go", key)), key_hint })
 }
 
 // ---------- HTTP ----------
@@ -467,7 +469,7 @@ async fn fetch_usage_for_key(key: &OpenCodeGoKey) -> Result<OpenCodeGoUsage, Pro
     // The identity string matches the attribution the success path builds
     // (`build_opencode_attribution` in the runtime), so the failure path and
     // the retained snapshot compare like-for-like.
-    let identity = account_hint(&key.0).map(|account| format!("key:{}", account.key_hint));
+    let identity = Some(crate::credential_identity::fingerprint("opencode-go", &key.0));
     let client = http_client()?;
     let response = client
         .get(USAGE_URL)

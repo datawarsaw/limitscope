@@ -63,6 +63,8 @@ pub struct GrokLimitWindow {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GrokAccount {
+    #[serde(skip)]
+    pub identity: Option<String>,
     pub id: String,
     pub source: String,
 }
@@ -303,13 +305,14 @@ fn mask_account_id(id: &str) -> String {
 /// The identity string the success attribution (`build_grok_attribution` in
 /// the runtime) and every post-resolution failure build from the credential
 /// actually attempted, so the runtime's last-good guard compares like-for-like.
-/// Keys on the store-agnostic masked account id: the same account seen
-/// through a different store is the same identity.
+/// Keys on the full credential fingerprint; display ids never establish ownership.
+/// Token rotation creates a separate partition even for the same account.
 fn credential_identity(credential: &GrokCredential) -> Option<String> {
-    credential
-        .account_id
-        .as_deref()
-        .map(|id| format!("xai:{}", mask_account_id(id)))
+    Some(crate::credential_identity::fingerprint("grok", &credential.token.0))
+}
+
+pub(crate) fn current_identity() -> Option<String> {
+    resolve_credential(Utc::now()).ok().and_then(|credential| credential_identity(&credential))
 }
 
 fn finite_number(value: Option<&Value>) -> Option<f64> {
@@ -968,8 +971,7 @@ async fn fetch_usage_with_credential(credential: &GrokCredential) -> Result<Grok
         .account_id
         .clone()
         .or_else(|| jwt_sub(&credential.token.0));
-    let account = credential.account_id.as_deref().map(|id| GrokAccount {
-        id: mask_account_id(id),
+    let account = credential.account_id.as_deref().map(|id| GrokAccount { identity: credential_identity(credential), id: mask_account_id(id),
         source: credential.source.to_string(),
     });
 
@@ -2150,8 +2152,7 @@ mod tests {
         let usage = assemble_usage(
             CreditsOutcome::Windows(weekly_windows()),
             Ok(LegacyOutcome::NoWindow),
-            Some(GrokAccount {
-                id: mask_account_id("7a2d5abe1234567890"),
+            Some(GrokAccount { identity: None, id: mask_account_id("7a2d5abe1234567890"),
                 source: "opencodex".to_string(),
             }),
         )
@@ -2178,8 +2179,7 @@ mod tests {
         ] {
             let usage = GrokUsage {
                 limits: vec![],
-                account: Some(GrokAccount {
-                    id: "abcd1234".to_string(),
+                account: Some(GrokAccount { identity: None, id: "abcd1234".to_string(),
                     source: source.to_string(),
                 }),
             };
@@ -2247,8 +2247,8 @@ mod tests {
             source: "opencodex",
         };
         assert_eq!(
-            credential_identity(&credential).as_deref(),
-            Some("xai:7a2d5abe…")
+            credential_identity(&credential),
+            Some(crate::credential_identity::fingerprint("grok", "access"))
         );
         // No account id: no identity anywhere — the runtime keeps its
         // conservative retention behavior.
@@ -2257,7 +2257,7 @@ mod tests {
             account_id: None,
             source: "grok-cli",
         };
-        assert_eq!(credential_identity(&anonymous), None);
+        assert_eq!(credential_identity(&anonymous), credential_identity(&credential));
     }
 
     #[test]

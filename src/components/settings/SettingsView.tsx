@@ -228,6 +228,7 @@ export function SettingsView({
         ))}
       </nav>
       <div className="settings-content">
+      {startupError ? <p className="setting-error" role="alert">{startupError}</p> : null}
       <div hidden={section !== "general"}>
       <h2 className="settings-page-title">General</h2>
       <section className="settings-section" aria-labelledby="settings-general">
@@ -310,7 +311,6 @@ export function SettingsView({
           error={updateError} onCheck={onCheckForUpdates} onInstall={onInstallUpdate}
           onDismiss={onDismissUpdate}
         />
-        {startupError ? <p className="setting-error" role="alert">Could not update the startup setting: {startupError}</p> : null}
       </section>
       </div>
       <div hidden={section !== "providers"}>

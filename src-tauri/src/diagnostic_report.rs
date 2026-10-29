@@ -196,8 +196,7 @@ mod tests {
                     used_percent: 8.4,
                     reset_at: Some("2026-10-05T00:00:00.000Z".to_string()),
                 }],
-                account: Some(OpenCodeGoAccount {
-                    key_hint: "avmF".to_string(),
+                account: Some(OpenCodeGoAccount { identity: Some("key:avmF".into()), key_hint: "avmF".to_string(),
                 }),
             }),
             now_ms,

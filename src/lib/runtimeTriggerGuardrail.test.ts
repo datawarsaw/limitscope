@@ -32,6 +32,7 @@ const ALLOWED_COMMANDS = new Set([
   // registered and which are still polled. TS never fetches.
   "set_codex_accounts",
   "get_codex_accounts",
+  "get_operational_settings",
   "request_refresh",
   "request_refresh_on_reconnect",
   // Wallet refresh rides the same runtime: it asks the existing owner to

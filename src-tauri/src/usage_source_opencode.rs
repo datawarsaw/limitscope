@@ -19,16 +19,10 @@
 //!
 //! # Read-only access (the hard boundary)
 //!
-//! The live database and its `-wal` / `-shm` sidecars are never opened by
-//! this module. Every collection pass copies the database plus its `-wal`
-//! sidecar into a fresh temporary directory and queries only the copy —
-//! the same snapshot pattern the ZCode reader uses. The source files are
-//! only ever touched by the copy calls themselves (read handles), never
-//! locked, never written, never checkpointed, never migrated; the `-shm`
-//! is a transient index the copy rebuilds for itself. A WAL copied
-//! mid-append replays only the committed, checksummed prefix, so the
-//! snapshot is a coherent committed state; a torn copy fails closed at
-//! open or query time.
+//! SQLite Online Backup reads the live source in read-only mode, with normal
+//! reader/WAL coordination, into a bounded in-memory destination. No SQL
+//! writes, migrations or checkpoint commands target the source. A deadline,
+//! size ceiling and quick_check reject unusable snapshots before cursor commits.
 //!
 //! # Opt-in and probing
 //!
@@ -192,11 +186,15 @@ pub enum OpencodeScanOutcome {
 /// Runs one collection pass. The disabled gate is first: a disabled store
 /// returns without resolving the source path.
 pub fn collect(store: &UsageIntelligenceStore) -> OpencodeScanOutcome {
+    collect_at(store, store.generation())
+}
+pub(crate) fn collect_at(store: &UsageIntelligenceStore, generation: u64) -> OpencodeScanOutcome {
+    if !store.generation_current(generation) { return OpencodeScanOutcome::Disabled; }
     if !store.enabled() {
         return OpencodeScanOutcome::Disabled;
     }
     let Some(db_path) = (store.opencode_db_resolver())() else {
-        store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::SourceAbsent, None);
+        store.mark_source_state_at(generation, USAGE_SOURCE_OPENCODE, SourceState::SourceAbsent, None);
         return OpencodeScanOutcome::Absent;
     };
     // Existence check (the first and only probe, post opt-in): a missing
@@ -204,7 +202,7 @@ pub fn collect(store: &UsageIntelligenceStore) -> OpencodeScanOutcome {
     let db_meta = match fs::metadata(&db_path) {
         Ok(meta) => meta,
         Err(_) => {
-            store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::SourceAbsent, None);
+            store.mark_source_state_at(generation, USAGE_SOURCE_OPENCODE, SourceState::SourceAbsent, None);
             return OpencodeScanOutcome::Absent;
         }
     };
@@ -229,35 +227,26 @@ pub fn collect(store: &UsageIntelligenceStore) -> OpencodeScanOutcome {
 
     let fingerprint = current_fingerprint(&db_path, &wal_path);
 
-    collect_from_live(&db_path, &wal_path, store, fingerprint)
+    collect_from_live(&db_path, &wal_path, store, fingerprint, generation)
 }
 
-/// Snapshot-copies the database (plus WAL) and runs the baseline or
-/// incremental read against the copy.
+/// Takes a consistent in-memory snapshot and reads its baseline or increment.
 fn collect_from_live(
     db_path: &Path,
-    wal_path: &Path,
+    _wal_path: &Path,
     store: &UsageIntelligenceStore,
     fingerprint: Option<SourceFingerprint>,
+    generation: u64,
 ) -> OpencodeScanOutcome {
-    let guard = match snapshot_database(db_path, wal_path) {
-        Ok(guard) => guard,
-        Err(detail) => {
-            store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
-            return OpencodeScanOutcome::ReadFailure(read_failure_detail());
-        }
-    };
-    let snapshot_db = guard.path.join("opencode.db");
-    let connection = match rusqlite::Connection::open(&snapshot_db) {
+    let connection = match crate::sqlite_snapshot::snapshot(db_path) {
         Ok(connection) => connection,
-        Err(error) => {
-            let detail = format!("could not open the snapshot: {error}");
-            store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
-            return OpencodeScanOutcome::ReadFailure(read_failure_detail());
+        Err(detail) => {
+            store.mark_source_state_at(generation, USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail.clone()));
+            return OpencodeScanOutcome::ReadFailure(detail);
         }
     };
     if let Err(detail) = verify_schema(&connection) {
-        store.mark_source_state(
+        store.mark_source_state_at(generation,
             USAGE_SOURCE_OPENCODE,
             SourceState::SchemaUnsupported,
             Some(detail),
@@ -291,7 +280,7 @@ fn collect_from_live(
             Ok(max) => max,
             Err(error) => {
                 let detail = format!("baseline high-water query failed: {error}");
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_OPENCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -300,7 +289,10 @@ fn collect_from_live(
             }
         };
         let watermark_ms = max_updated.map(|max| max + 1).unwrap_or(0);
-        store.establish_baseline(USAGE_SOURCE_OPENCODE, watermark_ms, fingerprint);
+        store.establish_baseline_at(generation, USAGE_SOURCE_OPENCODE, watermark_ms, fingerprint);
+        if !store.generation_current(generation) || !store.last_write_succeeded() {
+            return OpencodeScanOutcome::ReadFailure("Baseline not committed".into());
+        }
         return OpencodeScanOutcome::Baseline { watermark_ms };
     }
 
@@ -358,7 +350,7 @@ fn collect_from_live(
         Ok(statement) => statement,
         Err(error) => {
             let detail = format!("could not prepare the scan: {error}");
-            store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
+            store.mark_source_state_at(generation, USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
             return OpencodeScanOutcome::ReadFailure(read_failure_detail());
         }
     };
@@ -369,7 +361,7 @@ fn collect_from_live(
     let mut forward = match collect_rows(rows) {
         Ok(rows) => rows,
         Err(detail) => {
-            store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
+            store.mark_source_state_at(generation, USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, Some(detail));
             return OpencodeScanOutcome::ReadFailure(read_failure_detail());
         }
     };
@@ -404,7 +396,7 @@ fn collect_from_live(
             Ok(statement) => statement,
             Err(error) => {
                 let detail = format!("could not prepare the sweep: {error}");
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_OPENCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -422,7 +414,7 @@ fn collect_from_live(
             // the position), so one scan never processes a row twice.
             Ok(swept) => raw_rows.extend(swept),
             Err(detail) => {
-                store.mark_source_state(
+                store.mark_source_state_at(generation,
                     USAGE_SOURCE_OPENCODE,
                     SourceState::ReadFailure,
                     Some(detail),
@@ -466,7 +458,7 @@ fn collect_from_live(
         }
     }
 
-    let stats = store.apply_scan(
+    let stats = match store.apply_scan_at(generation,
         USAGE_SOURCE_OPENCODE,
         SourceScan {
             watermark_ms: new_watermark,
@@ -477,13 +469,19 @@ fn collect_from_live(
             files: Vec::new(),
             batch_end,
         },
-    );
+    ) { Ok(stats) => stats, Err(detail) => return OpencodeScanOutcome::ReadFailure(detail) };
+    if store.cursor(USAGE_SOURCE_OPENCODE).is_some_and(|cursor| cursor.state == SourceState::ScanCeiling) {
+        return OpencodeScanOutcome::Bounded {
+            accepted: stats.accepted, duplicates: stats.duplicates, rejected: stats.rejected, usage_not_reported: stats.usage_not_reported,
+            watermark_ms: store.cursor(USAGE_SOURCE_OPENCODE).map(|cursor| cursor.watermark_ms).unwrap_or(0),
+        };
+    }
     if bounded {
         // Surface the deferred remainder through the existing source
         // diagnostics; the state heals to `ok` on the scan that drains
         // the window (apply_scan), and progress is observable through
         // the advancing watermark.
-        store.mark_source_state(
+        store.mark_source_state_at(generation,
             USAGE_SOURCE_OPENCODE,
             SourceState::ScanCeiling,
             Some(format!(
@@ -816,39 +814,6 @@ fn normalize_model(raw: Option<&str>) -> Option<String> {
         return None;
     }
     Some(model.to_string())
-}
-
-/// Removes the snapshot directory whatever happens to the read.
-struct SnapshotDirGuard {
-    path: PathBuf,
-}
-
-impl Drop for SnapshotDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Copies the database and its `-wal` sidecar into a fresh temporary
-/// directory. The source files are only ever opened for reading by the
-/// copy calls themselves. The `-shm` sidecar is deliberately not copied:
-/// it is a transient shared-memory index the copy rebuilds from the
-/// copied WAL.
-fn snapshot_database(db_path: &Path, wal_path: &Path) -> Result<SnapshotDirGuard, String> {
-    let dir = std::env::temp_dir().join(format!(
-        "limitscope-opencode-usage-snapshot-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&dir)
-        .map_err(|error| format!("could not prepare a snapshot directory: {error}"))?;
-    let guard = SnapshotDirGuard { path: dir };
-    fs::copy(db_path, guard.path.join("opencode.db"))
-        .map_err(|error| format!("could not copy the database: {error}"))?;
-    if wal_path.exists() {
-        fs::copy(wal_path, guard.path.join("opencode.db-wal"))
-            .map_err(|error| format!("could not copy the database WAL: {error}"))?;
-    }
-    Ok(guard)
 }
 
 /// Verifies the snapshot carries the `message` table with every column
@@ -1184,7 +1149,7 @@ mod tests {
     }
 
     fn enable(store: &UsageIntelligenceStore) {
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
     }
 
     // 1. disabled = zero probes: the resolver is never even called.
@@ -2108,7 +2073,7 @@ mod tests {
         let collection_started_at = store.collection_started_at().unwrap();
 
         // Disabled: rows committed now must never be imported later.
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         for index in 0..3 {
             fix.insert_assistant(
                 &format!("msg-gap-{index}"),
@@ -2120,7 +2085,7 @@ mod tests {
 
         // Re-enable: the next pass re-baselines at the current
         // high-water mark and imports nothing from the disabled period.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert!(
             store
                 .cursor(USAGE_SOURCE_OPENCODE)
@@ -2187,9 +2152,9 @@ mod tests {
         let (store, _store_dir) = store_at("reenable-absent-store", Some(db.clone()));
         enable(&store);
         assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         fs::remove_file(&db).unwrap();
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert_eq!(collect(&store), OpencodeScanOutcome::Absent);
         let cursor = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
         assert_eq!(cursor.state, SourceState::SourceAbsent);
@@ -2231,7 +2196,7 @@ mod tests {
         let (store, _dir) = store_at("reenable-failure-store", Some(fix.path()));
         enable(&store);
         assert!(matches!(collect(&store), OpencodeScanOutcome::Baseline { .. }));
-        store.set_enabled(false);
+        store.set_enabled(false).unwrap();
         fix.insert_corrupt_time_updated("msg-corrupt");
         fix.insert_assistant(
             "msg-gap",
@@ -2239,7 +2204,7 @@ mod tests {
             NOW_MS - 20 * MIN,
             &AssistantFixture::completed(NOW_MS - 24 * MIN),
         );
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         assert!(matches!(
             collect(&store),
             OpencodeScanOutcome::ReadFailure(_)
@@ -2688,7 +2653,7 @@ mod tests {
         assert_eq!(accepted, 1);
 
         let db_before = fs::read(fix.path()).unwrap();
-        assert!(store.clear_owned());
+        assert!(store.clear_owned().unwrap());
         assert_eq!(store.cursor(USAGE_SOURCE_OPENCODE), None, "cursor reset");
         assert_eq!(store.collection_started_at(), None);
         assert!(store.enabled(), "clearing is not disabling");
@@ -2771,7 +2736,7 @@ mod tests {
             .unwrap_or(0);
 
         // The explicit enable exists ONLY inside this test path.
-        store.set_enabled(true);
+        store.set_enabled(true).unwrap();
         let outcome = collect(&store);
         let OpencodeScanOutcome::Baseline { watermark_ms } = outcome else {
             panic!("expected a baseline on the live source, got {outcome:?}");
