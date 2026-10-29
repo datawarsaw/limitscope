@@ -1011,6 +1011,46 @@ body {
   cursor: pointer;
 }
 
+/* The OpenAI/Codex account rows: a name, a credential reference and a
+   monitoring switch, one block per account. The path input is editable
+   text — the folder is chosen by the account owner, who logs that account
+   in themselves, so the app never picks a credential for them. */
+.codex-account {
+  padding: 6px 0 10px;
+  border-top: 1px solid var(--divider);
+}
+
+.codex-account:first-child {
+  border-top: none;
+}
+
+.codex-account-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.codex-account-field {
+  cursor: default;
+}
+
+.codex-account-input {
+  flex: 1 1 55%;
+  min-width: 0;
+  background: var(--field-bg);
+  color: var(--text);
+  border: 1px solid var(--card-border);
+  border-radius: 6px;
+  padding: 4px 7px;
+  font-size: 11.5px;
+  font-family: inherit;
+}
+
+.codex-account-input:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+
 /* v0.6 provider presentation preferences: compact rows that stay inside
    the drawer at 360px. Name flexes and ellipsizes; the visibility switch
    and reorder buttons are fixed-width so the list never overflows. */

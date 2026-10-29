@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import userEvent from "@testing-library/user-event";
 import { UsageView } from "./UsageView";
 import type {
+  CodexScope,
   UsageAnalytics,
   UsageAnalyticsQuery,
   UsageHeatmapDay,
@@ -11,6 +12,7 @@ import type {
   UsageTrendSeries,
 } from "../../lib/usageAnalytics";
 import type { ProviderUsage } from "../../types";
+import { isCodexProviderId } from "../../lib/providerIds";
 
 const HOUR = 60 * 60 * 1000;
 const NOW = Date.parse("2026-09-28T22:00:00Z");
@@ -59,6 +61,7 @@ function makeAnalytics(overrides: {
   peakUsedPercent?: number;
   trends?: UsageTrendSeries[];
   heatmapObserved?: boolean[];
+  codexIdentityScope?: CodexScope;
 } = {}): UsageAnalytics {
   const trends = overrides.trends ?? [makeSeries()];
   const peakUsed = overrides.peakUsedPercent ?? 84;
@@ -122,7 +125,23 @@ function makeAnalytics(overrides: {
     trends,
     gapSemantics: "notObservedNeverZeroFilled",
     availabilityInference: "none",
+    codexIdentityScope: overrides.codexIdentityScope ?? scopeFor(usages),
   };
+}
+
+/**
+ * The Codex identity scope a usage list implies. It mirrors the view's own
+ * derivation, so a fixture response and the rendered list describe the same
+ * session.
+ */
+function scopeFor(list: ProviderUsage[]): CodexScope {
+  return list
+    .filter((usage) => isCodexProviderId(usage.id))
+    .map((usage) => ({
+      providerId: usage.id,
+      generation: 0,
+      identity: usage.account?.identity ?? null,
+    }));
 }
 
 function emptyAnalytics(range: "24h" | "7d" = "24h"): UsageAnalytics {
@@ -196,6 +215,22 @@ describe("Usage view presentation semantics", () => {
     await screen.findByText("Peak observed");
     expect(loader).toHaveBeenCalledTimes(1);
     expect(loader).toHaveBeenCalledWith({ range: "24h" });
+  });
+
+  it("clears analytics immediately when the Codex identity changes", async () => {
+    let resolveNext!: (value: UsageAnalytics) => void;
+    const account = (identity: string): ProviderUsage[] => [{ ...usages[0], account: { label: "account", identity } }];
+    loader.mockImplementationOnce(async () =>
+      makeAnalytics({ codexIdentityScope: scopeFor(account("user-a")) }),
+    );
+    loader.mockImplementationOnce(() => new Promise<UsageAnalytics>((resolve) => { resolveNext = resolve; }));
+    const { rerender } = renderView({ usages: account("user-a") });
+    await screen.findByText("Peak observed");
+    rerender(<UsageView usages={account("user-b")} scopeProviderId={null} onScopeProvider={vi.fn()} historyRevision={1} loader={loader} />);
+    expect(screen.queryByText("Peak observed")).toBeNull();
+    await waitFor(() => expect(loader).toHaveBeenCalledTimes(2));
+    resolveNext({ ...emptyAnalytics(), codexIdentityScope: scopeFor(account("user-b")) });
+    await screen.findByText(/LimitScope will build this view/);
   });
 
   it("queries 7d when the range control is pressed, keeping prior data visible", async () => {

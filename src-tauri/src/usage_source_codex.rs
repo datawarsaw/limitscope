@@ -13,6 +13,18 @@
 //! disabled, [`collect`] returns before the Codex home is even resolved —
 //! no path resolution, no stat, no directory enumeration, no file reads.
 //!
+//! # Currently disabled
+//!
+//! This reader is NOT called from production. A Codex rollout record cannot
+//! be bound to the active session — the rollout files carry no owner — so
+//! collecting them would attribute one user's token usage to another.
+//! While that ownership cannot be proven, the collector is switched off:
+//! `run_collection_pass` runs the ZCode and OpenCode sources only, and
+//! every read projection excludes the whole Codex source, including the
+//! records that were collected before. The reader and its tests are kept
+//! deliberately, so the parsing rules survive for the day the ownership
+//! boundary can be proven; nothing reaches it meanwhile.
+//!
 //! # Record selection (verified against the live corpus, 2026-10-06)
 //!
 //! - Modern rollouts (`session_meta.cli_version >= 0.153.0`) carry
@@ -1535,7 +1547,7 @@ mod tests {
         let outcome = collect(&store);
         assert_eq!(outcome, CodexScanOutcome::Baseline { tracked: 2, refused: 0 });
         assert!(
-            store.events().is_empty(),
+            store.stored_events().is_empty(),
             "no historical event may be imported"
         );
         assert_eq!(store.collection_started_at(), Some(NOW_MS));
@@ -1549,8 +1561,8 @@ mod tests {
         // The aggregate stays empty: the backlog was skipped, not zeroed.
         let dto = store.aggregate(UsageRange::ThirtyDays, None);
         assert_eq!(dto.events_in_range, 0);
-        assert_eq!(dto.sources.len(), 1);
-        assert_eq!(dto.sources[0].source, USAGE_SOURCE_CODEX);
+        assert!(dto.sources.is_empty());
+        assert!(dto.source_coverage.is_empty());
     }
 
     // 4. unidentifiable files are refused: tracked at EOF, never read.
@@ -1599,7 +1611,7 @@ mod tests {
         .unwrap();
         let outcome = collect(&store);
         assert_eq!(outcome, CodexScanOutcome::Unchanged);
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
     }
 
     // 5. new files after baseline are read from byte 0.
@@ -1635,7 +1647,7 @@ mod tests {
         };
         assert_eq!(accepted, 1);
         assert_eq!(files_read, 1);
-        let events = store.events();
+        let events = store.stored_events();
         assert_eq!(events.len(), 1);
         assert_eq!(
             events[0].id,
@@ -1674,7 +1686,7 @@ mod tests {
             panic!("expected a collection, got {outcome:?}");
         };
         assert_eq!(accepted, 1, "only the appended record is ingested");
-        let events = store.events();
+        let events = store.stored_events();
         assert_eq!(events.len(), 1);
         assert!(events[0].id.ends_with("resp_2"));
     }
@@ -1728,7 +1740,7 @@ mod tests {
             panic!("expected a collection, got {outcome:?}");
         };
         assert_eq!(accepted, 1, "the completed line is ingested exactly once");
-        assert_eq!(store.events().len(), 1);
+        assert_eq!(store.stored_events().len(), 1);
     }
 
     // 8. the byte ceiling commits a safe prefix and the remainder is
@@ -1778,13 +1790,19 @@ mod tests {
             total_accepted, 900,
             "every deferred record is eventually ingested exactly once"
         );
-        assert_eq!(store.events().len(), 900);
+        assert_eq!(store.stored_events().len(), 900);
+        let stored_total: u64 = store
+            .stored_events()
+            .iter()
+            .map(|event| event.total_tokens)
+            .sum();
         let dto = store.aggregate(UsageRange::ThirtyDays, None);
         assert_eq!(
-            dto.totals.total_tokens,
+            stored_total,
             (900 * standard_dims().total()) as u64,
             "bounded scans never grow or shrink totals"
         );
+        assert_eq!(dto.totals.total_tokens, 0, "Codex is never query-visible");
     }
 
     // 9. the event ceiling bounds a cycle; the rest drains exactly.
@@ -1833,7 +1851,7 @@ mod tests {
         };
         assert_eq!(second_accepted, 6_000 - SCAN_EVENT_CEILING);
         assert_eq!(duplicates, 0, "no record is ingested twice");
-        assert_eq!(store.events().len(), 6_000);
+        assert_eq!(store.stored_events().len(), 6_000);
     }
 
     // 10. the file ceiling defers whole files; nothing is skipped.
@@ -1884,7 +1902,7 @@ mod tests {
         };
         assert_eq!(second_read, 5);
         assert_eq!(second_accepted, 5);
-        assert_eq!(store.events().len(), SCAN_FILE_CEILING + 5);
+        assert_eq!(store.stored_events().len(), SCAN_FILE_CEILING + 5);
     }
 
     // 11. truncation fails closed, preserves cursors, and recovers.
@@ -1914,7 +1932,7 @@ mod tests {
             "the cursor is preserved, not rewound to zero"
         );
         assert!(
-            store.events().is_empty(),
+            store.stored_events().is_empty(),
             "nothing is ingested from a failed-closed scan"
         );
         // Repairing the file (restoring + appending a fresh turn)
@@ -1961,7 +1979,7 @@ mod tests {
         let outcome = collect(&store);
         assert!(matches!(outcome, CodexScanOutcome::ReadFailure(_)));
         assert!(
-            store.events().is_empty(),
+            store.stored_events().is_empty(),
             "replaced content is never ingested as continuation"
         );
     }
@@ -2004,7 +2022,7 @@ mod tests {
             panic!("expected a collection, got {outcome:?}");
         };
         assert_eq!(accepted, 2);
-        let events = store.events();
+        let events = store.stored_events();
         assert_eq!(events.len(), 2);
         let grok = events.iter().find(|e| e.id.ends_with("resp_3")).unwrap();
         assert_eq!(grok.provider, "xai");
@@ -2049,7 +2067,7 @@ mod tests {
             collect(&store),
             CodexScanOutcome::Collected { accepted: 1, .. }
         ));
-        let event = &store.events()[0];
+        let event = &store.stored_events()[0];
         assert_eq!(event.provider, "unknown");
         assert_eq!(event.model, "mystery-model-v9");
     }
@@ -2087,7 +2105,7 @@ mod tests {
         };
         assert_eq!(accepted, 0);
         assert_eq!(rejected, 1);
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
     }
 
     // 16. a mid-turn model switch poisons the turn: usage is rejected.
@@ -2155,7 +2173,7 @@ mod tests {
             panic!("expected a collection, got {outcome:?}");
         };
         assert_eq!(accepted, 1);
-        let event = &store.events()[0];
+        let event = &store.stored_events()[0];
         assert_eq!(
             event.id, "codex:eeeeeeee-1111-2222-3333-444444444444:7",
             "legacy identity is session + line ordinal"
@@ -2238,12 +2256,13 @@ mod tests {
         };
         assert_eq!(accepted, 1, "only the modern record is ingested");
         assert_eq!(rejected, 0, "the mirror is ignored, not rejected");
-        let dto = store.aggregate(UsageRange::ThirtyDays, None);
         assert_eq!(
-            dto.totals.total_tokens,
+            store.stored_events()[0].total_tokens,
             standard_dims().total() as u64,
-            "the mirror never doubles the total"
+            "the mirror never doubles the stored total"
         );
+        let dto = store.aggregate(UsageRange::ThirtyDays, None);
+        assert_eq!(dto.totals.total_tokens, 0);
 
         // A modern-version file with only token_count lines (observed in
         // the wild) contributes nothing: its mirrors have no twins here.
@@ -2295,7 +2314,7 @@ mod tests {
         };
         assert_eq!(accepted, 0, "the compaction artifact is never ingested");
         assert_eq!(rejected, 0, "it is a deliberate exclusion, not an error");
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
     }
 
     // 21. state_5.sqlite is not an additive source and is never read.
@@ -2367,7 +2386,7 @@ mod tests {
         .unwrap();
         let outcome = collect(&store);
         assert_eq!(outcome, CodexScanOutcome::Unchanged);
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
     }
 
     // 23. replay safety: identical records re-offered under the same ids
@@ -2399,8 +2418,8 @@ mod tests {
             collect(&store),
             CodexScanOutcome::Collected { accepted: 1, .. }
         ));
-        assert_eq!(store.events().len(), 1);
-        let first_id = store.events()[0].id.clone();
+        assert_eq!(store.stored_events().len(), 1);
+        let first_id = store.stored_events()[0].id.clone();
         // Re-parse the same record: the identity is byte-stable.
         let mut state = FileScanState::default();
         state
@@ -2422,7 +2441,7 @@ mod tests {
         // The idle source is not rescanned at all.
         let outcome = collect(&store);
         assert_eq!(outcome, CodexScanOutcome::Unchanged);
-        assert_eq!(store.events().len(), 1, "no duplicates from overlap");
+        assert_eq!(store.stored_events().len(), 1, "no duplicates from overlap");
     }
 
     // 24. invalid and malformed records reject instead of guessing.
@@ -2484,7 +2503,7 @@ mod tests {
         };
         assert_eq!(accepted, 0);
         assert_eq!(rejected, 7, "every invalid record is counted, none stored");
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
     }
 
     // 25. token normalization: the verified overlap semantics.
@@ -2525,7 +2544,7 @@ mod tests {
             collect(&store),
             CodexScanOutcome::Collected { accepted: 1, .. }
         ));
-        let event = &store.events()[0];
+        let event = &store.stored_events()[0];
         assert_eq!(event.input_tokens, 700, "input excludes both caches");
         assert_eq!(event.cache_read_tokens, 200);
         assert_eq!(event.cache_write_tokens, 100);
@@ -2678,10 +2697,10 @@ mod tests {
             collect(&store),
             CodexScanOutcome::Collected { accepted: 1, .. }
         ));
-        assert_eq!(store.events().len(), 1);
+        assert_eq!(store.stored_events().len(), 1);
         let bytes_before = std::fs::read(&path).unwrap();
         assert!(store.clear_owned());
-        assert!(store.events().is_empty());
+        assert!(store.stored_events().is_empty());
         assert_eq!(store.collection_started_at(), None);
         // The next cycle re-baselines at the CURRENT EOF: the record
         // written since the last ingest is backlog now, not history to
@@ -2691,7 +2710,7 @@ mod tests {
             outcome,
             CodexScanOutcome::Baseline { tracked: 1, refused: 0 }
         ));
-        assert!(store.events().is_empty(), "no backfill after clear");
+        assert!(store.stored_events().is_empty(), "no backfill after clear");
         // The foreign file is byte-identical through all of it.
         assert_eq!(std::fs::read(&path).unwrap(), bytes_before);
         // And collection continues forward from the new baseline.
@@ -2824,7 +2843,7 @@ mod tests {
             collect(&store),
             CodexScanOutcome::Collected { accepted: 1, .. }
         ));
-        let events = store.events();
+        let events = store.stored_events();
         assert_eq!(events.len(), 1);
         let rendered = serde_json::to_string(&events).unwrap();
         for forbidden in ["payload", "message", "instructions", "cwd", "text", "content"] {
@@ -2834,7 +2853,8 @@ mod tests {
             );
         }
         let dto = store.aggregate(UsageRange::ThirtyDays, None);
-        assert_eq!(dto.events_in_range, 1);
+        assert_eq!(dto.events_in_range, 0);
+        assert!(dto.sources.is_empty());
     }
 
     // 32. an oversized single line fails closed instead of skipping.
@@ -2865,7 +2885,7 @@ mod tests {
         let outcome = collect(&store);
         assert!(matches!(outcome, CodexScanOutcome::ReadFailure(_)));
         assert!(
-            store.events().is_empty(),
+            store.stored_events().is_empty(),
             "an oversized record is never partially ingested"
         );
     }
@@ -2965,7 +2985,7 @@ mod tests {
         };
         assert_eq!(tracked + refused, before.len(), "every file is accounted for");
         assert!(
-            store.events().is_empty(),
+            store.stored_events().is_empty(),
             "no historical event may be imported on the live baseline"
         );
         let cursor = store
@@ -3013,7 +3033,7 @@ mod tests {
         }
         println!(
             "live proof: baselined {tracked} rollout files at EOF ({refused} refused), imported {} events, {grew} file(s) appended by a live writer, all files metadata-untouched by the collector",
-            store.events().len(),
+            store.stored_events().len(),
         );
     }
 }

@@ -27,16 +27,19 @@
 //!   fresh cycle is never starved by the cycle it replaced);
 //! - validation: blank identifiers, non-finite percentages, unparseable
 //!   `observedAt`, and a present-but-invalid `account` reject the
-//!   observation; out-of-range percentages clamp, and an unparseable
-//!   `resetAt` degrades to absent;
+//!   observation; Codex load and record additionally require a v2-form
+//!   `chatgpt-v2:<64 lowercase hex>` identity on every stored row;
+//!   out-of-range percentages clamp, and an unparseable `resetAt` degrades
+//!   to absent;
 //! - self-healing: a corrupt or foreign-version blob degrades to empty (or
 //!   the salvageable per-entry subset) and the sanitized state is written
 //!   back, so corruption never survives to the next session and never
 //!   crashes startup;
-//! - account identities are provider-generated display-safe tokens
-//!   (`key:3456`, `xai:<id>`): non-blank, at most 128 characters, no
-//!   grouping separator — never credentials. Unattributed (legacy) entries
-//!   stay unattributed; import never attaches them to a proven account.
+//! - non-Codex account identities keep the provider-generated, display-safe
+//!   token contract (`key:3456`, `xai:<id>`). Codex history keeps only the
+//!   v2-form `chatgpt-v2:<64 lowercase hex>` identity on load and record;
+//!   legacy and unattributed Codex rows are discarded. Import rejects every
+//!   Codex row because this identity form did not exist in legacy storage.
 //!
 //! Persistence is one bounded JSON file (`quota-history-v1.json`) in the
 //! Tauri app-data directory — no database, no framework — written
@@ -45,7 +48,7 @@
 //! optional two; no token, key, or credential material can appear in the
 //! schema (pinned by tests).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -83,6 +86,10 @@ pub const HISTORY_FILE_NAME: &str = "quota-history-v1.json";
 
 const BLOB_VERSION: u32 = 2;
 
+const CODEX_PROVIDER_IDS: [&str; 2] = ["openai-codex", "openai-codex:secondary"];
+const CODEX_HISTORY_IDENTITY_PREFIX: &str = "chatgpt-v2:";
+const CODEX_HISTORY_IDENTITY_HEX_LEN: usize = 64;
+
 /// One percentage snapshot of a single quota window at a point in time —
 /// the exact wire shape the TS history produced (`QuotaObservation` in
 /// `src/lib/quotaHistory.ts`), so the prediction engine consumes Rust
@@ -106,7 +113,8 @@ pub struct QuotaObservation {
     /// `AccountAttribution.identity` token). Optional: providers that cannot
     /// prove an account stay unpartitioned. Different accounts of one
     /// provider never mix — dedup, bounds, and prediction input all key on
-    /// this field. A display-safe fingerprint token, never secret material.
+    /// this field. Codex rows require `chatgpt-v2:` plus 64 lowercase hex
+    /// characters; other providers keep their display-safe identity tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 }
@@ -346,9 +354,10 @@ impl QuotaHistoryStore {
     /// validated with the exact store rules; valid entries merge into the
     /// existing history (dedup makes a retry — or two windows importing
     /// concurrently — a no-op), invalid ones are counted and dropped, and
-    /// the legacy account identities are stored verbatim: unattributed
-    /// entries stay unattributed and can never be attached to a proven
-    /// account. Import never blocks startup on malformed data.
+    /// non-Codex account identities are stored verbatim. All Codex rows are
+    /// rejected: the legacy storage source predates the `chatgpt-v2:`
+    /// identity form, so it cannot establish account ownership. Import never
+    /// blocks startup on malformed data.
     pub fn import_legacy(&self, raw: &Value) -> ImportResult {
         let entries: Vec<&Value> = match raw {
             Value::Array(entries) => entries.iter().collect(),
@@ -362,6 +371,14 @@ impl QuotaHistoryStore {
         let mut valid = Vec::new();
         let mut rejected = 0;
         for entry in entries {
+            if entry
+                .get("providerId")
+                .and_then(Value::as_str)
+                .is_some_and(is_codex_history_provider)
+            {
+                rejected += 1;
+                continue;
+            }
             match normalize_observation(entry) {
                 Some(observation) => valid.push(observation),
                 None => rejected += 1,
@@ -464,6 +481,36 @@ fn valid_account_identity(value: &str) -> bool {
     !value.contains('\u{0}')
 }
 
+pub(crate) fn is_codex_history_provider(provider_id: &str) -> bool {
+    CODEX_PROVIDER_IDS.contains(&provider_id)
+}
+
+/// Codex history may only carry a provider-issued v2 account identity. The
+/// fixed prefix and lowercase SHA-256-sized hex body make unattributed,
+/// display-label, and retired identity formats distinguishable from a
+/// v2-form account partition. This is a format check only; no cryptographic
+/// verification is performed.
+fn valid_codex_history_identity(account: Option<&str>) -> bool {
+    let Some(account) = account else {
+        return false;
+    };
+    let Some(hex) = account.strip_prefix(CODEX_HISTORY_IDENTITY_PREFIX) else {
+        return false;
+    };
+    hex.len() == CODEX_HISTORY_IDENTITY_HEX_LEN
+        && hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn valid_history_account(provider_id: &str, account: Option<&str>) -> bool {
+    if is_codex_history_provider(provider_id) {
+        valid_codex_history_identity(account)
+    } else {
+        account.is_none_or(valid_account_identity)
+    }
+}
+
 /// Validates one raw observation (legacy import) and canonicalizes it, or
 /// returns `None` when it must not be stored. Rejected: non-object shapes,
 /// blank provider or window identifiers, non-finite percentages,
@@ -503,6 +550,9 @@ fn normalize_observation(raw: &Value) -> Option<QuotaObservation> {
             Some(value.to_string())
         }
     };
+    if !valid_history_account(provider_id, account.as_deref()) {
+        return None;
+    }
     Some(QuotaObservation {
         provider_id: provider_id.to_string(),
         window_label: window_label.to_string(),
@@ -533,15 +583,12 @@ fn validate_canonical(
     if let Some(reset_at) = &candidate.reset_at {
         candidate.reset_at = parse_epoch_ms(reset_at).map(canonical_timestamp);
     }
-    if let Some(account) = &candidate.account {
-        if !valid_account_identity(account) {
-            return None;
-        }
+    if !valid_history_account(&candidate.provider_id, candidate.account.as_deref()) {
+        return None;
     }
     // Already outside retention, or stamped implausibly far into the future:
     // storing either would only be pruned again on the next pass.
-    if observed_at_ms < cutoff_ms
-        || observed_at_ms - now_ms > QUOTA_HISTORY_CLOCK_SKEW_TOLERANCE_MS
+    if observed_at_ms < cutoff_ms || observed_at_ms - now_ms > QUOTA_HISTORY_CLOCK_SKEW_TOLERANCE_MS
     {
         return None;
     }
@@ -562,7 +609,8 @@ pub(crate) fn is_reset_boundary(prev: &QuotaObservation, curr: &QuotaObservation
     }
     match (&prev.reset_at, &curr.reset_at) {
         (Some(prev_r), Some(curr_r)) => {
-            if let (Some(prev_ms), Some(curr_ms)) = (parse_epoch_ms(prev_r), parse_epoch_ms(curr_r)) {
+            if let (Some(prev_ms), Some(curr_ms)) = (parse_epoch_ms(prev_r), parse_epoch_ms(curr_r))
+            {
                 curr_ms.saturating_sub(prev_ms) > 60_000
             } else {
                 prev_r != curr_r
@@ -584,10 +632,8 @@ pub(crate) fn is_reset_boundary(prev: &QuotaObservation, curr: &QuotaObservation
 /// - sorts by provider, account, window label, and time.
 fn apply_retention(observations: Vec<QuotaObservation>, now_ms: i64) -> Vec<QuotaObservation> {
     let cutoff = now_ms - QUOTA_HISTORY_RETENTION_MS;
-    let mut windows: HashMap<
-        (String, Option<String>, String),
-        HashMap<i64, QuotaObservation>,
-    > = HashMap::new();
+    let mut windows: HashMap<(String, Option<String>, String), HashMap<i64, QuotaObservation>> =
+        HashMap::new();
     for observation in observations {
         let Some(observed_at_ms) = parse_epoch_ms(&observation.observed_at) else {
             continue;
@@ -670,7 +716,9 @@ fn apply_retention(observations: Vec<QuotaObservation>, now_ms: i64) -> Vec<Quot
         }
         let mut compacted: Vec<QuotaObservation> = bucket_groups.into_values().collect();
         compacted.sort_by_key(|o| parse_epoch_ms(&o.observed_at).unwrap_or(0));
-        let tier2_start = compacted.len().saturating_sub(QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW);
+        let tier2_start = compacted
+            .len()
+            .saturating_sub(QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW);
         let kept_tier2 = compacted.into_iter().skip(tier2_start);
 
         result.extend(kept_tier2);
@@ -770,8 +818,9 @@ fn valid_time(value: &str) -> Option<String> {
 /// - a present freshness verdict requires a parseable `sourceUpdatedAt`;
 ///   the observation time is the source snapshot time when there is one,
 ///   otherwise the fetch time;
-/// - only a non-blank proven identity partitions history; a provider that
-///   cannot prove one records unattributed;
+/// - other providers may store a non-blank identity or history without
+///   attribution; Codex requires a v2-form `chatgpt-v2:<64
+///   lowercase hex>` identity and contributes nothing without one;
 /// - a non-blank window label and a finite percentage are required, while a
 ///   malformed sibling window is dropped without losing the rest.
 pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObservation> {
@@ -787,10 +836,7 @@ pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObserva
             continue;
         }
         let checked_at = valid_time(&usage.checked_at);
-        let source_updated_at = usage
-            .source_updated_at
-            .as_deref()
-            .and_then(valid_time);
+        let source_updated_at = usage.source_updated_at.as_deref().and_then(valid_time);
         if usage.data_freshness.is_some() && source_updated_at.is_none() {
             continue;
         }
@@ -803,6 +849,10 @@ pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObserva
             .and_then(|account| account.identity.as_deref())
             .filter(|identity| !identity.trim().is_empty())
             .map(str::to_string);
+        if is_codex_history_provider(&usage.id) && !valid_codex_history_identity(account.as_deref())
+        {
+            continue;
+        }
 
         for limit in &usage.limits {
             let window_label = limit.label.trim();
@@ -823,12 +873,233 @@ pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObserva
     observations
 }
 
+pub(crate) type CodexIdentityBindings = HashMap<String, String>;
+
+/// One configured Codex slot's observed identity state, captured in one
+/// runtime snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexSlotFence {
+    /// The generation the slot's identity was observed at. It advances on
+    /// every observed change of that slot's identity, including
+    /// `Some(a) -> None -> Some(a)`, so an identity string is never used
+    /// as a substitute for provenance.
+    pub(crate) generation: u64,
+    /// The observed identity. `None` when the slot exists but no local
+    /// login could be proven.
+    pub(crate) identity: Option<String>,
+}
+
+/// One runtime snapshot's Codex ownership fence: one entry per configured
+/// Codex slot.
+///
+/// The fence is per slot on purpose. The global runtime sequence also moves
+/// for unrelated providers — a Grok cycle, a wallet publication, an
+/// OpenDesign manual refresh, an account-configuration change — so using it
+/// here would discard valid Codex history whenever any other provider
+/// happened to be busy. Each slot instead carries the generation its
+/// identity was observed at, which is monotonic for that slot alone. An
+/// A -> B -> A move therefore still advances the generation twice and is
+/// still proven, without borrowing another provider's activity.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct CodexSnapshotFence {
+    slots: BTreeMap<String, CodexSlotFence>,
+}
+
+impl CodexSnapshotFence {
+    /// Builds the fence from one snapshot's per-slot identity state.
+    pub(crate) fn new(states: &[crate::runtime::CodexIdentityStateDto]) -> Self {
+        let mut slots = BTreeMap::new();
+        for state in states {
+            // A malformed identity is treated as no identity at all, so the
+            // slot fails closed on its own instead of failing the fence.
+            let identity = state
+                .identity
+                .as_deref()
+                .filter(|identity| valid_codex_history_identity(Some(identity)))
+                .map(str::to_string);
+            slots.insert(
+                state.provider_id.clone(),
+                CodexSlotFence {
+                    generation: state.generation,
+                    identity,
+                },
+            );
+        }
+        Self { slots }
+    }
+
+    /// The verifiable identities this capture proves, per slot. A slot
+    /// whose identity is missing or malformed contributes nothing.
+    fn bindings(&self) -> CodexIdentityBindings {
+        self.slots
+            .iter()
+            .filter_map(|(id, slot)| slot.identity.clone().map(|identity| (id.clone(), identity)))
+            .collect()
+    }
+
+    /// The slots this capture observed, with the generation and the
+    /// identity the runtime reported for each. A consumer compares them
+    /// with its own observation to tell a current projection from one
+    /// that belongs to an older session.
+    pub(crate) fn slots(&self) -> &BTreeMap<String, CodexSlotFence> {
+        &self.slots
+    }
+}
+
+/// The Codex identities two captures agree on, per slot.
+///
+/// A slot is included only when BOTH captures observed it at the same
+/// generation with the same verifiable identity. A slot whose generation
+/// moved between the captures - including an A -> B -> A move, which
+/// advances the generation twice - is excluded, and its exclusion never
+/// affects the other Codex slots or any unrelated provider.
+pub(crate) fn codex_agreed_bindings(
+    first: &CodexSnapshotFence,
+    settled: &CodexSnapshotFence,
+) -> CodexIdentityBindings {
+    codex_agreed_bindings_across(&[first, settled])
+}
+
+/// The Codex identities every capture in the series agrees on, per slot.
+///
+/// A slot is proven only when EVERY capture observed it at the same
+/// generation with the same verifiable identity. The series is compared
+/// pairwise through the same rule the two-capture settlement uses, so a
+/// slot that moved at any point in the series is excluded - and only that
+/// slot is excluded.
+pub(crate) fn codex_agreed_bindings_across(
+    fences: &[&CodexSnapshotFence],
+) -> CodexIdentityBindings {
+    let mut agreed = CodexIdentityBindings::new();
+    let Some((first, rest)) = fences.split_first() else {
+        return agreed;
+    };
+    for (id, first_slot) in &first.slots {
+        let Some(first_identity) = first_slot.identity.as_deref() else {
+            continue;
+        };
+        let generation = first_slot.generation;
+        let proven = rest.iter().all(|fence| {
+            fence.slots.get(id).is_some_and(|slot| {
+                slot.generation == generation && slot.identity.as_deref() == Some(first_identity)
+            })
+        });
+        if proven {
+            agreed.insert(id.clone(), first_identity.to_string());
+        }
+    }
+    agreed
+}
+
+/// IPC-facing isolation: Codex rows survive only when they belong to the
+/// supplied binding. A slot the bindings do not prove discards only its own
+/// rows - including rows whose account looks valid - because no trustworthy
+/// binding is available for that slot. Other Codex slots and every
+/// unrelated provider retain their existing account semantics. The store
+/// itself deliberately keeps its all-account query for Lane B; this filter
+/// belongs at the read/export boundary.
+fn isolate_codex_accounts(
+    history: Vec<QuotaObservation>,
+    current: &CodexIdentityBindings,
+) -> Vec<QuotaObservation> {
+    history
+        .into_iter()
+        .filter(|observation| {
+            if !is_codex_history_provider(&observation.provider_id) {
+                return true;
+            }
+            let account = observation.account.as_deref();
+            valid_codex_history_identity(account)
+                && current
+                    .get(&observation.provider_id)
+                    .is_some_and(|identity| account == Some(identity.as_str()))
+        })
+        .collect()
+}
+
+/// Filters already-prepared history against one binding. A caller that
+/// brackets output preparation with two snapshots should filter its inputs
+/// first and call [`settle_codex_accounts`] immediately before returning.
+pub(crate) fn isolate_codex_accounts_for_bindings(
+    history: Vec<QuotaObservation>,
+    bindings: Option<&CodexIdentityBindings>,
+) -> Vec<QuotaObservation> {
+    match bindings {
+        Some(bindings) => isolate_codex_accounts(history, bindings),
+        None => history
+            .into_iter()
+            .filter(|observation| !is_codex_history_provider(&observation.provider_id))
+            .collect(),
+    }
+}
+
+/// Filters inputs against the bindings from one capture.
+pub(crate) fn isolate_codex_accounts_for_fence(
+    history: Vec<QuotaObservation>,
+    fence: &CodexSnapshotFence,
+) -> Vec<QuotaObservation> {
+    isolate_codex_accounts(history, &fence.bindings())
+}
+
+/// Applies the conservative two-capture settlement, per Codex slot.
+///
+/// Only a slot whose ownership both captures agree on may keep its rows. A
+/// slot whose generation or identity moved - including an A -> B -> A move
+/// - discards only its own rows. Every unrelated provider is retained, and
+/// one slot's disagreement never suppresses another slot.
+pub(crate) fn settle_codex_accounts_for_fences(
+    history: Vec<QuotaObservation>,
+    first: &CodexSnapshotFence,
+    settled: &CodexSnapshotFence,
+) -> Vec<QuotaObservation> {
+    isolate_codex_accounts(history, &codex_agreed_bindings(first, settled))
+}
+
+/// Single-snapshot compatibility wrapper for recording-side callers and
+/// focused tests. IPC read/export paths use the two-snapshot settlement.
+#[cfg(test)]
+pub(crate) fn isolate_current_codex_accounts(
+    history: Vec<QuotaObservation>,
+    providers: &[ProviderUsageDto],
+) -> Vec<QuotaObservation> {
+    isolate_codex_accounts(history, &provider_codex_identities(providers))
+}
+
+/// Reads the v2-form Codex identities from one set of provider entries, per
+/// slot. A slot whose identity is missing or malformed contributes nothing,
+/// so that slot fails closed on its own and never suppresses the others.
+#[cfg(test)]
+fn provider_codex_identities(providers: &[ProviderUsageDto]) -> CodexIdentityBindings {
+    let mut identities = CodexIdentityBindings::new();
+    for usage in providers
+        .iter()
+        .filter(|usage| is_codex_history_provider(&usage.id))
+    {
+        let identity = usage
+            .account
+            .as_ref()
+            .and_then(|account| account.identity.as_deref())
+            .filter(|identity| valid_codex_history_identity(Some(identity)));
+        if let Some(identity) = identity {
+            identities.insert(usage.id.clone(), identity.to_string());
+        }
+    }
+    identities
+}
+
 // ---------- tauri commands ----------
 
 #[tauri::command]
 pub fn get_history(handle: tauri::State<RuntimeHandle>) -> Vec<QuotaObservation> {
     match handle.history_store() {
-        Some(store) => store.history(),
+        Some(store) => {
+            let first = handle.snapshot();
+            let first = CodexSnapshotFence::new(&first.codex_identity_states);
+            let rows = isolate_codex_accounts_for_fence(store.history(), &first);
+            let settled = handle.snapshot();
+            let settled = CodexSnapshotFence::new(&settled.codex_identity_states);
+            settle_codex_accounts_for_fences(rows, &first, &settled)
+        }
         None => Vec::new(),
     }
 }
@@ -874,12 +1145,18 @@ pub fn get_history_range(
             } else {
                 q.account.as_deref().map(Some)
             };
-            store.history_range(
+            let first = handle.snapshot();
+            let first = CodexSnapshotFence::new(&first.codex_identity_states);
+            let rows = store.history_range(
                 q.provider_id.as_deref(),
                 account_filter,
                 q.window_label.as_deref(),
                 q.range.as_deref().unwrap_or("24h"),
-            )
+            );
+            let rows = isolate_codex_accounts_for_fence(rows, &first);
+            let settled = handle.snapshot();
+            let settled = CodexSnapshotFence::new(&settled.codex_identity_states);
+            settle_codex_accounts_for_fences(rows, &first, &settled)
         }
         None => Vec::new(),
     }
@@ -927,7 +1204,8 @@ mod tests {
 
     fn temp_store(tag: &str) -> (QuotaHistoryStore, tempdir::TempDir) {
         let dir = tempdir::temp_dir(tag);
-        let store = QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
+        let store =
+            QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
         (store, dir)
     }
 
@@ -985,6 +1263,21 @@ mod tests {
         }
     }
 
+    fn codex_identity(character: char) -> String {
+        assert!(character.is_ascii_hexdigit() && !character.is_ascii_uppercase());
+        format!("chatgpt-v2:{}", character.to_string().repeat(64))
+    }
+
+    fn usage_with_identity(id: &str, identity: Option<&str>) -> ProviderUsageDto {
+        let mut usage = ok_usage(id, "OpenAI / Codex", 10.0);
+        usage.account = identity.map(|identity| AccountAttributionDto {
+            label: "current Codex account".to_string(),
+            note: None,
+            identity: Some(identity.to_string()),
+        });
+        usage
+    }
+
     fn at(minute_offset: i64) -> String {
         canonical_timestamp(NOW_MS - minute_offset * 60_000)
     }
@@ -993,12 +1286,8 @@ mod tests {
     #[test]
     fn records_valid_observations_and_canonicalizes_them() {
         let (store, _dir) = temp_store("record-valid");
-        let mut candidate = observation(
-            "opencode-go",
-            "5-hour",
-            142.0,
-            "2026-09-28T12:00:00+00:00",
-        );
+        let mut candidate =
+            observation("opencode-go", "5-hour", 142.0, "2026-09-28T12:00:00+00:00");
         candidate.reset_at = Some("2026-09-28T13:00:00.000Z".to_string());
         candidate.account = Some("key:3456".to_string());
         let result = store.record(vec![candidate]);
@@ -1012,9 +1301,18 @@ mod tests {
         );
         let history = store.history();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].used_percent, 100.0, "out-of-range percent clamps");
-        assert_eq!(history[0].observed_at, CHECKED_AT, "timestamps canonicalize to ISO-8601 UTC millis");
-        assert_eq!(history[0].reset_at.as_deref(), Some("2026-09-28T13:00:00.000Z"));
+        assert_eq!(
+            history[0].used_percent, 100.0,
+            "out-of-range percent clamps"
+        );
+        assert_eq!(
+            history[0].observed_at, CHECKED_AT,
+            "timestamps canonicalize to ISO-8601 UTC millis"
+        );
+        assert_eq!(
+            history[0].reset_at.as_deref(),
+            Some("2026-09-28T13:00:00.000Z")
+        );
         assert_eq!(history[0].account.as_deref(), Some("key:3456"));
     }
 
@@ -1067,7 +1365,10 @@ mod tests {
         assert_eq!(history[0].provider_id, "grok");
         assert_eq!(history[0].window_label, "7-day");
         assert_eq!(history[0].account.as_deref(), Some("xai:acct12345"));
-        assert_eq!(history[0].reset_at.as_deref(), Some("2026-10-01T00:00:00.000Z"));
+        assert_eq!(
+            history[0].reset_at.as_deref(),
+            Some("2026-10-01T00:00:00.000Z")
+        );
         assert_eq!(history[0].used_percent, 42.5);
     }
 
@@ -1084,7 +1385,11 @@ mod tests {
         // shared dedup key would collapse these to one entry.
         store.record(vec![a.clone(), b.clone()]);
         let history = store.history();
-        assert_eq!(history.len(), 2, "distinct accounts are distinct logical windows");
+        assert_eq!(
+            history.len(),
+            2,
+            "distinct accounts are distinct logical windows"
+        );
         assert_eq!(history[0].account.as_deref(), Some("key:aaaa"));
         assert_eq!(history[0].used_percent, 10.0);
         assert_eq!(history[1].account.as_deref(), Some("key:bbbb"));
@@ -1111,22 +1416,25 @@ mod tests {
             .filter(|entry| entry.account.as_deref() == Some("key:bbbb"))
             .count();
         assert_eq!(a_entries, QUOTA_HISTORY_MAX_PER_WINDOW);
-        assert_eq!(b_entries, 1, "account B's history survives account A's flood");
+        assert_eq!(
+            b_entries, 1,
+            "account B's history survives account A's flood"
+        );
     }
 
-    // 5. unattributed legacy history does not attach to a proven account
+    // 5. unattributed legacy history does not attach to an attributed account
     #[test]
     fn unattributed_entries_stay_unattributed_and_separate() {
         let (store, _dir) = temp_store("unattributed");
-        store.import_legacy(&serde_json::to_value(vec![
-            serde_json::json!({
+        store.import_legacy(
+            &serde_json::to_value(vec![serde_json::json!({
                 "providerId": "opencode-go",
                 "windowLabel": "5-hour",
                 "usedPercent": 20.0,
                 "observedAt": CHECKED_AT
-            })
-        ])
-        .unwrap());
+            })])
+            .unwrap(),
+        );
         let mut attributed = observation("opencode-go", "5-hour", 30.0, &at(5));
         attributed.account = Some("key:3456".to_string());
         store.record(vec![attributed]);
@@ -1166,7 +1474,11 @@ mod tests {
         let fresh = observation("zai", "5-hour", 30.0, CHECKED_AT);
         store.record(vec![edge.clone(), older, fresh.clone()]);
         let history = store.history();
-        assert_eq!(history.len(), 2, "age == 24h keeps (engine parity), age > 24h drops");
+        assert_eq!(
+            history.len(),
+            2,
+            "age == 24h keeps (engine parity), age > 24h drops"
+        );
         assert_eq!(history[0], edge);
         assert_eq!(history[1], fresh);
     }
@@ -1191,25 +1503,32 @@ mod tests {
         let history = store.history();
         assert_eq!(history.len(), QUOTA_HISTORY_MAX_PER_WINDOW);
         // Newest samples survive; the oldest 25 are evicted.
+        assert_eq!(history[0].observed_at, canonical_timestamp(NOW_MS - 500));
         assert_eq!(
-            history[0].observed_at,
-            canonical_timestamp(NOW_MS - 500)
+            history.last().unwrap().observed_at,
+            canonical_timestamp(NOW_MS - 1)
         );
-        assert_eq!(history.last().unwrap().observed_at, canonical_timestamp(NOW_MS - 1));
     }
 
     #[test]
     fn bounds_apply_per_window_for_shared_labels() {
         let (store, _dir) = temp_store("shared-labels");
+        let codex = codex_identity('f');
         for provider in ["openai-codex", "zai"] {
             let candidates: Vec<QuotaObservation> = (0..QUOTA_HISTORY_MAX_PER_WINDOW + 5)
                 .map(|index| {
-                    observation(
+                    let mut entry = observation(
                         provider,
                         "5-hour",
                         index as f64,
-                        &canonical_timestamp(NOW_MS - (QUOTA_HISTORY_MAX_PER_WINDOW + 5 - index) as i64),
-                    )
+                        &canonical_timestamp(
+                            NOW_MS - (QUOTA_HISTORY_MAX_PER_WINDOW + 5 - index) as i64,
+                        ),
+                    );
+                    if provider == "openai-codex" {
+                        entry.account = Some(codex.clone());
+                    }
+                    entry
                 })
                 .collect();
             store.record(candidates);
@@ -1217,7 +1536,10 @@ mod tests {
         let history = store.history();
         assert_eq!(history.len(), 2 * QUOTA_HISTORY_MAX_PER_WINDOW);
         assert_eq!(
-            history.iter().filter(|o| o.provider_id == "openai-codex").count(),
+            history
+                .iter()
+                .filter(|o| o.provider_id == "openai-codex")
+                .count(),
             QUOTA_HISTORY_MAX_PER_WINDOW
         );
     }
@@ -1267,7 +1589,11 @@ mod tests {
         std::fs::write(&path, blob.to_string()).unwrap();
         let store = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
         let history = store.history();
-        assert_eq!(history.len(), 1, "valid entries are salvaged, invalid dropped");
+        assert_eq!(
+            history.len(),
+            1,
+            "valid entries are salvaged, invalid dropped"
+        );
         assert_eq!(history[0].used_percent, 30.0);
         // The sanitized state was written back (self-heal): only the valid
         // entry survives on disk.
@@ -1288,7 +1614,10 @@ mod tests {
         });
         std::fs::write(&path, blob.to_string()).unwrap();
         let store = QuotaHistoryStore::open_with_clock(path, fixed_clock());
-        assert!(store.history().is_empty(), "unknown layout must not blend into predictions");
+        assert!(
+            store.history().is_empty(),
+            "unknown layout must not blend into predictions"
+        );
     }
 
     // 11. clear_history clears memory + persisted data
@@ -1308,7 +1637,10 @@ mod tests {
         }
         drop(store);
         let reopened = QuotaHistoryStore::open_with_clock(path, fixed_clock());
-        assert!(reopened.history().is_empty(), "cleared state survives restart");
+        assert!(
+            reopened.history().is_empty(),
+            "cleared state survives restart"
+        );
     }
 
     // 12. import_legacy_history is idempotent
@@ -1342,7 +1674,10 @@ mod tests {
         store.import_legacy(&blob);
         let history = store.history();
         assert_eq!(history.len(), 2);
-        assert_eq!(history[1].used_percent, 35.0, "imported value replaces the recorded same-instant one");
+        assert_eq!(
+            history[1].used_percent, 35.0,
+            "imported value replaces the recorded same-instant one"
+        );
     }
 
     // 14. legacy invalid entries are ignored
@@ -1356,14 +1691,25 @@ mod tests {
             { "providerId": "zai", "windowLabel": "5-hour", "usedPercent": null, "observedAt": CHECKED_AT }
         ]);
         let result = store.import_legacy(&blob);
-        assert_eq!(result.accepted, 1, "unparseable resetAt degrades, valid entry survives");
+        assert_eq!(
+            result.accepted, 1,
+            "unparseable resetAt degrades, valid entry survives"
+        );
         assert_eq!(result.rejected, 3);
         assert_eq!(store.history().len(), 1);
 
         // Malformed blobs (wrong shapes entirely) import nothing and do not
         // block anything.
-        assert_eq!(store.import_legacy(&serde_json::json!("garbage")).accepted, 0);
-        assert_eq!(store.import_legacy(&serde_json::json!({ "version": 2 })).accepted, 0);
+        assert_eq!(
+            store.import_legacy(&serde_json::json!("garbage")).accepted,
+            0
+        );
+        assert_eq!(
+            store
+                .import_legacy(&serde_json::json!({ "version": 2 }))
+                .accepted,
+            0
+        );
         assert_eq!(store.import_legacy(&serde_json::json!(null)).accepted, 0);
     }
 
@@ -1382,6 +1728,396 @@ mod tests {
         assert_eq!(grok.account.as_deref(), Some("xai:acct"));
     }
 
+    #[test]
+    fn codex_history_requires_a_v2_form_identity_on_record() {
+        let (store, _dir) = temp_store("codex-record-identity");
+        let primary = codex_identity('a');
+        let secondary = codex_identity('b');
+        let check_codex = |provider: &str, account: Option<&str>| {
+            let mut entry = observation(provider, "5-hour", 10.0, CHECKED_AT);
+            entry.account = account.map(str::to_string);
+            entry
+        };
+        let zai_unattributed = observation("zai", "5-hour", 20.0, CHECKED_AT);
+        let mut zai_attributed = observation("zai", "weekly", 30.0, CHECKED_AT);
+        zai_attributed.account = Some("key:3456".to_string());
+        let valid_primary = check_codex("openai-codex", Some(&primary));
+        let valid_secondary = check_codex("openai-codex:secondary", Some(&secondary));
+
+        let result = store.record(vec![
+            valid_primary,
+            valid_secondary,
+            check_codex("openai-codex", Some("chatgpt:legacy")),
+            check_codex("openai-codex", None),
+            check_codex(
+                "openai-codex",
+                Some(&format!("chatgpt-v2:{}", "A".repeat(64))),
+            ),
+            check_codex("openai-codex:secondary", Some("chatgpt-v2:short")),
+            zai_unattributed,
+            zai_attributed,
+        ]);
+
+        assert_eq!(result.accepted, 4);
+        assert_eq!(result.rejected, 4);
+        let history = store.history();
+        let codex: Vec<_> = history
+            .iter()
+            .filter(|entry| is_codex_history_provider(&entry.provider_id))
+            .collect();
+        assert_eq!(codex.len(), 2);
+        assert!(codex
+            .iter()
+            .all(|entry| { valid_codex_history_identity(entry.account.as_deref()) }));
+        let zai: Vec<_> = history
+            .iter()
+            .filter(|entry| entry.provider_id == "zai")
+            .collect();
+        assert_eq!(
+            zai.len(),
+            2,
+            "other providers keep attributed and unattributed rows"
+        );
+        assert!(zai.iter().any(|entry| entry.account.is_none()));
+        assert!(zai
+            .iter()
+            .any(|entry| entry.account.as_deref() == Some("key:3456")));
+    }
+
+    #[test]
+    fn legacy_import_rejects_legacy_codex_rows_and_preserves_other_providers() {
+        let (store, _dir) = temp_store("codex-import-identity");
+        let primary = codex_identity('c');
+        let blob = serde_json::json!([
+            { "providerId": "openai-codex", "windowLabel": "5-hour", "usedPercent": 10.0, "observedAt": CHECKED_AT, "account": primary },
+            { "providerId": "openai-codex", "windowLabel": "weekly", "usedPercent": 20.0, "observedAt": CHECKED_AT, "account": "chatgpt:legacy" },
+            { "providerId": "openai-codex", "windowLabel": "weekly", "usedPercent": 30.0, "observedAt": CHECKED_AT },
+            { "providerId": "zai", "windowLabel": "5-hour", "usedPercent": 40.0, "observedAt": CHECKED_AT },
+            { "providerId": "zai", "windowLabel": "weekly", "usedPercent": 50.0, "observedAt": CHECKED_AT, "account": "key:3456" }
+        ]);
+
+        let result = store.import_legacy(&blob);
+        assert_eq!(
+            result,
+            ImportResult {
+                accepted: 2,
+                rejected: 3
+            }
+        );
+        let history = store.history();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.provider_id == "openai-codex")
+                .count(),
+            0
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.provider_id == "zai")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn legacy_import_rejects_v2_form_codex_rows() {
+        let (store, _dir) = temp_store("codex-import-v2-form");
+        let codex_identity = codex_identity('f');
+        let blob = serde_json::json!([
+            { "providerId": "openai-codex", "windowLabel": "5-hour", "usedPercent": 10.0, "observedAt": CHECKED_AT, "account": codex_identity },
+            { "providerId": "openai-codex:secondary", "windowLabel": "weekly", "usedPercent": 20.0, "observedAt": CHECKED_AT, "account": codex_identity },
+            { "providerId": "opencode-go", "windowLabel": "5-hour", "usedPercent": 30.0, "observedAt": CHECKED_AT, "account": "key:3456" }
+        ]);
+
+        let result = store.import_legacy(&blob);
+        assert_eq!(
+            result,
+            ImportResult {
+                accepted: 1,
+                rejected: 2
+            }
+        );
+        let history = store.history();
+        assert!(!history
+            .iter()
+            .any(|entry| is_codex_history_provider(&entry.provider_id)));
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].provider_id, "opencode-go");
+        assert_eq!(history[0].account.as_deref(), Some("key:3456"));
+    }
+
+    #[test]
+    fn load_migrates_out_legacy_codex_rows_and_rewrites_the_sanitized_file() {
+        let dir = tempdir::temp_dir("codex-load-migration");
+        let path = dir.path().join(HISTORY_FILE_NAME);
+        let primary = codex_identity('d');
+        let secondary = codex_identity('e');
+        let blob = serde_json::json!({
+            "version": BLOB_VERSION,
+            "observations": [
+                { "providerId": "openai-codex", "windowLabel": "5-hour", "usedPercent": 10.0, "observedAt": CHECKED_AT, "account": primary },
+                { "providerId": "openai-codex", "windowLabel": "weekly", "usedPercent": 20.0, "observedAt": CHECKED_AT, "account": "chatgpt:legacy" },
+                { "providerId": "openai-codex", "windowLabel": "weekly", "usedPercent": 30.0, "observedAt": CHECKED_AT },
+                { "providerId": "openai-codex:secondary", "windowLabel": "5-hour", "usedPercent": 40.0, "observedAt": CHECKED_AT, "account": secondary },
+                { "providerId": "zai", "windowLabel": "5-hour", "usedPercent": 50.0, "observedAt": CHECKED_AT },
+                { "providerId": "zai", "windowLabel": "weekly", "usedPercent": 60.0, "observedAt": CHECKED_AT, "account": "key:3456" }
+            ]
+        });
+        std::fs::write(&path, blob.to_string()).unwrap();
+
+        let store = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
+        let history = store.history();
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.provider_id == "openai-codex")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.provider_id == "openai-codex:secondary")
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|entry| entry.provider_id == "zai")
+                .count(),
+            2
+        );
+        assert!(history
+            .iter()
+            .filter(|entry| is_codex_history_provider(&entry.provider_id))
+            .all(|entry| valid_codex_history_identity(entry.account.as_deref())));
+
+        let healed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let observations = healed["observations"].as_array().unwrap();
+        assert_eq!(
+            observations.len(),
+            4,
+            "legacy Codex rows are removed from disk"
+        );
+        assert!(observations
+            .iter()
+            .filter(|entry| {
+                entry["providerId"]
+                    .as_str()
+                    .is_some_and(is_codex_history_provider)
+            })
+            .all(|entry| entry["account"]
+                .as_str()
+                .is_some_and(|identity| { valid_codex_history_identity(Some(identity)) })));
+    }
+
+    #[test]
+    fn command_read_isolation_keeps_only_the_current_v2_form_codex_accounts() {
+        let primary = codex_identity('1');
+        let other_primary = codex_identity('2');
+        let secondary = codex_identity('3');
+        let mut current_primary = observation("openai-codex", "5-hour", 10.0, CHECKED_AT);
+        current_primary.account = Some(primary.clone());
+        let mut old_primary = observation("openai-codex", "5-hour", 20.0, CHECKED_AT);
+        old_primary.account = Some(other_primary);
+        let mut legacy_primary = observation("openai-codex", "weekly", 30.0, CHECKED_AT);
+        legacy_primary.account = None;
+        let mut current_secondary =
+            observation("openai-codex:secondary", "weekly", 40.0, CHECKED_AT);
+        current_secondary.account = Some(secondary.clone());
+        let mut unattributed_secondary =
+            observation("openai-codex:secondary", "5-hour", 50.0, CHECKED_AT);
+        unattributed_secondary.account = None;
+        let zai_unattributed = observation("zai", "5-hour", 60.0, CHECKED_AT);
+        let mut zai_attributed = observation("zai", "weekly", 70.0, CHECKED_AT);
+        zai_attributed.account = Some("key:3456".to_string());
+        let stored = vec![
+            current_primary,
+            old_primary,
+            legacy_primary,
+            current_secondary,
+            unattributed_secondary,
+            zai_unattributed,
+            zai_attributed,
+        ];
+
+        let providers = vec![
+            usage_with_identity("openai-codex", Some(&primary)),
+            usage_with_identity("openai-codex:secondary", Some(&secondary)),
+            usage_with_identity("zai", None),
+        ];
+        let isolated = isolate_current_codex_accounts(stored, &providers);
+        assert_eq!(
+            isolated
+                .iter()
+                .filter(|entry| entry.provider_id == "openai-codex")
+                .count(),
+            1
+        );
+        assert_eq!(
+            isolated
+                .iter()
+                .filter(|entry| entry.provider_id == "openai-codex:secondary")
+                .count(),
+            1
+        );
+        assert_eq!(
+            isolated
+                .iter()
+                .filter(|entry| entry.provider_id == "zai")
+                .count(),
+            2
+        );
+        assert!(isolated
+            .iter()
+            .filter(|entry| entry.provider_id == "openai-codex")
+            .all(|entry| entry.account.as_deref() == Some(primary.as_str())));
+        assert!(isolated
+            .iter()
+            .filter(|entry| entry.provider_id == "openai-codex:secondary")
+            .all(|entry| entry.account.as_deref() == Some(secondary.as_str())));
+
+        let invalid_snapshot = vec![
+            usage_with_identity("openai-codex", None),
+            usage_with_identity("openai-codex:secondary", Some("chatgpt:legacy")),
+        ];
+        let fail_closed = isolate_current_codex_accounts(isolated, &invalid_snapshot);
+        assert!(!fail_closed
+            .iter()
+            .any(|entry| is_codex_history_provider(&entry.provider_id)));
+        assert_eq!(
+            fail_closed
+                .iter()
+                .filter(|entry| entry.provider_id == "zai")
+                .count(),
+            2
+        );
+    }
+
+    /// One observed Codex slot, as the runtime publishes it.
+    fn codex_state(
+        provider_id: &str,
+        generation: u64,
+        identity: Option<&str>,
+    ) -> crate::runtime::CodexIdentityStateDto {
+        crate::runtime::CodexIdentityStateDto {
+            provider_id: provider_id.to_string(),
+            generation,
+            identity: identity.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn two_capture_settlement_fails_closed_on_change_or_unverifiable_identity() {
+        let first_identity = codex_identity('4');
+        let second_identity = codex_identity('5');
+        let mut codex = observation("openai-codex", "5-hour", 10.0, CHECKED_AT);
+        codex.account = Some(first_identity.clone());
+        let zai = observation("zai", "5-hour", 20.0, CHECKED_AT);
+
+        let first = CodexSnapshotFence::new(&[codex_state("openai-codex", 7, Some(&first_identity))]);
+        let same = CodexSnapshotFence::new(&[codex_state("openai-codex", 7, Some(&first_identity))]);
+        // The identity moved but the generation did not: impossible in the
+        // runtime, and the fence must still reject it.
+        let changed =
+            CodexSnapshotFence::new(&[codex_state("openai-codex", 7, Some(&second_identity))]);
+        // The identity is back but the generation moved twice (A -> B -> A).
+        let moved_back =
+            CodexSnapshotFence::new(&[codex_state("openai-codex", 9, Some(&first_identity))]);
+        let unverifiable = CodexSnapshotFence::new(&[codex_state("openai-codex", 7, None)]);
+
+        let stable =
+            settle_codex_accounts_for_fences(vec![codex.clone(), zai.clone()], &first, &same);
+        assert_eq!(stable.len(), 2);
+
+        for settled in [&changed, &moved_back, &unverifiable] {
+            let filtered = settle_codex_accounts_for_fences(
+                vec![codex.clone(), zai.clone()],
+                &first,
+                settled,
+            );
+            assert_eq!(filtered, vec![zai.clone()]);
+        }
+    }
+
+    #[test]
+    fn a_moved_slot_loses_only_its_own_rows() {
+        let identity = codex_identity('6');
+        let secondary_identity = codex_identity('7');
+        let mut codex = observation("openai-codex", "5-hour", 10.0, CHECKED_AT);
+        codex.account = Some(identity.clone());
+        let mut secondary = observation("openai-codex:secondary", "5-hour", 11.0, CHECKED_AT);
+        secondary.account = Some(secondary_identity.clone());
+        let zai = observation("zai", "5-hour", 20.0, CHECKED_AT);
+
+        let first = CodexSnapshotFence::new(&[
+            codex_state("openai-codex", 7, Some(&identity)),
+            codex_state("openai-codex:secondary", 3, Some(&secondary_identity)),
+        ]);
+        // The primary slot moved; the secondary slot did not.
+        let moved_primary = CodexSnapshotFence::new(&[
+            codex_state("openai-codex", 8, Some(&identity)),
+            codex_state("openai-codex:secondary", 3, Some(&secondary_identity)),
+        ]);
+
+        let settled = settle_codex_accounts_for_fences(
+            vec![codex.clone(), secondary.clone(), zai.clone()],
+            &first,
+            &moved_primary,
+        );
+        assert!(
+            !settled.iter().any(|row| row.provider_id == "openai-codex"),
+            "the moved slot loses its own rows"
+        );
+        assert!(
+            settled
+                .iter()
+                .any(|row| row.provider_id == "openai-codex:secondary"),
+            "the unmoved slot keeps its rows"
+        );
+        assert!(
+            settled.iter().any(|row| row.provider_id == "zai"),
+            "unrelated providers are never affected"
+        );
+    }
+
+    #[test]
+    fn an_unprovable_slot_fails_closed_without_touching_the_other_slot() {
+        let identity = codex_identity('8');
+        let secondary_identity = codex_identity('9');
+        let mut codex = observation("openai-codex", "5-hour", 10.0, CHECKED_AT);
+        codex.account = Some(identity.clone());
+        let mut secondary = observation("openai-codex:secondary", "5-hour", 11.0, CHECKED_AT);
+        secondary.account = Some(secondary_identity.clone());
+
+        // The primary slot exists but no local login could be proven.
+        let fence = CodexSnapshotFence::new(&[
+            codex_state("openai-codex", 7, None),
+            codex_state("openai-codex:secondary", 3, Some(&secondary_identity)),
+        ]);
+        let settled = settle_codex_accounts_for_fences(
+            vec![codex.clone(), secondary.clone()],
+            &fence,
+            &fence,
+        );
+        assert!(
+            !settled.iter().any(|row| row.provider_id == "openai-codex"),
+            "the unprovable slot loses its own rows"
+        );
+        assert_eq!(
+            settled
+                .iter()
+                .filter(|row| row.provider_id == "openai-codex:secondary")
+                .count(),
+            1,
+            "the provable slot keeps its rows"
+        );
+    }
+
+
     // 15. one runtime cycle produces one history stream (runtime-owned)
     // 16. only usable snapshot entries are recorded (failed/stale/unknown
     //     never enter history; simulated providers cannot exist in the
@@ -1396,7 +2132,10 @@ mod tests {
                     kind: crate::runtime::ProviderKind::Codex,
                     fetch: std::sync::Arc::new(|| {
                         Box::pin(async {
-                            Ok(ok_usage("openai-codex", "OpenAI / Codex", 42.0))
+                            Ok(usage_with_identity(
+                                "openai-codex",
+                                Some(&codex_identity('a')),
+                            ))
                                 as Result<_, crate::runtime::ProviderFailure>
                         }) as crate::runtime::FetchFuture
                     }),
@@ -1453,7 +2192,10 @@ mod tests {
         core.run_cycle().await; // served from the 15-minute cadence cache
         let history = store.history();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].used_percent, 1.0, "cached result keeps its original observation time");
+        assert_eq!(
+            history[0].used_percent, 1.0,
+            "cached result keeps its original observation time"
+        );
     }
 
     // Eligibility port (former v03Integration "history observation boundary"):
@@ -1468,7 +2210,8 @@ mod tests {
         let mut indeterminate = ok_usage("zai", "Z.ai", 60.0);
         indeterminate.data_freshness = Some("fresh");
         indeterminate.source_updated_at = None;
-        let mut cached = ok_usage("openai-codex", "OpenAI / Codex", 70.0);
+        let mut cached = usage_with_identity("openai-codex", Some(&codex_identity('b')));
+        cached.limits[0].used_percent = 70.0;
         cached.data_freshness = Some("stale");
         let observations = observations_from_usages(&[fresh, indeterminate, cached]);
         assert_eq!(observations.len(), 1);
@@ -1494,7 +2237,8 @@ mod tests {
             (crate::runtime::ProviderHealth::Unknown, "unknown"),
         ];
         for (health, legacy) in non_live {
-            let mut usage = ok_usage("openai-codex", "OpenAI / Codex", 42.0);
+            let mut usage = usage_with_identity("openai-codex", Some(&codex_identity('c')));
+            usage.limits[0].used_percent = 42.0;
             usage.health = health;
             usage.status = legacy;
             usage.data_freshness = Some("fresh");
@@ -1505,7 +2249,8 @@ mod tests {
             );
         }
 
-        let mut live = ok_usage("openai-codex", "OpenAI / Codex", 42.0);
+        let mut live = usage_with_identity("openai-codex", Some(&codex_identity('d')));
+        live.limits[0].used_percent = 42.0;
         live.data_freshness = Some("fresh");
         live.source_updated_at = Some("2026-09-28T11:30:00.000Z".to_string());
         assert_eq!(observations_from_usages(&[live]).len(), 1);
@@ -1549,8 +2294,14 @@ mod tests {
             "blank label and NaN percent drop; both weekly windows survive eligibility"
         );
         assert_eq!(candidates[0].window_label, "weekly");
-        assert_eq!(candidates[0].reset_at, None, "garbage resetAt degrades to absent");
-        assert_eq!(candidates[1].reset_at.as_deref(), Some("2026-10-01T00:00:00.000Z"));
+        assert_eq!(
+            candidates[0].reset_at, None,
+            "garbage resetAt degrades to absent"
+        );
+        assert_eq!(
+            candidates[1].reset_at.as_deref(),
+            Some("2026-10-01T00:00:00.000Z")
+        );
 
         // Through the store, the two same-instant weekly candidates dedup
         // with the newest input winning — the recorded history keeps one.
@@ -1559,11 +2310,14 @@ mod tests {
         let history = store.history();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].used_percent, 25.0);
-        assert_eq!(history[0].reset_at.as_deref(), Some("2026-10-01T00:00:00.000Z"));
+        assert_eq!(
+            history[0].reset_at.as_deref(),
+            Some("2026-10-01T00:00:00.000Z")
+        );
     }
 
     #[test]
-    fn eligibility_carries_the_proven_account_identity() {
+    fn eligibility_carries_the_account_identity() {
         let mut usage = ok_usage("opencode-go", "OpenCode Go", 42.0);
         usage.account = Some(AccountAttributionDto {
             label: "key ••3456".to_string(),
@@ -1580,7 +2334,8 @@ mod tests {
             identity: Some("   ".to_string()),
         });
         assert_eq!(
-            observations_from_usages(&[blank])[0].account, None,
+            observations_from_usages(&[blank])[0].account,
+            None,
             "a blank identity token stays unattributed"
         );
     }
@@ -1601,11 +2356,28 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["account", "observedAt", "providerId", "resetAt", "usedPercent", "windowLabel"],
+            vec![
+                "account",
+                "observedAt",
+                "providerId",
+                "resetAt",
+                "usedPercent",
+                "windowLabel"
+            ],
             "exactly the six safe fields serialize; no token/credential/secret-shaped field exists"
         );
         let serialized = serde_json::to_string(&entry).unwrap().to_lowercase();
-        for forbidden in ["token", "bearer", "apikey", "api_key", "secret", "password", "authorization", "jwt", "refresh"] {
+        for forbidden in [
+            "token",
+            "bearer",
+            "apikey",
+            "api_key",
+            "secret",
+            "password",
+            "authorization",
+            "jwt",
+            "refresh",
+        ] {
             assert!(
                 !serialized.contains(forbidden),
                 "persisted schema must never contain secret-shaped field names ({forbidden})"
@@ -1615,7 +2387,13 @@ mod tests {
         let minimal = serde_json::to_value(&observation("zai", "5-hour", 1.0, CHECKED_AT)).unwrap();
         assert!(minimal.get("resetAt").is_none());
         assert!(minimal.get("account").is_none());
-        assert!(serde_json::to_string(&minimal).unwrap().find("reset_at").is_none(), "snake_case must never leak");
+        assert!(
+            serde_json::to_string(&minimal)
+                .unwrap()
+                .find("reset_at")
+                .is_none(),
+            "snake_case must never leak"
+        );
     }
 
     // 18. restart/reload history round-trip preserves valid data
@@ -1676,11 +2454,20 @@ mod tests {
         let mut candidates = Vec::new();
         for i in 0..5 {
             let offset_mins = 20 - i * 2;
-            candidates.push(observation("zai", "5-hour", 10.0 + i as f64, &at(offset_mins)));
+            candidates.push(observation(
+                "zai",
+                "5-hour",
+                10.0 + i as f64,
+                &at(offset_mins),
+            ));
         }
         store.record(candidates);
         let history = store.history();
-        assert_eq!(history.len(), 5, "all recent 24h samples remain uncompacted and detailed");
+        assert_eq!(
+            history.len(),
+            5,
+            "all recent 24h samples remain uncompacted and detailed"
+        );
         for (i, obs) in history.iter().enumerate() {
             assert_eq!(obs.used_percent, 10.0 + i as f64);
         }
@@ -1693,14 +2480,26 @@ mod tests {
         let two_days_ago_ms = NOW_MS - 48 * 60 * 60_000;
         // Two samples in the exact same 30-minute bucket 48 hours ago
         let s1 = observation("zai", "5-hour", 20.0, &canonical_timestamp(two_days_ago_ms));
-        let s2 = observation("zai", "5-hour", 25.0, &canonical_timestamp(two_days_ago_ms + 10 * 60_000));
+        let s2 = observation(
+            "zai",
+            "5-hour",
+            25.0,
+            &canonical_timestamp(two_days_ago_ms + 10 * 60_000),
+        );
         store.record(vec![s1, s2.clone()]);
         // Prediction 24h query ignores 2-day-old samples
         assert!(store.history().is_empty());
         // 7d query sees the compacted 1 sample (the later one in the 30m bucket)
         let seven_d = store.history_range(Some("zai"), None, Some("5-hour"), "7d");
-        assert_eq!(seven_d.len(), 1, "two samples in the same 30m bucket compact to one");
-        assert_eq!(seven_d[0].used_percent, 25.0, "latest sample in the bucket wins");
+        assert_eq!(
+            seven_d.len(),
+            1,
+            "two samples in the same 30m bucket compact to one"
+        );
+        assert_eq!(
+            seven_d[0].used_percent, 25.0,
+            "latest sample in the bucket wins"
+        );
         assert_eq!(seven_d[0].observed_at, s2.observed_at);
     }
 
@@ -1709,7 +2508,12 @@ mod tests {
     fn seven_day_retention_works() {
         let (store, _dir) = temp_store("seven-day-retention");
         let exact_seven_days_ms = NOW_MS - 7 * 24 * 60 * 60_000;
-        let s = observation("zai", "5-hour", 42.0, &canonical_timestamp(exact_seven_days_ms));
+        let s = observation(
+            "zai",
+            "5-hour",
+            42.0,
+            &canonical_timestamp(exact_seven_days_ms),
+        );
         store.record(vec![s]);
         let trend = store.history_range(None, None, None, "7d");
         assert_eq!(trend.len(), 1, "observation at exactly 7 days is retained");
@@ -1721,10 +2525,18 @@ mod tests {
     fn older_than_seven_days_observations_expire() {
         let (store, _dir) = temp_store("expire-seven-days");
         let over_seven_days_ms = NOW_MS - (7 * 24 * 60 * 60_000 + 1_000);
-        let s = observation("zai", "5-hour", 42.0, &canonical_timestamp(over_seven_days_ms));
+        let s = observation(
+            "zai",
+            "5-hour",
+            42.0,
+            &canonical_timestamp(over_seven_days_ms),
+        );
         store.record(vec![s]);
         let trend = store.history_range(None, None, None, "7d");
-        assert!(trend.is_empty(), "observations older than 7 days must expire");
+        assert!(
+            trend.is_empty(),
+            "observations older than 7 days must expire"
+        );
     }
 
     // 5. bucket selection deterministic
@@ -1733,9 +2545,15 @@ mod tests {
         let t1_ms = NOW_MS - 40 * 60 * 60_000;
         let bucket1 = t1_ms / QUOTA_HISTORY_COMPACT_BUCKET_MS;
         let bucket1_later = (t1_ms + 10 * 60_000) / QUOTA_HISTORY_COMPACT_BUCKET_MS;
-        assert_eq!(bucket1, bucket1_later, "same 30m window maps to same bucket index");
+        assert_eq!(
+            bucket1, bucket1_later,
+            "same 30m window maps to same bucket index"
+        );
         let bucket2 = (t1_ms + 35 * 60_000) / QUOTA_HISTORY_COMPACT_BUCKET_MS;
-        assert_ne!(bucket1, bucket2, "different 30m window maps to different bucket index");
+        assert_ne!(
+            bucket1, bucket2,
+            "different 30m window maps to different bucket index"
+        );
     }
 
     // 6. reset boundary preserved
@@ -1745,26 +2563,56 @@ mod tests {
         let two_days_ago_ms = NOW_MS - 48 * 60 * 60_000;
         // Observations within the SAME 30m bucket straddling a reset cycle:
         // Pre-reset: 95% at t0 with reset_at cycle 1
-        let mut pre = observation("zai", "5-hour", 95.0, &canonical_timestamp(two_days_ago_ms + 5 * 60_000));
+        let mut pre = observation(
+            "zai",
+            "5-hour",
+            95.0,
+            &canonical_timestamp(two_days_ago_ms + 5 * 60_000),
+        );
         pre.reset_at = Some(canonical_timestamp(two_days_ago_ms + 10 * 60_000));
 
         // Post-reset: 5% at t0 + 15min with reset_at cycle 2 (moved forward by 5 hours)
-        let mut post = observation("zai", "5-hour", 5.0, &canonical_timestamp(two_days_ago_ms + 15 * 60_000));
-        post.reset_at = Some(canonical_timestamp(two_days_ago_ms + (5 * 60 + 10) * 60_000));
+        let mut post = observation(
+            "zai",
+            "5-hour",
+            5.0,
+            &canonical_timestamp(two_days_ago_ms + 15 * 60_000),
+        );
+        post.reset_at = Some(canonical_timestamp(
+            two_days_ago_ms + (5 * 60 + 10) * 60_000,
+        ));
 
         store.record(vec![pre, post]);
         let trend = store.history_range(Some("zai"), None, Some("5-hour"), "7d");
-        assert_eq!(trend.len(), 2, "both pre-reset peak and post-reset floor are preserved; no collapse");
+        assert_eq!(
+            trend.len(),
+            2,
+            "both pre-reset peak and post-reset floor are preserved; no collapse"
+        );
         assert_eq!(trend[0].used_percent, 95.0);
         assert_eq!(trend[1].used_percent, 5.0);
 
         // Also verify when reset_at is absent but percentage drops sharply (> 5%)
         let (store2, _dir2) = temp_store("reset-boundary-no-resetat");
-        let pre_drop = observation("codex", "5-hour", 90.0, &canonical_timestamp(two_days_ago_ms + 5 * 60_000));
-        let post_drop = observation("codex", "5-hour", 10.0, &canonical_timestamp(two_days_ago_ms + 15 * 60_000));
+        let pre_drop = observation(
+            "codex",
+            "5-hour",
+            90.0,
+            &canonical_timestamp(two_days_ago_ms + 5 * 60_000),
+        );
+        let post_drop = observation(
+            "codex",
+            "5-hour",
+            10.0,
+            &canonical_timestamp(two_days_ago_ms + 15 * 60_000),
+        );
         store2.record(vec![pre_drop, post_drop]);
         let trend2 = store2.history_range(Some("codex"), None, Some("5-hour"), "7d");
-        assert_eq!(trend2.len(), 2, "percentage drop > 5% identifies reset boundary even without reset_at");
+        assert_eq!(
+            trend2.len(),
+            2,
+            "percentage drop > 5% identifies reset boundary even without reset_at"
+        );
         assert_eq!(trend2[0].used_percent, 90.0);
         assert_eq!(trend2[1].used_percent, 10.0);
     }
@@ -1781,8 +2629,15 @@ mod tests {
 
         // store.history() is the prediction entry point (via get_history)
         let pred_history = store.history();
-        assert_eq!(pred_history, vec![recent], "prediction query sees only 24h data");
-        assert!(!pred_history.contains(&compacted), "compacted 2-day-old data must not leak into predictions");
+        assert_eq!(
+            pred_history,
+            vec![recent],
+            "prediction query sees only 24h data"
+        );
+        assert!(
+            !pred_history.contains(&compacted),
+            "compacted 2-day-old data must not leak into predictions"
+        );
 
         // UI trend query sees both
         let trend = store.history_range(None, None, None, "7d");
@@ -1794,7 +2649,12 @@ mod tests {
     fn range_queries_24h_and_7d_return_expected_slices() {
         let (store, _dir) = temp_store("ranges");
         let h2 = observation("zai", "5-hour", 60.0, &at(120)); // 2 hours ago
-        let d3 = observation("zai", "5-hour", 30.0, &canonical_timestamp(NOW_MS - 72 * 60 * 60_000)); // 3 days ago
+        let d3 = observation(
+            "zai",
+            "5-hour",
+            30.0,
+            &canonical_timestamp(NOW_MS - 72 * 60 * 60_000),
+        ); // 3 days ago
 
         store.record(vec![h2.clone(), d3.clone()]);
 
@@ -1810,7 +2670,12 @@ mod tests {
     fn clear_history_clears_both_recent_and_compacted_tiers() {
         let (store, dir) = temp_store("clear-tiers");
         let h2 = observation("zai", "5-hour", 60.0, &at(120));
-        let d3 = observation("zai", "5-hour", 30.0, &canonical_timestamp(NOW_MS - 72 * 60 * 60_000));
+        let d3 = observation(
+            "zai",
+            "5-hour",
+            30.0,
+            &canonical_timestamp(NOW_MS - 72 * 60 * 60_000),
+        );
 
         store.record(vec![h2, d3]);
         assert_eq!(store.history_range(None, None, None, "7d").len(), 2);
@@ -1819,8 +2684,12 @@ mod tests {
         assert!(store.history_range(None, None, None, "7d").is_empty());
         assert!(store.history().is_empty());
 
-        let reopened = QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
-        assert!(reopened.history_range(None, None, None, "7d").is_empty(), "cleared tiers stay empty after restart");
+        let reopened =
+            QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
+        assert!(
+            reopened.history_range(None, None, None, "7d").is_empty(),
+            "cleared tiers stay empty after restart"
+        );
     }
 
     // 15. restart persistence across tiers
@@ -1828,12 +2697,18 @@ mod tests {
     fn restart_persistence_preserves_both_tiers() {
         let (store, dir) = temp_store("restart-tiers");
         let h2 = observation("zai", "5-hour", 60.0, &at(120));
-        let d3 = observation("zai", "5-hour", 30.0, &canonical_timestamp(NOW_MS - 72 * 60 * 60_000));
+        let d3 = observation(
+            "zai",
+            "5-hour",
+            30.0,
+            &canonical_timestamp(NOW_MS - 72 * 60 * 60_000),
+        );
 
         store.record(vec![h2.clone(), d3.clone()]);
         drop(store);
 
-        let reopened = QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
+        let reopened =
+            QuotaHistoryStore::open_with_clock(dir.path().join(HISTORY_FILE_NAME), fixed_clock());
         let trend = reopened.history_range(None, None, None, "7d");
         assert_eq!(trend, vec![d3, h2]);
     }
@@ -1866,7 +2741,10 @@ mod tests {
         // Verify the file was rewritten as version 2
         let raw = std::fs::read_to_string(&path).unwrap();
         let upgraded: Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(upgraded["version"], 2, "legacy v1 blob is automatically upgraded to v2");
+        assert_eq!(
+            upgraded["version"], 2,
+            "legacy v1 blob is automatically upgraded to v2"
+        );
     }
 
     // 18. max points/window enforced
@@ -1885,7 +2763,11 @@ mod tests {
             ));
         }
         store.record(candidates);
-        assert_eq!(store.history().len(), QUOTA_HISTORY_MAX_PER_WINDOW, "recent tier capped at 500");
+        assert_eq!(
+            store.history().len(),
+            QUOTA_HISTORY_MAX_PER_WINDOW,
+            "recent tier capped at 500"
+        );
 
         // Record 400 compacted samples in distinct buckets -> capped at 350
         let compacted_total = QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW + 50;
@@ -1893,17 +2775,14 @@ mod tests {
         for i in 0..compacted_total {
             let t = NOW_MS - 48 * 60 * 60_000 - (i as i64) * 30 * 60_000;
             if t >= NOW_MS - QUOTA_HISTORY_RETENTION_MS {
-                older_candidates.push(observation(
-                    "zai",
-                    "5-hour",
-                    50.0,
-                    &canonical_timestamp(t),
-                ));
+                older_candidates.push(observation("zai", "5-hour", 50.0, &canonical_timestamp(t)));
             }
         }
         store.record(older_candidates);
         let all_7d = store.history_range(Some("zai"), None, Some("5-hour"), "7d");
-        assert!(all_7d.len() <= QUOTA_HISTORY_MAX_PER_WINDOW + QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW);
+        assert!(
+            all_7d.len() <= QUOTA_HISTORY_MAX_PER_WINDOW + QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW
+        );
     }
 
     // 22. storage growth bounded & performance benchmark
@@ -1914,6 +2793,7 @@ mod tests {
         // (12 refreshes/hr * 24 * 7 = 2016 intervals * 10 windows = 20,160 raw observation candidates)
         let providers = ["openai-codex", "zai", "opencode-go", "antigravity", "grok"];
         let windows = ["5-hour", "weekly"];
+        let codex = codex_identity('e');
 
         let mut all_samples = Vec::new();
         for interval in 0..2016 {
@@ -1922,7 +2802,11 @@ mod tests {
             for p in &providers {
                 for w in &windows {
                     let percent = ((interval % 100) as f64).clamp(0.0, 100.0);
-                    all_samples.push(observation(p, w, percent, &t_str));
+                    let mut entry = observation(p, w, percent, &t_str);
+                    if p == &"openai-codex" {
+                        entry.account = Some(codex.clone());
+                    }
+                    all_samples.push(entry);
                 }
             }
         }
@@ -1942,7 +2826,10 @@ mod tests {
         let total_7d = reopened.history_range(None, None, None, "7d");
         let pred_24h = reopened.history();
 
-        assert!(total_7d.len() <= 10 * (QUOTA_HISTORY_MAX_PER_WINDOW + QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW));
+        assert!(
+            total_7d.len()
+                <= 10 * (QUOTA_HISTORY_MAX_PER_WINDOW + QUOTA_HISTORY_MAX_COMPACTED_PER_WINDOW)
+        );
         assert!(pred_24h.len() <= 10 * QUOTA_HISTORY_MAX_PER_WINDOW);
 
         println!("BENCHMARK: 7-day realistic dataset (10 windows, 20160 raw points ingested)");
@@ -1952,7 +2839,11 @@ mod tests {
         println!("  Total 7d retained:    {} points", total_7d.len());
         println!("  Total 24h pred:       {} points", pred_24h.len());
 
-        assert!(file_size_kb < 1500.0, "File size must remain well under 1.5MB (actual: {:.2}KB)", file_size_kb);
+        assert!(
+            file_size_kb < 1500.0,
+            "File size must remain well under 1.5MB (actual: {:.2}KB)",
+            file_size_kb
+        );
     }
 
     // ---------- shared fixtures ----------
@@ -1985,6 +2876,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -2005,7 +2898,8 @@ mod tests {
                         identity: None,
                         credential_binding: None,
                         transport_timeout: false,
-                    }) as Result<ProviderUsageDto, crate::runtime::ProviderFailure>
+                    })
+                        as Result<ProviderUsageDto, crate::runtime::ProviderFailure>
                 }) as crate::runtime::FetchFuture
             }),
         }

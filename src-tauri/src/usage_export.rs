@@ -135,7 +135,8 @@ pub(crate) fn build_usage_export_rows(
             .then_with(|| {
                 let t_a = parse_epoch_ms(&a.observed_at).unwrap_or(0);
                 let t_b = parse_epoch_ms(&b.observed_at).unwrap_or(0);
-                t_a.cmp(&t_b).then_with(|| a.observed_at.cmp(&b.observed_at))
+                t_a.cmp(&t_b)
+                    .then_with(|| a.observed_at.cmp(&b.observed_at))
             })
     });
 
@@ -208,8 +209,7 @@ pub(crate) fn build_usage_export_json(
         None
     } else {
         let from = rows
-            .iter(
-            )
+            .iter()
             .map(|r| &r.observed_at)
             .min_by(|a, b| {
                 let t_a = parse_epoch_ms(a).unwrap_or(0);
@@ -239,14 +239,26 @@ pub(crate) fn build_usage_export_json(
         semantics: ExportSemantics {
             gap_semantics: "notObservedNeverZeroFilled".to_string(),
             resolution_semantics: "detailedWithin24hOtherwiseCompacted".to_string(),
-            reset_boundary_rule:
-                "usedPercentDropOver5PointsOrResetAtForwardMoveOver1Minute".to_string(),
+            reset_boundary_rule: "usedPercentDropOver5PointsOrResetAtForwardMoveOver1Minute"
+                .to_string(),
             thresholds_measure_used: true,
         },
         rows: rows.to_vec(),
     };
 
     serde_json::to_string_pretty(&envelope).map_err(|error| sanitize_text(&error.to_string()))
+}
+
+fn build_usage_export_content(
+    observations: &[QuotaObservation],
+    exported_at: DateTime<Utc>,
+    format: UsageExportFormat,
+) -> Result<String, String> {
+    let rows = build_usage_export_rows(observations, exported_at);
+    match format {
+        UsageExportFormat::Csv => Ok(build_usage_export_csv(&rows)),
+        UsageExportFormat::Json => build_usage_export_json(&rows, exported_at),
+    }
 }
 
 fn write_export(path: &Path, content: &str, format: UsageExportFormat) -> Result<(), String> {
@@ -284,16 +296,18 @@ pub(crate) fn validate_export_file_name(
     if trimmed.ends_with('.') || trimmed.ends_with(' ') {
         return Err("The file name cannot end with a dot or a space".to_string());
     }
-    if trimmed
-        .chars()
-        .any(|character| matches!(character, '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*') || character.is_control())
-    {
+    if trimmed.chars().any(|character| {
+        matches!(
+            character,
+            '/' | '\\' | '<' | '>' | ':' | '"' | '|' | '?' | '*'
+        ) || character.is_control()
+    }) {
         return Err("The file name contains characters that are not allowed".to_string());
     }
     let stem = trimmed.split('.').next().unwrap_or_default();
     const RESERVED_DEVICE_NAMES: [&str; 22] = [
-        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7",
-        "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+        "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
+        "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
     ];
     if RESERVED_DEVICE_NAMES.contains(&stem.to_ascii_lowercase().as_str()) {
         return Err("The file name uses a reserved device name".to_string());
@@ -339,7 +353,11 @@ pub(crate) fn resolve_export_destination(
 /// save-file dialog on this path anymore — see the module documentation.
 #[tauri::command]
 pub async fn pick_usage_export_directory(app: AppHandle) -> Result<Option<String>, String> {
-    let selected = app.dialog().file().set_title("Choose export folder").blocking_pick_folder();
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Choose export folder")
+        .blocking_pick_folder();
     let path = selected.and_then(|selection| selection.into_path().ok());
     Ok(path.map(|path| path.to_string_lossy().into_owned()))
 }
@@ -358,14 +376,21 @@ pub async fn export_usage_history(
         return Err("History store is unavailable".to_string());
     };
     let exported_at = Utc::now();
+    let first = handle.snapshot();
+    let first = crate::history::CodexSnapshotFence::new(&first.codex_identity_states);
     let observations = store.history_range(None, None, None, "7d");
-    let rows = build_usage_export_rows(&observations, exported_at);
-    let content = match export_format {
-        UsageExportFormat::Csv => build_usage_export_csv(&rows),
-        UsageExportFormat::Json => build_usage_export_json(&rows, exported_at)?,
-    };
+    let filtered = crate::history::isolate_codex_accounts_for_fence(observations.clone(), &first);
 
-    let destination = resolve_export_destination(&directory, &file_name, export_format, confirm_overwrite)?;
+    let destination =
+        resolve_export_destination(&directory, &file_name, export_format, confirm_overwrite)?;
+    let settled = handle.snapshot();
+    let settled = crate::history::CodexSnapshotFence::new(&settled.codex_identity_states);
+    // The settlement is per Codex slot: an unrelated provider moving the
+    // global sequence never discards a valid Codex row, while a slot whose
+    // own ownership moved loses only its own rows.
+    let settled_rows =
+        crate::history::settle_codex_accounts_for_fences(filtered, &first, &settled);
+    let content = build_usage_export_content(&settled_rows, exported_at, export_format)?;
     match destination {
         ExportDestination::ConfirmOverwrite { file_name, .. } => Ok(ExportUsageResult {
             status: "confirm-overwrite",
@@ -421,6 +446,7 @@ mod tests {
         std::fs::create_dir_all(&path).unwrap();
         TempDir { path }
     }
+
 
     fn parse_csv_test_rows(csv: &str) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
@@ -536,7 +562,10 @@ mod tests {
         assert_eq!(envelope.exported_at, "2026-09-30T12:00:00.000Z");
         assert!(envelope.range_covered.is_none());
         assert!(envelope.rows.is_empty());
-        assert_eq!(envelope.semantics.gap_semantics, "notObservedNeverZeroFilled");
+        assert_eq!(
+            envelope.semantics.gap_semantics,
+            "notObservedNeverZeroFilled"
+        );
         assert_eq!(
             envelope.semantics.resolution_semantics,
             "detailedWithin24hOtherwiseCompacted"
@@ -625,16 +654,14 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc);
 
-        let hostile_obs = vec![
-            QuotaObservation {
-                provider_id: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-ae9MIDwtx".to_string(),
-                window_label: "sk-abcdef1234567890abcdef1234567890".to_string(),
-                used_percent: 50.0,
-                observed_at: "2026-09-30T11:00:00.000Z".to_string(),
-                reset_at: Some("Authorization: Bearer secret-value-12345678".to_string()),
-                account: Some("api_key: secret-value-12345678".to_string()),
-            },
-        ];
+        let hostile_obs = vec![QuotaObservation {
+            provider_id: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.t-ae9MIDwtx".to_string(),
+            window_label: "sk-abcdef1234567890abcdef1234567890".to_string(),
+            used_percent: 50.0,
+            observed_at: "2026-09-30T11:00:00.000Z".to_string(),
+            reset_at: Some("Authorization: Bearer secret-value-12345678".to_string()),
+            account: Some("api_key: secret-value-12345678".to_string()),
+        }];
 
         let rows = build_usage_export_rows(&hostile_obs, exported_at);
         let csv = build_usage_export_csv(&rows);
@@ -731,26 +758,53 @@ mod tests {
 
         // Assert 1:1 CSV <-> JSON equivalence
         let csv_rows = parse_csv_test_rows(&csv);
-        assert_eq!(csv_rows[0], vec![
-            "providerId", "providerName", "account", "windowLabel",
-            "usedPercent", "observedAt", "resetAt", "resolution"
-        ]);
+        assert_eq!(
+            csv_rows[0],
+            vec![
+                "providerId",
+                "providerName",
+                "account",
+                "windowLabel",
+                "usedPercent",
+                "observedAt",
+                "resetAt",
+                "resolution"
+            ]
+        );
         let data_rows = &csv_rows[1..];
         let envelope: UsageExportEnvelope = serde_json::from_str(&json_str).unwrap();
         assert_eq!(data_rows.len(), envelope.rows.len());
 
         for (i, (csv_row, json_row)) in data_rows.iter().zip(envelope.rows.iter()).enumerate() {
-            assert_eq!(csv_row[0], json_row.provider_id, "row {i} providerId mismatch");
-            assert_eq!(csv_row[1], json_row.provider_name, "row {i} providerName mismatch");
+            assert_eq!(
+                csv_row[0], json_row.provider_id,
+                "row {i} providerId mismatch"
+            );
+            assert_eq!(
+                csv_row[1], json_row.provider_name,
+                "row {i} providerName mismatch"
+            );
             let expected_account = json_row.account.as_deref().unwrap_or("");
             assert_eq!(csv_row[2], expected_account, "row {i} account mismatch");
-            assert_eq!(csv_row[3], json_row.window_label, "row {i} windowLabel mismatch");
+            assert_eq!(
+                csv_row[3], json_row.window_label,
+                "row {i} windowLabel mismatch"
+            );
             let csv_used: f64 = csv_row[4].parse().unwrap();
-            assert_eq!(csv_used, json_row.used_percent, "row {i} usedPercent mismatch");
-            assert_eq!(csv_row[5], json_row.observed_at, "row {i} observedAt mismatch");
+            assert_eq!(
+                csv_used, json_row.used_percent,
+                "row {i} usedPercent mismatch"
+            );
+            assert_eq!(
+                csv_row[5], json_row.observed_at,
+                "row {i} observedAt mismatch"
+            );
             let expected_reset = json_row.reset_at.as_deref().unwrap_or("");
             assert_eq!(csv_row[6], expected_reset, "row {i} resetAt mismatch");
-            assert_eq!(csv_row[7], json_row.resolution, "row {i} resolution mismatch");
+            assert_eq!(
+                csv_row[7], json_row.resolution,
+                "row {i} resolution mismatch"
+            );
         }
     }
 
@@ -811,9 +865,8 @@ mod tests {
         permissions.set_readonly(true);
         fs::set_permissions(&target_path, permissions).unwrap();
 
-        let error =
-            write_export(&target_path, "NEW,CONTENT\r\n", UsageExportFormat::Csv)
-                .expect_err("rename onto a read-only target must fail");
+        let error = write_export(&target_path, "NEW,CONTENT\r\n", UsageExportFormat::Csv)
+            .expect_err("rename onto a read-only target must fail");
 
         // Deterministic failure receipt: sanitized, no raw provider or path
         // material, and no partial state at the destination.
@@ -833,9 +886,8 @@ mod tests {
         let target_path = dir.path().join("occupied");
         fs::create_dir(&target_path).unwrap();
 
-        let error =
-            write_export(&target_path, "NEW,CONTENT\r\n", UsageExportFormat::Csv)
-                .expect_err("a directory cannot be replaced by a file");
+        let error = write_export(&target_path, "NEW,CONTENT\r\n", UsageExportFormat::Csv)
+            .expect_err("a directory cannot be replaced by a file");
 
         assert!(!error.contains("NEW"));
         assert!(target_path.is_dir());
@@ -893,24 +945,16 @@ mod tests {
         let dir_str = dir.path().to_string_lossy().into_owned();
 
         // A fresh name never asks for confirmation.
-        let fresh = resolve_export_destination(
-            &dir_str,
-            "fresh.csv",
-            UsageExportFormat::Csv,
-            false,
-        )
-        .unwrap();
+        let fresh =
+            resolve_export_destination(&dir_str, "fresh.csv", UsageExportFormat::Csv, false)
+                .unwrap();
         assert!(matches!(fresh, ExportDestination::Write(_)));
 
         // An existing destination asks for confirmation first.
         fs::write(dir.path().join("existing.csv"), "old").unwrap();
-        let existing = resolve_export_destination(
-            &dir_str,
-            "existing.csv",
-            UsageExportFormat::Csv,
-            false,
-        )
-        .unwrap();
+        let existing =
+            resolve_export_destination(&dir_str, "existing.csv", UsageExportFormat::Csv, false)
+                .unwrap();
         assert_eq!(
             existing,
             ExportDestination::ConfirmOverwrite {
@@ -921,13 +965,9 @@ mod tests {
 
         // With the explicit confirmation the write proceeds onto the same
         // path (the write itself is exercised by the read-only tests).
-        let confirmed = resolve_export_destination(
-            &dir_str,
-            "existing.csv",
-            UsageExportFormat::Csv,
-            true,
-        )
-        .unwrap();
+        let confirmed =
+            resolve_export_destination(&dir_str, "existing.csv", UsageExportFormat::Csv, true)
+                .unwrap();
         assert!(matches!(confirmed, ExportDestination::Write(_)));
 
         // An unusable directory is rejected before any write.

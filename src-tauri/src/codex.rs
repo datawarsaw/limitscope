@@ -10,16 +10,20 @@ use std::path::Path;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use crate::provider_error::ProviderError;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
-use crate::provider_error::ProviderError;
 use chrono::{DateTime, SecondsFormat, TimeDelta, Utc};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const USER_AGENT: &str = concat!("rate-limits/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const CODEX_IDENTITY_PREFIX: &str = "chatgpt-v2:";
+const CODEX_IDENTITY_DOMAIN: &[u8] = b"limitscope.codex.identity.v2";
 
 const MINUTE: i64 = 60;
 const HOUR: i64 = 60 * MINUTE;
@@ -43,10 +47,23 @@ pub struct CodexLimitWindow {
 /// Masked attribution of the one local Codex session: the tail of the
 /// `tokens.account_id` the request is already scoped with, so the card can
 /// name the account without any token material crossing the boundary.
-#[derive(Debug, Serialize, PartialEq)]
+#[derive(Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexAccount {
     pub account_hint: String,
+    /// Internal full account identity. The wire shape keeps only the masked
+    /// display hint; history and last-good retention consume this digest.
+    #[serde(skip)]
+    pub(crate) identity: Option<String>,
+}
+
+impl std::fmt::Debug for CodexAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CodexAccount")
+            .field("account_hint", &self.account_hint)
+            .field("identity", &self.identity.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -189,14 +206,20 @@ pub fn reset_credits_fresh(checked_at: &str, now: DateTime<Utc>) -> bool {
 /// Display-safe account binding shared by the quota windows and the credit
 /// observation of one fetch. The served account wins when present (it is
 /// what the windows actually describe); otherwise the requested local scope
-/// is used. None when neither proves an identity. Masked with the same
-/// `account_hint` vocabulary the failure stamps and the last-good guard use.
-fn codex_account(observed_account: Option<&str>, local_account: Option<&str>) -> Option<CodexAccount> {
+/// is used. The hint is display-only; the separate identity binds retention.
+fn codex_account(
+    observed_account: Option<&str>,
+    local_account: Option<&str>,
+    identity: Option<String>,
+) -> Option<CodexAccount> {
     let raw = observed_account
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .or_else(|| local_account.map(str::trim).filter(|s| !s.is_empty()))?;
-    account_hint(raw).map(|account_hint| CodexAccount { account_hint })
+    account_hint(raw).map(|account_hint| CodexAccount {
+        account_hint,
+        identity,
+    })
 }
 
 /// Binds a credit observation to the account identity the Codex provider
@@ -209,17 +232,16 @@ fn codex_account(observed_account: Option<&str>, local_account: Option<&str>) ->
 ///   not attach one account's balance to another).
 /// - Observed absent: unknown (an unbound count must never read as the
 ///   current account's balance).
-fn bind_credit_account(
-    observed_account: Option<&str>,
-    local_account: Option<&str>,
-) -> Option<CodexAccount> {
-    let observed = observed_account.map(str::trim).filter(|s| !s.is_empty())?;
+fn bind_credit_account(observed_account: Option<&str>, local_account: Option<&str>) -> bool {
+    let Some(observed) = observed_account.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
     if let Some(local) = local_account.map(str::trim).filter(|s| !s.is_empty()) {
         if observed != local {
-            return None;
+            return false;
         }
     }
-    account_hint(observed).map(|account_hint| CodexAccount { account_hint })
+    account_hint(observed).is_some()
 }
 
 /// Extracts the optional reset-credit capability from an already-validated
@@ -241,7 +263,9 @@ fn parse_reset_credits(
     }
     let summary: ResetCreditSummary = serde_json::from_value(raw.clone()).ok()?;
     // The balance is only meaningful bound to its account.
-    bind_credit_account(observed_account, local_account)?;
+    if !bind_credit_account(observed_account, local_account) {
+        return None;
+    }
     let banked_credits = strict_count(summary.available_count.as_ref())?;
     Some(CodexResetCredits {
         banked_credits,
@@ -299,6 +323,7 @@ fn normalize_window(window: RateWindow, now: DateTime<Utc>) -> Option<CodexLimit
 struct CodexAuth {
     access_token: String,
     account_id: Option<String>,
+    identity: Option<String>,
 }
 
 // Manual impl so the token can never reach logs through Debug formatting.
@@ -306,16 +331,52 @@ impl std::fmt::Debug for CodexAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CodexAuth")
             .field("access_token", &"<redacted>")
-            .field("account_id", &self.account_id)
+            .field(
+                "account_id",
+                &self.account_id.as_ref().map(|_| "<redacted>"),
+            )
+            .field("identity", &self.identity.as_ref().map(|_| "<redacted>"))
             .finish()
     }
 }
 
 fn codex_dir() -> Result<std::path::PathBuf, ProviderError> {
     let home = std::env::home_dir().ok_or_else(|| {
-        ProviderError::new("codex_not_installed", "Could not locate the user home directory.")
+        ProviderError::new(
+            "codex_not_installed",
+            "Could not locate the user home directory.",
+        )
     })?;
-    Ok(codex_home_dir(std::env::var("CODEX_HOME").ok().as_deref(), &home))
+    Ok(codex_home_dir(
+        std::env::var("CODEX_HOME").ok().as_deref(),
+        &home,
+    ))
+}
+
+/// The Codex home one account reads its credential from.
+///
+/// An explicit account home wins: it is that account's own credential
+/// reference, set by the operator who logged that account in with
+/// `codex login` inside its own `CODEX_HOME`. Without one the process falls
+/// back to the ambient `CODEX_HOME` and then to `~/.codex` — the single-login
+/// behavior this adapter has always had.
+///
+/// A configured home that does not exist is an error, not a silent fallback:
+/// falling back would read the primary account's credential under the second
+/// account's name, which is exactly the identity mix-up the per-account
+/// model exists to prevent.
+pub fn resolve_codex_home(explicit: Option<&str>) -> Result<std::path::PathBuf, ProviderError> {
+    if let Some(home) = explicit.map(str::trim).filter(|home| !home.is_empty()) {
+        let path = std::path::PathBuf::from(home);
+        if !path.is_dir() {
+            return Err(ProviderError::new(
+                "codex_home_missing",
+                format!("The configured Codex home does not exist: {home}"),
+            ));
+        }
+        return Ok(path);
+    }
+    codex_dir()
 }
 
 /// Resolves the Codex home the adapter reads auth state from. A standard
@@ -355,7 +416,10 @@ fn load_auth(dir: &Path) -> Result<CodexAuth, ProviderError> {
 
 fn parse_auth(raw: &str) -> Result<CodexAuth, ProviderError> {
     let value: Value = serde_json::from_str(raw).map_err(|_| {
-        ProviderError::new("auth_unreadable", "Codex auth state (auth.json) is not valid JSON.")
+        ProviderError::new(
+            "auth_unreadable",
+            "Codex auth state (auth.json) is not valid JSON.",
+        )
     })?;
     let tokens = match value.get("tokens").filter(|tokens| tokens.is_object()) {
         Some(tokens) => tokens,
@@ -375,18 +439,137 @@ fn parse_auth(raw: &str) -> Result<CodexAuth, ProviderError> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string);
+    let id_token = tokens
+        .get("id_token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|token| !token.is_empty());
+    let identity = codex_identity_from_tokens(access_token, id_token, account_id.as_deref());
     Ok(CodexAuth {
         access_token: access_token.to_string(),
         account_id,
+        identity,
     })
+}
+
+/// Loads only the local login state and returns its collision-resistant
+/// user/workspace identity. Missing, malformed, or contradictory claims fail
+/// closed without exposing the credential or either identifier.
+pub(crate) fn current_codex_identity(codex_home: Option<&str>) -> Option<String> {
+    let dir = resolve_codex_home(codex_home).ok()?;
+    load_auth(&dir).ok()?.identity
+}
+
+#[derive(Deserialize)]
+struct JwtIdentityClaims {
+    #[serde(rename = "https://api.openai.com/auth", default)]
+    auth: Option<OpenAiIdentityClaims>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiIdentityClaims {
+    #[serde(default)]
+    chatgpt_user_id: Option<String>,
+    #[serde(default)]
+    user_id: Option<String>,
+    #[serde(default)]
+    chatgpt_account_id: Option<String>,
+}
+
+struct TokenIdentity {
+    user: Option<String>,
+    workspace: Option<String>,
+}
+
+fn nonempty_id(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// Decodes the standard three-part JWT payload exactly as Codex does. The
+/// signature is not checked locally; the usage endpoint remains the authority
+/// for rejecting the credential.
+fn jwt_payload<T: DeserializeOwned>(jwt: &str) -> Option<T> {
+    let mut parts = jwt.split('.');
+    let (header, payload, signature) = match (parts.next(), parts.next(), parts.next()) {
+        (Some(header), Some(payload), Some(signature))
+            if !header.is_empty() && !payload.is_empty() && !signature.is_empty() =>
+        {
+            (header, payload, signature)
+        }
+        _ => return None,
+    };
+    let _ = (header, signature);
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn token_identity(jwt: &str) -> Option<TokenIdentity> {
+    let claims: JwtIdentityClaims = jwt_payload(jwt)?;
+    let auth = claims.auth?;
+    let primary = nonempty_id(auth.chatgpt_user_id.as_deref());
+    let fallback = nonempty_id(auth.user_id.as_deref());
+    let user = match (primary, fallback) {
+        (Some(primary), Some(fallback)) if primary == fallback => Some(primary),
+        (Some(primary), None) => Some(primary),
+        (None, Some(fallback)) => Some(fallback),
+        _ => None,
+    };
+    Some(TokenIdentity {
+        user,
+        workspace: nonempty_id(auth.chatgpt_account_id.as_deref()),
+    })
+}
+
+/// SHA-256 over explicitly labelled, length-prefixed fields. Prefixing each
+/// field prevents concatenation collisions; neither tokens nor email enter
+/// the digest.
+fn codex_identity(user: &str, workspace: &str) -> Option<String> {
+    let user = nonempty_id(Some(user))?;
+    let workspace = nonempty_id(Some(workspace))?;
+    let mut digest = Sha256::new();
+    for field in [
+        CODEX_IDENTITY_DOMAIN,
+        b"user".as_slice(),
+        user.as_bytes(),
+        b"workspace".as_slice(),
+        workspace.as_bytes(),
+    ] {
+        digest.update((field.len() as u64).to_le_bytes());
+        digest.update(field);
+    }
+    Some(format!("{CODEX_IDENTITY_PREFIX}{:x}", digest.finalize()))
+}
+
+fn codex_identity_from_tokens(
+    access_token: &str,
+    id_token: Option<&str>,
+    account_id: Option<&str>,
+) -> Option<String> {
+    let id = token_identity(id_token?)?;
+    let access = token_identity(access_token)?;
+    let user = id.user?;
+    if access.user.as_deref() != Some(user.as_str()) {
+        return None;
+    }
+    let workspace = nonempty_id(account_id)?;
+    for claimed_workspace in [id.workspace.as_deref(), access.workspace.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if claimed_workspace != workspace {
+            return None;
+        }
+    }
+    codex_identity(&user, &workspace)
 }
 
 /// Expiry claim from the access token's JWT payload, when parseable.
 /// Only the timestamp is used — the token itself stays in place.
 fn jwt_expiry(token: &str) -> Option<i64> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let value: Value = jwt_payload(token)?;
     value.get("exp")?.as_i64()
 }
 
@@ -394,8 +577,7 @@ fn jwt_expiry(token: &str) -> Option<i64> {
 /// account identifier the usage request is already scoped with (as the
 /// `chatgpt-account-id` header). Only its last eight characters are used, so
 /// the hint distinguishes account A from account B without exposing the
-/// identifier; no JWT is decoded beyond the expiry check above, and no email
-/// or token material is involved. `None` when the id is too short to mask
+/// identifier. No email or token material enters the hint. `None` when the id is too short to mask
 /// meaningfully (the tail would leak most of it) or the tail is not
 /// identifier-shaped.
 fn account_hint(account_id: &str) -> Option<String> {
@@ -409,14 +591,6 @@ fn account_hint(account_id: &str) -> Option<String> {
         return None;
     }
     Some(tail)
-}
-
-/// The identity string the success attribution and every post-resolution
-/// failure build, so the runtime's last-good guard compares like-for-like.
-fn codex_identity(account_id: Option<&str>) -> Option<String> {
-    account_id
-        .and_then(account_hint)
-        .map(|tail| format!("chatgpt:{tail}"))
 }
 
 // ---------- HTTP ----------
@@ -459,13 +633,33 @@ fn unexpected_usage_response(reason: &str) -> ProviderError {
 /// fields are parsed best-effort from the same payload, so windows available
 /// with credit data missing or malformed still yields a Live quota with the
 /// credit capability unavailable — never a quota failure.
+#[cfg(test)]
 fn parse_usage_response(
     body: &[u8],
     now: DateTime<Utc>,
     local_account: Option<&str>,
 ) -> Result<CodexUsage, ProviderError> {
+    parse_usage_response_with_identity(body, now, local_account, None)
+}
+
+fn parse_usage_response_with_identity(
+    body: &[u8],
+    now: DateTime<Utc>,
+    local_account: Option<&str>,
+    identity: Option<String>,
+) -> Result<CodexUsage, ProviderError> {
     let parsed: UsageResponse = serde_json::from_slice(body)
         .map_err(|_| unexpected_usage_response("no known windows found."))?;
+    let observed_account = parsed.account_id.as_deref();
+    let local_account = local_account.map(str::trim).filter(|id| !id.is_empty());
+    if let (Some(observed), Some(local)) = (observed_account, local_account) {
+        if observed.trim() != local {
+            return Err(ProviderError::new(
+                "unexpected_response",
+                "Codex usage response describes a different workspace than the local login.",
+            ));
+        }
+    }
     let Some(rate_limit) = parsed.rate_limit else {
         return Err(unexpected_usage_response("no rate-limit payload found."));
     };
@@ -489,15 +683,13 @@ fn parse_usage_response(
     );
     // Never derive a banked balance from windows, resets, history, or usage
     // drops: only the explicit summary counts, bound to its account.
-    let observed_account = parsed.account_id.as_deref();
     Ok(CodexUsage {
         limits,
         plan_type: parsed.plan_type,
-        // Windows name the served account when the payload proves one (it is
-        // what the windows actually describe); otherwise the requested local
-        // scope. Credits bind strictly: unobserved or contradicting accounts
-        // leave the capability unavailable rather than misattributed.
-        account: codex_account(observed_account, local_account),
+        // Windows name the served account when present; otherwise the
+        // requested local scope. The internal digest always comes from the
+        // locally read login claims, so success and failure share one identity.
+        account: codex_account(observed_account, local_account, identity),
         reset_credits: parse_reset_credits(
             parsed.rate_limit_reset_credits.as_ref(),
             observed_account,
@@ -507,32 +699,30 @@ fn parse_usage_response(
     })
 }
 
+#[cfg(test)]
+pub(crate) fn fixture_collect(auth_json: &str, body: &[u8], now: DateTime<Utc>) -> Result<CodexUsage, ProviderError> {
+    let auth = parse_auth(auth_json)?;
+    parse_usage_response_with_identity(body, now, auth.account_id.as_deref(), auth.identity.clone())
+        .map_err(|error| error.with_identity_hint(auth.identity))
+}
+
 // ---------- fetch + command ----------
 
-async fn fetch_codex_usage() -> Result<CodexUsage, ProviderError> {
-    let dir = codex_dir()?;
+async fn fetch_codex_usage(codex_home: Option<&str>) -> Result<CodexUsage, ProviderError> {
+    let dir = resolve_codex_home(codex_home)?;
     let auth = load_auth(&dir)?;
-    // The attempted account is known as soon as auth.json is resolved; every
-    // failure after this point carries its masked identity so the runtime can
-    // never retain one account's last-good data for a different account (the
-    // same guard pattern the OpenCode Go backend stamps).
-    let identity = codex_identity(auth.account_id.as_deref());
     // Final-boundary value scrub (`secret_scrub`): the access token is alive
     // for this whole fetch, so any exact occurrence of it in a failure
     // message is removed before the error leaves the adapter.
-    fetch_usage_for_auth(&auth, identity)
-        .await
-        .map_err(|error| {
-            crate::secret_scrub::scrub_provider_error(error, &[auth.access_token.as_str()])
-        })
+    fetch_usage_for_auth(&auth).await.map_err(|error| {
+        crate::secret_scrub::scrub_provider_error(error, &[auth.access_token.as_str()])
+    })
 }
 
 /// The usage fetch for an already-resolved credential. No token refresh: an
 /// expired session fails here and stays failed until Codex itself re-auths.
-async fn fetch_usage_for_auth(
-    auth: &CodexAuth,
-    identity: Option<String>,
-) -> Result<CodexUsage, ProviderError> {
+async fn fetch_usage_for_auth(auth: &CodexAuth) -> Result<CodexUsage, ProviderError> {
+    let identity = auth.identity.clone();
     // authoritative check (401/403 below).
     if let Some(exp) = jwt_expiry(&auth.access_token) {
         if Utc::now().timestamp() >= exp {
@@ -540,7 +730,7 @@ async fn fetch_usage_for_auth(
         }
     }
 
-    let client = http_client()?;
+    let client = http_client().map_err(|error| error.with_identity_hint(identity.clone()))?;
     let mut request = client
         .get(USAGE_URL)
         .bearer_auth(&auth.access_token)
@@ -558,7 +748,8 @@ async fn fetch_usage_for_auth(
         .with_identity_hint(identity.clone())
     })?;
     let status = response.status();
-    let retry_after = crate::provider_error::retry_after_header(response.headers()).map(String::from);
+    let retry_after =
+        crate::provider_error::retry_after_header(response.headers()).map(String::from);
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         return Err(auth_expired().with_identity_hint(identity.clone()));
     }
@@ -580,16 +771,30 @@ async fn fetch_usage_for_auth(
         .with_identity_hint(identity.clone()));
     }
 
-    // Attribution and credit binding resolve inside the parse (served
-    // account wins, requested local scope as fallback), using the same
-    // masked identity vocabulary the failure stamps carry.
-    parse_usage_response(&body, Utc::now(), auth.account_id.as_deref())
-        .map_err(|error| error.with_identity_hint(identity.clone()))
+    // A served-workspace contradiction is a failure of this same attempt, so
+    // it carries the local identity; success stores that exact identity.
+    parse_usage_response_with_identity(
+        &body,
+        Utc::now(),
+        auth.account_id.as_deref(),
+        identity.clone(),
+    )
+    .map_err(|error| error.with_identity_hint(identity.clone()))
 }
 
 #[tauri::command]
 pub async fn get_codex_usage() -> Result<CodexUsage, ProviderError> {
-    fetch_codex_usage().await
+    fetch_codex_usage(None).await
+}
+
+/// The usage read for one explicitly configured account.
+///
+/// The account's own Codex home is the only thing that differs from
+/// `get_codex_usage`: the credential, the request scope and therefore the
+/// quota windows are that account's own. Nothing is shared between two
+/// accounts and no limit is ever combined.
+pub async fn get_codex_usage_for(codex_home: Option<&str>) -> Result<CodexUsage, ProviderError> {
+    fetch_codex_usage(codex_home).await
 }
 
 // ---------- tests ----------
@@ -682,20 +887,14 @@ mod tests {
     #[test]
     fn normalize_clamps_percent_and_keeps_reset() {
         let now = Utc::now();
-        let over = normalize_window(
-            serde_json::from_value(window_json(150.0)).unwrap(),
-            now,
-        )
-        .unwrap();
+        let over =
+            normalize_window(serde_json::from_value(window_json(150.0)).unwrap(), now).unwrap();
         assert_eq!(over.used_percent, 100.0);
         assert_eq!(over.label, "Weekly");
         assert_eq!(over.reset_at.as_deref(), Some("2026-10-03T07:15:21Z"));
 
-        let under = normalize_window(
-            serde_json::from_value(window_json(-5.0)).unwrap(),
-            now,
-        )
-        .unwrap();
+        let under =
+            normalize_window(serde_json::from_value(window_json(-5.0)).unwrap(), now).unwrap();
         assert_eq!(under.used_percent, 0.0);
     }
 
@@ -750,7 +949,10 @@ mod tests {
         assert_eq!(usage.limits.len(), 1);
         assert_eq!(usage.limits[0].label, "Weekly");
         assert_eq!(usage.limits[0].used_percent, 1.0);
-        assert_eq!(usage.limits[0].reset_at.as_deref(), Some("2026-10-03T07:15:21Z"));
+        assert_eq!(
+            usage.limits[0].reset_at.as_deref(),
+            Some("2026-10-03T07:15:21Z")
+        );
     }
 
     #[test]
@@ -791,7 +993,8 @@ mod tests {
     #[test]
     fn missing_rate_limit_is_a_schema_error() {
         let body = serde_json::json!({ "plan_type": "free", "extra_field": 1 });
-        let error = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
+        let error =
+            parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
         assert_eq!(error.code, "unexpected_response");
         assert!(error.message.contains("no rate-limit payload found."));
     }
@@ -799,7 +1002,8 @@ mod tests {
     #[test]
     fn null_rate_limit_is_a_schema_error() {
         let body = serde_json::json!({ "plan_type": "free", "rate_limit": null });
-        let error = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
+        let error =
+            parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
         assert_eq!(error.code, "unexpected_response");
         assert!(error.message.contains("no rate-limit payload found."));
     }
@@ -810,9 +1014,12 @@ mod tests {
             "plan_type": "free",
             "rate_limit": { "allowed": true, "secondary_window": window_json(2.0) }
         });
-        let error = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
+        let error =
+            parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
         assert_eq!(error.code, "unexpected_response");
-        assert!(error.message.contains("no primary rate-limit window found."));
+        assert!(error
+            .message
+            .contains("no primary rate-limit window found."));
     }
 
     #[test]
@@ -822,7 +1029,8 @@ mod tests {
             "plan_type": "free",
             "rate_limit": { "primary_window": { "limit_window_seconds": 300 } }
         });
-        let error = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
+        let error =
+            parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
         assert_eq!(error.code, "unexpected_response");
         assert!(error.message.contains("no usable usage figure."));
 
@@ -831,7 +1039,8 @@ mod tests {
             "plan_type": "free",
             "rate_limit": { "primary_window": null }
         });
-        let error = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
+        let error =
+            parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap_err();
         assert_eq!(error.code, "unexpected_response");
     }
 
@@ -889,7 +1098,10 @@ mod tests {
             .transient,
             Some(false)
         );
-        assert_eq!(ProviderError::transient("network", "offline").transient, Some(true));
+        assert_eq!(
+            ProviderError::transient("network", "offline").transient,
+            Some(true)
+        );
         assert_eq!(auth_expired().transient, Some(false));
         assert_eq!(not_logged_in().transient, Some(false));
     }
@@ -927,14 +1139,22 @@ mod tests {
         });
         let usage = parse_usage_response(body.to_string().as_bytes(), Utc::now(), None).unwrap();
         let wire = serde_json::to_string(&usage).unwrap();
-        for secret in ["sk-secret-token", "acct-1234567890abcdef", "someone@example.com", "user-x"] {
+        for secret in [
+            "sk-secret-token",
+            "acct-1234567890abcdef",
+            "someone@example.com",
+            "user-x",
+        ] {
             assert!(!wire.contains(secret), "leaked: {secret}");
         }
         // The served account binds as a masked hint only; no credit summary
         // was reported, so the capability stays unavailable.
         assert_eq!(
             usage.account,
-            Some(CodexAccount { account_hint: "90abcdef".to_string() })
+            Some(CodexAccount {
+                account_hint: "90abcdef".to_string(),
+                identity: None
+            })
         );
         assert_eq!(usage.reset_credits, None);
         let value: Value = serde_json::from_str(&wire).unwrap();
@@ -966,14 +1186,202 @@ mod tests {
 
     #[test]
     fn parse_auth_rejects_missing_tokens() {
-        assert_eq!(parse_auth(r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap_err().code, "not_logged_in");
-        assert_eq!(parse_auth(r#"{"tokens":{}}"#).unwrap_err().code, "not_logged_in");
+        assert_eq!(
+            parse_auth(r#"{"OPENAI_API_KEY":"sk-x"}"#).unwrap_err().code,
+            "not_logged_in"
+        );
+        assert_eq!(
+            parse_auth(r#"{"tokens":{}}"#).unwrap_err().code,
+            "not_logged_in"
+        );
         assert_eq!(parse_auth("not json").unwrap_err().code, "auth_unreadable");
     }
 
+    fn jwt_with_auth_claims(auth: Value) -> String {
+        jwt_with_payload(serde_json::json!({ "https://api.openai.com/auth": auth }))
+    }
+
+    fn jwt_with_payload(payload: Value) -> String {
+        let payload = URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("fixture-header.{payload}.fixture-signature")
+    }
+
+    fn auth_json(access_auth: Value, id_auth: Value, account_id: Option<&str>) -> String {
+        let mut tokens = serde_json::json!({
+            "access_token": jwt_with_auth_claims(access_auth),
+            "id_token": jwt_with_auth_claims(id_auth),
+        });
+        if let Some(account_id) = account_id {
+            tokens["account_id"] = Value::String(account_id.to_string());
+        }
+        serde_json::json!({ "tokens": tokens }).to_string()
+    }
+
+    #[test]
+    fn identity_is_a_domain_separated_sha256_of_user_and_workspace() {
+        let identity = codex_identity("fixture-user-a", "fixture-workspace-a").unwrap();
+        assert!(identity.starts_with(CODEX_IDENTITY_PREFIX));
+        let hex = identity.strip_prefix(CODEX_IDENTITY_PREFIX).unwrap();
+        assert_eq!(hex.len(), 64);
+        assert!(hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert_eq!(
+            identity,
+            codex_identity("fixture-user-a", "fixture-workspace-a").unwrap()
+        );
+        assert_ne!(
+            identity,
+            codex_identity("fixture-user-b", "fixture-workspace-a").unwrap()
+        );
+        assert_ne!(
+            identity,
+            codex_identity("fixture-user-a", "fixture-workspace-b").unwrap()
+        );
+        assert_eq!(codex_identity("", "fixture-workspace-a"), None);
+        assert_eq!(codex_identity("fixture-user-a", " "), None);
+    }
+
+    #[test]
+    fn reconnect_keeps_identity_while_both_tokens_rotate() {
+        let first = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            serde_json::json!({ "user_id": "fixture-user-a" }),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap();
+        let reconnected = parse_auth(&auth_json(
+            serde_json::json!({ "user_id": "fixture-user-a" }),
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap();
+        assert!(first.identity.is_some());
+        assert_eq!(first.identity, reconnected.identity);
+        assert_ne!(first.access_token, reconnected.access_token);
+    }
+
+    #[test]
+    fn identity_changes_for_a_different_user_or_workspace() {
+        let base = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap()
+        .identity;
+        let other_user = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-b" }),
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-b" }),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap()
+        .identity;
+        let other_workspace = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+            Some("fixture-workspace-b"),
+        ))
+        .unwrap()
+        .identity;
+        assert!(base.is_some());
+        assert_ne!(base, other_user);
+        assert_ne!(base, other_workspace);
+    }
+
+    #[test]
+    fn absent_or_contradictory_identity_claims_fail_closed() {
+        let claims = |user: &str| serde_json::json!({ "chatgpt_user_id": user });
+        let valid = auth_json(
+            claims("fixture-user-a"),
+            claims("fixture-user-a"),
+            Some("fixture-workspace-a"),
+        );
+        let mut without_id_token: Value = serde_json::from_str(&valid).unwrap();
+        without_id_token["tokens"]
+            .as_object_mut()
+            .unwrap()
+            .remove("id_token");
+        let missing_id = parse_auth(&without_id_token.to_string()).unwrap();
+        let missing_user = parse_auth(&auth_json(
+            serde_json::json!({}),
+            claims("fixture-user-a"),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap();
+        let user_mismatch = parse_auth(&auth_json(
+            claims("fixture-user-b"),
+            claims("fixture-user-a"),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap();
+        let missing_workspace = parse_auth(&auth_json(
+            claims("fixture-user-a"),
+            claims("fixture-user-a"),
+            None,
+        ))
+        .unwrap();
+        let workspace_mismatch = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-user-a", "chatgpt_account_id": "fixture-workspace-b" }),
+            claims("fixture-user-a"),
+            Some("fixture-workspace-a"),
+        ))
+        .unwrap();
+        let malformed = parse_auth(&serde_json::json!({
+            "tokens": { "access_token": "not-a-jwt", "id_token": "also-not-a-jwt", "account_id": "fixture-workspace-a" }
+        }).to_string()).unwrap();
+        for auth in [
+            missing_id,
+            missing_user,
+            user_mismatch,
+            missing_workspace,
+            workspace_mismatch,
+            malformed,
+        ] {
+            assert_eq!(auth.identity, None);
+        }
+    }
+
+    #[test]
+    fn current_codex_identity_reads_only_the_local_auth_file() {
+        let dir = unique_temp_dir("identity");
+        fs::write(
+            dir.join("auth.json"),
+            auth_json(
+                serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+                serde_json::json!({ "chatgpt_user_id": "fixture-user-a" }),
+                Some("fixture-workspace-a"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            current_codex_identity(dir.to_str()),
+            codex_identity("fixture-user-a", "fixture-workspace-a")
+        );
+        fs::write(dir.join("auth.json"), "not json").unwrap();
+        assert_eq!(current_codex_identity(dir.to_str()), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_debug_and_identity_never_expose_auth_material() {
+        let auth = parse_auth(&auth_json(
+            serde_json::json!({ "chatgpt_user_id": "fixture-private-user" }),
+            serde_json::json!({ "chatgpt_user_id": "fixture-private-user" }),
+            Some("fixture-private-workspace"),
+        ))
+        .unwrap();
+        let debug = format!("{auth:?}");
+        assert!(!debug.contains("fixture-private-user"));
+        assert!(!debug.contains("fixture-private-workspace"));
+        assert!(!debug.contains(&auth.access_token));
+    }
+
     fn unique_temp_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("limitscope-codex-test-{}-{label}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "limitscope-codex-test-{}-{label}",
+            std::process::id()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("create temp dir");
         dir
@@ -1004,7 +1412,10 @@ mod tests {
         assert_eq!(codex_home_dir(Some("   "), home), fallback);
         // A path that does not exist…
         let missing = std::env::temp_dir().join("limitscope-codex-test-missing-does-not-exist");
-        assert_eq!(codex_home_dir(Some(missing.to_str().unwrap()), home), fallback);
+        assert_eq!(
+            codex_home_dir(Some(missing.to_str().unwrap()), home),
+            fallback
+        );
         // …and one that exists but is a file, not a directory.
         let dir = unique_temp_dir("unusable");
         let file = dir.join("not-a-dir");
@@ -1033,7 +1444,8 @@ mod tests {
     fn load_auth_error_categories_are_unchanged() {
         // A missing home reads as "not installed"; a home without auth.json
         // reads as "not logged in" — whether defaulted or overridden.
-        let missing = std::env::temp_dir().join("limitscope-codex-test-missing-home-does-not-exist");
+        let missing =
+            std::env::temp_dir().join("limitscope-codex-test-missing-home-does-not-exist");
         assert_eq!(load_auth(&missing).unwrap_err().code, "codex_not_installed");
         let dir = unique_temp_dir("empty-home");
         assert_eq!(load_auth(&dir).unwrap_err().code, "not_logged_in");
@@ -1058,7 +1470,10 @@ mod tests {
         let hint = account_hint("12345678-1234-1234-1234-123456789abc").unwrap();
         assert_eq!(hint, "56789abc");
         // Deterministic per account: the same id derives the same hint.
-        assert_eq!(account_hint("12345678-1234-1234-1234-123456789abc"), Some(hint));
+        assert_eq!(
+            account_hint("12345678-1234-1234-1234-123456789abc"),
+            Some(hint)
+        );
         // A different account derives a different hint.
         assert_ne!(
             account_hint("12345678-1234-1234-1234-123456789abc"),
@@ -1081,20 +1496,6 @@ mod tests {
         assert_eq!(account_hint("123456789012345.6"), None);
     }
 
-    /// The identity string the failure paths stamp must match the identity
-    /// the success attribution carries (the runtime guard compares them).
-    #[test]
-    fn identity_format_matches_the_success_attribution_input() {
-        assert_eq!(
-            codex_identity(Some("12345678-1234-1234-1234-123456789abc")),
-            Some("chatgpt:56789abc".to_string())
-        );
-        // No account_id in auth.json: no identity anywhere — the runtime
-        // keeps its conservative retention behavior.
-        assert_eq!(codex_identity(None), None);
-        assert_eq!(codex_identity(Some("abc-123")), None);
-    }
-
     /// The usage wire carries only the masked hint — never the account id,
     /// the token, or any other credential material.
     #[test]
@@ -1108,11 +1509,15 @@ mod tests {
             plan_type: Some("team".to_string()),
             account: Some(CodexAccount {
                 account_hint: "56789abc".to_string(),
+                identity: None,
             }),
             reset_credits: None,
         };
         let wire = serde_json::to_string(&usage).unwrap();
-        assert!(wire.contains("\"account\":{\"accountHint\":\"56789abc\"}"), "wire: {wire}");
+        assert!(
+            wire.contains("\"account\":{\"accountHint\":\"56789abc\"}"),
+            "wire: {wire}"
+        );
         for secret in [
             "12345678-1234-1234-1234-123456789abc",
             "access-token",
@@ -1125,7 +1530,7 @@ mod tests {
     #[test]
     #[ignore = "live test: requires a real local Codex login and network access"]
     fn live_fetch_returns_windows() {
-        let usage = tauri::async_runtime::block_on(fetch_codex_usage()).expect("live fetch");
+        let usage = tauri::async_runtime::block_on(fetch_codex_usage(None)).expect("live fetch");
         println!("plan_type: {:?}", usage.plan_type);
         if let Some(account) = &usage.account {
             println!("account: chatgpt:{}", account.account_hint);
@@ -1204,26 +1609,44 @@ mod tests {
             assert_eq!(credits.source, RESET_CREDITS_SOURCE);
             assert_eq!(
                 usage.account,
-                Some(CodexAccount { account_hint: "7890abcd".to_string() })
+                Some(CodexAccount {
+                    account_hint: "7890abcd".to_string(),
+                    identity: None
+                })
             );
         }
     }
 
     #[test]
     fn applicability_zero_one_and_missing() {
-        let zero = credited_usage(Value::from(3), Some(Value::from(0)), Some("acct-1234567890abcd"), Some("acct-1234567890abcd"));
+        let zero = credited_usage(
+            Value::from(3),
+            Some(Value::from(0)),
+            Some("acct-1234567890abcd"),
+            Some("acct-1234567890abcd"),
+        );
         assert_eq!(
             zero.reset_credits.expect("credits").currently_applicable,
             Some(0)
         );
-        let one = credited_usage(Value::from(3), Some(Value::from(1)), Some("acct-1234567890abcd"), Some("acct-1234567890abcd"));
+        let one = credited_usage(
+            Value::from(3),
+            Some(Value::from(1)),
+            Some("acct-1234567890abcd"),
+            Some("acct-1234567890abcd"),
+        );
         assert_eq!(
             one.reset_credits.expect("credits").currently_applicable,
             Some(1)
         );
         // Missing applicability is unknown, never zero — the banked balance
         // itself still stands.
-        let missing = credited_usage(Value::from(2), None, Some("acct-1234567890abcd"), Some("acct-1234567890abcd"));
+        let missing = credited_usage(
+            Value::from(2),
+            None,
+            Some("acct-1234567890abcd"),
+            Some("acct-1234567890abcd"),
+        );
         let credits = missing.reset_credits.expect("banked balance must stand");
         assert_eq!(credits.banked_credits, 2);
         assert_eq!(credits.currently_applicable, None);
@@ -1299,8 +1722,12 @@ mod tests {
             }),
         ];
         for body in bodies {
-            let usage =
-                parse_usage_response(body.to_string().as_bytes(), now, Some("acct-1234567890abcd")).unwrap();
+            let usage = parse_usage_response(
+                body.to_string().as_bytes(),
+                now,
+                Some("acct-1234567890abcd"),
+            )
+            .unwrap();
             assert_eq!(usage.limits.len(), 1, "quota windows must survive");
             assert_eq!(usage.reset_credits, None, "body: {body}");
         }
@@ -1321,7 +1748,12 @@ mod tests {
             serde_json::json!(u64::MAX),
         ];
         for count in malformed {
-            let usage = credited_usage(count.clone(), None, Some("acct-1234567890abcd"), Some("acct-1234567890abcd"));
+            let usage = credited_usage(
+                count.clone(),
+                None,
+                Some("acct-1234567890abcd"),
+                Some("acct-1234567890abcd"),
+            );
             assert_eq!(usage.limits.len(), 1, "quota must survive: {count}");
             assert_eq!(usage.reset_credits, None, "count: {count}");
         }
@@ -1346,8 +1778,12 @@ mod tests {
             "total_earned_count": 5,
             "rate_limit_reset_credits": { "credit_items": [{}, {}, {}] }
         });
-        let usage =
-            parse_usage_response(body.to_string().as_bytes(), Utc::now(), Some("acct-1234567890abcd")).unwrap();
+        let usage = parse_usage_response(
+            body.to_string().as_bytes(),
+            Utc::now(),
+            Some("acct-1234567890abcd"),
+        )
+        .unwrap();
         assert_eq!(usage.limits.len(), 2);
         assert_eq!(usage.reset_credits, None);
     }
@@ -1361,27 +1797,67 @@ mod tests {
             "rate_limit": { "primary_window": window_json(1.0) },
             "rate_limit_reset_credits": { "available_count": 3, "credit_items": [{}, {}] }
         });
-        let usage =
-            parse_usage_response(body.to_string().as_bytes(), Utc::now(), Some("acct-1234567890abcd")).unwrap();
+        let usage = parse_usage_response(
+            body.to_string().as_bytes(),
+            Utc::now(),
+            Some("acct-1234567890abcd"),
+        )
+        .unwrap();
         assert_eq!(usage.reset_credits.expect("credits").banked_credits, 3);
     }
 
     #[test]
-    fn account_mismatch_drops_credits_not_quota() {
-        // Served account contradicts the stored scope: windows stay bound to
-        // what was actually served, the balance goes unavailable.
-        let usage = credited_usage(
+    fn served_workspace_mismatch_rejects_the_whole_reading() {
+        let body = credited_body(
             Value::from(3),
             Some(Value::from(0)),
             Some("acct-1234567890abcd"),
+        );
+        let error = parse_usage_response(
+            body.to_string().as_bytes(),
+            Utc::now(),
             Some("acct-0987654321fedc"),
-        );
-        assert_eq!(usage.limits.len(), 1);
-        assert_eq!(usage.reset_credits, None);
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "unexpected_response");
+        assert!(!error.message.contains("acct-"));
+    }
+
+    #[tokio::test]
+    async fn success_and_post_resolution_failure_share_the_exact_identity() {
+        let identity = codex_identity("fixture-user-a", "acct-1234567890abcd").unwrap();
+        let auth = CodexAuth {
+            access_token: jwt_with_payload(serde_json::json!({
+                "exp": 1,
+                "https://api.openai.com/auth": { "chatgpt_user_id": "fixture-user-a" }
+            })),
+            account_id: Some("acct-1234567890abcd".to_string()),
+            identity: Some(identity.clone()),
+        };
+        let failure = fetch_usage_for_auth(&auth).await.unwrap_err();
+        assert_eq!(failure.code, "auth_expired");
+        assert_eq!(failure.identity_hint.as_deref(), Some(identity.as_str()));
+
+        let body = serde_json::json!({
+            "account_id": "acct-1234567890abcd",
+            "plan_type": "team",
+            "rate_limit": { "primary_window": window_json(1.0) }
+        });
+        let success = parse_usage_response_with_identity(
+            body.to_string().as_bytes(),
+            Utc::now(),
+            auth.account_id.as_deref(),
+            Some(identity.clone()),
+        )
+        .unwrap();
         assert_eq!(
-            usage.account,
-            Some(CodexAccount { account_hint: "7890abcd".to_string() })
+            success
+                .account
+                .as_ref()
+                .and_then(|account| account.identity.as_deref()),
+            Some(identity.as_str())
         );
+        assert_eq!(failure.identity_hint, Some(identity));
     }
 
     #[test]
@@ -1396,7 +1872,10 @@ mod tests {
         assert_eq!(usage.reset_credits, None);
         assert_eq!(
             usage.account,
-            Some(CodexAccount { account_hint: "7890abcd".to_string() })
+            Some(CodexAccount {
+                account_hint: "7890abcd".to_string(),
+                identity: None
+            })
         );
         // Neither side proves an identity: unattributed, unavailable.
         let usage = credited_usage(Value::from(3), None, None, None);
@@ -1416,12 +1895,19 @@ mod tests {
         let observed = "0123456789abcdef";
         let usage = credited_usage(Value::from(3), None, Some(observed), None);
         assert_eq!(
-            usage.reset_credits.as_ref().expect("credits").banked_credits,
+            usage
+                .reset_credits
+                .as_ref()
+                .expect("credits")
+                .banked_credits,
             3
         );
         assert_eq!(
             usage.account,
-            Some(CodexAccount { account_hint: "89abcdef".to_string() })
+            Some(CodexAccount {
+                account_hint: "89abcdef".to_string(),
+                identity: None
+            })
         );
         // The raw id must never survive anywhere on the wire.
         let wire = serde_json::to_string(&usage).unwrap();
@@ -1436,7 +1922,10 @@ mod tests {
         };
         assert!(reset_credits_fresh(&stamp(0), now));
         assert!(reset_credits_fresh(&stamp(-RESET_CREDITS_TTL_SECS), now));
-        assert!(!reset_credits_fresh(&stamp(-RESET_CREDITS_TTL_SECS - 1), now));
+        assert!(!reset_credits_fresh(
+            &stamp(-RESET_CREDITS_TTL_SECS - 1),
+            now
+        ));
         assert!(!reset_credits_fresh(&stamp(-3600), now));
         // Clock skew inside tolerance still reads fresh; beyond it does not.
         assert!(reset_credits_fresh(&stamp(240), now));
@@ -1458,7 +1947,10 @@ mod tests {
         // below to mean anything.
         assert_eq!(
             usage.account,
-            Some(CodexAccount { account_hint: "7890abcd".to_string() }),
+            Some(CodexAccount {
+                account_hint: "7890abcd".to_string(),
+                identity: None
+            }),
             "local identity did not bind as the masked hint"
         );
         let credits = usage.reset_credits.expect("credits");
@@ -1469,8 +1961,16 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            vec!["bankedCredits", "checkedAt", "currentlyApplicable", "source"]
+            vec![
+                "bankedCredits",
+                "checkedAt",
+                "currentlyApplicable",
+                "source"
+            ]
         );
-        assert!(!wire.contains("acct-1234567890abcd"), "raw identity leaked: {wire}");
+        assert!(
+            !wire.contains("acct-1234567890abcd"),
+            "raw identity leaked: {wire}"
+        );
     }
 }

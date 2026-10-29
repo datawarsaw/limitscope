@@ -776,6 +776,10 @@ mod tests {
     use chrono::TimeZone;
     use std::sync::{Arc, Mutex};
 
+    const CODEX_IDENTITY_A: &str =
+        "chatgpt-v2:1111111111111111111111111111111111111111111111111111111111111111";
+    const CODEX_IDENTITY_B: &str =
+        "chatgpt-v2:2222222222222222222222222222222222222222222222222222222222222222";
     const NOW_MS: i64 = 1_790_596_800_000; // == Date.parse("2026-09-28T12:00:00.000Z")
     const NOW: &str = "2026-09-28T12:00:00.000Z";
     const RESET_LATER: &str = "2026-09-28T16:00:00.000Z";
@@ -912,7 +916,11 @@ mod tests {
                 reset_text: None,
                 reset_at: Some(RESET_LATER.to_string()),
             }],
-            account: None,
+            account: Some(AccountAttributionDto {
+                label: "Codex account A".to_string(),
+                note: None,
+                identity: Some(CODEX_IDENTITY_A.to_string()),
+            }),
             plan_type: None,
             error: None,
             error_category: None,
@@ -923,6 +931,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -951,6 +961,8 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            account_alias: None,
+            monitoring_paused: None,
             fallback_failure: None,
         }
     }
@@ -1099,27 +1111,28 @@ mod tests {
     #[test]
     fn accounts_have_independent_notification_state() {
         let harness = enabled_harness("accounts");
-        let a = with_account(usage(79.0), "key:aaaa");
+        let a = with_account(usage(79.0), CODEX_IDENTITY_A);
         harness.cycle(&[a]);
 
-        let a = with_account(usage(81.0), "key:aaaa");
-        let b = with_account(usage(82.0), "key:bbbb");
+        let a = with_account(usage(81.0), CODEX_IDENTITY_A);
+        let b = with_account(usage(82.0), CODEX_IDENTITY_B);
         let delivered = harness.cycle(&[a, b]);
         assert_eq!(delivered.len(), 1, "B's first observation is baseline, not a crossing");
-        assert_eq!(delivered[0].account.as_deref(), Some("key:aaaa"));
+        assert_eq!(delivered[0].account.as_deref(), Some(CODEX_IDENTITY_A));
 
         // B crosses on its own later and fires independently.
-        let b = with_account(usage(79.0), "key:bbbb");
+        let b = with_account(usage(79.0), CODEX_IDENTITY_B);
         harness.cycle(&[b]);
-        let b = with_account(usage(81.0), "key:bbbb");
+        let b = with_account(usage(81.0), CODEX_IDENTITY_B);
         let delivered = harness.cycle(&[b]);
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].account.as_deref(), Some("key:bbbb"));
+        assert_eq!(delivered[0].account.as_deref(), Some(CODEX_IDENTITY_B));
         assert_eq!(harness.deliveries().len(), 2);
 
         // An unattributed window is a third identity entirely.
         let mut unattributed = usage(79.0);
         unattributed.id = "zai".to_string();
+        unattributed.account = None;
         harness.cycle(&[unattributed]);
         let mut attributed_now = usage(81.0);
         attributed_now.id = "zai".to_string();
@@ -1628,16 +1641,22 @@ mod tests {
     #[test]
     fn recovery_account_isolation() {
         let harness = enabled_harness("recovery-accounts");
-        harness.cycle(&[with_account(with_reset_at(usage(96.0), RESET_LATER), "key:aaaa")]);
+        harness.cycle(&[with_account(
+            with_reset_at(usage(96.0), RESET_LATER),
+            CODEX_IDENTITY_A,
+        )]);
         // B never constrained: its reset must not notify, and must not
         // inherit A's constrained peak.
-        harness.cycle(&[with_account(with_reset_at(usage(10.0), RESET_LATER), "key:bbbb")]);
+        harness.cycle(&[with_account(
+            with_reset_at(usage(10.0), RESET_LATER),
+            CODEX_IDENTITY_B,
+        )]);
         let delivered = harness.cycle(&[
-            with_account(with_reset_at(usage(4.0), RESET_NEXT), "key:aaaa"),
-            with_account(with_reset_at(usage(5.0), RESET_NEXT), "key:bbbb"),
+            with_account(with_reset_at(usage(4.0), RESET_NEXT), CODEX_IDENTITY_A),
+            with_account(with_reset_at(usage(5.0), RESET_NEXT), CODEX_IDENTITY_B),
         ]);
         assert_eq!(delivered.len(), 1);
-        assert_eq!(delivered[0].account.as_deref(), Some("key:aaaa"));
+        assert_eq!(delivered[0].account.as_deref(), Some(CODEX_IDENTITY_A));
         assert_eq!(delivered[0].kind, ThresholdKind::Recovery);
     }
 
@@ -1909,6 +1928,7 @@ mod tests {
             "enabled": true,
             "windows": [{
                 "providerId": "openai-codex",
+                "account": CODEX_IDENTITY_A,
                 "windowLabel": "Weekly credits",
                 "resetAt": RESET_LATER,
                 "lastPercent": 96.0,
@@ -1964,13 +1984,22 @@ mod tests {
     #[test]
     fn recovery_persisted_state_carries_no_secrets() {
         let harness = enabled_harness("recovery-secrets");
-        harness.cycle(&[with_account(with_reset_at(usage(96.0), RESET_LATER), "key:3456")]);
-        harness.cycle(&[with_account(with_reset_at(usage(4.0), RESET_NEXT), "key:3456")]);
+        harness.cycle(&[with_account(
+            with_reset_at(usage(96.0), RESET_LATER),
+            CODEX_IDENTITY_A,
+        )]);
+        harness.cycle(&[with_account(
+            with_reset_at(usage(4.0), RESET_NEXT),
+            CODEX_IDENTITY_A,
+        )]);
         let raw = std::fs::read_to_string(harness.dir.path().join(NOTIFICATIONS_FILE_NAME)).unwrap();
         let lower = raw.to_lowercase();
         for forbidden in ["bearer", "jwt", "api_key", "apikey", "cookie", "credential", "secret", "password"] {
             assert!(!lower.contains(forbidden), "persisted state must not contain {forbidden}");
         }
-        assert!(raw.contains("key:3456"), "masked identity token is preserved");
+        assert!(
+            raw.contains(CODEX_IDENTITY_A),
+            "display-safe identity is preserved"
+        );
     }
 }

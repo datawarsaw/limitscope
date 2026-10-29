@@ -16,18 +16,19 @@
 //!
 //! # Ownership and honesty contract
 //!
-//! - The sources are the ZCode local database (`~/.zcode/cli/db/db.sqlite`,
+//! - Enabled sources are the ZCode local database (`~/.zcode/cli/db/db.sqlite`,
 //!   table `model_usage`, read strictly read-only through a temporary
-//!   snapshot copy — see `usage_source_zcode.rs`), the Codex rollout logs
-//!   (`~/.codex/sessions/**` and `~/.codex/archived_sessions/**`, read
-//!   strictly read-only with per-file byte cursors — see
-//!   `usage_source_codex.rs`), and the OpenCode local database
+//!   snapshot copy — see `usage_source_zcode.rs`) and the OpenCode local database
 //!   (`~/.local/share/opencode/opencode.db`, table `message`, read
 //!   strictly read-only through a temporary snapshot copy — see
 //!   `usage_source_opencode.rs`). Source files are never opened for
 //!   writing, never checkpointed, never mutated. Each source keeps its
 //!   own cursor under its own source id; one source failing never blocks
 //!   or hides the others.
+//! - Codex token collection is disabled because an owned event cannot be
+//!   tied to the active session. Existing Codex events and cursor metadata
+//!   remain persisted and inspectable, but every Usage Intelligence read
+//!   projection excludes the entire source; new Codex rollouts are never read.
 //! - Collection is strictly opt-in. While the persisted `enabled` flag is
 //!   false the collector does not even resolve the source path — no stat,
 //!   no existence probe, no open, no copy, no schema inspection
@@ -46,8 +47,7 @@
 //!   the deferral through the source's `scanCeiling` diagnostics, and
 //!   continues from the saved position on subsequent scans — nothing is
 //!   skipped and the cursor never stalls on an oversized backlog.
-//! - A source can instead stop before reading anything (the Codex rollout
-//!   tree above its file ceiling or nested too deeply). That fail-closed
+//! - An enabled source can stop before reading anything. That fail-closed
 //!   pause is a separate `collectionPaused` state, never `scanCeiling`: no
 //!   new events are collected, so its range coverage is uncertain rather
 //!   than complete.
@@ -508,6 +508,11 @@ pub struct UsageIntelligenceStore {
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
+    /// The Codex home resolver. The Codex source is disabled for
+    /// collection, so nothing resolves it in production; the field and
+    /// its accessors stay so the source can be reconsidered without
+    /// re-deriving the wiring.
+    #[allow(dead_code)]
     codex_home: CodexHomeResolver,
     opencode_db: OpencodeDbResolver,
     /// Transient in-flight latch for the "collecting" diagnostic.
@@ -544,6 +549,7 @@ impl UsageIntelligenceStore {
     }
 
     /// Overrides the Codex home resolver (tests, fixtures). Chainable.
+    #[allow(dead_code)]
     pub fn with_codex_home_resolver(mut self, resolver: CodexHomeResolver) -> Self {
         self.codex_home = resolver;
         self
@@ -551,6 +557,7 @@ impl UsageIntelligenceStore {
 
     /// Overrides the OpenCode database resolver (tests, fixtures).
     /// Chainable.
+    #[allow(dead_code)]
     pub fn with_opencode_db_resolver(mut self, resolver: OpencodeDbResolver) -> Self {
         self.opencode_db = resolver;
         self
@@ -570,6 +577,7 @@ impl UsageIntelligenceStore {
     /// The injected Codex home resolver (production: `~/.codex`; tests:
     /// fixtures). Only the collector may call it — and only after the
     /// enabled gate has passed.
+    #[allow(dead_code)]
     pub(crate) fn codex_home_resolver(&self) -> &CodexHomeResolver {
         &self.codex_home
     }
@@ -650,14 +658,27 @@ impl UsageIntelligenceStore {
             .unwrap_or(true)
     }
 
-    /// The owned events, oldest first (canonical store order). Read-only
-    /// accessor for diagnostics and tests.
+    /// The query-visible owned events, oldest first. Codex records remain in
+    /// the persisted store, but the source is disabled for collection and is
+    /// excluded from every read projection.
+    #[allow(dead_code)]
     pub fn events(&self) -> Vec<UsageEvent> {
+        self.state.lock().unwrap().events.clone()
+            .into_iter()
+            .filter(|event| event.source != USAGE_SOURCE_CODEX)
+            .collect()
+    }
+
+    /// Raw stored events for collector unit tests. Production readers use
+    /// [`Self::events`] or [`Self::aggregate`], which exclude Codex.
+    #[cfg(test)]
+    pub(crate) fn stored_events(&self) -> Vec<UsageEvent> {
         self.state.lock().unwrap().events.clone()
     }
 
     /// The disclosure anchor: when local collection started (the first
     /// baseline), or `None` before any baseline was ever established.
+    #[allow(dead_code)]
     pub fn collection_started_at(&self) -> Option<i64> {
         self.state.lock().unwrap().collection_started_at
     }
@@ -976,13 +997,22 @@ impl UsageIntelligenceStore {
                 state.events.clone(),
                 state.enabled,
                 state.collection_started_at,
-                state.cursors.values().cloned().collect::<Vec<_>>(),
+                state
+                    .cursors
+                    .values()
+                    .filter(|cursor| cursor.source != USAGE_SOURCE_CODEX)
+                    .cloned()
+                    .collect::<Vec<_>>(),
                 self.is_collecting(),
             )
         };
 
+        // Codex rollout records predate a trustworthy owner binding. Keep
+        // them in the store so existing data is not destroyed, but exclude
+        // the entire source from every current read projection.
         let in_range: Vec<&UsageEvent> = events
             .iter()
+            .filter(|event| event.source != USAGE_SOURCE_CODEX)
             .filter(|event| event.event_at >= range_start && event.event_at <= now_ms)
             .collect();
 
@@ -1545,15 +1575,15 @@ pub fn collect_zcode(
     crate::usage_source_zcode::collect(store)
 }
 
-/// Runs one collection pass over every source under the single shared
-/// opt-in: ZCode first, then Codex, then OpenCode. The sources are
-/// isolated — each updates only its own cursor and diagnostics, so one
-/// source failing never blocks or corrupts the others, and no failure can
-/// reach quota-provider health. Blocking filesystem work — call from
-/// `spawn_blocking` off the async runtime.
+/// Runs one collection pass over the sources with a trustworthy ownership
+/// boundary: ZCode and OpenCode. Codex rollout ingestion is deliberately
+/// disabled because those records cannot be bound to the active session;
+/// its existing cursor and events remain untouched for inspection and are
+/// excluded by [`UsageIntelligenceStore::aggregate`]. The enabled sources
+/// are isolated — one failing never blocks the other. Blocking filesystem
+/// work — call from `spawn_blocking` off the async runtime.
 pub fn run_collection_pass(store: &UsageIntelligenceStore) {
     let _ = collect_zcode(store);
-    let _ = crate::usage_source_codex::collect(store);
     let _ = crate::usage_source_opencode::collect(store);
 }
 
@@ -2084,12 +2114,12 @@ mod tests {
         let (store, _dir) = temp_store_with_clock("coverage-complete", clock);
         store.set_enabled(true);
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(dto.source_coverage.len(), 2);
-        for source in [USAGE_SOURCE_ZCODE, USAGE_SOURCE_CODEX] {
+        for source in [USAGE_SOURCE_ZCODE, USAGE_SOURCE_OPENCODE] {
             let coverage = dto_coverage(&dto, source);
             assert_eq!(coverage.coverage, "complete");
             assert_eq!(coverage.reason, None);
@@ -2114,7 +2144,7 @@ mod tests {
         store.set_enabled(true);
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS - 3 * DAY_MS;
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 4 * DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 4 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
         store.apply_scan(
             USAGE_SOURCE_ZCODE,
@@ -2126,7 +2156,7 @@ mod tests {
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
         let zcode = dto_coverage(&dto, USAGE_SOURCE_ZCODE);
-        let codex = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        let codex = dto_coverage(&dto, USAGE_SOURCE_OPENCODE);
         assert_eq!(zcode.coverage, "complete");
         assert_eq!(codex.coverage, "incomplete");
         assert_eq!(codex.reason.as_deref(), Some("lateBaseline"));
@@ -2170,10 +2200,10 @@ mod tests {
         store.set_enabled(true);
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
-        store.mark_source_state(USAGE_SOURCE_CODEX, SourceState::ReadFailure, None);
+        store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ReadFailure, None);
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
-        let codex = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        let codex = dto_coverage(&dto, USAGE_SOURCE_OPENCODE);
         assert_eq!(codex.coverage, "uncertain");
         assert_eq!(codex.reason.as_deref(), Some("noBaseline"));
         assert_eq!(codex.covered_from, None);
@@ -2207,21 +2237,21 @@ mod tests {
         let (now, clock) = manual_clock(NOW_MS - 10 * DAY_MS);
         let (store, _dir) = temp_store_with_clock("coverage-paused", clock);
         store.set_enabled(true);
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
-        let baseline = store.cursor(USAGE_SOURCE_CODEX).unwrap();
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 10 * DAY_MS, None);
+        let baseline = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
         *now.lock().unwrap() = NOW_MS;
-        // The Codex reader pauses fail-closed when the rollout tree cannot
+        // The selected source reader pauses fail-closed when the rollout tree cannot
         // be enumerated safely. An old baseline must not turn that into a
         // completeness claim.
         store.mark_source_state(
-            USAGE_SOURCE_CODEX,
+            USAGE_SOURCE_OPENCODE,
             SourceState::CollectionPaused,
             Some("the rollout tree holds too many files; collection is paused fail-closed"
                 .to_string()),
         );
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
-        let coverage = dto_coverage(&dto, USAGE_SOURCE_CODEX);
+        let coverage = dto_coverage(&dto, USAGE_SOURCE_OPENCODE);
         assert_eq!(coverage.coverage, "uncertain");
         assert_eq!(coverage.reason.as_deref(), Some("collectionPaused"));
         assert_eq!(
@@ -2232,17 +2262,17 @@ mod tests {
         let diagnostics = dto
             .sources
             .iter()
-            .find(|source| source.source == USAGE_SOURCE_CODEX)
+            .find(|source| source.source == USAGE_SOURCE_OPENCODE)
             .unwrap();
         assert_eq!(diagnostics.state, "collectionPaused");
 
         // A bounded-progress ceiling stays complete: it committed a prefix
         // and continues on the next scan. Only the fail-closed pause is a
         // coverage gap.
-        store.mark_source_state(USAGE_SOURCE_CODEX, SourceState::ScanCeiling, None);
+        store.mark_source_state(USAGE_SOURCE_OPENCODE, SourceState::ScanCeiling, None);
         let progressing = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(
-            dto_coverage(&progressing, USAGE_SOURCE_CODEX).coverage,
+            dto_coverage(&progressing, USAGE_SOURCE_OPENCODE).coverage,
             "complete"
         );
         assert!(!progressing.incomplete_history);
@@ -2273,7 +2303,7 @@ mod tests {
         // Envelope fields are snake_case (the nested cursors are camelCase);
         // this is the exact shape an older build persisted.
         let legacy = format!(
-            r#"{{"version":1,"enabled":true,"collection_started_at":{baseline},"events":[],"cursors":[{{"source":"codex","watermarkMs":{watermark},"baselineWatermarkMs":{watermark},"baselined":true,"baselinedAt":{baseline},"lastObservedAt":{watermark},"state":"scanCeiling"}}]}}"#
+            r#"{{"version":1,"enabled":true,"collection_started_at":{baseline},"events":[],"cursors":[{{"source":"opencode","watermarkMs":{watermark},"baselineWatermarkMs":{watermark},"baselined":true,"baselinedAt":{baseline},"lastObservedAt":{watermark},"state":"scanCeiling"}}]}}"#
         );
         std::fs::write(&path, legacy).unwrap();
 
@@ -2283,11 +2313,11 @@ mod tests {
         let diagnostics = dto
             .sources
             .iter()
-            .find(|source| source.source == USAGE_SOURCE_CODEX)
+            .find(|source| source.source == USAGE_SOURCE_OPENCODE)
             .unwrap();
         assert_eq!(diagnostics.state, "scanCeiling");
         // A bounded-progress ceiling keeps its meaning under the new rules.
-        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_CODEX).coverage, "complete");
+        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_OPENCODE).coverage, "complete");
         assert!(!dto.incomplete_history);
     }
 
@@ -2369,7 +2399,7 @@ mod tests {
         assert_eq!(before.events_in_range, 2);
         assert_eq!(before.totals.total_tokens, 760);
 
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - DAY_MS, None);
         let after = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(after.events_in_range, before.events_in_range);
         assert_eq!(after.totals.total_tokens, before.totals.total_tokens);
@@ -2383,7 +2413,7 @@ mod tests {
             "coverage verdicts must not re-anchor the daily projection"
         );
         assert_eq!(
-            dto_coverage(&after, USAGE_SOURCE_CODEX).coverage,
+            dto_coverage(&after, USAGE_SOURCE_OPENCODE).coverage,
             "incomplete"
         );
         assert!(after.incomplete_history);
@@ -2405,11 +2435,11 @@ mod tests {
         );
         assert!(!complete.incomplete_history);
 
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - DAY_MS, None);
         let incomplete = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(incomplete.totals.events, 0);
         assert_eq!(
-            dto_coverage(&incomplete, USAGE_SOURCE_CODEX).coverage,
+            dto_coverage(&incomplete, USAGE_SOURCE_OPENCODE).coverage,
             "incomplete"
         );
         assert!(
@@ -2444,12 +2474,12 @@ mod tests {
         store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = range_start;
         // Equality is covered from the range start.
-        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 10 * DAY_MS, None);
+        store.establish_baseline(USAGE_SOURCE_OPENCODE, NOW_MS - 10 * DAY_MS, None);
         *now.lock().unwrap() = NOW_MS;
 
         let dto = store.aggregate(UsageRange::SevenDays, None);
         assert_eq!(dto.range_start, canonical_timestamp(range_start));
-        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_CODEX).coverage, "complete");
+        assert_eq!(dto_coverage(&dto, USAGE_SOURCE_OPENCODE).coverage, "complete");
         assert!(!dto.incomplete_history);
 
         let wire = serde_json::to_value(&dto).unwrap();
@@ -2627,7 +2657,7 @@ mod tests {
             },
         ];
         store.establish_baseline_with_files(
-            USAGE_SOURCE_CODEX,
+            USAGE_SOURCE_OPENCODE,
             NOW_MS - 60_000,
             None,
             files.clone(),
@@ -2635,7 +2665,7 @@ mod tests {
         drop(store);
 
         let reopened = UsageIntelligenceStore::open_with(path, fixed_clock(), Box::new(|| None));
-        let cursor = reopened.cursor(USAGE_SOURCE_CODEX).expect("cursor survives");
+        let cursor = reopened.cursor(USAGE_SOURCE_OPENCODE).expect("cursor survives");
         assert!(cursor.baselined);
         assert_eq!(cursor.files, files, "per-file cursors survive restart");
         assert_eq!(reopened.collection_started_at(), Some(NOW_MS));
@@ -2647,7 +2677,7 @@ mod tests {
         updated[0].size = 200;
         updated.remove(1); // the junk file was deleted by its owner
         let stats = reopened.apply_scan(
-            USAGE_SOURCE_CODEX,
+            USAGE_SOURCE_OPENCODE,
             SourceScan {
                 watermark_ms: NOW_MS - 30_000,
                 fingerprint: None,
@@ -2659,7 +2689,7 @@ mod tests {
             },
         );
         assert_eq!(stats.accepted, 0);
-        let cursor = reopened.cursor(USAGE_SOURCE_CODEX).unwrap();
+        let cursor = reopened.cursor(USAGE_SOURCE_OPENCODE).unwrap();
         assert_eq!(cursor.files.len(), 1);
         assert_eq!(cursor.files[0].offset, 200);
         assert_eq!(reopened.cursor(USAGE_SOURCE_ZCODE), None);
@@ -2705,7 +2735,7 @@ mod tests {
         // behind — every source reporting sourceAbsent.
         let sources = [
             USAGE_SOURCE_ZCODE,
-            USAGE_SOURCE_CODEX,
+            USAGE_SOURCE_OPENCODE,
             USAGE_SOURCE_OPENCODE,
         ];
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -3067,5 +3097,80 @@ mod tests {
                 .all(|cell| cell.get("totalTokens").is_none()),
             "no cell serializes a fabricated zero"
         );
+    }
+
+    #[test]
+    fn production_collection_pass_never_resolves_or_collects_codex() {
+        let dir = tempdir::temp_dir("codex-collection-stopped");
+        let probes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = probes.clone();
+        let store = UsageIntelligenceStore::open_with(
+            dir.path().join(USAGE_INTELLIGENCE_FILE_NAME),
+            fixed_clock(),
+            Box::new(|| None),
+        )
+        .with_codex_home_resolver(Box::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            None
+        }))
+        .with_opencode_db_resolver(Box::new(|| None));
+        store.set_enabled(true);
+
+        run_collection_pass(&store);
+
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert!(store.cursor(USAGE_SOURCE_CODEX).is_none());
+        assert!(!store.events().iter().any(|event| event.source == USAGE_SOURCE_CODEX));
+    }
+
+    #[test]
+    fn legacy_codex_events_remain_persisted_but_are_absent_from_aggregates() {
+        let (store, dir) = temp_store("legacy-codex-filter");
+        let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        store.set_enabled(true);
+        store.establish_baseline(USAGE_SOURCE_CODEX, NOW_MS - 120_000, None);
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 120_000, None);
+
+        let mut codex = event("codex:legacy", "openai", "gpt-5", NOW_MS - 30_000);
+        codex.source = USAGE_SOURCE_CODEX.to_string();
+        codex.source_provider_id = "openai".to_string();
+        let other = event("zcode:current", "zai", "GLM-5.3", NOW_MS - 20_000);
+        store.apply_scan(USAGE_SOURCE_CODEX, scan_from(vec![codex.clone()], NOW_MS - 30_000));
+        store.apply_scan(USAGE_SOURCE_ZCODE, scan_from(vec![other.clone()], NOW_MS - 20_000));
+        drop(store);
+
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(persisted["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["id"] == codex.id));
+
+        let reopened = UsageIntelligenceStore::open_with(path, fixed_clock(), Box::new(|| None));
+        let stored = reopened.stored_events();
+        assert!(stored.iter().any(|event| event.id == codex.id));
+        let visible = reopened.events();
+        assert!(!visible.iter().any(|event| event.source == USAGE_SOURCE_CODEX));
+        assert!(visible.iter().any(|event| event.id == other.id));
+
+        let dto = reopened.aggregate(UsageRange::ThirtyDays, None);
+        assert_eq!(dto.events_in_range, 1);
+        assert_eq!(dto.groups.len(), 1);
+        assert_eq!(dto.groups[0].provider, "zai");
+        assert_eq!(dto.totals.total_tokens, other.total_tokens);
+        assert_eq!(
+            dto.daily.iter().map(|day| day.events).sum::<usize>(),
+            dto.events_in_range
+        );
+        assert!(!serde_json::to_string(&dto).unwrap().contains("codex:legacy"));
+        assert!(dto
+            .sources
+            .iter()
+            .all(|source| source.source != USAGE_SOURCE_CODEX));
+        assert!(dto
+            .source_coverage
+            .iter()
+            .all(|coverage| coverage.source != USAGE_SOURCE_CODEX));
     }
 }

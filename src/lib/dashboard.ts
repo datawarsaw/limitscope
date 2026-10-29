@@ -1,6 +1,7 @@
 import type { QuotaPrediction } from "./prediction/types";
 import { isUsableQuotaWindow, primaryQuotaWindow } from "./quotaStrip";
 import { visiblePrediction } from "./v03Integration";
+import { baseProviderId, isCodexAccountScopedId } from "./providerIds";
 import type { LimitWindow, ProviderUsage } from "../types";
 import {
   quotaPresentation,
@@ -31,19 +32,34 @@ const SHORT_NAMES: Readonly<Record<string, string>> = {
 };
 
 export function shortProviderName(usage: ProviderUsage): string {
-  const curated = SHORT_NAMES[usage.id];
-  if (curated) return curated;
+  const curated = SHORT_NAMES[baseProviderId(usage.id)];
+  if (curated) return withAccountAlias(curated, usage);
   // "OpenAI / Codex" → "Codex"; "Grok (xAI)" → "Grok".
   let name = usage.name;
   const slash = name.lastIndexOf(" / ");
   if (slash !== -1) name = name.slice(slash + 3);
-  return name.replace(/\s*\([^)]*\)\s*$/, "").trim() || usage.name;
+  return withAccountAlias(
+    name.replace(/\s*\([^)]*\)\s*$/, "").trim() || usage.name,
+    usage,
+  );
+}
+
+/**
+ * A configured account is named by its alias, so two accounts of one
+ * provider never collapse into the same label. An account-scoped id
+ * without an alias keeps a neutral scope marker — never an initial and
+ * never a number.
+ */
+function withAccountAlias(base: string, usage: ProviderUsage): string {
+  if (usage.accountAlias) return base + " · " + usage.accountAlias;
+  if (isCodexAccountScopedId(usage.id)) return base + " · secondary account";
+  return base;
 }
 
 /** Rail-style short name straight from a provider id — for surfaces (the
  * Usage view's trend titles) that hold ids from history, not usages. */
 export function shortProviderId(providerId: string): string {
-  return SHORT_NAMES[providerId] ?? providerId;
+  return SHORT_NAMES[baseProviderId(providerId)] ?? providerId;
 }
 
 /** Monogram badge for the rail: the short name's first character. */

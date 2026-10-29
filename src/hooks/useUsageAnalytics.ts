@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  codexScopeIsCurrentOrNewer,
   loadUsageAnalytics,
+  type CodexScope,
   type UsageAnalytics,
   type UsageAnalyticsLoader,
   type UsageAnalyticsQuery,
@@ -47,32 +49,68 @@ function errorText(error: unknown): string {
     : "Usage history could not be loaded.";
 }
 
+/**
+ * The canonical form of a Codex identity scope: the slots, their observed
+ * generations and their identities, in a stable order. It is the cache key
+ * for one session's projection.
+ */
+function scopeKey(scope: CodexScope): string {
+  return JSON.stringify(
+    [...scope]
+      .sort((a, b) => a.providerId.localeCompare(b.providerId))
+      .map((state) => [state.providerId, state.generation, state.identity]),
+  );
+}
+
 export function useUsageAnalytics(
   query: UsageAnalyticsQuery,
   enabled: boolean,
   historyRevision: number | null,
   loader: UsageAnalyticsLoader = loadUsageAnalytics,
+  identityScope: CodexScope = [],
 ): UsageAnalyticsView {
   const [state, setState] = useState<UsageAnalyticsState>(IDLE);
+  // The scope the currently displayed payload was computed under.
+  const [dataScope, setDataScope] = useState<string>(scopeKey(identityScope));
   // Key of the request whose response is currently allowed to land.
   const keyRef = useRef<string>("");
   const requestRef = useRef(0);
+  // The scope the consumer currently observes. A response computed under an
+  // older scope must not land under the current one.
+  const scopeRef = useRef<CodexScope>(identityScope);
+  scopeRef.current = identityScope;
 
-  const queryKey = JSON.stringify(query);
+  const currentScopeKey = scopeKey(identityScope);
+  const queryKey = JSON.stringify([query, currentScopeKey]);
 
   const runQuery = useCallback(
     (key: string, currentQuery: UsageAnalyticsQuery) => {
       const request = ++requestRef.current;
       keyRef.current = key;
       setState((previous) => ({
-        data: previous.data,
-        loading: previous.data === null,
-        refreshing: previous.data !== null,
+        data: dataScope === currentScopeKey ? previous.data : null,
+        loading: dataScope !== currentScopeKey || previous.data === null,
+        refreshing: dataScope === currentScopeKey && previous.data !== null,
         error: null,
       }));
+      setDataScope(currentScopeKey);
       loader(currentQuery)
         .then((data) => {
           if (request !== requestRef.current || keyRef.current !== key) return;
+          // The projection carries the Codex identity scope it was computed
+          // under. A response that belongs to an older session must not be
+          // shown under the current one.
+          if (!codexScopeIsCurrentOrNewer(data.codexIdentityScope, scopeRef.current)) {
+            // The response is obsolete: the consumer already observed a
+            // newer session. The spinner must not stay up for a response
+            // that will never be shown.
+            setState((previous) => ({
+              ...previous,
+              loading: false,
+              refreshing: false,
+            }));
+            return;
+          }
           setState({ data, loading: false, refreshing: false, error: null });
         })
         .catch((error) => {
@@ -86,7 +124,7 @@ export function useUsageAnalytics(
           }));
         });
     },
-    [loader],
+    [loader, dataScope, currentScopeKey],
   );
 
   useEffect(() => {
@@ -112,5 +150,7 @@ export function useUsageAnalytics(
     if (enabled) runQuery(queryKey, query);
   }, [enabled, queryKey, query, runQuery]);
 
-  return { ...state, retry };
+  return dataScope === currentScopeKey
+    ? { ...state, retry }
+    : { ...IDLE, loading: enabled, retry };
 }

@@ -26,6 +26,10 @@ import {
   withWalletMonitored,
   type WalletPreferences,
 } from "../lib/walletPreferences";
+import {
+  withCodexAccount,
+  type CodexAccountSettings,
+} from "../lib/codexAccounts";
 
 
 export function useSettings() {
@@ -210,6 +214,41 @@ export function useSettings() {
     });
   }, []);
 
+  /**
+   * Updates one OpenAI/Codex account: its alias, its own credential
+   * reference (the Codex home that holds that account's `auth.json`) or
+   * whether it is still monitored.
+   *
+   * The runtime owns the effective configuration: the settings lane
+   * forwards it on attach and on every change, and the Rust side persists
+   * it, so a configured account is collected from the next cycle on and a
+   * paused one is not polled at all.
+   */
+  const setCodexAccount = useCallback(
+    (
+      accountId: string,
+      patch: Partial<
+        Pick<CodexAccountSettings, "alias" | "codexHome" | "monitored">
+      >,
+    ) => {
+      setSettings((prev) => {
+        const next = {
+          ...prev,
+          codexAccounts: {
+            accounts: withCodexAccount(
+              prev.codexAccounts.accounts,
+              accountId,
+              patch,
+            ),
+          },
+        };
+        saveSettings(next);
+        return next;
+      });
+    },
+    [],
+  );
+
   const setProviderPreferences = useCallback(
     (providerPreferences: ProviderPreferences) => {
       setSettings((prev) => {
@@ -363,6 +402,20 @@ export function useSettings() {
     });
   }, [settings.walletPreferences.monitored]);
 
+  // The runtime owns the effective account set: it registers a configured
+  // account as its own provider and stops collecting a paused one. The
+  // configuration is forwarded on attach and on every change; the Rust
+  // side persists it, which covers the scheduler's immediate startup cycle
+  // before any window attaches.
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+    void invoke("set_codex_accounts", {
+      accounts: settings.codexAccounts.accounts,
+    }).catch((error) => {
+      console.error("Failed to sync the OpenAI/Codex account settings", error);
+    });
+  }, [settings.codexAccounts]);
+
   return {
     settings,
     setLaunchAtStartup,
@@ -377,6 +430,7 @@ export function useSettings() {
     setWalletPreferences,
     setWalletMonitored,
     setWalletInFloatingBar,
+    setCodexAccount,
     resetPreferences,
     startupPending,
     startupError,

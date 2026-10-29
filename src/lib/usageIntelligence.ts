@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isTauriRuntime } from "./floatingWindowChrome";
+import { baseProviderId } from "./providerIds";
 
 /**
  * Usage Intelligence (v0.8.9) — the token-usage data plane client.
@@ -188,7 +189,7 @@ export const USAGE_PROVIDER_LABELS: Record<string, string> = {
 };
 
 export function usageProviderLabel(provider: string): string {
-  return USAGE_PROVIDER_LABELS[provider] ?? provider;
+  return USAGE_PROVIDER_LABELS[baseProviderId(provider)] ?? provider;
 }
 
 /** Friendly wording of a source's diagnostic state. */

@@ -238,6 +238,21 @@ export type ProviderUsage = {
    * states so the card keeps naming its account. */
   account?: AccountAttribution;
   /**
+   * The user-facing alias of the monitored account, when that account
+   * carries one (multi-account OpenAI/Codex).
+   *
+   * Display only: it never appears beside the compact bar's percentages,
+   * and the expanded account card is where the account is named.
+   */
+  accountAlias?: string;
+  /**
+   * Whether collection for this entry is paused by the user.
+   *
+   * The runtime stopped polling this account, so its reading is frozen at
+   * the last known value. Nothing may read that value as live.
+   */
+  monitoringPaused?: boolean;
+  /**
    * Plan type or subscription tier (e.g. "team", "plus", "pro") explicitly
    * returned by the provider backend. Never guessed or inferred from model names.
    */
@@ -379,4 +394,26 @@ export type RuntimeSnapshot = {
    * re-pull `get_usage_intelligence` only when this moves.
    */
   usageIntelligenceRevision: number;
+  /**
+   * The observed identity state of every configured OpenAI/Codex slot.
+   *
+   * Each slot carries the generation its identity was observed at. The
+   * generation advances on every observed change of that slot's identity,
+   * including a move away and back, so a consumer can order two captures
+   * of the same slot without relying on the global sequence, which also
+   * moves for unrelated providers.
+   *
+   * The identity is null when the slot exists but no local login could be
+   * proven. That slot fails closed on its own.
+   */
+  codexIdentityStates?: CodexIdentityState[];
+};
+
+/**
+ * The observed identity state of one configured OpenAI/Codex slot.
+ */
+export type CodexIdentityState = {
+  providerId: string;
+  generation: number;
+  identity: string | null;
 };

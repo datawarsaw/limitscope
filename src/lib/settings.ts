@@ -11,6 +11,11 @@ import {
   sanitizeWalletPreferences,
   type WalletPreferences,
 } from "./walletPreferences";
+import {
+  DEFAULT_CODEX_ACCOUNT_PREFERENCES,
+  sanitizeCodexAccountPreferences,
+  type CodexAccountPreferences,
+} from "./codexAccounts";
 
 export const REFRESH_INTERVAL_MINUTES = [1, 5, 15, 30] as const;
 export type RefreshIntervalMinutes = (typeof REFRESH_INTERVAL_MINUTES)[number];
@@ -60,6 +65,16 @@ export type Settings = {
    * DeepSeek: monitored and visible).
    */
   walletPreferences: WalletPreferences;
+  /**
+   * Per-account OpenAI/Codex preferences: the two configured accounts,
+   * each with its own credential reference (the Codex home that holds its
+   * own `auth.json`), its own alias and its own monitoring flag.
+   *
+   * The configuration is mirrored into a persisted Rust store, so a
+   * configured second account is collected from the startup cycle on and a
+   * paused account is never polled at all.
+   */
+  codexAccounts: CodexAccountPreferences;
 };
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -75,6 +90,11 @@ export const DEFAULT_SETTINGS: Settings = {
   providerPreferences: { order: [], hidden: [] },
   quotaPerspective: "used",
   walletPreferences: { ...DEFAULT_WALLET_PREFERENCES },
+  codexAccounts: {
+    accounts: DEFAULT_CODEX_ACCOUNT_PREFERENCES.accounts.map((account) => ({
+      ...account,
+    })),
+  },
 };
 
 // Plain localStorage is the smallest mechanism that survives restarts without
@@ -92,6 +112,7 @@ const KNOWN_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "providerPreferences",
   "quotaPerspective",
   "walletPreferences",
+  "codexAccounts",
 ]);
 
 function isRefreshInterval(value: unknown): value is RefreshIntervalMinutes {
@@ -115,6 +136,11 @@ export function parseSettings(raw: unknown): Settings {
     ...DEFAULT_SETTINGS,
     providerPreferences: { ...DEFAULT_SETTINGS.providerPreferences },
     walletPreferences: { ...DEFAULT_SETTINGS.walletPreferences },
+    codexAccounts: {
+      accounts: DEFAULT_SETTINGS.codexAccounts.accounts.map((account) => ({
+        ...account,
+      })),
+    },
   };
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return settings;
   const record = raw as Record<string, unknown>;
@@ -141,6 +167,9 @@ export function parseSettings(raw: unknown): Settings {
   }
   settings.walletPreferences = sanitizeWalletPreferences(
     record.walletPreferences,
+  );
+  settings.codexAccounts = sanitizeCodexAccountPreferences(
+    record.codexAccounts,
   );
   return settings;
 }
@@ -194,6 +223,7 @@ export function mergeSettingsWithRaw(
   merged.walletPreferences = sanitizeWalletPreferences(
     settings.walletPreferences,
   );
+  merged.codexAccounts = sanitizeCodexAccountPreferences(settings.codexAccounts);
   return JSON.stringify(merged);
 }
 
@@ -222,6 +252,11 @@ export function resetSettings(): Settings {
     ...DEFAULT_SETTINGS,
     providerPreferences: { ...DEFAULT_SETTINGS.providerPreferences },
     walletPreferences: { ...DEFAULT_SETTINGS.walletPreferences },
+    codexAccounts: {
+      accounts: DEFAULT_SETTINGS.codexAccounts.accounts.map((account) => ({
+        ...account,
+      })),
+    },
   };
   saveSettings(defaults);
   return defaults;

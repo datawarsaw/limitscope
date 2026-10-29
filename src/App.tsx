@@ -62,6 +62,7 @@ export default function App() {
     moveProvider,
     setWalletMonitored,
     setWalletInFloatingBar,
+    setCodexAccount,
     setQuotaPerspective,
     resetPreferences,
     startupPending,
@@ -304,6 +305,7 @@ export default function App() {
               moveProvider={moveProvider}
               setWalletMonitored={setWalletMonitored}
               setWalletInFloatingBar={setWalletInFloatingBar}
+              setCodexAccount={setCodexAccount}
               resetPreferences={resetPreferences}
               startupPending={startupPending}
               startupError={startupError}

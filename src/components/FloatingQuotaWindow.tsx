@@ -91,7 +91,7 @@ export function FloatingQuotaWindow() {
   // and the monitor flag decides whether an item presents as live or paused.
   // With every wallet hidden the slot drops out and the bar's width math
   // sizes the window to the providers alone.
-  const visibleWallets = (runtimeWallets ?? []).filter((wallet) =>
+  const visibleWallets = (devFixture?.wallets ?? runtimeWallets ?? []).filter((wallet) =>
     isWalletInFloatingBar(settings.walletPreferences, wallet.id),
   );
   const walletItems = floatingWalletItems(

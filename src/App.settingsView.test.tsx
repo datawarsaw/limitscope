@@ -43,6 +43,17 @@ vi.mock("./hooks/useSettings", () => ({
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       usageIntelligence: false,
+      codexAccounts: {
+        accounts: [
+          { accountId: "openai-codex", alias: "", codexHome: "", monitored: true },
+          {
+            accountId: "openai-codex:secondary",
+            alias: "",
+            codexHome: "",
+            monitored: true,
+          },
+        ],
+      },
     },
     setLaunchAtStartup: mocks.setLaunchAtStartup,
     setRefreshInterval: mocks.setRefreshInterval,
@@ -52,6 +63,7 @@ vi.mock("./hooks/useSettings", () => ({
     setProviderHidden: mocks.setProviderHidden,
     moveProvider: mocks.moveProvider,
     setQuotaPerspective: mocks.setQuotaPerspective,
+    setCodexAccount: vi.fn(),
     resetPreferences: mocks.resetPreferences,
     startupPending: false,
     startupError: null,
@@ -265,6 +277,17 @@ describe("settings destination", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       usageIntelligence: false,
+      codexAccounts: {
+        accounts: [
+          { accountId: "openai-codex", alias: "", codexHome: "", monitored: true },
+          {
+            accountId: "openai-codex:secondary",
+            alias: "",
+            codexHome: "",
+            monitored: true,
+          },
+        ],
+      },
     });
     expect(
       await screen.findByText(

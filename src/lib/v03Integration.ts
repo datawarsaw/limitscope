@@ -4,8 +4,18 @@ import { formatAge, formatTime } from "./format";
 import type { ProviderUsage } from "../types";
 
 export type ProviderStatusPresentation = {
-  label: "Live" | "Cached" | "Stale" | "Refresh failed" | "Cooldown" | "Unavailable" | "Mock" | "Unknown";
-  className: "ok" | "stale" | "error" | "unknown" | "mock";
+  label:
+    | "Live"
+    | "Cached"
+    | "Stale"
+    | "Refresh failed"
+    | "Cooldown"
+    | "Unavailable"
+    | "Mock"
+    | "Unknown"
+    /** Collection is paused: the reading is frozen, not current. */
+    | "Monitoring off";
+  className: "ok" | "stale" | "error" | "unknown" | "mock" | "paused";
 };
 
 function validTime(value: string | undefined): string | undefined {
@@ -90,6 +100,12 @@ export function providerStatusPresentation(
   usage: ProviderUsage,
 ): ProviderStatusPresentation {
   if (usage.simulated) return { label: "Mock", className: "mock" };
+  // A paused account is not a failure and not a live reading: the runtime
+  // stopped polling it and the value is frozen. It says so before any
+  // freshness verdict, so a frozen reading never wears a live label.
+  if (usage.monitoringPaused) {
+    return { label: "Monitoring off", className: "paused" };
+  }
   if (usage.health === "error") return { label: "Refresh failed", className: "error" };
   if (usage.health === "cooldown") return { label: "Cooldown", className: "error" };
   if (usage.health === "unavailable") return { label: "Unavailable", className: "error" };

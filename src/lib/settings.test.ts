@@ -15,6 +15,23 @@ import {
   type Settings,
 } from "./settings";
 
+/**
+ * The canonical OpenAI/Codex account defaults. The primary account reads
+ * the default Codex home; the second account has no home of its own, so it
+ * contributes no provider until the user points it at one.
+ */
+const DEFAULT_CODEX_ACCOUNTS = {
+  accounts: [
+    { accountId: "openai-codex", alias: "", codexHome: "", monitored: true },
+    {
+      accountId: "openai-codex:secondary",
+      alias: "",
+      codexHome: "",
+      monitored: true,
+    },
+  ],
+};
+
 // loadSettings/saveSettings talk to localStorage, which node's test
 // environment does not provide; a Map-backed stub keeps the tests honest
 // about what round-trips through JSON.
@@ -71,6 +88,7 @@ describe("settings persistence", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
   });
 
@@ -131,6 +149,7 @@ describe("v0.6 settings migration contract", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
   });
 
@@ -145,6 +164,7 @@ describe("v0.6 settings migration contract", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
   });
 
@@ -217,6 +237,7 @@ describe("v0.6 settings migration contract", () => {
       providerPreferences: { order: ["openai-codex"], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
 
     saveSettings(loaded);
@@ -244,6 +265,7 @@ describe("v0.6 settings migration contract", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
   });
 
@@ -307,6 +329,7 @@ describe("v0.6 settings migration contract", () => {
       },
       quotaPerspective: "remaining",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
 
     saveSettings(loaded);
@@ -334,6 +357,7 @@ describe("settings safe write contract", () => {
       providerPreferences: { order: [], hidden: [] },
       quotaPerspective: "used",
       walletPreferences: { monitored: {}, floatingBar: {} },
+      codexAccounts: DEFAULT_CODEX_ACCOUNTS,
     });
   });
 
@@ -381,6 +405,7 @@ describe("settings reset (v0.7 local data)", () => {
 
     const stored = JSON.parse(map.get("rate-limits.settings.v1")!);
     expect(Object.keys(stored).sort()).toEqual([
+      "codexAccounts",
       "futureLaneField",
       "launchAtStartup",
       "providerPreferences",

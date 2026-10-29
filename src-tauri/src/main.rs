@@ -3,6 +3,7 @@
 
 mod antigravity;
 mod codex;
+mod codex_accounts;
 mod cursor_grok_bot;
 #[cfg(test)]
 mod diagnostic_report;
@@ -26,6 +27,11 @@ mod secret_scrub;
 mod usage_analytics;
 mod usage_export;
 mod usage_intelligence;
+// The Codex rollout reader is retained on purpose: its records cannot be
+// bound to the active session, so collection is disabled, but the parsing
+// rules and their tests stay so the policy can be revisited without
+// re-deriving them. Nothing in production calls into it.
+#[allow(dead_code)]
 mod usage_source_codex;
 mod usage_source_opencode;
 mod usage_source_zcode;
@@ -163,6 +169,8 @@ fn main() {
             runtime::set_refresh_interval,
             runtime::set_quota_notifications_enabled,
             runtime::set_wallet_monitoring,
+            runtime::get_codex_accounts,
+            runtime::set_codex_accounts,
             history::get_history,
             history::get_history_range,
             usage_analytics::get_usage_analytics,
