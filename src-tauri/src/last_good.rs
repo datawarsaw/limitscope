@@ -16,6 +16,8 @@
 //! - Bounded retention: entries older than 7 days ([\`MAX_CACHE_AGE_SECS\`]) are discarded at load time.
 //! - Reset safety: quota windows whose `reset_at` is already in the past at load time are omitted.
 //! - Registry safety: unknown providers and malformed windows are dropped without invalidating valid entries.
+//! - Identity safety: Codex cache entries are retained only when their account identity is the current
+//!   `chatgpt-v2:` form; legacy identities are rejected at load, sanitization, and write time.
 //! - Self-healing: corrupt files or foreign schema versions degrade safely to empty and rewrite cleanly.
 //! - Write policy: only genuine successful live provider data updates the cache. Errors, cooldown skips,
 //!   stale projections, and unavailable states NEVER overwrite a good cached entry.
@@ -29,7 +31,7 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::runtime::{
-    AccountAttributionDto, ApiWalletDto, ProviderHealth, ProviderKind, ProviderSpec,
+    is_codex_provider_id, AccountAttributionDto, ApiWalletDto, ProviderHealth, ProviderKind, ProviderSpec,
     ProviderUsageDto, UsageLimitDto, WalletBalanceDto, WalletHealth, WalletSpec,
 };
 
@@ -460,6 +462,14 @@ impl ProviderLastGoodStore {
         if kind.is_manual_only() {
             return;
         }
+        if !provider_identity_is_current(
+            kind.id(),
+            dto.account
+                .as_ref()
+                .and_then(|account| account.identity.as_deref()),
+        ) {
+            return;
+        }
         if dto.health != ProviderHealth::Live
             || dto.data_freshness == Some("stale")
             || dto.limits.is_empty()
@@ -492,6 +502,24 @@ impl ProviderLastGoodStore {
         let mut lock = self.state.lock().unwrap();
         let wallets = self.wallets.lock().unwrap();
         lock.insert(kind.id().to_string(), state);
+        let _ = self.persist_locked(&lock, &wallets);
+    }
+
+    /// Drops one provider's cached entry.
+    ///
+    /// The runtime calls this when a Codex slot's observed identity moves:
+    /// the cached reading belongs to the previous session's user, so it must
+    /// not be restored under the new one. The entry is removed from memory
+    /// and from disk in the same step, so a restart cannot resurrect it
+    /// either. Providers whose identity did not move keep their entry.
+    pub fn evict_provider(&self, provider_id: &str) {
+        let mut lock = self.state.lock().unwrap();
+        lock.remove(provider_id);
+        // The file is rewritten even when the in-memory map held no entry:
+        // the persisted file can be out of step with the memory (a failed
+        // write, a repair at load time), and a foreign reading must not
+        // survive on disk either.
+        let wallets = self.wallets.lock().unwrap();
         let _ = self.persist_locked(&lock, &wallets);
     }
 
@@ -717,6 +745,15 @@ fn is_valid_persisted_state(state: &PersistedProviderState) -> bool {
     if state.provider_id.trim().is_empty() || state.provider_name.trim().is_empty() {
         return false;
     }
+    if !provider_identity_is_current(
+        &state.provider_id,
+        state
+            .account
+            .as_ref()
+            .and_then(|account| account.identity.as_deref()),
+    ) {
+        return false;
+    }
     if DateTime::parse_from_rfc3339(&state.last_successful_at).is_err() {
         return false;
     }
@@ -745,6 +782,15 @@ fn sanitize_provider_state(state: &PersistedProviderState) -> Option<PersistedPr
     if state.provider_id.trim().is_empty() || state.provider_name.trim().is_empty() {
         return None;
     }
+    if !provider_identity_is_current(
+        &state.provider_id,
+        state
+            .account
+            .as_ref()
+            .and_then(|account| account.identity.as_deref()),
+    ) {
+        return None;
+    }
     if DateTime::parse_from_rfc3339(&state.last_successful_at).is_err() {
         return None;
     }
@@ -766,6 +812,21 @@ fn sanitize_provider_state(state: &PersistedProviderState) -> Option<PersistedPr
     let mut sanitized = state.clone();
     sanitized.limits = valid_limits;
     Some(sanitized)
+}
+
+/// The cache accepts only identities minted by the current Codex binding.
+/// Other providers retain their existing attribution rules.
+fn provider_identity_is_current(provider_id: &str, identity: Option<&str>) -> bool {
+    if !is_codex_provider_id(provider_id) {
+        return true;
+    }
+    let Some(suffix) = identity.and_then(|value| value.strip_prefix("chatgpt-v2:")) else {
+        return false;
+    };
+    suffix.len() == 64
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 #[cfg(test)]
@@ -818,6 +879,10 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    fn codex_identity(hex_digit: char) -> String {
+        format!("chatgpt-v2:{}", hex_digit.to_string().repeat(64))
+    }
+
     fn mock_spec(
         kind: ProviderKind,
         outcome: Result<ProviderUsageDto, ProviderFailure>,
@@ -833,6 +898,11 @@ mod tests {
     }
 
     fn sample_usage(kind: ProviderKind, percent: f64, reset_at: Option<&str>) -> ProviderUsageDto {
+        let identity = if is_codex_provider_id(kind.id()) {
+            codex_identity('a')
+        } else {
+            "key:1234".to_string()
+        };
         ProviderUsageDto {
             id: kind.id().to_string(),
             name: kind.name().to_string(),
@@ -848,7 +918,7 @@ mod tests {
             account: Some(AccountAttributionDto {
                 label: "Account A".to_string(),
                 note: None,
-                identity: Some("key:1234".to_string()),
+                identity: Some(identity),
             }),
             plan_type: None,
             error: None,
@@ -879,10 +949,176 @@ mod tests {
         let raw = fs::read_to_string(&path).expect("file should exist");
         assert!(raw.contains("openai-codex"));
         assert!(raw.contains("42"));
-        assert!(raw.contains("key:1234"));
+        assert!(raw.contains(&codex_identity('a')));
 
         let persisted = store.get_persisted("openai-codex").expect("should be stored in memory");
         assert_eq!(persisted.limits[0].used_percent, 42.0);
+    }
+
+    #[test]
+    fn load_drops_both_legacy_codex_entries_and_repairs_disk() {
+        let dir = tempdir::temp_dir("legacy-codex-invalidation");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let envelope = serde_json::json!({
+            "version": SCHEMA_VERSION,
+            "providers": [
+                {
+                    "providerId": "openai-codex",
+                    "providerName": "OpenAI / Codex",
+                    "account": {
+                        "label": "Legacy primary",
+                        "identity": format!("chatgpt:{}", "a".repeat(64))
+                    },
+                    "limits": [{ "label": "5-hour limit", "usedPercent": 40.0 }],
+                    "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+                },
+                {
+                    "providerId": "openai-codex:secondary",
+                    "providerName": "OpenAI / Codex",
+                    "account": {
+                        "label": "Legacy secondary",
+                        "identity": format!("chatgpt-v2:{}", "A".repeat(64))
+                    },
+                    "limits": [{ "label": "5-hour limit", "usedPercent": 60.0 }],
+                    "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+                },
+                {
+                    "providerId": "zai",
+                    "providerName": "Z.ai",
+                    "account": { "label": "Z.ai key", "identity": "key:zai" },
+                    "limits": [{ "label": "Daily", "usedPercent": 35.0 }],
+                    "lastSuccessfulAt": "2026-09-29T11:00:00Z"
+                }
+            ]
+        });
+        fs::write(&path, envelope.to_string()).unwrap();
+
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+
+        assert!(store.get_persisted("openai-codex").is_none());
+        assert!(store.get_persisted("openai-codex:secondary").is_none());
+        assert_eq!(
+            store
+                .get_persisted("zai")
+                .expect("another provider survives invalidation")
+                .limits[0]
+                .used_percent,
+            35.0
+        );
+
+        let repaired: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let provider_ids: Vec<&str> = repaired["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|provider| provider["providerId"].as_str().unwrap())
+            .collect();
+        assert_eq!(provider_ids, vec!["zai"], "load removes legacy rows from disk");
+
+        let reopened = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert!(reopened.get_persisted("openai-codex").is_none());
+        assert!(reopened.get_persisted("openai-codex:secondary").is_none());
+        assert!(reopened.get_persisted("zai").is_some());
+    }
+
+    #[test]
+    fn record_success_requires_current_codex_identity_and_preserves_valid_entries() {
+        let dir = tempdir::temp_dir("codex-record-identity");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+
+        store.record_success(
+            ProviderKind::Zai,
+            &sample_usage(ProviderKind::Zai, 30.0, None),
+        );
+
+        let mut legacy = sample_usage(ProviderKind::Codex, 99.0, None);
+        legacy.account = Some(AccountAttributionDto {
+            label: "Legacy primary".to_string(),
+            note: None,
+            identity: Some(format!("chatgpt:{}", "a".repeat(64))),
+        });
+        store.record_success(ProviderKind::Codex, &legacy);
+
+        let mut legacy_secondary = sample_usage(ProviderKind::CodexSecondary, 98.0, None);
+        legacy_secondary.account = Some(AccountAttributionDto {
+            label: "Legacy secondary".to_string(),
+            note: None,
+            identity: Some(format!("chatgpt-v2:{}", "A".repeat(64))),
+        });
+        store.record_success(ProviderKind::CodexSecondary, &legacy_secondary);
+
+        assert!(store.get_persisted("openai-codex").is_none());
+        assert!(store.get_persisted("openai-codex:secondary").is_none());
+        assert!(store.get_persisted("zai").is_some());
+
+        let mut primary = sample_usage(ProviderKind::Codex, 40.0, None);
+        primary.account.as_mut().unwrap().identity = Some(codex_identity('a'));
+        store.record_success(ProviderKind::Codex, &primary);
+
+        let mut secondary = sample_usage(ProviderKind::CodexSecondary, 60.0, None);
+        secondary.account.as_mut().unwrap().identity = Some(codex_identity('b'));
+        store.record_success(ProviderKind::CodexSecondary, &secondary);
+
+        let reopened = ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now));
+        assert_eq!(
+            reopened
+                .get_persisted("openai-codex")
+                .expect("a current Codex identity is accepted")
+                .limits[0]
+                .used_percent,
+            40.0
+        );
+        assert_eq!(
+            reopened
+                .get_persisted("openai-codex:secondary")
+                .expect("the second Codex identity is accepted")
+                .account
+                .unwrap()
+                .identity
+                .as_deref(),
+            Some(codex_identity('b').as_str())
+        );
+        assert!(reopened.get_persisted("zai").is_some());
+    }
+
+    #[test]
+    fn sanitize_cannot_revive_a_legacy_codex_identity() {
+        for (provider_id, identity) in [
+            ("openai-codex", format!("chatgpt:{}", "a".repeat(64))),
+            ("openai-codex:secondary", format!("chatgpt-v2:{}", "A".repeat(64))),
+        ] {
+            let state = PersistedProviderState {
+                provider_id: provider_id.to_string(),
+                provider_name: "OpenAI / Codex".to_string(),
+                account: Some(PersistedAccountAttribution {
+                    label: "Legacy account".to_string(),
+                    note: None,
+                    identity: Some(identity),
+                }),
+                limits: vec![
+                    PersistedQuotaLimit {
+                        label: "Valid window".to_string(),
+                        used_percent: 50.0,
+                        reset_at: None,
+                    },
+                    PersistedQuotaLimit {
+                        label: String::new(),
+                        used_percent: 90.0,
+                        reset_at: None,
+                    },
+                ],
+                last_successful_at: "2026-09-29T11:00:00Z".to_string(),
+                source_updated_at: None,
+            };
+
+            assert!(!is_valid_persisted_state(&state));
+            assert!(
+                sanitize_provider_state(&state).is_none(),
+                "a repairable window must not revive an invalid Codex identity"
+            );
+        }
     }
 
     // 2. cold start hydrates persisted state
@@ -1280,7 +1516,7 @@ mod tests {
             http_status: None,
             transient: Some(false),
             retry_after_ms: None,
-            identity: None,
+            identity: Some(codex_identity('a')),
             credential_binding: None,
             transport_timeout: false,
         };
@@ -1356,15 +1592,16 @@ mod tests {
         usage_a.account = Some(AccountAttributionDto {
             label: "Account A".to_string(),
             note: None,
-            identity: Some("key:AAAA".to_string()),
+            identity: Some(codex_identity('a')),
         });
         store.record_success(ProviderKind::Codex, &usage_a);
 
         let mut usage_b = sample_usage(ProviderKind::Codex, 80.0, Some("2026-09-29T16:00:00Z"));
+        let identity_b = codex_identity('b');
         usage_b.account = Some(AccountAttributionDto {
             label: "Account B".to_string(),
             note: None,
-            identity: Some("key:BBBB".to_string()),
+            identity: Some(identity_b.clone()),
         });
 
         let specs = vec![mock_spec(ProviderKind::Codex, Ok(usage_b))];
@@ -1381,11 +1618,14 @@ mod tests {
 
         let snapshot = core.snapshot();
         let acc = snapshot.providers[0].account.as_ref().unwrap();
-        assert_eq!(acc.identity.as_deref(), Some("key:BBBB"));
+        assert_eq!(acc.identity.as_deref(), Some(identity_b.as_str()));
         assert_eq!(snapshot.providers[0].limits[0].used_percent, 80.0);
 
         let persisted = store.get_persisted("openai-codex").unwrap();
-        assert_eq!(persisted.account.unwrap().identity.as_deref(), Some("key:BBBB"));
+        assert_eq!(
+            persisted.account.unwrap().identity.as_deref(),
+            Some(identity_b.as_str())
+        );
     }
 
     // 11. unattributed cache does not attach to proven account
@@ -1400,10 +1640,11 @@ mod tests {
         store.record_success(ProviderKind::Codex, &usage_unattributed);
 
         let mut usage_proven = sample_usage(ProviderKind::Codex, 75.0, Some("2026-09-29T16:00:00Z"));
+        let proven_identity = codex_identity('c');
         usage_proven.account = Some(AccountAttributionDto {
             label: "Proven User".to_string(),
             note: None,
-            identity: Some("key:PROVEN".to_string()),
+            identity: Some(proven_identity.clone()),
         });
 
         let specs = vec![mock_spec(ProviderKind::Codex, Ok(usage_proven))];
@@ -1416,14 +1657,24 @@ mod tests {
             ).with_last_good_store(Some(store.clone())),
         );
 
-        // Before cycle: snapshot has unattributed cache
-        assert!(core.snapshot().providers[0].account.is_none());
+        // Before cycle: the unattributed legacy write was refused, so there is
+        // no cached Codex snapshot to expose.
+        assert!(store.get_persisted("openai-codex").is_none());
+        assert!(core.snapshot().providers.is_empty());
 
         core.run_cycle().await;
 
-        // After cycle: replaced by proven account; unattributed cache did not attach
+        // After cycle: only the proven account observation is present.
         let snapshot = core.snapshot();
-        assert_eq!(snapshot.providers[0].account.as_ref().unwrap().identity.as_deref(), Some("key:PROVEN"));
+        assert_eq!(
+            snapshot.providers[0]
+                .account
+                .as_ref()
+                .unwrap()
+                .identity
+                .as_deref(),
+            Some(proven_identity.as_str())
+        );
         assert_eq!(snapshot.providers[0].limits[0].used_percent, 75.0);
     }
 
@@ -1440,6 +1691,7 @@ mod tests {
             "providers": [{
                 "providerId": "openai-codex",
                 "providerName": "OpenAI / Codex",
+                "account": { "label": "Account A", "identity": codex_identity('a') },
                 "limits": [{ "label": "5-hour limit", "usedPercent": 50.0 }],
                 "lastSuccessfulAt": old_time
             }]
@@ -1466,6 +1718,7 @@ mod tests {
             "providers": [{
                 "providerId": "openai-codex",
                 "providerName": "OpenAI / Codex",
+                "account": { "label": "Account A", "identity": codex_identity('a') },
                 "limits": [
                     { "label": "Expired Window", "usedPercent": 95.0, "resetAt": "2026-09-29T10:00:00Z" },
                     { "label": "Active Window", "usedPercent": 40.0, "resetAt": "2026-09-29T14:00:00Z" }
@@ -1534,6 +1787,7 @@ mod tests {
                 {
                     "providerId": "openai-codex",
                     "providerName": "OpenAI / Codex",
+                    "account": { "label": "Account A", "identity": codex_identity('a') },
                     "limits": [{ "label": "5h", "usedPercent": 50.0, "resetAt": "2026-09-29T14:00:00Z" }],
                     "lastSuccessfulAt": "2026-09-29T11:00:00Z"
                 },
@@ -1565,6 +1819,7 @@ mod tests {
             "providers": [{
                 "providerId": "openai-codex",
                 "providerName": "OpenAI / Codex",
+                "account": { "label": "Account A", "identity": codex_identity('a') },
                 "limits": [
                     { "label": "", "usedPercent": 50.0, "resetAt": "2026-09-29T14:00:00Z" },
                     { "label": "Valid", "usedPercent": 60.0, "resetAt": "2026-09-29T14:00:00Z" },
@@ -1643,7 +1898,7 @@ mod tests {
                 account: Some(PersistedAccountAttribution {
                     label: "Masked Key".to_string(),
                     note: Some("Account note".to_string()),
-                    identity: Some("key:1234".to_string()),
+                    identity: Some(codex_identity('a')),
                 }),
                 limits: vec![PersistedQuotaLimit {
                     label: "5-hour limit".to_string(),

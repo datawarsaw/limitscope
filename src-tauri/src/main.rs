@@ -27,6 +27,11 @@ mod secret_scrub;
 mod usage_analytics;
 mod usage_export;
 mod usage_intelligence;
+// The Codex rollout reader is retained on purpose: its records cannot be
+// bound to the active session, so collection is disabled, but the parsing
+// rules and their tests stay so the policy can be revisited without
+// re-deriving them. Nothing in production calls into it.
+#[allow(dead_code)]
 mod usage_source_codex;
 mod usage_source_opencode;
 mod usage_source_zcode;

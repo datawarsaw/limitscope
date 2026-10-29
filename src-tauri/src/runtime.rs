@@ -467,6 +467,33 @@ pub struct RuntimeSnapshot {
     /// (v0.8.9), bumped whenever the token-usage store actually changed.
     /// Consumers re-pull `get_usage_intelligence` only when this moves.
     pub usage_intelligence_revision: u64,
+    /// The observed identity state of every configured OpenAI/Codex slot.
+    ///
+    /// This is the per-slot consistency token for Codex data. The global
+    /// `seq` also moves for unrelated providers — a Grok cycle, a wallet
+    /// publication, an OpenDesign manual refresh — so it cannot decide
+    /// whether a Codex slot still describes the same session. Each slot
+    /// instead carries the generation its identity was observed at.
+    pub codex_identity_states: Vec<CodexIdentityStateDto>,
+}
+
+/// The observed identity state of one configured OpenAI/Codex slot.
+///
+/// `generation` advances on every observed change of that slot's identity,
+/// including `Some(a) -> None -> Some(a)`, so an identity string is never
+/// used as a substitute for provenance and an A -> B -> A move is still
+/// proven. The generation is per slot: one account changing never moves
+/// another account's generation.
+///
+/// `identity` is `None` when the slot exists but no local login could be
+/// proven. That slot fails closed on its own and never suppresses the
+/// other slot or any unrelated provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexIdentityStateDto {
+    pub provider_id: String,
+    pub generation: u64,
+    pub identity: Option<String>,
 }
 
 // ---------- unified provider failure ----------
@@ -939,11 +966,8 @@ fn normalize_codex(
     }
 }
 
-/// Codex attribution: the masked tail of the `tokens.account_id` the request
-/// was scoped with — the single local Codex session is the account. The
-/// identity format matches what the backend stamps on post-resolution
-/// failures, so the last-good guard compares like-for-like. The same bound
-/// account carries the banked-credit observation of the same fetch.
+/// The masked workspace hint is for display; the user/workspace binding is
+/// shared with failure attribution for last-good and history isolation.
 fn build_codex_attribution(account: Option<&codex::CodexAccount>) -> Option<AccountAttributionDto> {
     let hint = account?.account_hint.trim();
     if hint.is_empty() {
@@ -955,7 +979,7 @@ fn build_codex_attribution(account: Option<&codex::CodexAccount>) -> Option<Acco
             "This account's own local Codex login. Accounts are read separately and their limits are never combined."
                 .to_string(),
         ),
-        identity: Some(format!("chatgpt:{hint}")),
+        identity: account?.identity.clone(),
     })
 }
 
@@ -1771,6 +1795,24 @@ fn project_account_state(
     usage
 }
 
+/// A Codex reading is usable only while the configured local session still
+/// proves the same user and workspace as the observation.
+fn project_codex_identity(usage: &ProviderUsageDto, current: Option<&str>) -> ProviderUsageDto {
+    if !is_codex_provider_id(&usage.id) {
+        return usage.clone();
+    }
+    let observed = usage.account.as_ref().and_then(|account| account.identity.as_deref());
+    if current.is_some() && current == observed {
+        return usage.clone();
+    }
+    let Some(kind) = ProviderKind::from_id(&usage.id) else { return usage.clone() };
+    let mut blank = base_usage(kind, ProviderHealth::Unavailable, Vec::new());
+    blank.checked_at = usage.checked_at.clone();
+    blank.error = Some("Codex identity could not be matched to this reading.".to_string());
+    blank.error_category = Some("identity_unavailable".to_string());
+    blank
+}
+
 // ---------- retry, cadence, cooldown, and last-good constants ----------
 
 const RETRY_DELAY_MS: u64 = 750;
@@ -1912,6 +1954,10 @@ struct ProviderCooldown {
     until: DateTime<Utc>,
     failure: ProviderFailure,
     failure_at: DateTime<Utc>,
+    /// Codex cooldowns belong to one observed identity generation, not just
+    /// to an identity string. This keeps A -> B -> A from reviving A's old
+    /// deadline after the runtime observed either transition.
+    identity_generation: Option<u64>,
     /// Wallet cooldowns are credential-scoped: a `Retry-After` observed with
     /// credential A says nothing about credential B's budget, so a cooldown
     /// may only defer the credential that produced it. Provider cooldowns
@@ -1984,6 +2030,82 @@ struct PendingConfirmation {
     held_at_ms: i64,
 }
 
+/// One observed Codex login. `identity: None` is a real observation: the
+/// configured slot exists, but its local login is unavailable. A generation
+/// advances on every change, including `Some(a) -> None -> Some(a)`, so an
+/// identity string is never used as a substitute for provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexIdentityObservation {
+    identity: Option<String>,
+    generation: u64,
+}
+
+#[derive(Debug, Default)]
+struct CodexLifecycle {
+    providers: HashMap<&'static str, CodexIdentityObservation>,
+    /// Last generation carried by a snapshot (or by a validated cycle
+    /// publication, whose cycle `seq` already covered it). It lets a snapshot
+    /// advance `seq` once for an observation made outside a cycle.
+    published: HashMap<&'static str, u64>,
+    next_generation: u64,
+}
+
+impl CodexLifecycle {
+    fn observe(&mut self, id: &'static str, identity: Option<String>) -> &CodexIdentityObservation {
+        let changed = self
+            .providers
+            .get(id)
+            .is_none_or(|previous| previous.identity != identity);
+        if changed {
+            self.next_generation = self.next_generation.wrapping_add(1).max(1);
+            self.providers.insert(
+                id,
+                CodexIdentityObservation {
+                    identity,
+                    generation: self.next_generation,
+                },
+            );
+        }
+        self.providers.get(id).expect("observation was just inserted")
+    }
+}
+
+/// The identity and configuration generation that authorize one Codex job's
+/// result. A result belongs only to the exact login and account configuration
+/// that existed when its fetch started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexJobScope {
+    config_revision: u64,
+    identity_generation: u64,
+    identity: Option<String>,
+}
+
+#[derive(Debug)]
+enum CodexJobPayload {
+    /// The configured slot had no usable local identity when the job began.
+    Unavailable,
+    /// A valid cooldown prevented any credential or network read. The skip is
+    /// projected only after the generation is revalidated at commit time;
+    /// projecting it in the worker would mutate diagnostics before commit.
+    Cooldown(ProviderCooldown),
+    /// A real collection attempt. It is applied only by the cycle commit.
+    Observed(Result<ProviderUsageDto, ProviderFailure>),
+}
+
+#[derive(Debug)]
+struct PreparedCodexResult {
+    scope: CodexJobScope,
+    payload: CodexJobPayload,
+}
+
+#[derive(Debug)]
+enum ProviderJobResult {
+    /// A non-Codex job whose existing state transition ran in its worker.
+    Applied(ProviderUsageDto),
+    Codex(PreparedCodexResult),
+    Discarded,
+}
+
 // ---------- runtime core ----------
 
 struct RuntimeInner {
@@ -2008,6 +2130,9 @@ struct RuntimeInner {
     /// snapshot on the way out, so every consumer sees the same alias and
     /// the same monitoring state for an account.
     codex_accounts: Vec<CodexAccountConfig>,
+    /// Advances whenever the effective account configuration changes. A job
+    /// started before a config or pause toggle cannot publish after it.
+    codex_config_revision: u64,
     /// Which Codex accounts the runtime still polls, keyed by provider id.
     /// A paused account is never collected: its reading freezes at the
     /// last known value instead of pretending to be current.
@@ -2022,7 +2147,7 @@ struct RuntimeInner {
     last_cycle_started_at: Option<DateTime<Utc>>,
     last_cycle_completed_at: Option<DateTime<Utc>>,
     last_failures: HashMap<&'static str, (ProviderFailure, DateTime<Utc>)>,
-    last_successes: HashMap<&'static str, DateTime<Utc>>,
+    last_successes: HashMap<&'static str, (DateTime<Utc>, Option<String>)>,
     cycle_succeeded: bool,
     cycle_in_flight: bool,
     rerun_pending: bool,
@@ -2054,6 +2179,9 @@ pub enum RuntimeEvent {
 
 pub struct RuntimeCore {
     inner: Mutex<RuntimeInner>,
+    /// Serializes Codex identity observations, account/pause changes, and
+    /// validated result commits. Lock order is always lifecycle -> inner.
+    codex_lifecycle: Mutex<CodexLifecycle>,
     /// The registered providers. Replaceable: the OpenAI/Codex account
     /// configuration changes which accounts exist, and an account that
     /// stops being configured leaves the registry entirely.
@@ -2081,16 +2209,148 @@ pub struct RuntimeCore {
     /// Loaded before the first cycle, so a configured second account is
     /// collected from the startup cycle on.
     codex_accounts_store: Option<Arc<CodexAccountStore>>,
+    codex_identity_resolver: Option<Arc<dyn Fn(Option<&str>) -> Option<String> + Send + Sync>>,
 }
 
 impl RuntimeCore {
+    /// Reads the local login twice while the lifecycle lock is held. This
+    /// detects a file replacement observed between the reads. It cannot make
+    /// an external writer atomic: a replacement after the second read is a
+    /// new observation, and a complete unobserved A -> B -> A cycle is
+    /// indistinguishable from an unchanged file. See the multi-account guide.
+    fn resolve_stable_codex_identity(&self, account: &CodexAccountConfig) -> Option<String> {
+        let resolver = self.codex_identity_resolver.as_ref()?;
+        let first = resolver(account.codex_home_option());
+        let second = resolver(account.codex_home_option());
+        if first == second { first } else { None }
+    }
+
+    /// Drops process-local facts that belonged to a Codex identity generation
+    /// which is no longer current. The first observation preserves hydrated
+    /// state only when that state names the exact same identity; every later
+    /// observed transition is generation-scoped, so returning from B to A
+    /// cannot make A's pre-transition reading current again.
+    fn invalidate_codex_generation_state(
+        &self,
+        kind: ProviderKind,
+        identity: &Option<String>,
+        previous: Option<&CodexIdentityObservation>,
+    ) {
+        // Whether the persisted cache must lose this slot's entry too. The
+        // cached reading belongs to the session that produced it, so a
+        // session change must remove it from disk as well as from memory.
+        let evict_cached;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let first_observation = previous.is_none();
+            let preserves = |observed: Option<&str>| {
+                first_observation && identity.is_some() && observed == identity.as_deref()
+            };
+            if let Some(current) = inner.usages.iter_mut().find(|usage| usage.id == kind.id()) {
+                let observed = current
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.identity.as_deref());
+                if !preserves(observed) {
+                    *current = base_usage(kind, ProviderHealth::Unavailable, Vec::new());
+                }
+            }
+            let foreign_cached_reading = inner
+                .last_good
+                .get(kind.id())
+                .and_then(|usage| usage.account.as_ref())
+                .and_then(|account| account.identity.as_deref())
+                .is_some_and(|observed| !preserves(Some(observed)));
+            if !first_observation || foreign_cached_reading || identity.is_none() {
+                inner.last_good.remove(kind.id());
+                evict_cached = true;
+            } else {
+                evict_cached = false;
+            }
+            let mismatched_failure =
+                inner.last_failures.get(kind.id()).is_some_and(|(failure, _)| {
+                    !preserves(failure.identity.as_deref())
+                });
+            if !first_observation || mismatched_failure {
+                inner.last_failures.remove(kind.id());
+            }
+            let mismatched_success =
+                inner.last_successes.get(kind.id()).is_some_and(|(_, observed)| {
+                    !preserves(observed.as_deref())
+                });
+            if !first_observation || mismatched_success {
+                inner.last_successes.remove(kind.id());
+            }
+            // A cooldown is generation-scoped even before the first observation
+            // has a recorded predecessor. It is ephemeral and safe to drop.
+            inner.cooldowns.remove(kind.id());
+            inner
+                .pending_confirmations
+                .retain(|(id, _, _), _| id != kind.id());
+        }
+        if evict_cached {
+            // The persisted cache holds the same foreign reading. Dropping
+            // it there as well keeps a restart from restoring it under the
+            // new session.
+            if let Some(store) = &self.last_good_store {
+                store.evict_provider(kind.id());
+            }
+        }
+    }
+
+    fn observe_codex_identity_locked(
+        &self,
+        lifecycle: &mut CodexLifecycle,
+        account: &CodexAccountConfig,
+    ) -> Option<CodexIdentityObservation> {
+        let kind = codex_kind_for(&account.account_id)?;
+        let previous = lifecycle.providers.get(kind.id()).cloned();
+        let identity = self.resolve_stable_codex_identity(account);
+        let observation = lifecycle.observe(kind.id(), identity).clone();
+        if previous
+            .as_ref()
+            .is_none_or(|previous| previous.generation != observation.generation)
+        {
+            self.invalidate_codex_generation_state(kind, &observation.identity, previous.as_ref());
+        }
+        Some(observation)
+    }
+
+    fn current_codex_job_scope_locked(
+        &self,
+        lifecycle: &mut CodexLifecycle,
+        id: &'static str,
+    ) -> Option<CodexJobScope> {
+        let (config_revision, account) = {
+            let inner = self.inner.lock().unwrap();
+            let account = inner
+                .codex_accounts
+                .iter()
+                .find(|account| {
+                    account.account_id == id
+                        && account.is_configured()
+                        && account.monitored
+                })?
+                .clone();
+            (inner.codex_config_revision, account)
+        };
+        let observed = self.observe_codex_identity_locked(lifecycle, &account)?;
+        Some(CodexJobScope {
+            config_revision,
+            identity_generation: observed.generation,
+            identity: observed.identity,
+        })
+    }
+
     pub fn new(specs: Vec<ProviderSpec>, interval_minutes: u64) -> Self {
-        Self::with_injections(
+        let mut core = Self::with_injections(
             specs,
             interval_minutes,
             Box::new(|| RETRY_DELAY_MS + rand_below(RETRY_JITTER_MS)),
             Box::new(Utc::now),
-        )
+        );
+        core.codex_identity_resolver = Some(Arc::new(codex::current_codex_identity));
+        core
     }
 
     /// Attaches the quota history store this runtime records into. Chainable
@@ -2172,6 +2432,10 @@ impl RuntimeCore {
     /// Returns whether the effective configuration changed, so the caller
     /// can decide to trigger a fresh cycle.
     pub fn set_codex_accounts(&self, accounts: &[CodexAccountConfig]) -> bool {
+        // Account/home/pause changes and every subsequent result validation
+        // share this lock. A job that began under the previous configuration
+        // can therefore never pass validation after this method returns.
+        let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let normalized = codex_accounts::normalize_accounts(accounts);
         let specs_changed;
         {
@@ -2186,7 +2450,11 @@ impl RuntimeCore {
             specs_changed =
                 spec_identity(&inner.codex_accounts) != spec_identity(&normalized);
             inner.codex_accounts = normalized.clone();
+            inner.codex_config_revision = inner.codex_config_revision.wrapping_add(1);
             inner.codex_monitored = monitored_map(&normalized);
+            // The settings snapshot is broadcast immediately; it must advance
+            // the same sequence that consumers use to reject older events.
+            inner.seq += 1;
         }
         if !specs_changed {
             if let Some(store) = &self.codex_accounts_store {
@@ -2205,6 +2473,11 @@ impl RuntimeCore {
                 .collect();
             let still_registered =
                 |id: &str| !is_codex_provider_id(id) || registered.contains(&id);
+            // Retire removed registrations while retaining the monotonic
+            // allocator. Re-adding even the same identity must start a new
+            // generation, so delayed snapshots cannot restore the old slot.
+            lifecycle.providers.retain(|id, _| still_registered(id));
+            lifecycle.published.retain(|id, _| still_registered(id));
             inner.usages.retain(|usage| still_registered(&usage.id));
             inner.last_good.retain(|id, _| still_registered(id));
             inner.cooldowns.retain(|id, _| still_registered(id));
@@ -2375,6 +2648,7 @@ impl RuntimeCore {
                 wallet_force_requested: false,
                 wallet_monitored: HashMap::new(),
                 codex_accounts: codex_accounts::default_accounts(),
+                codex_config_revision: 0,
                 codex_monitored: HashMap::new(),
                 cooldowns: HashMap::new(),
                 last_auto_trigger: HashMap::new(),
@@ -2395,6 +2669,7 @@ impl RuntimeCore {
                 pending_confirmations: HashMap::new(),
                 opendesign_manual_revision: 0,
             }),
+            codex_lifecycle: Mutex::new(CodexLifecycle::default()),
             specs: RwLock::new(Arc::new(specs)),
             wallet_specs: Vec::new(),
             retry_delay_ms,
@@ -2405,6 +2680,7 @@ impl RuntimeCore {
             last_good_store: None,
             wallet_prefs: None,
             codex_accounts_store: None,
+            codex_identity_resolver: None,
         }
     }
 
@@ -2565,7 +2841,7 @@ impl RuntimeCore {
             let spec = spec.clone();
             wallet_jobs.spawn(async move { (index, core.run_wallet_job(&spec).await) });
         }
-        let mut results: Vec<(usize, ProviderUsageDto)> = Vec::new();
+        let mut results: Vec<(usize, ProviderJobResult)> = Vec::new();
         let mut lost_task_panics: usize = 0;
         while let Some(joined) = jobs.join_next().await {
             match joined {
@@ -2637,12 +2913,61 @@ impl RuntimeCore {
             } else {
                 job_lost_failure()
             };
-            let dto = self.apply_failure(spec.kind, failure);
-            results.push((index, dto));
+            let result = if self.codex_identity_resolver.is_some()
+                && is_codex_provider_id(spec.kind.id())
+            {
+                // A lost Codex task has no original identity/config scope.
+                // Its panic cannot be attributed to whichever generation is
+                // current now, so fail closed and write nothing.
+                ProviderJobResult::Discarded
+            } else {
+                ProviderJobResult::Applied(self.apply_failure(spec.kind, failure))
+            };
+            results.push((index, result));
         }
         results.sort_by_key(|(index, _)| *index);
 
-        let mut usages: Vec<ProviderUsageDto> = results.into_iter().map(|(_, dto)| dto).collect();
+        // Token-log collection is a blocking, read-only work item. Complete it
+        // before taking the synchronous lifecycle/state guard so `run_cycle`
+        // remains `Send`; none of its output participates in the Codex commit.
+        if let Some(usage_intelligence) = &self.usage_intelligence {
+            if usage_intelligence.enabled() {
+                let store = usage_intelligence.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    store
+                        .collecting
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    crate::usage_intelligence::run_collection_pass(&store);
+                    store
+                        .collecting
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                })
+                .await;
+            }
+        }
+
+        // All Codex observations are validated and all result mutations are
+        // committed while holding this one lock. A snapshot or account/pause
+        // change therefore cannot interleave between revalidation, cache,
+        // history, notification, and state publication.
+        let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut usages: Vec<ProviderUsageDto> = Vec::new();
+        let mut discarded_codex_ids: HashSet<&'static str> = HashSet::new();
+        for (index, result) in results {
+            let Some(spec) = specs.get(index) else { continue };
+            let dto = match result {
+                ProviderJobResult::Applied(dto) => Some(dto),
+                ProviderJobResult::Codex(prepared) => {
+                    self.commit_prepared_codex_locked(&mut lifecycle, spec.kind, prepared)
+                }
+                ProviderJobResult::Discarded => None,
+            };
+            if let Some(dto) = dto {
+                usages.push(dto);
+            } else if is_codex_provider_id(spec.kind.id()) {
+                discarded_codex_ids.insert(spec.kind.id());
+            }
+        }
         let mut wallets: Vec<ApiWalletDto> =
             wallet_results.into_iter().map(|(_, dto)| dto).collect();
         // History recording (phase 2): one batch per completed cycle, from
@@ -2674,30 +2999,6 @@ impl RuntimeCore {
             let _ = history.record(accepted);
             if confirmation_requested {
                 self.request_confirmation_follow_up();
-            }
-        }
-        // Usage Intelligence (v0.8.9): one opt-in collection pass per
-        // completed cycle, off the async path (the pass is blocking
-        // filesystem work — snapshot copy, rollout reads — awaited here so
-        // the snapshot event that follows already reflects the plane's
-        // revision). The pass covers every source (ZCode, Codex) under the
-        // single shared opt-in; sources are isolated from each other. A
-        // disabled store returns before any probe, and a failure only
-        // updates the plane's own diagnostics — it can never degrade
-        // quota-provider health or the cycle verdict.
-        if let Some(usage_intelligence) = &self.usage_intelligence {
-            if usage_intelligence.enabled() {
-                let store = usage_intelligence.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store
-                        .collecting
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    crate::usage_intelligence::run_collection_pass(&store);
-                    store
-                        .collecting
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                })
-                .await;
             }
         }
         // Threshold notifications (v0.5 step 4): one evaluation per
@@ -2745,11 +3046,28 @@ impl RuntimeCore {
         // the snapshot and the last known reading keeps its stamp. The vec
         // stays in spec order.
         for spec in specs.iter() {
-            if !paused_ids.contains(spec.kind.id()) {
-                continue;
-            }
-            if let Some(frozen) = inner.usages.iter().find(|usage| usage.id == spec.kind.id()) {
-                usages.push(frozen.clone());
+            let id = spec.kind.id();
+            let paused_now = paused_ids.contains(id)
+                || inner
+                    .codex_monitored
+                    .get(id)
+                    .is_some_and(|monitored| !monitored);
+            if paused_now {
+                // A paused account did not run. Its last accepted reading is
+                // intentionally frozen until monitoring resumes.
+                if let Some(frozen) = inner.usages.iter().find(|usage| usage.id == id) {
+                    usages.push(frozen.clone());
+                }
+            } else if discarded_codex_ids.contains(id) {
+                // A rejected Codex result has no authority to republish any
+                // prior slot: the current generation may have been observed
+                // as unavailable while the job was in flight. Fail closed and
+                // never copy a possibly stale value back from inner state.
+                usages.push(base_usage(
+                    spec.kind,
+                    ProviderHealth::Unavailable,
+                    Vec::new(),
+                ));
             }
         }
         usages.sort_by_key(|usage| {
@@ -2781,20 +3099,106 @@ impl RuntimeCore {
         inner.seq += 1;
     }
 
-    async fn run_provider_job(self: &Arc<Self>, spec: &ProviderSpec) -> ProviderUsageDto {
+    fn commit_prepared_codex_locked(
+        &self,
+        lifecycle: &mut CodexLifecycle,
+        kind: ProviderKind,
+        prepared: PreparedCodexResult,
+    ) -> Option<ProviderUsageDto> {
+        let observed_identity = match &prepared.payload {
+            CodexJobPayload::Unavailable => None,
+            CodexJobPayload::Cooldown(cooldown) => cooldown.failure.identity.as_deref(),
+            CodexJobPayload::Observed(Ok(dto)) => dto
+                .account
+                .as_ref()
+                .and_then(|account| account.identity.as_deref()),
+            CodexJobPayload::Observed(Err(failure)) => failure.identity.as_deref(),
+        };
+        let current = self.current_codex_job_scope_locked(lifecycle, kind.id())?;
+        // The enclosing cycle advances `seq`, so this observed generation is
+        // covered even when the result itself is rejected below. A later
+        // snapshot must not add a second sequence tick for the same change.
+        lifecycle
+            .published
+            .insert(kind.id(), current.identity_generation);
+        if current != prepared.scope
+            || observed_identity != prepared.scope.identity.as_deref()
+        {
+            return None;
+        }
+        lifecycle
+            .published
+            .insert(kind.id(), prepared.scope.identity_generation);
+        match prepared.payload {
+            CodexJobPayload::Unavailable => {
+                Some(base_usage(kind, ProviderHealth::Unavailable, Vec::new()))
+            }
+            CodexJobPayload::Cooldown(cooldown) => {
+                let active = self.active_codex_cooldown(kind.id(), &prepared.scope)?;
+                if active.identity_generation != Some(prepared.scope.identity_generation) {
+                    return None;
+                }
+                Some(self.cooldown_skip_dto(kind, cooldown))
+            }
+            CodexJobPayload::Observed(Ok(dto)) => {
+                self.inner.lock().unwrap().cooldowns.remove(kind.id());
+                Some(self.apply_success(kind, dto))
+            }
+            CodexJobPayload::Observed(Err(failure)) => {
+                self.maybe_apply_codex_cooldown(
+                    kind,
+                    &failure,
+                    prepared.scope.identity_generation,
+                );
+                Some(self.apply_failure(kind, failure))
+            }
+        }
+    }
+
+    async fn run_provider_job(
+        self: &Arc<Self>,
+        spec: &ProviderSpec,
+    ) -> ProviderJobResult {
         if spec.kind == ProviderKind::OpenDesign {
             // Keep the offline registry closure as the only runtime input,
             // then reproject the newest manual attempt before assigning
             // state. Only direct publication advances the revision marker.
             let _ = self.fetch_with_retry(spec).await;
             let (_, refresh) = opendesign::latest_manual_refresh_with_revision();
-            return normalize_opendesign_manual(refresh, self.now());
+            return ProviderJobResult::Applied(normalize_opendesign_manual(refresh, self.now()));
+        }
+        let is_codex = self.codex_identity_resolver.is_some()
+            && is_codex_provider_id(spec.kind.id());
+        let codex_scope = if is_codex {
+            let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match self.current_codex_job_scope_locked(&mut lifecycle, spec.kind.id()) {
+                Some(scope) => Some(scope),
+                None => return ProviderJobResult::Discarded,
+            }
+        } else {
+            None
+        };
+        if codex_scope
+            .as_ref()
+            .is_some_and(|scope| scope.identity.is_none())
+        {
+            return ProviderJobResult::Codex(PreparedCodexResult {
+                scope: codex_scope.expect("checked above"),
+                payload: CodexJobPayload::Unavailable,
+            });
         }
         // Server-directed cooldown first: while it lasts the provider is not
         // fetched at all, by any trigger. Eligibility is the later of this
         // and the provider cadence below.
-        if let Some(cooldown) = self.active_cooldown(spec.kind.id()) {
-            return self.cooldown_skip_dto(spec.kind, cooldown);
+        if let Some(scope) = &codex_scope {
+            if let Some(cooldown) = self.active_codex_cooldown(spec.kind.id(), scope) {
+                return ProviderJobResult::Codex(PreparedCodexResult {
+                    scope: scope.clone(),
+                    payload: CodexJobPayload::Cooldown(cooldown),
+                });
+            }
+        } else if let Some(cooldown) = self.active_cooldown(spec.kind.id()) {
+            return ProviderJobResult::Applied(self.cooldown_skip_dto(spec.kind, cooldown));
         }
         // Grok cadence: serve the cached last result inside the 15-minute
         // window — except on a confirmation follow-up cycle, which must
@@ -2805,13 +3209,19 @@ impl RuntimeCore {
             let bypass = self.inner.lock().unwrap().grok_cache_bypass;
             if !bypass {
                 if let Some(cached) = self.grok_cached_result() {
-                    return cached;
+                    return ProviderJobResult::Applied(cached);
                 }
             }
             self.inner.lock().unwrap().grok_last_attempt_at = Some(self.now());
         }
 
         let outcome = self.fetch_with_retry(spec).await;
+        if let Some(scope) = codex_scope {
+            return ProviderJobResult::Codex(PreparedCodexResult {
+                scope,
+                payload: CodexJobPayload::Observed(outcome),
+            });
+        }
         let mut final_failure: Option<ProviderFailure> = None;
         let dto = match outcome {
             Ok(dto) => {
@@ -2838,7 +3248,7 @@ impl RuntimeCore {
                 self.inner.lock().unwrap().grok_last_result = Some(dto.clone());
             }
         }
-        dto
+        ProviderJobResult::Applied(dto)
     }
 
     async fn run_wallet_job(self: &Arc<Self>, spec: &WalletSpec) -> ApiWalletDto {
@@ -3121,8 +3531,27 @@ impl RuntimeCore {
     /// The provider's active cooldown, if it has not expired yet.
     fn active_cooldown(&self, id: &'static str) -> Option<ProviderCooldown> {
         let inner = self.inner.lock().unwrap();
-        let cooldown = inner.cooldowns.get(id)?;
-        (self.now() < cooldown.until).then(|| cooldown.clone())
+        let cooldown = inner.cooldowns.get(id)?.clone();
+        (self.now() < cooldown.until).then_some(cooldown)
+    }
+
+    /// Codex cooldown eligibility is scoped to the exact observed generation.
+    /// The caller holds or has captured a validated job scope; identity text
+    /// alone is insufficient because an observed A -> B -> A transition must
+    /// not revive A's old deadline.
+    fn active_codex_cooldown(
+        &self,
+        id: &'static str,
+        scope: &CodexJobScope,
+    ) -> Option<ProviderCooldown> {
+        let inner = self.inner.lock().unwrap();
+        let cooldown = inner.cooldowns.get(id).cloned()?;
+        if cooldown.identity_generation != Some(scope.identity_generation)
+            || cooldown.failure.identity != scope.identity
+        {
+            return None;
+        }
+        (self.now() < cooldown.until).then_some(cooldown)
     }
 
     /// Records a cooldown from a failure that carried a `Retry-After` hint,
@@ -3142,6 +3571,31 @@ impl RuntimeCore {
                 until,
                 failure: failure.clone(),
                 failure_at: now,
+                identity_generation: None,
+                credential_binding: None,
+            },
+        );
+    }
+
+    fn maybe_apply_codex_cooldown(
+        &self,
+        kind: ProviderKind,
+        failure: &ProviderFailure,
+        identity_generation: u64,
+    ) {
+        let wait_ms = failure.retry_after_ms.unwrap_or(0);
+        if wait_ms == 0 {
+            return;
+        }
+        let now = self.now();
+        let until = now + chrono::Duration::milliseconds(wait_ms.min(MAX_COOLDOWN_MS) as i64);
+        self.inner.lock().unwrap().cooldowns.insert(
+            kind.id(),
+            ProviderCooldown {
+                until,
+                failure: failure.clone(),
+                failure_at: now,
+                identity_generation: Some(identity_generation),
                 credential_binding: None,
             },
         );
@@ -3197,6 +3651,7 @@ impl RuntimeCore {
                 until,
                 failure: failure.clone(),
                 failure_at: now,
+                identity_generation: None,
                 credential_binding: failure.credential_binding.clone(),
             },
         );
@@ -3494,11 +3949,15 @@ impl RuntimeCore {
                 .last_failures
                 .insert(kind.id(), (live_failure, self.now()));
         }
+        let identity = dto
+            .account
+            .as_ref()
+            .and_then(|account| account.identity.clone());
         self.inner
             .lock()
             .unwrap()
             .last_successes
-            .insert(kind.id(), self.now());
+            .insert(kind.id(), (self.now(), identity));
         match kind {
             // A structurally successful refresh stores last-good data —
             // even an "unknown" one (the TS adapters stored whatever the
@@ -3621,7 +4080,7 @@ impl RuntimeCore {
                 .and_then(|account| account.identity.as_deref());
             let same_account = match (failure.identity.as_deref(), retained_identity) {
                 (Some(attempted), Some(retained)) => attempted == retained,
-                _ => true,
+                _ => !is_codex_provider_id(kind.id()),
             };
             if same_account {
                 // checkedAt stays at the original fetch time, so the card
@@ -3668,7 +4127,7 @@ impl RuntimeCore {
 
     // ---- snapshot and settings ----
 
-    pub fn snapshot(&self) -> RuntimeSnapshot {
+    fn snapshot_locked(&self, lifecycle: &mut CodexLifecycle) -> RuntimeSnapshot {
         let history_revision = self
             .history
             .as_ref()
@@ -3689,7 +4148,42 @@ impl RuntimeCore {
             .iter()
             .map(|spec| (spec.id, (spec.current_credential_binding)()))
             .collect();
-        let inner = self.inner.lock().unwrap();
+        let account_configs = self.inner.lock().unwrap().codex_accounts.clone();
+        let mut codex_bindings: HashMap<&'static str, Option<String>> = HashMap::new();
+        let mut codex_identity_states: Vec<CodexIdentityStateDto> = Vec::new();
+        let mut identity_generation_changed = false;
+        if self.codex_identity_resolver.is_some() {
+            for account in account_configs.iter().filter(|account| account.is_configured()) {
+                let Some(observation) = self.observe_codex_identity_locked(lifecycle, account)
+                else {
+                    continue;
+                };
+                let Some(kind) = codex_kind_for(&account.account_id) else {
+                    continue;
+                };
+                codex_bindings.insert(kind.id(), observation.identity.clone());
+                codex_identity_states.push(CodexIdentityStateDto {
+                    provider_id: kind.id().to_string(),
+                    generation: observation.generation,
+                    identity: observation.identity,
+                });
+                match lifecycle.published.get(kind.id()) {
+                    Some(published) if *published != observation.generation => {
+                        identity_generation_changed = true;
+                    }
+                    // The first observation is a generation change too. It
+                    // must advance the published sequence so an older event
+                    // already carrying the prior state cannot win last.
+                    None => identity_generation_changed = true,
+                    _ => {}
+                }
+                lifecycle.published.insert(kind.id(), observation.generation);
+            }
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if identity_generation_changed {
+            inner.seq = inner.seq.wrapping_add(1);
+        }
         let mut wallets: Vec<ApiWalletDto> = inner
             .wallets
             .iter()
@@ -3725,7 +4219,19 @@ impl RuntimeCore {
             providers: inner
                 .usages
                 .iter()
-                .map(|usage| project_account_state(usage, &inner.codex_accounts))
+                .map(|usage| {
+                    let projected = if self.codex_identity_resolver.is_some()
+                        && is_codex_provider_id(&usage.id)
+                    {
+                        let binding = codex_bindings
+                            .get(usage.id.as_str())
+                            .and_then(|identity| identity.as_deref());
+                        project_codex_identity(usage, binding)
+                    } else {
+                        usage.clone()
+                    };
+                    project_account_state(&projected, &inner.codex_accounts)
+                })
                 .collect(),
             wallets,
             last_updated_at: inner
@@ -3736,7 +4242,13 @@ impl RuntimeCore {
             refresh_interval_minutes: inner.interval_minutes,
             history_revision,
             usage_intelligence_revision,
+            codex_identity_states,
         }
+    }
+
+    pub fn snapshot(&self) -> RuntimeSnapshot {
+        let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.snapshot_locked(&mut lifecycle)
     }
 
     /// Publishes the latest explicit OpenDesign attempt without starting a
@@ -3798,14 +4310,40 @@ impl RuntimeCore {
     /// runtime's normalized DTOs and structured failures only; provider
     /// response payloads are never retained here and cannot cross this API.
     pub fn diagnostic_source(&self, now: DateTime<Utc>) -> RuntimeDiagnosticSource {
-        let inner = self.inner.lock().unwrap();
+        // Identity observation, snapshot publication, diagnostics filtering and
+        // the state copy form one validated read. Taking the lifecycle lock
+        // here prevents a resolver result on one side of the copy from
+        // authorizing a cooldown or failure retained on the other side.
+        let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let projected = self.snapshot_locked(&mut lifecycle);
         let specs = self.specs_snapshot();
+        let codex_identity_is_current = |id: &str, observed: Option<&str>| {
+            if self.codex_identity_resolver.is_none() || !is_codex_provider_id(id) {
+                return true;
+            }
+            lifecycle
+                .providers
+                .get(id)
+                .is_some_and(|current| observed == current.identity.as_deref())
+        };
+        let codex_cooldown_is_current = |id: &str, cooldown: &ProviderCooldown| {
+            if self.codex_identity_resolver.is_none() || !is_codex_provider_id(id) {
+                return true;
+            }
+            cooldown.identity_generation.is_some_and(|generation| {
+                lifecycle
+                    .providers
+                    .get(id)
+                    .is_some_and(|current| current.generation == generation)
+            })
+        };
+        let inner = self.inner.lock().unwrap();
         let providers = specs
             .iter()
             .map(|spec| {
                 let id = spec.kind.id();
-                let usage = inner
-                    .usages
+                let usage = projected
+                    .providers
                     .iter()
                     .find(|usage| usage.id == id)
                     .cloned()
@@ -3814,10 +4352,14 @@ impl RuntimeCore {
                     .cooldowns
                     .get(id)
                     .filter(|cooldown| now < cooldown.until)
+                    .filter(|cooldown| codex_cooldown_is_current(id, cooldown))
                     .map(|cooldown| cooldown.until);
                 let (last_error, last_error_at) = inner
                     .last_failures
                     .get(id)
+                    .filter(|(failure, _)| {
+                        codex_identity_is_current(id, failure.identity.as_deref())
+                    })
                     .map(|(failure, at)| {
                         (
                             Some(ErrorDiagnosticSource {
@@ -3829,10 +4371,16 @@ impl RuntimeCore {
                         )
                     })
                     .unwrap_or((None, None));
+                let last_success_at = inner
+                    .last_successes
+                    .get(id)
+                    .and_then(|(at, identity)| {
+                        codex_identity_is_current(id, identity.as_deref()).then_some(*at)
+                    });
                 ProviderDiagnosticSource {
                     usage,
                     cooldown_until,
-                    last_success_at: inner.last_successes.get(id).copied(),
+                    last_success_at,
                     last_error,
                     last_error_at,
                 }
@@ -3847,6 +4395,7 @@ impl RuntimeCore {
             cycle_in_flight: inner.cycle_in_flight,
             follow_up_pending: inner.rerun_pending,
             providers,
+            codex_identity_states: projected.codex_identity_states,
         }
     }
 
@@ -3868,8 +4417,7 @@ impl RuntimeCore {
     /// [`earliest_reset_wake_at`]), or `None` when no reset is eligible.
     /// A read over the same live snapshot the cycles publish.
     pub fn earliest_reset_wake_at(&self) -> Option<DateTime<Utc>> {
-        let inner = self.inner.lock().unwrap();
-        earliest_reset_wake_at(&inner.usages, self.now())
+        earliest_reset_wake_at(&self.snapshot().providers, self.now())
     }
 }
 
@@ -4052,7 +4600,16 @@ impl RuntimeHandle {
     /// is rebuilt and the configuration is persisted, so a restart keeps
     /// the same accounts.
     pub fn set_codex_accounts(&self, accounts: Vec<CodexAccountConfig>) -> bool {
-        self.core.set_codex_accounts(&accounts)
+        let changed = self.core.set_codex_accounts(&accounts);
+        if changed {
+            // Publish the identity-projected state before the caller queues
+            // the network refresh. A switched or paused account must stop
+            // showing its previous reading without waiting for that fetch.
+            let _ = self
+                .app
+                .emit(SNAPSHOT_EVENT, &self.core.snapshot());
+        }
+        changed
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -4445,6 +5002,9 @@ pub fn set_codex_accounts(
 
 #[cfg(test)]
 mod codex_attribution_tests;
+
+#[cfg(test)]
+mod codex_identity_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4868,6 +5428,7 @@ mod tests {
             plan_type: Some("team".to_string()),
             account: Some(crate::codex::CodexAccount {
                 account_hint: tail.to_string(),
+                identity: Some(format!("chatgpt:{tail}")),
             }),
             reset_credits: Some(CodexResetCredits {
                 banked_credits: banked,
@@ -5645,10 +6206,10 @@ mod tests {
     #[tokio::test]
     async fn transport_timeout_failure_is_terminal_for_its_cycle() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             2 => Err(transport_timeout_failure()),
-            _ => Ok(ok_usage("openai-codex", "OpenAI / Codex", 34.0)),
+            _ => Ok(ok_usage("zai", "Z.ai", 34.0)),
         });
         let core = test_core(vec![spec]);
         core.run_cycle().await; // success seeds last good
@@ -5662,7 +6223,7 @@ mod tests {
         );
         let failed = &core.snapshot().providers[0];
         assert_eq!(failed.status, "error");
-        assert_eq!(failed.limits, ok_usage("openai-codex", "OpenAI / Codex", 33.0).limits);
+        assert_eq!(failed.limits, ok_usage("zai", "Z.ai", 33.0).limits);
         assert_eq!(
             failed.error.as_deref(),
             Some("Refresh failed: operation timed out (network)")
@@ -5719,8 +6280,8 @@ mod tests {
     #[tokio::test]
     async fn last_good_is_retained_and_marked_errored_on_failure() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             _ => Err(transient_failure("network")),
         });
         let core = test_core(vec![spec]);
@@ -5730,7 +6291,7 @@ mod tests {
         core.run_cycle().await; // failure (after its one retry) retains it
         let retained = &core.snapshot().providers[0];
         assert_eq!(retained.status, "error");
-        assert_eq!(retained.limits, ok_usage("openai-codex", "OpenAI / Codex", 33.0).limits);
+        assert_eq!(retained.limits, ok_usage("zai", "Z.ai", 33.0).limits);
         assert_eq!(retained.checked_at, good_checked_at, "retained checkedAt stays at the original fetch time");
         assert_eq!(
             retained.error.as_deref(),
@@ -5808,15 +6369,15 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_fetch = calls.clone();
         let spec = ProviderSpec {
-            kind: ProviderKind::Codex,
+            kind: ProviderKind::Zai,
             fetch: Arc::new(move || {
                 let calls = calls_fetch.clone();
                 Box::pin(async move {
                     let nth = calls.fetch_add(1, Ordering::SeqCst) + 1;
                     match nth {
-                        1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+                        1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
                         2 => panic!("boom on the second cycle"),
-                        _ => Ok(ok_usage("openai-codex", "OpenAI / Codex", 40.0)),
+                        _ => Ok(ok_usage("zai", "Z.ai", 40.0)),
                     }
                 }) as FetchFuture
             }),
@@ -5831,7 +6392,7 @@ mod tests {
         assert_eq!(retained.status, "error");
         assert_eq!(
             retained.limits,
-            ok_usage("openai-codex", "OpenAI / Codex", 33.0).limits,
+            ok_usage("zai", "Z.ai", 33.0).limits,
             "the panic failure retains last-good like any failed refresh"
         );
         assert_eq!(
@@ -6095,6 +6656,7 @@ mod tests {
         let mut usage = ok_usage("openai-codex", "OpenAI / Codex", percent);
         usage.account = build_codex_attribution(Some(&codex::CodexAccount {
             account_hint: hint.to_string(),
+            identity: Some(format!("chatgpt:{hint}")),
         }));
         usage
     }
@@ -6293,6 +6855,7 @@ mod tests {
         assert_eq!(
             build_codex_attribution(Some(&codex::CodexAccount {
                 account_hint: "56789abc".to_string(),
+                identity: Some("chatgpt:56789abc".to_string()),
             }))
             .unwrap()
             .identity
@@ -6786,8 +7349,8 @@ mod tests {
     #[tokio::test]
     async fn cooling_down_provider_retains_last_good() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             _ => Err(rate_limited_failure(Some(30 * 60_000))),
         });
         let (core, clock) = manual_clock_core(vec![spec]);
@@ -6817,8 +7380,8 @@ mod tests {
     #[tokio::test]
     async fn cooldown_skip_creates_no_history_observation() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 25.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 25.0)),
             _ => Err(rate_limited_failure(Some(30 * 60_000))),
         });
         // Seed the clock at real wall time so the history store's future-skew
@@ -7459,8 +8022,8 @@ mod tests {
     #[tokio::test]
     async fn failure_with_last_good_is_error_with_metadata() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             _ => Err(failure("network", None)),
         });
         let core = test_core(vec![spec]);
@@ -7533,8 +8096,8 @@ mod tests {
     #[tokio::test]
     async fn cooldown_projects_cooldown_bare_and_with_last_good() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             _ => Err(rate_limited_failure(Some(30 * 60_000))),
         });
         let (core, clock) = manual_clock_core(vec![spec]);
@@ -7594,8 +8157,8 @@ mod tests {
     #[tokio::test]
     async fn unavailable_auth_failure_with_retained_last_good_stays_error() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage("openai-codex", "OpenAI / Codex", 33.0)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage("zai", "Z.ai", 33.0)),
             _ => Err(permanent_failure()), // auth_expired
         });
         let core = test_core(vec![spec]);
@@ -8195,7 +8758,10 @@ mod tests {
                 reset_at: Some(week_ahead_reset()),
             }],
             plan_type: None,
-            account: None,
+            account: Some(crate::codex::CodexAccount {
+                account_hint: "abcd".to_string(),
+                identity: Some(format!("chatgpt-v2:{}", "a".repeat(64))),
+            }),
             reset_credits: None,
         };
         let mut dto = normalize_codex(ProviderKind::Codex, Ok(usage), fixed_now().timestamp_millis())
@@ -8239,10 +8805,10 @@ mod tests {
     #[tokio::test]
     async fn normal_progression_records_every_cycle_without_holds() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
-            1 => Ok(ok_usage_window("openai-codex", "OpenAI / Codex", "Weekly", 10.0, None)),
-            2 => Ok(ok_usage_window("openai-codex", "OpenAI / Codex", "Weekly", 45.0, None)),
-            _ => Ok(ok_usage_window("openai-codex", "OpenAI / Codex", "Weekly", 70.0, None)),
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
+            1 => Ok(ok_usage_window("zai", "Z.ai", "Weekly", 10.0, None)),
+            2 => Ok(ok_usage_window("zai", "Z.ai", "Weekly", 45.0, None)),
+            _ => Ok(ok_usage_window("zai", "Z.ai", "Weekly", 70.0, None)),
         });
         let clock = laneb_clock();
         let (store, path) = laneb_store("normal-progression", &clock);
@@ -8271,17 +8837,17 @@ mod tests {
         let two_weeks_ahead = (fixed_now() + chrono::Duration::days(14))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| match nth {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| match nth {
             1 => Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 50.0,
                 Some(&week_ahead),
             )),
             _ => Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 12.0,
                 Some(&two_weeks_ahead),
@@ -8312,17 +8878,17 @@ mod tests {
     async fn suspicious_drop_is_held_and_never_written_before_confirmation() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| match nth {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| match nth {
             1 => Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 50.0,
                 Some(&week_ahead),
             )),
             _ => Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 20.0,
                 Some(&week_ahead),
@@ -8362,15 +8928,15 @@ mod tests {
     async fn confirmed_drop_writes_candidate_and_confirming_sample_time_ordered() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             let percent = match nth {
                 1 => 50.0,
                 2 => 20.0,
                 _ => 18.0,
             };
             Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 percent,
                 Some(&week_ahead),
@@ -8410,15 +8976,15 @@ mod tests {
     async fn refuted_drop_discards_the_candidate_and_records_the_refuting_sample() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             let percent = match nth {
                 1 => 50.0,
                 2 => 20.0,
                 _ => 49.0,
             };
             Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 percent,
                 Some(&week_ahead),
@@ -8453,7 +9019,7 @@ mod tests {
     async fn inconclusive_sample_defers_without_writing_and_the_pending_survives() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             let percent = match nth {
                 1 => 50.0,
                 2 => 20.0,
@@ -8461,8 +9027,8 @@ mod tests {
                 _ => 18.0,
             };
             Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 percent,
                 Some(&week_ahead),
@@ -8507,15 +9073,15 @@ mod tests {
     async fn pending_confirmation_expires_after_ttl_and_reclassifies() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             let percent = match nth {
                 1 => 50.0,
                 2 => 20.0,
                 _ => 55.0,
             };
             Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 percent,
                 Some(&week_ahead),
@@ -8560,7 +9126,7 @@ mod tests {
         // The baseline records normally (no hold, no request).
         let (accepted, requested) = core.admit_observations(
             &[],
-            vec![seeded_observation("openai-codex", "Weekly", 50.0, at(0))],
+            vec![seeded_observation("zai", "Weekly", 50.0, at(0))],
             at(0).timestamp_millis(),
         );
         assert!(!requested);
@@ -8570,7 +9136,7 @@ mod tests {
         // The glitch is held: withheld from history, one follow-up requested.
         let (accepted, requested) = core.admit_observations(
             &store.history(),
-            vec![seeded_observation("openai-codex", "Weekly", 20.0, at(30))],
+            vec![seeded_observation("zai", "Weekly", 20.0, at(30))],
             at(30).timestamp_millis(),
         );
         assert!(accepted.is_empty() && requested, "the drop is held");
@@ -8581,7 +9147,7 @@ mod tests {
         // second observation: defer, write nothing, request nothing.
         let (accepted, requested) = core.admit_observations(
             &store.history(),
-            vec![seeded_observation("openai-codex", "Weekly", 20.0, at(30))],
+            vec![seeded_observation("zai", "Weekly", 20.0, at(30))],
             at(60).timestamp_millis(),
         );
         assert!(accepted.is_empty() && !requested, "the echo defers");
@@ -8600,7 +9166,7 @@ mod tests {
         // confirming sample land time-ordered, exactly once.
         let (accepted, _requested) = core.admit_observations(
             &store.history(),
-            vec![seeded_observation("openai-codex", "Weekly", 18.0, at(90))],
+            vec![seeded_observation("zai", "Weekly", 18.0, at(90))],
             at(90).timestamp_millis(),
         );
         let values: Vec<f64> = accepted.iter().map(|o| o.used_percent).collect();
@@ -8675,18 +9241,18 @@ mod tests {
     async fn failed_confirmation_cycle_keeps_pending_without_history_write() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             match nth {
                 1 => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     50.0,
                     Some(&week_ahead),
                 )),
                 2 => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     20.0,
                     Some(&week_ahead),
@@ -8694,8 +9260,8 @@ mod tests {
                 // The confirmation fetch fails through its one bounded retry.
                 3 | 4 => Err(transient_failure("network")),
                 _ => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     18.0,
                     Some(&week_ahead),
@@ -8735,18 +9301,18 @@ mod tests {
     async fn cooldown_blocked_confirmation_waits_without_refetching() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             match nth {
                 1 => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     50.0,
                     Some(&week_ahead),
                 )),
                 2 => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     20.0,
                     Some(&week_ahead),
@@ -8756,8 +9322,8 @@ mod tests {
                 // cooldown expires.
                 3 => Err(rate_limited_failure(Some(5 * 60_000))),
                 _ => Ok(ok_usage_window(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     "Weekly",
                     18.0,
                     Some(&week_ahead),
@@ -8804,7 +9370,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let clock = laneb_clock();
         let follow_up_clock = clock.clone();
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             // The follow-up observes genuinely fresh state: the fetch stamps
             // a later time (the manual clock advances with it) and the values
             // moved (still ≤ baseline − 5, so they confirm). Re-serving the
@@ -8817,22 +9383,22 @@ mod tests {
             }
             if nth == 1 {
                 Ok(multi_window_usage(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     &[("Weekly", 20.0), ("Daily", 25.0)],
                 ))
             } else {
                 Ok(multi_window_usage(
-                    "openai-codex",
-                    "OpenAI / Codex",
+                    "zai",
+                    "Z.ai",
                     &[("Weekly", 19.0), ("Daily", 24.0)],
                 ))
             }
         });
         let (store, path) = laneb_store("no-storm", &clock);
         store.record(vec![
-            seeded_observation("openai-codex", "Weekly", 50.0, fixed_now() - chrono::Duration::minutes(5)),
-            seeded_observation("openai-codex", "Daily", 60.0, fixed_now() - chrono::Duration::minutes(5)),
+            seeded_observation("zai", "Weekly", 50.0, fixed_now() - chrono::Duration::minutes(5)),
+            seeded_observation("zai", "Daily", 60.0, fixed_now() - chrono::Duration::minutes(5)),
         ]);
         let core = laneb_core(vec![spec], store.clone(), &clock);
 
@@ -8876,11 +9442,11 @@ mod tests {
     #[tokio::test]
     async fn global_cap_discards_suspicious_candidates_beyond_eight_pendings() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
             // Nine suspicious windows; past the cap only eight may be held.
             1 => Ok(multi_window_usage(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 &[
                     ("w1", 20.0),
                     ("w2", 21.0),
@@ -8895,8 +9461,8 @@ mod tests {
             )),
             // The confirmation cycle samples only the eight held windows.
             _ => Ok(multi_window_usage(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 &[
                     ("w1", 20.0),
                     ("w2", 21.0),
@@ -8914,7 +9480,7 @@ mod tests {
         let baselines: Vec<QuotaObservation> = (1..=9)
             .map(|i| {
                 seeded_observation(
-                    "openai-codex",
+                    "zai",
                     &format!("w{i}"),
                     50.0 + i as f64,
                     fixed_now() - chrono::Duration::minutes(5),
@@ -8956,14 +9522,14 @@ mod tests {
     async fn clearing_pending_confirmations_lets_the_window_reclassify() {
         let week_ahead = week_ahead_reset();
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), move |nth| {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), move |nth| {
             let percent = match nth {
                 1 => 50.0,
                 _ => 18.0,
             };
             Ok(ok_usage_window(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "Weekly",
                 percent,
                 Some(&week_ahead),
@@ -9660,7 +10226,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_fetch = calls.clone();
         let spec = ProviderSpec {
-            kind: ProviderKind::Codex,
+            kind: ProviderKind::Zai,
             fetch: Arc::new(move || {
                 let clock = fetch_clock.clone();
                 let calls = calls_fetch.clone();
@@ -9671,15 +10237,15 @@ mod tests {
                         .to_rfc3339_opts(SecondsFormat::Millis, true);
                     match nth {
                         1 => Ok(usage_with_reset(
-                            "openai-codex",
-                            "OpenAI / Codex",
+                            "zai",
+                            "Z.ai",
                             "5 hours",
                             Some(&reset_at),
                         )),
                         2 => Err(rate_limited_failure(Some(10 * 60_000))),
                         _ => Ok(usage_with_reset(
-                            "openai-codex",
-                            "OpenAI / Codex",
+                            "zai",
+                            "Z.ai",
                             "5 hours",
                             Some(&reset_at),
                         )),
@@ -9745,10 +10311,10 @@ mod tests {
     #[tokio::test]
     async fn a_reset_wake_stamp_is_spent_once_fired_even_while_cooling_down() {
         let calls = Arc::new(AtomicUsize::new(0));
-        let spec = counting_spec(ProviderKind::Codex, calls.clone(), |nth| match nth {
+        let spec = counting_spec(ProviderKind::Zai, calls.clone(), |nth| match nth {
             1 => Ok(usage_with_reset(
-                "openai-codex",
-                "OpenAI / Codex",
+                "zai",
+                "Z.ai",
                 "5 hours",
                 Some(&reset_at_ms(12 * 60_000)),
             )),
@@ -9843,7 +10409,7 @@ mod tests {
         let gate_fetch = gate.clone();
         let calls_fetch = calls.clone();
         let spec = ProviderSpec {
-            kind: ProviderKind::Codex,
+            kind: ProviderKind::Zai,
             fetch: Arc::new(move || {
                 let calls = calls_fetch.clone();
                 let gate = gate_fetch.clone();
@@ -9853,8 +10419,8 @@ mod tests {
                     let _permit = gate.acquire_owned().await.unwrap();
                     let percent = if nth == 1 { 50.0 } else { 85.0 };
                     Ok(ok_usage_window(
-                        "openai-codex",
-                        "OpenAI / Codex",
+                        "zai",
+                        "Z.ai",
                         "Weekly",
                         percent,
                         Some(&week),

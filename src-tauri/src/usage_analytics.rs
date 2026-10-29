@@ -223,6 +223,22 @@ pub struct UsageAnalyticsDto {
     pub trends: Vec<UsageTrendSeriesDto>,
     pub gap_semantics: &'static str,
     pub availability_inference: &'static str,
+    /// The Codex identity scope this projection was computed under.
+    ///
+    /// The consumer compares it with the scope it currently observes and
+    /// discards a response that belongs to an older session. It is empty
+    /// when no Codex slot is configured.
+    pub codex_identity_scope: Vec<CodexIdentityScopeDto>,
+}
+
+/// The observed identity state of one configured OpenAI/Codex slot, as the
+/// analytics projection saw it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexIdentityScopeDto {
+    pub provider_id: String,
+    pub generation: u64,
+    pub identity: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -243,11 +259,34 @@ pub fn get_usage_analytics(
     query: UsageAnalyticsQuery,
 ) -> UsageAnalyticsDto {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    let first = handle.snapshot();
+    let first = crate::history::CodexSnapshotFence::new(&first.codex_identity_states);
     let observations = handle
         .history_store()
         .map(|store| store.history_range(None, None, None, "7d"))
         .unwrap_or_default();
-    build_usage_analytics(observations, now_ms, query)
+    let filtered = crate::history::isolate_codex_accounts_for_fence(observations.clone(), &first);
+    let settled = handle.snapshot();
+    let settled = crate::history::CodexSnapshotFence::new(&settled.codex_identity_states);
+    // The settlement is per Codex slot: a slot whose ownership both
+    // captures agree on keeps its rows, a slot that moved loses only its
+    // own rows, and every unrelated provider is retained either way.
+    let settled_rows =
+        crate::history::settle_codex_accounts_for_fences(filtered, &first, &settled);
+    let mut analytics = build_usage_analytics(settled_rows, now_ms, query);
+    // The projection is stamped with the scope it was computed under, so a
+    // consumer can tell it apart from a response that belongs to an older
+    // session.
+    analytics.codex_identity_scope = settled
+        .slots()
+        .iter()
+        .map(|(provider_id, slot)| CodexIdentityScopeDto {
+            provider_id: provider_id.clone(),
+            generation: slot.generation,
+            identity: slot.identity.clone(),
+        })
+        .collect();
+    analytics
 }
 
 fn build_usage_analytics(
@@ -289,6 +328,7 @@ fn build_usage_analytics(
         trends: series,
         gap_semantics: "notObservedNeverZeroFilled",
         availability_inference: "none",
+        codex_identity_scope: Vec::new(),
     }
 }
 
@@ -785,6 +825,8 @@ mod tests {
             exact_account: false,
         }
     }
+
+
     #[test]
     fn empty_history_omits_unproven_metrics_and_marks_days_not_observed() {
         let result =

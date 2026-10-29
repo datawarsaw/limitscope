@@ -6,21 +6,117 @@ credential, a quota window, a reset clock or a failure.
 
 ## The identity model
 
-The account id IS the provider id. That single choice gives every
-provider-keyed subsystem — last-good retention, quota history, cooldowns,
-notification state — a separate scope per account for free.
+The provider ID identifies a configured slot, not a ChatGPT user. Retained
+Codex data is also bound to both the authenticated user and the workspace.
+Different users in a Team workspace can share the same workspace ID.
 
 | Account | Account id / provider id | Credential reference |
 | --- | --- | --- |
 | Primary | `openai-codex` | the default Codex home (`$CODEX_HOME`, then `~/.codex`) |
 | Secondary | `openai-codex:secondary` | its own Codex home, named in the settings |
 
-The primary keeps the historical id, so an existing single-account
-installation keeps its history, preferences and notifications continuous.
+The primary keeps the historical provider ID and its preferences. Legacy
+Codex history and last-good entries cannot prove their user and are discarded;
+new observations build fresh, user-bound history.
 The secondary uses an account-scoped id: everything that only knows the
 provider resolves it back to `openai-codex` by dropping the scope suffix
 (`baseProviderId` in `src/lib/providerIds.ts`,
 `is_codex_provider_id` in `src-tauri/src/runtime.rs`).
+
+The local Codex auth file contains the ID and access tokens. The adapter reads
+`https://api.openai.com/auth.chatgpt_user_id` (or `user_id`) from both and
+requires the user claims to agree. `tokens.account_id` supplies the workspace;
+contradictory workspace claims or a contradictory usage response fail closed.
+These locally decoded claims are not signature-validated by LimitScope. This
+is a local attribution mechanism that trusts the existing Codex-owned auth
+file, not an authentication or authorization check. Codex itself parses
+these claims: https://github.com/openai/codex/blob/main/codex-rs/login/src/token_data.rs.
+
+The internal `chatgpt-v2:` binding is SHA-256 over domain-separated,
+length-prefixed user and workspace identifiers. It uses no token, email,
+quota, or alias. It remains stable across token rotation when those IDs stay
+the same; a different user or workspace yields a different partition. The
+unkeyed digest is pseudonymous and linkable across installations, not a secret
+or anonymization against someone who knows a candidate identifier. Provider ID
+remains a separate partition. The UI label still uses only a masked workspace
+hint. When the current binding is missing or changes, snapshots suppress
+retained values, including on pause, cooldown and cold start; cooldowns do not
+carry over to another binding. History reads, analytics, export and diagnostics
+filter to the current binding. Identity is rechecked at snapshot publication,
+not continuously between UI updates. Live two-account validation and Human
+Acceptance remain pending.
+
+### The session-generation fence
+
+Each slot carries its own **session generation**: a counter that advances
+every time the runtime observes a change of that slot's identity, including
+an identity that moves away and back. The generation is the consistency token
+for every Codex-owned surface, and it is deliberately **not** the global
+snapshot sequence:
+
+| Surface | What decides ownership |
+| --- | --- |
+| Snapshot projection | the slot's current binding vs. the observation's binding |
+| History, analytics, export, diagnostics | the per-slot generation and identity agreed across the bracketing captures |
+| Last-good cache | the slot's current binding; a foreign entry is dropped from memory and from disk |
+| Notifications | the `(provider, identity, window)` key, so a window belongs to one identity partition |
+| Frontend | the per-slot generation carried in `codexIdentityStates` |
+
+The global sequence moves for unrelated reasons — a Grok cycle, a wallet
+publication, an OpenDesign manual refresh, an account-configuration change.
+Using it for Codex ownership meant that any other provider's activity could
+discard valid Codex history, or make a valid Codex identity update look
+stale. The per-slot generation removes that coupling: unrelated providers
+cannot suppress a Codex slot, and one slot's failure never suppresses
+another slot or an unrelated provider.
+
+Two details are deliberately weaker than the generation:
+
+- The notification lane keys its per-window state by the identity
+  partition, not by the session generation. Returning to an earlier
+  identity therefore returns to the same partition and keeps that
+  partition's already-fired flags, so the same account is not notified
+  twice for one threshold. It is the same user either way, so no value
+  crosses a user boundary.
+- The frontend keeps the highest generation it has seen for a slot, and
+  never lowers it. Removing a slot also retires that generation: delayed
+  snapshots at the same generation cannot restore its reading or identity
+  state. The runtime drops the removed registration while retaining its
+  monotonic generation allocator, so re-adding even the same user starts a
+  newer generation. Normal refreshes within an active generation still land.
+
+### The actual consistency guarantee
+
+The guarantee is **the last session observed by LimitScope**, and nothing
+stronger:
+
+- The runtime re-reads the local auth file on every snapshot and on every
+  collection, and compares the observed identity with the one the pending
+  work was started under. A result whose generation moved is discarded
+  before it can reach the cache, the history, the notifications or the
+  snapshot.
+- An A → B → A move advances the generation twice. Returning to A therefore
+  does **not** revive A's earlier reading: the reading belonged to a session
+  the runtime has moved past, and it is dropped.
+- A slot whose login cannot be proven fails closed **for that slot only**.
+  The other slot and every unrelated provider keep their own state.
+- The frontend orders every Codex slot by that slot's own generation, so a
+  delayed read, a delayed event or an unrelated provider's sequence movement
+  can never move a slot to an earlier session. A failed revalidation hides
+  Codex until a later read confirms it; events cannot clear that fence.
+
+This is **not** atomic coordination with the externally modified Codex
+authentication file. LimitScope does not share a lock with the Codex
+process, never writes that file, and never observes it continuously. An
+authentication change that happens entirely between two observations cannot
+be detected, and a change that lands immediately after an observation is
+only visible at the next observation. Every statement above is scoped to the
+last observed session.
+
+Codex token-usage collection in Usage Intelligence is disabled while the
+source cannot prove event ownership. Existing Codex token events remain in the
+store but are excluded from its visible projections; they are not assigned to
+an account retroactively. This policy is separate from user-bound quota history.
 
 The alias ("Personal", "Work — WG") is display only. It is never part of an
 id, never a credential, and it never appears beside the compact bar's
@@ -145,20 +241,63 @@ authentication, credentials, installed application, or release/version surface.
 
 Validation on 2026-10-28:
 
-- New native production-path regressions: 5 PASS. Negative control restoring
-  only the old hard-coded primary kind: 4 FAIL with the expected
-  `openai-codex` versus `openai-codex:secondary` mismatch; the primary-only
-  regression still passed. The fixed source was restored byte-for-byte.
-- `cargo test --locked -- --quiet`: 1036 PASS, 18 intentionally ignored
-  live probes, 0 FAIL.
-- `npm test`: 79 files / 1365 tests PASS, including 4 new account-state
+- `cargo test --locked`: 1068 PASS, 18 intentionally ignored live probes,
+  0 FAIL (1086 tests in the binary).
+- `npm test`: 79 files / 1387 tests PASS, including the new per-slot
   consumer cases and the existing source/updater security guardrails.
 - `npm run build`: PASS (TypeScript and Vite).
 - `cargo check --locked --all-targets --features custom-protocol`: PASS;
-  three dead-code warnings in unchanged `usage_intelligence`, `zcode_plans`
-  and `zcode_reset` code.
-- Existing `scripts/secret-scan.mjs` patterns: PASS over 9 files (built
-  frontend, Tauri config and all five changed files). The signing-key
-  needle call was disabled in memory for this run, so no local signing
-  key was read. The tracked scanner itself was not changed.
+  two dead-code warnings, both in unchanged `zcode_plans` code.
+- `npm run scan:secrets`: PASS over 5 files (built frontend, Tauri
+  config and the release bundle). The tracked scanner was not changed.
+
+New production-path regressions added for this candidate:
+
+- Rust (`src-tauri/src/runtime/codex_identity_tests.rs`, plus the per-slot
+  fence tests in `history.rs`): two users in one Team workspace; an
+  unprovable login in one slot; an observed A -> B -> A move; a result
+  started under an older generation; a session change immediately before
+  the cache, history and notification writes; cache restoration after a
+  session change; unrelated provider activity against valid Codex history;
+  a single Codex account beside an unrelated provider.
+- Frontend (`src/hooks/useProviderUsage.test.ts`,
+  `src/lib/usageAnalytics.test.ts`): two slots in different sessions; one
+  slot failing closed while the other stays visible; an A -> B -> A move; a
+  Codex slot that moved while an unrelated provider moved the global
+  sequence; a read that outlives the revalidation interval; and the
+  identity-scope fence, including the A -> B -> A case; plus a retired
+  slot's earlier session never being reinstated by a late snapshot.
+
+Negative controls, run against the unfixed code and then restored:
+
+- Restoring the global-sequence rule in the Codex fence made
+  `unrelated_provider_activity_does_not_discard_valid_codex_history` fail
+  with 0 of 2 Codex rows surviving, and the fixed source was restored.
+- Restoring the revalidation tick's read-fence poisoning made
+  `lands a read that takes longer than the revalidation interval` fail
+  with the Codex reading stuck at its earlier value, and the fixed source
+  was restored.
+- Removing the frontend's per-slot generation high-water fence made
+  `never reinstates an earlier session after the accepted entry was
+  retired` fail with user A's reading back on screen, and the fixed
+  source was restored.
+
+Removed-slot regression (2026-10-28): the real `useProviderUsage` hook
+reproduced secondary at generation 5 / seq 1 / user A / 14%, removal at seq 2,
+then resurrection from the delayed original event. The added regression
+failed before the correction and passes afterward, including same-user
+re-addition at generation 6, another delayed original event and a normal
+same-generation refresh. A runtime regression separately failed before the
+correction because re-addition reused the old generation; it now confirms a
+new generation without changing the primary slot's generation.
+
+Validation after the removed-slot correction: 1069 Rust tests passed
+(18 live probes ignored), 1388 frontend tests passed across 79 files,
+frontend build and `cargo check --locked --all-targets --features
+custom-protocol` passed. One initial targeted run of the existing single-slot
+history-count test returned 2 rows instead of 1; the isolated rerun, full
+identity group and final full Rust suite passed without changing that test.
+
+These are deterministic fixture results. They do not establish live
+two-account behaviour, which remains an operator-owned check.
 

@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 const IDS: [&str; 2] = [PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID];
 const HINTS: [&str; 2] = ["11111111", "22222222"];
 
+fn identity(index: usize) -> String { format!("chatgpt-v2:{}", if index == 0 { "a".repeat(64) } else { "b".repeat(64) }) }
+
 fn now() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 10, 28, 12, 0, 0).unwrap()
 }
@@ -36,6 +38,7 @@ fn usage(index: usize, increment: f64) -> CodexUsage {
         }],
         account: Some(codex::CodexAccount {
             account_hint: HINTS[index].into(),
+            identity: Some(identity(index)),
         }),
         plan_type: Some([" Plus ", " Pro "][index].into()),
         reset_credits: Some(CodexResetCredits {
@@ -53,7 +56,7 @@ fn assert_own_reading(dto: &ProviderUsageDto, index: usize, increment: f64) {
     assert_eq!(dto.limits[0].used_percent, [14.0, 81.0][index] + increment);
     assert_eq!(
         dto.account.as_ref().unwrap().identity.as_deref(),
-        Some(format!("chatgpt:{}", HINTS[index]).as_str())
+        Some(identity(index).as_str())
     );
     assert_eq!(dto.limits[0].reset_at, None);
 }
@@ -267,7 +270,7 @@ async fn production_normalization_isolates_last_good_cooldown_history_pause_and_
                             reqwest::StatusCode::TOO_MANY_REQUESTS,
                             "fixture cooldown",
                         )
-                        .with_identity_hint(Some(format!("chatgpt:{}", HINTS[index])));
+                        .with_identity_hint(Some(identity(index)));
                         error.retry_after_ms = Some(60_000);
                         Err(error)
                     } else {
@@ -337,7 +340,7 @@ async fn production_normalization_isolates_last_good_cooldown_history_pause_and_
                 assert_eq!(observation.provider_id, IDS[index]);
                 assert_eq!(
                     observation.account.as_deref(),
-                    Some(format!("chatgpt:{}", HINTS[index]).as_str())
+                    Some(identity(index).as_str())
                 );
                 assert_eq!(observation.used_percent, [14.0, 81.0][index] + call as f64);
             }

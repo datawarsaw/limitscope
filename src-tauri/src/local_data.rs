@@ -136,6 +136,11 @@ mod tests {
     }
 
     fn sample_usage(kind: ProviderKind, percent: f64, reset_at: Option<&str>) -> ProviderUsageDto {
+        let identity = if matches!(kind, ProviderKind::Codex) {
+            "chatgpt-v2:3333333333333333333333333333333333333333333333333333333333333333"
+        } else {
+            "key:1234"
+        };
         ProviderUsageDto {
             id: kind.id().to_string(),
             name: kind.name().to_string(),
@@ -151,7 +156,7 @@ mod tests {
             account: Some(AccountAttributionDto {
                 label: "Account A".to_string(),
                 note: None,
-                identity: Some("key:1234".to_string()),
+                identity: Some(identity.to_string()),
             }),
             plan_type: None,
             reset_credits: None,

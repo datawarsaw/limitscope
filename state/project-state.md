@@ -53,6 +53,26 @@
   `docs/codex-multi-account.md`. Authenticated two-account verification remains
   an operator-owned release check; deterministic fixtures do not establish it.
 
+- Codex user isolation work in progress (2026-10-28, not accepted or released):
+  the candidate uses a user/workspace binding and invalidates legacy Codex
+  ownership records. The Codex ownership fence is now per slot: each slot
+  carries its own session generation, and the global snapshot sequence no
+  longer decides Codex ownership, so an unrelated provider can no longer
+  suppress valid Codex history or a valid identity update. A slot whose
+  login cannot be proven fails closed for that slot only; a foreign last-good
+  entry is dropped from memory and from disk; the frontend orders every
+  Codex slot by that slot's own generation. The documented guarantee is the
+  LAST SESSION OBSERVED BY LIMITSCOPE - not atomic coordination with the
+  externally modified Codex authentication file. Human Acceptance and live
+  two-account verification remain pending.
+
+- Removed-slot P1 correction (2026-10-28, staged candidate): the frontend
+  retains a per-slot retirement boundary that rejects delayed snapshots at
+  the removed generation, and the runtime gives a re-added slot a newer
+  generation even for the same user. Active same-generation refreshes and
+  other slots keep their behavior. Hook and runtime regressions reproduced
+  both failures before the correction. See `docs/codex-multi-account.md`.
+
 ## Architecture and boundaries
 
 - Rust owns provider collection, normalized status and runtime snapshot fan-out.

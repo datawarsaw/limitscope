@@ -49,6 +49,12 @@ pub(crate) struct RuntimeDiagnosticSource {
     pub cycle_in_flight: bool,
     pub follow_up_pending: bool,
     pub providers: Vec<ProviderDiagnosticSource>,
+    /// The observed identity state of every configured OpenAI/Codex slot,
+    /// captured in the same validated read as `providers`. The diagnostics
+    /// lane uses it as the per-slot Codex ownership fence: the global
+    /// `snapshot_seq` also moves for unrelated providers and therefore
+    /// cannot decide whether a Codex slot still describes one session.
+    pub codex_identity_states: Vec<crate::runtime::CodexIdentityStateDto>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,17 +399,75 @@ fn history_summary(revision: u64, observations: Vec<QuotaObservation>) -> Histor
     }
 }
 
+struct PreparedDiagnosticsBundle {
+    bundle: DiagnosticsBundle,
+    history_observations: Vec<QuotaObservation>,
+    history_revision: u64,
+    first: crate::history::CodexSnapshotFence,
+    source: crate::history::CodexSnapshotFence,
+    settled: crate::history::CodexSnapshotFence,
+}
+
+/// Removes the Codex-specific values of every slot whose ownership the
+/// endpoint captures, the provider source and the final post-dialog capture
+/// do not all prove. Other provider data remains untouched.
+///
+/// The fence is per Codex slot. The global runtime sequence also moves for
+/// unrelated providers, so it cannot decide whether a Codex slot still
+/// describes one session; a slot that did not move keeps its data even
+/// while another provider was busy, and a slot that moved loses only its
+/// own data.
+fn settle_codex_diagnostics(
+    bundle: &mut DiagnosticsBundle,
+    history_observations: &[QuotaObservation],
+    history_revision: u64,
+    first: &crate::history::CodexSnapshotFence,
+    source: &crate::history::CodexSnapshotFence,
+    settled: &crate::history::CodexSnapshotFence,
+    final_snapshot: &crate::history::CodexSnapshotFence,
+) {
+    let agreed = crate::history::codex_agreed_bindings_across(&[
+        first,
+        source,
+        settled,
+        final_snapshot,
+    ]);
+    bundle
+        .providers
+        .retain(|provider| {
+            if !crate::history::is_codex_history_provider(&provider.provider_id) {
+                return true;
+            }
+            agreed.contains_key(&provider.provider_id)
+        });
+    bundle.history = history_summary(
+        history_revision,
+        crate::history::isolate_codex_accounts_for_bindings(
+            history_observations.to_vec(),
+            Some(&agreed),
+        ),
+    );
+}
+
 fn build_bundle(
     app: &AppHandle,
     handle: &RuntimeHandle,
     settings: DiagnosticsSettingsInput,
     generated_at: DateTime<Utc>,
-) -> DiagnosticsBundle {
+) -> PreparedDiagnosticsBundle {
+    let first_snapshot = handle.snapshot();
+    let first = crate::history::CodexSnapshotFence::new(&first_snapshot.codex_identity_states);
     let source = handle.diagnostic_source(generated_at);
-    let history = handle
+    let source_fence =
+        crate::history::CodexSnapshotFence::new(&source.codex_identity_states);
+    let (history_revision, history_observations) = handle
         .history_store()
         .map(|store| (store.revision(), store.history()))
         .unwrap_or((0, Vec::new()));
+    let prepared_history = crate::history::isolate_codex_accounts_for_fence(
+        history_observations.clone(),
+        &first,
+    );
     let notification_counts = handle.notification_counts().unwrap_or((false, 0, 0));
     let app_data_health =
         if handle.history_store().is_some() && handle.notification_counts().is_some() {
@@ -419,7 +483,7 @@ fn build_bundle(
         "idle"
     };
     let provider_count = source.providers.len();
-    DiagnosticsBundle {
+    let mut bundle = DiagnosticsBundle {
         schema_version: DIAGNOSTICS_SCHEMA_VERSION,
         generated_at: safe_timestamp(generated_at),
         app: AppDiagnostics {
@@ -454,7 +518,7 @@ fn build_bundle(
             .into_iter()
             .map(|provider| normalize_provider(provider, generated_at))
             .collect(),
-        history: history_summary(history.0, history.1),
+        history: history_summary(history_revision, prepared_history),
         notifications: NotificationDiagnostics {
             enabled: notification_counts.0,
             dedup_entry_count: notification_counts.1,
@@ -466,6 +530,26 @@ fn build_bundle(
             launch_at_startup: settings.launch_at_startup,
             notification_enabled: settings.notification_enabled,
         },
+    };
+    let settled_snapshot = handle.snapshot();
+    let settled =
+        crate::history::CodexSnapshotFence::new(&settled_snapshot.codex_identity_states);
+    settle_codex_diagnostics(
+        &mut bundle,
+        &history_observations,
+        history_revision,
+        &first,
+        &source_fence,
+        &settled,
+        &settled,
+    );
+    PreparedDiagnosticsBundle {
+        bundle,
+        history_observations,
+        history_revision,
+        first,
+        source: source_fence,
+        settled,
     }
 }
 
@@ -494,7 +578,7 @@ pub async fn export_diagnostics(
     settings: DiagnosticsSettingsInput,
 ) -> Result<ExportDiagnosticsResult, String> {
     let generated_at = Utc::now();
-    let bundle = build_bundle(&app, &handle, settings, generated_at);
+    let mut prepared = build_bundle(&app, &handle, settings, generated_at);
     let file_name = export_file_name(generated_at);
     let selected = app
         .dialog()
@@ -503,6 +587,18 @@ pub async fn export_diagnostics(
         .set_file_name(&file_name)
         .blocking_save_file();
     let Some(selected) = selected else {
+        let final_snapshot = handle.snapshot();
+        let final_fence =
+            crate::history::CodexSnapshotFence::new(&final_snapshot.codex_identity_states);
+        settle_codex_diagnostics(
+            &mut prepared.bundle,
+            &prepared.history_observations,
+            prepared.history_revision,
+            &prepared.first,
+            &prepared.source,
+            &prepared.settled,
+            &final_fence,
+        );
         return Ok(ExportDiagnosticsResult {
             status: "cancelled",
             file_name: None,
@@ -511,7 +607,19 @@ pub async fn export_diagnostics(
     let path = selected
         .into_path()
         .map_err(|_| "The selected diagnostics destination is unavailable".to_string())?;
-    write_bundle(&path, &bundle)?;
+    let final_snapshot = handle.snapshot();
+    let final_fence =
+        crate::history::CodexSnapshotFence::new(&final_snapshot.codex_identity_states);
+    settle_codex_diagnostics(
+        &mut prepared.bundle,
+        &prepared.history_observations,
+        prepared.history_revision,
+        &prepared.first,
+        &prepared.source,
+        &prepared.settled,
+        &final_fence,
+    );
+    write_bundle(&path, &prepared.bundle)?;
     Ok(ExportDiagnosticsResult {
         status: "saved",
         file_name: path
@@ -638,6 +746,150 @@ mod tests {
         serde_json::to_string(&provider).unwrap()
     }
 
+    /// One observed Codex slot, as the runtime publishes it.
+    fn codex_state(
+        provider_id: &str,
+        generation: u64,
+        identity: Option<&str>,
+    ) -> crate::runtime::CodexIdentityStateDto {
+        crate::runtime::CodexIdentityStateDto {
+            provider_id: provider_id.to_string(),
+            generation,
+            identity: identity.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn binding_change_removes_codex_provider_and_history_from_diagnostics() {
+        let first_identity = format!("chatgpt-v2:{}", "a".repeat(64));
+        let second_identity = format!("chatgpt-v2:{}", "b".repeat(64));
+
+        let raw_history = vec![
+            QuotaObservation {
+                provider_id: "openai-codex".to_string(),
+                account: Some(first_identity.clone()),
+                window_label: "5h".to_string(),
+                used_percent: 42.5,
+                observed_at: "2026-09-29T11:55:00.000Z".to_string(),
+                reset_at: None,
+            },
+            QuotaObservation {
+                provider_id: "zai".to_string(),
+                account: None,
+                window_label: "5h".to_string(),
+                used_percent: 25.0,
+                observed_at: "2026-09-29T11:56:00.000Z".to_string(),
+                reset_at: None,
+            },
+        ];
+        let mut bundle = fixture_bundle("safe failure");
+        settle_codex_diagnostics(
+            &mut bundle,
+            &raw_history,
+            2,
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&first_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&first_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                4,
+                Some(&second_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                4,
+                Some(&first_identity),
+            )]),
+        );
+
+        assert_eq!(bundle.providers.len(), 0);
+        assert_eq!(bundle.environment.runtime_provider_count, 1);
+        assert_eq!(bundle.history.total_observations, 1);
+        assert_eq!(bundle.history.observation_counts.len(), 1);
+        assert_eq!(bundle.history.observation_counts[0].provider_id, "zai");
+
+        // The provider source itself may differ even when the endpoint
+        // captures agree (A -> B -> A). It must invalidate Codex data too.
+        let mut source_changed = fixture_bundle("safe failure");
+        let source_identity = format!("chatgpt-v2:{}", "c".repeat(64));
+        settle_codex_diagnostics(
+            &mut source_changed,
+            &raw_history,
+            2,
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&first_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&source_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&first_identity),
+            )]),
+            &crate::history::CodexSnapshotFence::new(&[codex_state(
+                "openai-codex",
+                3,
+                Some(&first_identity),
+            )]),
+        );
+        assert_eq!(source_changed.providers.len(), 0);
+        assert_eq!(source_changed.history.total_observations, 1);
+    }
+
+    #[test]
+    fn final_post_dialog_sequence_change_removes_codex_diagnostics() {
+        let identity = format!("chatgpt-v2:{}", "d".repeat(64));
+        let raw_history = vec![
+            QuotaObservation {
+                provider_id: "openai-codex".to_string(),
+                account: Some(identity.clone()),
+                window_label: "5h".to_string(),
+                used_percent: 42.5,
+                observed_at: "2026-09-29T11:55:00.000Z".to_string(),
+                reset_at: None,
+            },
+            QuotaObservation {
+                provider_id: "zai".to_string(),
+                account: None,
+                window_label: "5h".to_string(),
+                used_percent: 25.0,
+                observed_at: "2026-09-29T11:56:00.000Z".to_string(),
+                reset_at: None,
+            },
+        ];
+        let stable =
+            crate::history::CodexSnapshotFence::new(&[codex_state("openai-codex", 10, Some(&identity))]);
+        let final_changed =
+            crate::history::CodexSnapshotFence::new(&[codex_state("openai-codex", 11, Some(&identity))]);
+        let mut bundle = fixture_bundle("safe failure");
+
+        settle_codex_diagnostics(
+            &mut bundle,
+            &raw_history,
+            2,
+            &stable,
+            &stable,
+            &stable,
+            &final_changed,
+        );
+
+        assert_eq!(bundle.providers.len(), 0);
+        assert_eq!(bundle.history.total_observations, 1);
+        assert_eq!(bundle.history.observation_counts[0].provider_id, "zai");
+    }
+
     fn assert_secret_removed(secret: &str) {
         let nested = format!("nested failure {{ error: {{ message: '{secret}' }} }}");
         let sanitized = sanitize_text(&nested);
@@ -651,7 +903,10 @@ mod tests {
         assert!(!serialized.contains(&nested), "{serialized}");
         // Positive control: the hostile message actually entered the error
         // path and was replaced by the fixed safe sentence.
-        assert!(serialized.contains("Provider refresh failed."), "{serialized}");
+        assert!(
+            serialized.contains("Provider refresh failed."),
+            "{serialized}"
+        );
     }
 
     #[test]
@@ -786,12 +1041,18 @@ mod tests {
         // The hostile fixture must itself serialize — the comparison and the
         // absence checks below are only meaningful when the payload is
         // actually present.
-        assert!(raw_serialized.contains("raw-access-token"), "{raw_serialized}");
+        assert!(
+            raw_serialized.contains("raw-access-token"),
+            "{raw_serialized}"
+        );
         assert!(!serialized.contains("raw-access-token"));
         assert!(!serialized.contains("raw response"));
         assert!(!serialized.contains("raw exception"));
         assert_ne!(serialized, raw_serialized);
-        assert!(serialized.contains("openai-codex"), "provider serialization must be populated: {serialized}");
+        assert!(
+            serialized.contains("openai-codex"),
+            "provider serialization must be populated: {serialized}"
+        );
         assert!(provider.windows.len() == 1);
     }
 
@@ -883,8 +1144,14 @@ mod tests {
             raw.contains("Provider refresh failed."),
             "error path not exercised: {raw}"
         );
-        assert!(raw.contains("openai-codex"), "sanitized provider content missing: {raw}");
-        assert!(raw.contains("key ••3456"), "masked account label missing: {raw}");
+        assert!(
+            raw.contains("openai-codex"),
+            "sanitized provider content missing: {raw}"
+        );
+        assert!(
+            raw.contains("key ••3456"),
+            "masked account label missing: {raw}"
+        );
         assert!(raw.len() < MAX_BUNDLE_BYTES);
         let lower = raw.to_lowercase();
         for secret_term in [
@@ -935,7 +1202,10 @@ mod tests {
         let raw = serde_json::to_string(&normalize_provider(source, now())).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let credits = parsed.get("resetCredits").expect("credits must project");
-        assert_eq!(credits.get("bankedCredits").and_then(|v| v.as_u64()), Some(3));
+        assert_eq!(
+            credits.get("bankedCredits").and_then(|v| v.as_u64()),
+            Some(3)
+        );
         assert_eq!(
             credits.get("currentlyApplicable").and_then(|v| v.as_u64()),
             Some(0)

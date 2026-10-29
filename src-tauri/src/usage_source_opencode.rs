@@ -2662,10 +2662,7 @@ mod tests {
             store2.cursor(USAGE_SOURCE_ZCODE).unwrap().state,
             SourceState::SourceAbsent
         );
-        assert_eq!(
-            store2.cursor(USAGE_SOURCE_CODEX).unwrap().state,
-            SourceState::SourceAbsent
-        );
+        assert!(store2.cursor(USAGE_SOURCE_CODEX).is_none());
     }
 
     // 24. the shared clear: owned OpenCode events and cursor are reset,

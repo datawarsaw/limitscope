@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import {
   loadUsageAnalytics,
+  type CodexScope,
   type UsageAnalyticsLoader,
   type UsageAnalyticsQuery,
   type UsageAnalyticsRange,
@@ -19,6 +20,7 @@ import { UsageTrendChart } from "./UsageTrendChart";
 import { UsageHeatmap } from "./UsageHeatmap";
 import { TokenUsageSection } from "./TokenUsageSection";
 import type { ProviderUsage } from "../../types";
+import { isCodexProviderId } from "../../lib/providerIds";
 
 /**
  * The v0.7 Usage view: one coherent analytics surface over the backend
@@ -41,6 +43,7 @@ export function UsageView({
   usageIntelligenceEnabled = false,
   usageIntelligenceRevision = null,
   usageIntelligenceLoader = loadUsageIntelligence,
+  codexIdentityStates,
   onOpenSettings,
 }: {
   usages: readonly ProviderUsage[];
@@ -62,6 +65,12 @@ export function UsageView({
   usageIntelligenceRevision?: number | null;
   /** Injected intelligence source (tests, dev fixtures). */
   usageIntelligenceLoader?: UsageIntelligenceLoader;
+  /**
+   * The runtime's per-slot Codex identity observation. It is the
+   * authoritative session scope for the analytics read; without it the
+   * visible account identities are used instead.
+   */
+  codexIdentityStates?: CodexScope;
   /** Opens the settings drawer (the section's "off" explainer action). */
   onOpenSettings?: () => void;
 }) {
@@ -78,7 +87,19 @@ export function UsageView({
     [range, scopeProviderId, windowLabel],
   );
 
-  const analytics = useUsageAnalytics(query, true, historyRevision, loader);
+  // The Codex identity scope the analytics are read under. The runtime's
+  // per-slot observation is authoritative; without it the visible account
+  // identities are used, which still changes when a session changes.
+  const identityScope: CodexScope =
+    codexIdentityStates ??
+    usages
+      .filter((usage) => isCodexProviderId(usage.id))
+      .map((usage) => ({
+        providerId: usage.id,
+        generation: 0,
+        identity: usage.account?.identity ?? null,
+      }));
+  const analytics = useUsageAnalytics(query, true, historyRevision, loader, identityScope);
 
   // Window filter options come from the runtime's own quota windows — the
   // same labels history records — scoped to the current provider when one is.
