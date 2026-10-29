@@ -41,17 +41,6 @@ import type { ApiWallet, ProviderUsage } from "../../types";
 import type { ReleaseNote, SafeUpdateError, UpdatePhase } from "../../lib/updater";
 import type { LocalDataClearResult } from "../../lib/localData";
 
-/**
- * The Settings destination of the Usage-first main window: the long bottom
- * drawer became a proper page under the primary navigation, organized into
- * four scannable sections — General, Providers & Wallets, Data & Privacy,
- * Support. Every functional setting and action keeps its exact behavior
- * (same controls, same confirmations, same callbacks); only the structure
- * changed.
- *
- * Section-owned transient state (diagnostics and export outcomes) lives here,
- * on the page it belongs to, instead of the app shell.
- */
 export type SettingsViewProps = {
   settings: Settings;
   setLaunchAtStartup: (launchAtStartup: boolean) => void;
@@ -138,6 +127,8 @@ export function SettingsView({
   onInstallUpdate,
   onDismissUpdate,
 }: SettingsViewProps) {
+  const [section, setSection] = useState<"general" | "providers" | "data">("general");
+
   // Diagnostics export: transient page-local feedback only.
   const [diagnosticsSaving, setDiagnosticsSaving] = useState(false);
   const [diagnosticsMessage, setDiagnosticsMessage] = useState<string | null>(
@@ -230,6 +221,15 @@ export function SettingsView({
 
   return (
     <div className="settings-view">
+      <nav className="settings-sidebar" aria-label="Settings sections">
+        <div className="settings-sidebar-title">Settings</div>
+        {([ ["general", "General"], ["providers", "Providers & Wallets"], ["data", "Data & Privacy"] ] as const).map(([id, label]) => (
+          <button key={id} type="button" className="settings-nav-item" aria-current={section === id ? "page" : undefined} onClick={() => setSection(id)}>{label}</button>
+        ))}
+      </nav>
+      <div className="settings-content">
+      <div hidden={section !== "general"}>
+      <h2 className="settings-page-title">General</h2>
       <section className="settings-section" aria-labelledby="settings-general">
         <h3 className="settings-section-heading" id="settings-general">
           General
@@ -304,8 +304,19 @@ export function SettingsView({
         </label>
       </section>
 
+      <section className="settings-section" aria-label="Version and updates">
+        <UpdatesSection
+          phase={updatePhase} currentVersion={currentVersion} update={availableUpdate}
+          error={updateError} onCheck={onCheckForUpdates} onInstall={onInstallUpdate}
+          onDismiss={onDismissUpdate}
+        />
+        {startupError ? <p className="setting-error" role="alert">Could not update the startup setting: {startupError}</p> : null}
+      </section>
+      </div>
+      <div hidden={section !== "providers"}>
+      <h2 className="settings-page-title">Providers &amp; Wallets</h2>
       <section
-        className="settings-section"
+        className="settings-section settings-provider-section"
         aria-labelledby="settings-providers-wallets"
       >
         <h3 className="settings-section-heading" id="settings-providers-wallets">
@@ -320,6 +331,8 @@ export function SettingsView({
           {usages.length === 0 ? (
             <p className="providers-prefs-note">No providers yet.</p>
           ) : (
+            <>
+            <div className="provider-prefs-head" aria-hidden="true"><span>Provider</span><span>Floating bar</span><span>Order</span></div>
             <ul className="providers-prefs-list">
               {fullDisplayOrder(registryIds, settings.providerPreferences).map(
                 (providerId, index, all) => {
@@ -375,6 +388,7 @@ export function SettingsView({
                 },
               )}
             </ul>
+            </>
           )}
           {providerPrefsNote ? (
             <p className="setting-error" role="status">
@@ -382,6 +396,8 @@ export function SettingsView({
             </p>
           ) : null}
         </div>
+      </section>
+      <section className="settings-section">
         <div className="wallet-prefs" role="group" aria-label="API wallets">
           <span className="setting-label">API Wallets</span>
           <p className="providers-prefs-note">
@@ -463,6 +479,8 @@ export function SettingsView({
             </>
           )}
         </div>
+      </section>
+      <section className="settings-section">
         <div className="codex-accounts" role="group" aria-label="OpenAI / Codex accounts">
           <span className="setting-label">OpenAI / Codex accounts</span>
           <p className="providers-prefs-note">
@@ -559,6 +577,9 @@ export function SettingsView({
 
       </section>
 
+      </div>
+      <div hidden={section !== "data"}>
+      <h2 className="settings-page-title">Data &amp; Privacy</h2>
       <section
         className="settings-section"
         aria-labelledby="settings-data-privacy"
@@ -643,21 +664,9 @@ export function SettingsView({
             Prediction history is unavailable on this device.
           </p>
         ) : null}
-        <UpdatesSection
-          phase={updatePhase}
-          currentVersion={currentVersion}
-          update={availableUpdate}
-          error={updateError}
-          onCheck={onCheckForUpdates}
-          onInstall={onInstallUpdate}
-          onDismiss={onDismissUpdate}
-        />
-        {startupError ? (
-          <p className="setting-error" role="alert">
-            Could not update the startup setting: {startupError}
-          </p>
-        ) : null}
       </section>
+      </div>
+      </div>
     </div>
   );
 }

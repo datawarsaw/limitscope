@@ -3293,3 +3293,27 @@ body {
   text-transform: uppercase;
   color: var(--text-faint);
 }
+
+/* Settings navigation and content share the existing theme tokens. */
+.settings-view { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 0; max-width: none; align-items: start; }
+.settings-sidebar { position: sticky; top: 0; display: flex; flex-direction: column; gap: 4px; padding: 12px; border-right: 1px solid var(--divider); }
+.settings-sidebar-title { padding: 4px 8px; color: var(--text-faint); text-transform: uppercase; font-size: 10px; letter-spacing: .06em; }
+.settings-nav-item { text-align: left; font: inherit; color: var(--text-dim); background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 8px; cursor: pointer; }
+.settings-nav-item[aria-current="page"] { color: var(--teal); background: var(--field-bg); border-color: var(--teal); }
+.settings-nav-item:focus-visible { outline: 2px solid var(--teal); outline-offset: 2px; }
+.settings-content { min-width: 0; padding: 12px 18px; }
+.settings-content [hidden] { display: none; }
+.settings-page-title { margin: 0 0 12px; color: var(--text); font-size: 16px; }
+.settings-content .settings-section + .settings-section { margin-top: 10px; }
+.settings-provider-section .provider-prefs-row { border-top: 1px solid var(--divider); padding: 6px 0; }
+@media (max-width: 600px) {
+  .settings-view { grid-template-columns: minmax(0, 1fr); }
+  .settings-sidebar { position: static; flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--divider); }
+  .settings-sidebar-title { width: 100%; }
+  .settings-content { padding: 12px; }
+}
+
+.provider-prefs-head { display: flex; align-items: center; gap: 8px; color: var(--text-faint); font-size: 10px; padding: 5px 0; }
+.provider-prefs-head span:first-child { flex: 1 1 auto; }
+.provider-prefs-head span:nth-child(2) { width: 52px; text-align: right; }
+.provider-prefs-head span:last-child { width: 52px; text-align: center; }

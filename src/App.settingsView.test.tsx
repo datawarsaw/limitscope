@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   setQuotaNotifications: vi.fn(),
   setUsageIntelligence: vi.fn(),
   setProviderHidden: vi.fn(),
+  setCodexAccount: vi.fn(),
   moveProvider: vi.fn(),
   setQuotaPerspective: vi.fn(),
   resetPreferences: vi.fn(async () => ({ ok: true, removed: true })),
@@ -63,7 +64,7 @@ vi.mock("./hooks/useSettings", () => ({
     setProviderHidden: mocks.setProviderHidden,
     moveProvider: mocks.moveProvider,
     setQuotaPerspective: mocks.setQuotaPerspective,
-    setCodexAccount: vi.fn(),
+    setCodexAccount: mocks.setCodexAccount,
     resetPreferences: mocks.resetPreferences,
     startupPending: false,
     startupError: null,
@@ -133,17 +134,10 @@ describe("settings destination", () => {
     expect(screen.getByText(/Updated/)).toBeTruthy();
   });
 
-  it("opens on Settings click and exposes every control in four groups", () => {
+  it("opens Settings and exposes controls in three sections", () => {
     render(<App />);
     openSettings();
-    for (const heading of [
-      "General",
-      "Providers & Wallets",
-      "Data & Privacy",
-      "Support",
-    ]) {
-      expect(screen.getByRole("heading", { name: heading })).toBeTruthy();
-    }
+    expect(screen.getByRole("heading", { name: "General", level: 2 })).toBeTruthy();
     expect(
       screen.getByRole("switch", {
         name: "Launch LimitScope when Windows starts",
@@ -155,6 +149,8 @@ describe("settings destination", () => {
     expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
     expect(screen.getByLabelText("Theme")).toBeTruthy();
     expect(screen.getByRole("radiogroup", { name: "Quota display" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     expect(
       screen.getByRole("switch", { name: "Usage Intelligence" }),
     ).toBeTruthy();
@@ -176,13 +172,31 @@ describe("settings destination", () => {
     expect(
       screen.getByRole("button", { name: "Export diagnostics" }),
     ).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: "Check for updates" }),
-    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Providers & Wallets" }));
     // The wallet feature keeps a named seam inside its group.
     expect(
       screen.getByRole("group", { name: "API wallets" }),
     ).toBeTruthy();
+  });
+
+  it("keeps Codex account configuration connected after section navigation", () => {
+    render(<App />);
+    openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Providers & Wallets" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Codex home of the Second account OpenAI / Codex account" }), { target: { value: "C:\\codex-secondary" } });
+    expect(mocks.setCodexAccount).toHaveBeenCalledWith("openai-codex:secondary", { codexHome: "C:\\codex-secondary" });
+  });
+
+  it("preserves an unfinished confirmation when switching sections", () => {
+    render(<App />);
+    openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear usage history" }));
+    expect(screen.getByText("Clear usage history?")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    expect(screen.getByText("Clear usage history?")).toBeTruthy();
+    expect(mocks.clearLocalHistory).not.toHaveBeenCalled();
   });
 
   it("returns to the Usage overview on the Usage button", () => {
@@ -215,6 +229,7 @@ describe("settings destination", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("oled");
     fireEvent.click(screen.getByRole("radio", { name: "Remaining" }));
     expect(mocks.setQuotaPerspective).toHaveBeenCalledWith("remaining");
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("switch", { name: "Usage Intelligence" }));
     expect(mocks.setUsageIntelligence).toHaveBeenCalledWith(true);
   });
@@ -222,6 +237,7 @@ describe("settings destination", () => {
   it("confirms a clear before clearing the usage history", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(
       screen.getByRole("button", { name: "Clear usage history" }),
     );
@@ -240,6 +256,7 @@ describe("settings destination", () => {
   it("clears the provider cache and resets preferences from the same section", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
 
     fireEvent.click(
       screen.getByRole("button", { name: "Clear provider cache" }),
@@ -268,6 +285,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(mocks.exportDiagnostics).toHaveBeenCalledWith({
       launchAtStartup: false,
@@ -302,6 +320,7 @@ describe("settings destination", () => {
     );
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(await screen.findByText("Could not export diagnostics.")).toBeTruthy();
     expect(screen.queryByText(/must-not-render/)).toBeNull();
@@ -318,6 +337,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     const save = screen.getByRole("button", { name: "Save" });
     expect(save.hasAttribute("disabled")).toBe(true);
@@ -348,6 +368,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -364,6 +385,7 @@ describe("settings destination", () => {
     );
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -387,6 +409,7 @@ describe("settings destination", () => {
       .mockResolvedValueOnce({ status: "saved", fileName: "existing.csv" });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -410,6 +433,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -425,6 +449,7 @@ describe("settings destination", () => {
   it("closes the chooser without invoking when cancelled", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(mocks.exportUsageHistory).not.toHaveBeenCalled();
@@ -437,6 +462,7 @@ describe("settings destination", () => {
     mocks.pickUsageExportDirectory.mockResolvedValueOnce(null);
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await waitFor(() =>

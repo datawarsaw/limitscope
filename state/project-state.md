@@ -8,6 +8,12 @@
 
 ## Current status
 
+- Settings redesign candidate (not released): branch `codex/settings-redesign`
+  is based on `v0.8.22` (`956fdadb4ac4f481c76da587dcca386a41d3ff7a`).
+  Settings now uses General, Providers & Wallets, and Data & Privacy sections.
+  Provider switches control floating-bar visibility, while existing wallet and
+  Codex account monitoring remain separate. Human Acceptance is pending.
+
 - v0.8.16 released: the combined floating-experience, monitor-recovery,
   DeepSeek-wallet and MiniMax-quota work is on `main`. Release commit
   `c597bc1f318bc9227bc64b48087b61ecb89dd31b`, annotated tag `v0.8.16`, published
