@@ -8,6 +8,20 @@
 
 ## Current status
 
+- v0.8.24 local release preparation (2026-10-29): reuse
+  `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, branch
+  `codex/settings-persistence-hotfix`, from hotfix
+  `1d6c96a03d7559ff48740633c68a416e260541f3` and parent Settings Redesign
+  candidate `10e7325b1f4636fc82ce1e8859053bdcf4739dfd`. The five canonical
+  version files now identify 0.8.24; see `docs/release-notes-v0.8.24.md`.
+  Local build, integrity evidence and installation/rollback handoff belong
+  under the ignored `artifacts/release-v0.8.24/` directory in that worktree.
+  This entry records preparation, not a successful build or delivery;
+  consult its local verification report for the observed packaging result.
+  Installed 0.8.23, live profile, credentials, recovery evidence and public
+  distribution are outside the mutation scope. Hotfix Human Acceptance,
+  native 0.8.24 validation and installation authorization remain pending.
+
 - Settings persistence hotfix (2026-10-29, not released): branch
   `codex/settings-persistence-hotfix`, worktree
   `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, is based on
@@ -16,8 +30,9 @@
   on WebView initialization; cached/default values no longer invoke their
   Rust setters on attach or storage events. Explicit changes still use
   the existing setters. This does not restore overwritten configuration,
-  alter account isolation or modify the installed app. No version bump,
-  installer, signing, publication or installation is included. Human
+  alter account isolation or modify the installed app. That implementation commit included no version bump,
+  installer, signing, publication or installation; local 0.8.24 release
+  preparation is recorded separately above. Human
   Acceptance remains pending. See section 8 of
   `docs/settings-persistence-contract-v0.6.md` for the cause, regression
   coverage and compatibility limits.
