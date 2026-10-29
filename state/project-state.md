@@ -8,6 +8,23 @@
 
 ## Current status
 
+- Reliability remediation (2026-10-29, local source candidate, not released):
+  `codex/settings-persistence-hotfix` now includes ordered durable stores,
+  generation-fenced background Usage Intelligence, capacity-safe cursors,
+  non-destructive recovery, in-memory SQLite snapshots, Rust-owned operational
+  settings, complete-credential account fingerprints, native export grants and
+  draft-first release publication. Qwen quota stays visible, but new history and
+  prediction attribution are disabled until a trustworthy identity exists.
+  See `docs/reliability-remediation-contract.md`; final candidate/evidence are in
+  ignored `artifacts/reliability-remediation/HANDOFF.md` in the same worktree.
+  The earlier 0.8.24 installer/signature below are superseded for the changed
+  source and remain untouched. Installed 0.8.23 and live data are unchanged.
+  Runtime implementation: `02eab88cddc83c6bbcb1a2f5afd0c60eb28bb91d`;
+  publication implementation: `80029088c9ee60797396eedf073fa742ccc6c2e4`.
+  Local validation: 1090 Rust PASS / 18 live ignored, 1414 frontend PASS,
+  production build and cargo check PASS. Global formatting remains non-clean.
+  Independent exact-head review and Human Acceptance remain separate gates.
+
 - v0.8.24 local release preparation (2026-10-29): reuse
   `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, branch
   `codex/settings-persistence-hotfix`, from hotfix

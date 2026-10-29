@@ -212,3 +212,12 @@ simultaneous explicit edits from different windows remain outside this
 hotfix's concurrency guarantee. Notification and wallet-monitoring startup
 synchronization retain their existing behavior. Native Human Acceptance of
 this hotfix remains pending; no installed-app modification is part of it.
+
+
+## 9. Operational ownership and durable acknowledgement (2026-10-29)
+
+Rust owns persisted wallet monitoring and quota notification choices. WebViews hydrate `get_operational_settings` and subscribe to `operational-settings-changed`; revision ordering rejects stale replies/events. Storage events update presentation preferences but cannot overwrite these Rust-owned fields. Explicit wallet changes send only the edited wallet; an empty monitoring map is the explicit reset operation. Native writes are serialized and acknowledgements follow durable persistence. Failed writes remain retryable and display a scoped settings error.
+
+Codex account and wallet stores replace memory only after a successful disk write, including retries whose desired values equal defaults. Usage Intelligence enable/clear failures reject IPC and restore committed state. Malformed supported stores preserve originals before repair; unknown versions remain write-blocked. The original v0.6 localStorage merge contract above continues to apply to presentation data, not to authoritative operational state.
+
+See [the reliability contract](reliability-remediation-contract.md) for migration, recovery, test evidence and the separate Human Acceptance boundary.
