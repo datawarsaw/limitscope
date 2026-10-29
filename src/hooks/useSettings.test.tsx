@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, renderHook, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
 import { useSettings } from "./useSettings";
 import { DEFAULT_SETTINGS, SETTINGS_STORAGE_KEY } from "../lib/settings";
 import {
@@ -25,7 +25,15 @@ function simulateTauri(): void {
   (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {};
 }
 
+beforeEach(() => {
+  mocks.invoke.mockImplementation(async (command) => {
+    if (command === "get_codex_accounts") return DEFAULT_SETTINGS.codexAccounts.accounts;
+    if (command === "get_usage_intelligence") return { enabled: false };
+  });
+});
+
 afterEach(() => {
+  cleanup();
   delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   window.localStorage.clear();
   vi.clearAllMocks();
@@ -73,15 +81,16 @@ describe("useSettings quota notification forwarding", () => {
     expect(notificationCalls).toHaveLength(2);
   });
 
-  it("forwards the Usage Intelligence opt-in on attach and change", async () => {
+  it("reads the Usage Intelligence opt-in on attach and writes only an explicit change", async () => {
     simulateTauri();
     const { result } = renderHook(() => useSettings());
     await waitFor(() => {
       expect(mocks.invoke).toHaveBeenCalledWith(
-        "set_usage_intelligence_enabled",
-        { enabled: false },
+        "get_usage_intelligence",
+        { query: { range: "today" } },
       );
     });
+    expect(mocks.invoke).not.toHaveBeenCalledWith("set_usage_intelligence_enabled", { enabled: false });
     act(() => result.current.setUsageIntelligence(true));
     await waitFor(() => {
       expect(mocks.invoke).toHaveBeenCalledWith(

@@ -150,3 +150,65 @@ Until a field is added to the known-keys set, saves preserve it as a foreign fie
 | 15 | Full canonical roundtrip | `settings.test.ts` "round-trips the full v0.6 canonical settings" |
 
 Cross-feature survival is additionally pinned at the React layer in `useSettings.test.tsx` (theme change preserves v0.6 and foreign fields; perspective and provider-preference setters persist).
+
+## 8. Rust-owned account configuration and Usage Intelligence (2026-10-29 hotfix)
+
+For `codexAccounts` and `usageIntelligence`, the WebView value is a cache.
+Rust loads `codex-accounts-v1.json` and the Usage Intelligence store before
+the first scheduler cycle. Rust is authoritative for these two settings;
+the canonical-key merge policy above applies to the WebView cache only.
+
+The regression was caused by `useSettings` effects pushing both cached
+values to Rust on mount. A missing cache supplied defaults; an old cache
+supplied stale aliases or an old opt-in. Either could overwrite the Rust
+store without a user action. Settings navigation did not itself edit these
+values, but attaching the hook was sufficient to trigger the writes.
+
+The hotfix uses the existing IPC surface and storage formats:
+
+- Initialization reads `get_codex_accounts` and the `enabled` field from
+  `get_usage_intelligence`. The latter reads the owned store only; it does
+  not probe tool databases or trigger collection. These reads do not save
+  the cache or invoke either protected setter.
+- Native storage events retain the current account configuration and opt-in;
+  stale WebView data cannot become an instruction to Rust. Other WebView
+  preferences keep their existing storage-event behavior.
+- Only explicit account edits invoke `set_codex_accounts`. Each edit reads
+  the current Rust account list and patches its requested account/fields.
+  Edits from one hook are serialized, preserving rapid input and the other
+  account's home, alias and monitoring flag.
+- Only explicit opt-in changes invoke `set_usage_intelligence_enabled`.
+  An explicit choice is sent even if it happens to match the old cache.
+- Late initialization replies cannot replace explicit edits or an existing
+  explicit preference reset. The existing reset still sends its defaults
+  deliberately; no new reset functionality is introduced.
+- Browser-only development remains localStorage-backed. Existing unknown
+  WebView fields and all persistence keys/formats remain unchanged.
+
+Regression coverage is in `src/hooks/useSettings.persistence.test.tsx`:
+`Main` / `Cowork`, opt-in `true`, missing/stale/corrupt cache, StrictMode,
+storage events, explicit edits, edits during delayed initialization, failed
+reads, the real Settings view reopening, hook restart, opt-out, browser-only
+editing and the existing explicit reset. `src-tauri/src/codex_accounts.rs`
+also verifies startup reads leave a temporary persisted configuration
+unchanged and an explicit edit survives reopening. The existing
+`usage_intelligence::tests::persisted_state_roundtrips_through_disk` checks
+opt-in, events and cursors across a Rust-store restart.
+
+Hotfix validation (2026-10-29): 124 frontend tests passed across the 10
+targeted settings/account/storage/UI suites (including 14 new persistence
+regressions); `npm run build` passed. Rust validation passed all 10
+`codex_accounts::tests`, the Usage Intelligence disk roundtrip above, and
+`runtime::tests::an_alias_or_a_monitor_flag_never_rebuilds_the_collectors`.
+All fixtures use mocks or temporary files; the installed app and the
+offline backup/diagnostic evidence are untouched.
+
+Compatibility limits: this does not restore already overwritten values or
+change account/session isolation. IPC failures retain the existing
+best-effort/logged-error behavior; opening a window with a failed read may
+temporarily show its cached value, but does not push it into Rust. The
+existing whole-list account setter is not an atomic cross-window patch;
+simultaneous explicit edits from different windows remain outside this
+hotfix's concurrency guarantee. Notification and wallet-monitoring startup
+synchronization retain their existing behavior. Native Human Acceptance of
+this hotfix remains pending; no installed-app modification is part of it.

@@ -305,6 +305,33 @@ mod tests {
     }
 
     #[test]
+    fn startup_reads_preserve_main_cowork_and_explicit_edits_still_persist() {
+        let path = store_path("startup-read");
+        let mut accounts = default_accounts();
+        accounts[0].alias = "Main".to_string();
+        accounts[0].codex_home = "C:\\fixture\\main".to_string();
+        accounts[1].alias = "Cowork".to_string();
+        accounts[1].codex_home = "C:\\fixture\\cowork".to_string();
+        accounts[1].monitored = false;
+        CodexAccountStore::open(path.clone()).set_accounts(&accounts).expect("persist fixture");
+        let before = fs::read(&path).expect("read fixture");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let startup = CodexAccountStore::open(path.clone());
+        assert_eq!(startup.accounts(), accounts);
+        assert_eq!(startup.accounts(), accounts, "reopening Settings only reads");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        let mut edited = startup.accounts();
+        edited[0].alias = "Main edited".to_string();
+        startup.set_accounts(&edited).expect("explicit edit");
+        assert_eq!(CodexAccountStore::open(path.clone()).accounts(), edited);
+        assert_eq!(edited[1], accounts[1], "the other account stays isolated");
+        remove_store(&path);
+    }
+
+    #[test]
     fn applied_accounts_round_trip_through_the_file() {
         let path = store_path("roundtrip");
         let store = CodexAccountStore::open(path.clone());

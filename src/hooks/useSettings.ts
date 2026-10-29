@@ -38,6 +38,41 @@ export function useSettings() {
   settingsRef.current = settings;
   const [startupPending, setStartupPending] = useState(false);
   const [startupError, setStartupError] = useState<string | null>(null);
+  const accountsEdit = useRef(0);
+  const usageEdit = useRef(0);
+  const accountWrites = useRef<Promise<void>>(Promise.resolve());
+  const usageWrites = useRef<Promise<void>>(Promise.resolve());
+
+  // Rust loads these stores before the scheduler starts. The WebView copy
+  // is only a cache: attaching a window must never push it back into Rust.
+  useEffect(() => {
+    if (!isRunningInTauri()) return;
+    let cancelled = false;
+    const accountsVersion = accountsEdit.current;
+    const usageVersion = usageEdit.current;
+    void invoke<CodexAccountSettings[]>("get_codex_accounts")
+      .then((accounts) => {
+        if (cancelled || accountsEdit.current !== accountsVersion) return;
+        setSettings((prev) => ({ ...prev, codexAccounts: { accounts } }));
+      })
+      .catch((error) => {
+        console.error("Failed to load the OpenAI/Codex account settings", error);
+      });
+    // Existing read-only projection: never probes sources or starts collection.
+    void invoke<{ enabled: boolean }>("get_usage_intelligence", {
+      query: { range: "today" },
+    })
+      .then(({ enabled }) => {
+        if (cancelled || usageEdit.current !== usageVersion) return;
+        setSettings((prev) => ({ ...prev, usageIntelligence: enabled }));
+      })
+      .catch((error) => {
+        console.error("Failed to load the Usage Intelligence setting", error);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // The OS autostart state is authoritative over the stored preference:
   // reconcile once at startup in case the entry was changed or removed
@@ -69,7 +104,16 @@ export function useSettings() {
   useEffect(() => {
     const onStorage = (event: StorageEvent) => {
       if (event.key !== SETTINGS_STORAGE_KEY) return;
-      setSettings(loadSettings());
+      const cached = loadSettings();
+      setSettings((prev) =>
+        isRunningInTauri()
+          ? {
+              ...cached,
+              codexAccounts: prev.codexAccounts,
+              usageIntelligence: prev.usageIntelligence,
+            }
+          : cached,
+      );
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -145,12 +189,23 @@ export function useSettings() {
   }, []);
 
   const setUsageIntelligence = useCallback((usageIntelligence: boolean) => {
+    usageEdit.current += 1;
     setSettings((prev) => {
       if (prev.usageIntelligence === usageIntelligence) return prev;
       const next = { ...prev, usageIntelligence };
       saveSettings(next);
       return next;
     });
+    if (isRunningInTauri()) {
+      // An explicit choice is valid even if the stale cache already had it.
+      usageWrites.current = usageWrites.current
+        .then(() => invoke<void>("set_usage_intelligence_enabled", {
+          enabled: usageIntelligence,
+        }))
+        .catch((error) => {
+          console.error("Failed to sync the Usage Intelligence setting", error);
+        });
+    }
   }, []);
 
   const setQuotaPerspective = useCallback((quotaPerspective: QuotaPerspective) => {
@@ -219,10 +274,10 @@ export function useSettings() {
    * reference (the Codex home that holds that account's `auth.json`) or
    * whether it is still monitored.
    *
-   * The runtime owns the effective configuration: the settings lane
-   * forwards it on attach and on every change, and the Rust side persists
-   * it, so a configured account is collected from the next cycle on and a
-   * paused one is not polled at all.
+   * Only an explicit edit writes to Rust. Read the effective configuration
+   * before applying the patch so a stale window cannot replace the other
+   * account's alias, credential reference or monitoring flag. Serialize
+   * edits to preserve rapid input and changes to different accounts.
    */
   const setCodexAccount = useCallback(
     (
@@ -231,6 +286,7 @@ export function useSettings() {
         Pick<CodexAccountSettings, "alias" | "codexHome" | "monitored">
       >,
     ) => {
+      const edit = ++accountsEdit.current;
       setSettings((prev) => {
         const next = {
           ...prev,
@@ -245,6 +301,23 @@ export function useSettings() {
         saveSettings(next);
         return next;
       });
+      if (!isRunningInTauri()) return;
+      accountWrites.current = accountWrites.current
+        .then(async () => {
+          const current = await invoke<CodexAccountSettings[]>("get_codex_accounts");
+          const accounts = withCodexAccount(current, accountId, patch);
+          if (accounts === current) return;
+          await invoke("set_codex_accounts", { accounts });
+          if (edit !== accountsEdit.current) return;
+          setSettings((prev) => {
+            const next = { ...prev, codexAccounts: { accounts } };
+            saveSettings(next);
+            return next;
+          });
+        })
+        .catch((error) => {
+          console.error("Failed to sync the OpenAI/Codex account settings", error);
+        });
     },
     [],
   );
@@ -322,6 +395,10 @@ export function useSettings() {
    */
   const resetPreferences = useCallback(async (): Promise<LocalDataClearResult> => {
     setStartupError(null);
+    // Reset is also an explicit action; late initialization reads cannot
+    // restore the pre-reset values, and pending edits must finish first.
+    accountsEdit.current += 1;
+    usageEdit.current += 1;
     const { settings: defaults } = resetPreferenceStores();
     setSettings(defaults);
     if (!isRunningInTauri()) return { ok: true, removed: true };
@@ -338,6 +415,7 @@ export function useSettings() {
       setStartupPending(false);
     }
     try {
+      await Promise.all([accountWrites.current, usageWrites.current]);
       // The runtime persists two of these preferences itself (the
       // notification lane's enabled flag and the refresh interval), so the
       // reset is mirrored into it. Both setters are idempotent, which makes
@@ -353,6 +431,8 @@ export function useSettings() {
       await invoke("set_wallet_monitoring", {
         monitored: defaults.walletPreferences.monitored,
       });
+      await invoke("set_codex_accounts", { accounts: defaults.codexAccounts.accounts });
+      await invoke("set_usage_intelligence_enabled", { enabled: defaults.usageIntelligence });
     } catch (error) {
       console.error("Failed to push the reset preferences to the runtime", error);
       return { ok: false };
@@ -373,20 +453,6 @@ export function useSettings() {
     });
   }, [settings.quotaNotifications]);
 
-  // The runtime's Usage Intelligence store is the single collection owner
-  // (v0.8.9), so the opt-in toggle is forwarded to Rust on attach and on
-  // every change, like the notification lane. The store persists the flag
-  // itself, which covers the scheduler's startup cycle before any window
-  // attaches; enabling there triggers the first baseline immediately.
-  useEffect(() => {
-    if (!isRunningInTauri()) return;
-    void invoke("set_usage_intelligence_enabled", {
-      enabled: settings.usageIntelligence,
-    }).catch((error) => {
-      console.error("Failed to sync the Usage Intelligence setting", error);
-    });
-  }, [settings.usageIntelligence]);
-
   // The runtime gates wallet collection on these flags (v0.8.17), so the
   // monitor map is forwarded to Rust on attach and on every change, like
   // the notification lane. The wallet-prefs store persists it itself,
@@ -401,20 +467,6 @@ export function useSettings() {
       console.error("Failed to sync the wallet monitoring settings", error);
     });
   }, [settings.walletPreferences.monitored]);
-
-  // The runtime owns the effective account set: it registers a configured
-  // account as its own provider and stops collecting a paused one. The
-  // configuration is forwarded on attach and on every change; the Rust
-  // side persists it, which covers the scheduler's immediate startup cycle
-  // before any window attaches.
-  useEffect(() => {
-    if (!isRunningInTauri()) return;
-    void invoke("set_codex_accounts", {
-      accounts: settings.codexAccounts.accounts,
-    }).catch((error) => {
-      console.error("Failed to sync the OpenAI/Codex account settings", error);
-    });
-  }, [settings.codexAccounts]);
 
   return {
     settings,

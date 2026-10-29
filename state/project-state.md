@@ -8,6 +8,20 @@
 
 ## Current status
 
+- Settings persistence hotfix (2026-10-29, not released): branch
+  `codex/settings-persistence-hotfix`, worktree
+  `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, is based on
+  the clean v0.8.23 candidate `10e7325b1f4636fc82ce1e8859053bdcf4739dfd`.
+  Account configuration and Usage Intelligence opt-in are read from Rust
+  on WebView initialization; cached/default values no longer invoke their
+  Rust setters on attach or storage events. Explicit changes still use
+  the existing setters. This does not restore overwritten configuration,
+  alter account isolation or modify the installed app. No version bump,
+  installer, signing, publication or installation is included. Human
+  Acceptance remains pending. See section 8 of
+  `docs/settings-persistence-contract-v0.6.md` for the cause, regression
+  coverage and compatibility limits.
+
 - Settings redesign candidate (not released): branch `codex/settings-redesign`
   is based on `v0.8.22` (`956fdadb4ac4f481c76da587dcca386a41d3ff7a`).
   Settings now uses General, Providers & Wallets, and Data & Privacy sections.
