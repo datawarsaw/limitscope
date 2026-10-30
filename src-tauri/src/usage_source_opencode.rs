@@ -458,43 +458,45 @@ fn collect_from_live(
         }
     }
 
-    let stats = match store.apply_scan_at(generation,
-        USAGE_SOURCE_OPENCODE,
-        SourceScan {
-            watermark_ms: new_watermark,
-            fingerprint,
-            rejected,
-            usage_not_reported,
-            events,
-            files: Vec::new(),
-            batch_end,
-        },
-    ) { Ok(stats) => stats, Err(detail) => return OpencodeScanOutcome::ReadFailure(detail) };
-    if store.cursor(USAGE_SOURCE_OPENCODE).is_some_and(|cursor| cursor.state == SourceState::ScanCeiling) {
+    let scan = SourceScan {
+        watermark_ms: new_watermark,
+        fingerprint,
+        rejected,
+        usage_not_reported,
+        events,
+        files: Vec::new(),
+        batch_end,
+    };
+    // Commit the deferred-backlog diagnostic with the batch and the
+    // cursor in one durable replacement. A failed write rolls back all
+    // three. Two writes would leave a window in which the batch is
+    // durable while the cursor still claims `ok` with the unchanged
+    // fingerprint: the next scan would short-circuit as `Unchanged` and
+    // the deferred remainder would never be drained.
+    let result = if bounded {
+        store.apply_bounded_scan_at(
+            generation,
+            USAGE_SOURCE_OPENCODE,
+            scan,
+            format!(
+                "backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch \
+                 (watermark now {new_watermark}) and continue on the next scan"
+            ),
+        )
+    } else {
+        store.apply_scan_at(generation, USAGE_SOURCE_OPENCODE, scan)
+    };
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(detail) => return OpencodeScanOutcome::ReadFailure(detail),
+    };
+    if store
+        .cursor(USAGE_SOURCE_OPENCODE)
+        .is_some_and(|cursor| cursor.state == SourceState::ScanCeiling)
+    {
         return OpencodeScanOutcome::Bounded {
             accepted: stats.accepted, duplicates: stats.duplicates, rejected: stats.rejected, usage_not_reported: stats.usage_not_reported,
             watermark_ms: store.cursor(USAGE_SOURCE_OPENCODE).map(|cursor| cursor.watermark_ms).unwrap_or(0),
-        };
-    }
-    if bounded {
-        // Surface the deferred remainder through the existing source
-        // diagnostics; the state heals to `ok` on the scan that drains
-        // the window (apply_scan), and progress is observable through
-        // the advancing watermark.
-        store.mark_source_state_at(generation,
-            USAGE_SOURCE_OPENCODE,
-            SourceState::ScanCeiling,
-            Some(format!(
-                "backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch \
-                 (watermark now {new_watermark}) and continue on the next scan"
-            )),
-        );
-        return OpencodeScanOutcome::Bounded {
-            accepted: stats.accepted,
-            duplicates: stats.duplicates,
-            rejected: stats.rejected,
-            usage_not_reported: stats.usage_not_reported,
-            watermark_ms: new_watermark,
         };
     }
     OpencodeScanOutcome::Collected {
@@ -891,7 +893,7 @@ mod tests {
         run_collection_pass, UsageIntelligenceStore, UsageRange, USAGE_INTELLIGENCE_FILE_NAME,
         USAGE_SOURCE_CODEX, USAGE_SOURCE_ZCODE,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     const NOW_MS: i64 = 1_791_288_000_000; // 2026-10-06T12:00:00.000Z
 
@@ -1750,9 +1752,9 @@ mod tests {
         assert_eq!(store.events().len(), 2);
     }
 
-    // 14. restart safety: the cursor, fingerprint, and owned identities
-    //     survive a store reopen; an unchanged source costs no copy and
-    //     a changed source ingests only what is new.
+    // 14. restart safety: the cursor and owned identities survive a store
+    //     reopen, but an `Ok` cursor is revalidated before it can attest
+    //     coverage; a changed source still ingests only what is new.
     #[test]
     fn restart_safe_cursor_and_identities() {
         let fix = fixture("restart");
@@ -1787,11 +1789,22 @@ mod tests {
             .cursor(USAGE_SOURCE_OPENCODE)
             .expect("cursor survives");
         assert!(cursor.baselined);
-        // Unchanged fingerprint: no snapshot copy is taken.
-        assert_eq!(collect(&reopened), OpencodeScanOutcome::Unchanged);
-        // A changed source ingests only what is new; the pre-restart row
-        // is re-read inside the lookback and matched by its identity —
-        // the same content address computed before the restart.
+        assert_eq!(cursor.state, SourceState::ReadFailure);
+        assert!(
+            cursor.fingerprint.is_none(),
+            "an unchanged fingerprint cannot bypass revalidation"
+        );
+        let outcome = collect(&reopened);
+        let OpencodeScanOutcome::Collected { accepted, duplicates, .. } = outcome else {
+            panic!("expected a restart revalidation scan, got {outcome:?}");
+        };
+        assert_eq!(accepted, 0, "the historical row is already owned");
+        assert_eq!(
+            duplicates, 1,
+            "the revalidation sweep recognizes the old identity"
+        );
+        // A changed source ingests only what is new; older rows are matched
+        // again by the same content address computed before the restart.
         fix.insert_assistant(
             "msg-newer",
             "ses",
@@ -1806,8 +1819,367 @@ mod tests {
             panic!("expected a collection, got {outcome:?}");
         };
         assert_eq!(accepted, 1);
-        assert_eq!(duplicates, 1, "the pre-restart event is not re-ingested");
+        assert_eq!(
+            duplicates, 1,
+            "the re-read newer event is not ingested twice"
+        );
         assert!(reopened.events().iter().any(|event| event.id == stored_id));
+    }
+
+    // 14a. a healthy restart cannot report complete coverage from the old
+    //      `Ok` cursor alone: one fresh scan must revalidate it without
+    //      losing or duplicating historical events.
+    #[test]
+    fn healthy_restart_revalidates_without_losing_historical_coverage() {
+        let fix = fixture("healthy-restart");
+        seed_old(&fix);
+        let path = fix.path();
+        let (store, dir) = store_at("healthy-restart-store", Some(path.clone()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Baseline { .. }
+        ));
+        fix.insert_assistant(
+            "msg-new",
+            "ses",
+            NOW_MS - 30 * MIN,
+            &AssistantFixture::completed(NOW_MS - 34 * MIN),
+        );
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Collected { accepted, .. } = outcome else {
+            panic!("expected a collection before restart, got {outcome:?}");
+        };
+        assert_eq!(accepted, 1);
+        let stored_id = store.events()[0].id.clone();
+        drop(store);
+
+        let reopened = UsageIntelligenceStore::open_with(
+            dir.path().join(USAGE_INTELLIGENCE_FILE_NAME),
+            fixed_clock(),
+            Box::new(|| None),
+        )
+        .with_codex_home_resolver(Box::new(|| None))
+        .with_opencode_db_resolver(Box::new(move || Some(path.clone())));
+        let coverage = |store: &UsageIntelligenceStore| {
+            store
+                .aggregate(UsageRange::Today, Some(NOW_MS))
+                .source_coverage
+                .into_iter()
+                .find(|source| source.source == USAGE_SOURCE_OPENCODE)
+                .unwrap()
+                .coverage
+        };
+        assert_eq!(coverage(&reopened), "uncertain");
+        let outcome = collect(&reopened);
+        let OpencodeScanOutcome::Collected { accepted, duplicates, .. } = outcome else {
+            panic!("expected a restart revalidation scan, got {outcome:?}");
+        };
+        assert_eq!(accepted, 0);
+        assert_eq!(duplicates, 1);
+        assert_eq!(coverage(&reopened), "complete");
+        assert_eq!(reopened.events().len(), 1);
+        assert!(reopened.events().iter().any(|event| event.id == stored_id));
+    }
+
+    // 14b. a failed backlog write remains uncertain across restarts and a
+    //      second failed write; retries drain the backlog exactly once.
+    #[test]
+    fn failed_backlog_write_restart_and_retry_preserve_coverage_and_events() {
+        let fix = fixture("failed-restart");
+        seed_old(&fix);
+        let path = fix.path();
+        let (store, dir) = store_at("failed-restart-store", Some(path.clone()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Baseline { .. }
+        ));
+        let coverage = |store: &UsageIntelligenceStore| {
+            store
+                .aggregate(UsageRange::Today, Some(NOW_MS))
+                .source_coverage
+                .into_iter()
+                .find(|source| source.source == USAGE_SOURCE_OPENCODE)
+                .unwrap()
+                .coverage
+        };
+        assert_eq!(coverage(&store), "complete");
+
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..=SCAN_CEILING as i64 {
+            fix.insert_assistant(
+                &format!("msg-retry-{index:07}"),
+                "ses",
+                NOW_MS - 30 * MIN + index,
+                &AssistantFixture::completed(NOW_MS - 31 * MIN + index),
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        let store_path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let saved = dir.path().join("saved.json");
+        std::fs::rename(&store_path, &saved).unwrap();
+        std::fs::create_dir(&store_path).unwrap();
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::ReadFailure(_)
+        ));
+        assert_eq!(coverage(&store), "uncertain");
+        assert!(store.events().is_empty());
+        std::fs::remove_dir(&store_path).unwrap();
+        std::fs::rename(&saved, &store_path).unwrap();
+        drop(store);
+
+        let retry_path = path.clone();
+        let reopened = UsageIntelligenceStore::open_with(
+            store_path.clone(),
+            fixed_clock(),
+            Box::new(|| None),
+        )
+        .with_codex_home_resolver(Box::new(|| None))
+        .with_opencode_db_resolver(Box::new(move || Some(retry_path.clone())));
+        assert_eq!(coverage(&reopened), "uncertain");
+        std::fs::rename(&store_path, &saved).unwrap();
+        std::fs::create_dir(&store_path).unwrap();
+        assert!(matches!(
+            collect(&reopened),
+            OpencodeScanOutcome::ReadFailure(_)
+        ));
+        assert_eq!(coverage(&reopened), "uncertain");
+        std::fs::remove_dir(&store_path).unwrap();
+        std::fs::rename(&saved, &store_path).unwrap();
+        drop(reopened);
+
+        let reopened = UsageIntelligenceStore::open_with(
+            store_path,
+            fixed_clock(),
+            Box::new(|| None),
+        )
+        .with_codex_home_resolver(Box::new(|| None))
+        .with_opencode_db_resolver(Box::new(move || Some(path.clone())));
+        assert_eq!(coverage(&reopened), "uncertain");
+        assert!(matches!(
+            collect(&reopened),
+            OpencodeScanOutcome::Bounded { .. }
+        ));
+        assert_eq!(coverage(&reopened), "uncertain");
+        assert!(matches!(
+            collect(&reopened),
+            OpencodeScanOutcome::Collected { .. }
+        ));
+        assert_eq!(coverage(&reopened), "complete");
+        assert_eq!(reopened.events().len(), SCAN_CEILING + 1);
+        assert_eq!(
+            reopened
+                .aggregate(UsageRange::ThirtyDays, None)
+                .totals
+                .total_tokens,
+            (SCAN_CEILING + 1) as u64 * 1_850
+        );
+        assert_eq!(collect(&reopened), OpencodeScanOutcome::Unchanged);
+        assert_eq!(reopened.events().len(), SCAN_CEILING + 1);
+    }
+
+    // 14c. the bounded commit is a single durable replacement: a process
+    //      that dies right after it leaves a file whose cursor already
+    //      carries the ScanCeiling verdict and the batch's resume position
+    //      beside the committed events. No durable snapshot ever shows the
+    //      batch stored under an `ok` cursor, so the deferred remainder
+    //      cannot be lost to the unchanged-fingerprint short circuit. The
+    //      next scan in this same process drains exactly the remainder.
+    #[test]
+    fn interrupted_bounded_commit_persists_batch_and_ceiling_together() {
+        let fix = fixture("interrupted-bounded");
+        seed_old(&fix);
+        let (store, dir) = store_at("interrupted-bounded-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Baseline { .. }
+        ));
+        let coverage = |store: &UsageIntelligenceStore| {
+            store
+                .aggregate(UsageRange::Today, Some(NOW_MS))
+                .source_coverage
+                .into_iter()
+                .find(|source| source.source == USAGE_SOURCE_OPENCODE)
+                .unwrap()
+                .coverage
+        };
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..=SCAN_CEILING as i64 {
+            fix.insert_assistant(
+                &format!("msg-interrupt-{index:07}"),
+                "ses",
+                NOW_MS - 30 * MIN + index,
+                &AssistantFixture::completed(NOW_MS - 31 * MIN + index),
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        // The crash boundary: the first durable replacement after arming
+        // is the bounded batch itself. Capture the file exactly as the
+        // interrupted process would leave it, then abort the scan.
+        let store_path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let (sink, flag, path) = (captured.clone(), fired.clone(), store_path.clone());
+        store.set_persist_hook(Some(std::sync::Arc::new(move || {
+            if flag.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            *sink.lock().unwrap() = Some(std::fs::read_to_string(&path).unwrap());
+            panic!("simulated interruption after the durable replacement");
+        })));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| collect(&store))).is_err(),
+            "the simulated crash must abort the scan"
+        );
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "the hook reached the bounded write boundary"
+        );
+        store.set_persist_hook(None);
+        store.recover_after_interrupted_persist();
+
+        // 1. The durable artifact at the instant of the crash is already
+        //    the whole commit: the batch, the ScanCeiling verdict, and the
+        //    resume position, all in one replacement.
+        let raw = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the interruption captured the durable file");
+        let envelope: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(envelope["events"].as_array().unwrap().len(), SCAN_CEILING);
+        let cursor = envelope["cursors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|cursor| cursor["source"] == USAGE_SOURCE_OPENCODE)
+            .expect("the opencode cursor is persisted");
+        assert_eq!(cursor["state"], "scanCeiling");
+        let last_committed = SCAN_CEILING as i64 - 1;
+        assert_eq!(cursor["batchEnd"]["stampMs"], NOW_MS - 30 * MIN + last_committed);
+        assert_eq!(
+            cursor["batchEnd"]["id"],
+            format!("msg-interrupt-{last_committed:07}")
+        );
+        assert!(
+            cursor.get("fingerprint").is_none(),
+            "a deferred backlog never persists a healthy fingerprint"
+        );
+
+        // 2. The in-memory store agrees with the file the crash left.
+        let interrupted = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
+        assert_eq!(interrupted.state, SourceState::ScanCeiling);
+        assert!(interrupted.batch_end.is_some());
+        assert!(interrupted.fingerprint.is_none());
+        assert_eq!(store.events().len(), SCAN_CEILING);
+        assert_eq!(coverage(&store), "uncertain");
+
+        // 3. The next scan in the same process resumes past the committed
+        //    prefix and drains exactly the one deferred row.
+        let outcome = collect(&store);
+        let OpencodeScanOutcome::Collected { accepted, .. } = outcome else {
+            panic!("expected the deferred remainder, got {outcome:?}");
+        };
+        assert_eq!(accepted, 1);
+        assert_eq!(coverage(&store), "complete");
+        assert_eq!(store.events().len(), SCAN_CEILING + 1);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            (SCAN_CEILING + 1) as u64 * 1_850
+        );
+        assert_eq!(collect(&store), OpencodeScanOutcome::Unchanged);
+        assert_eq!(store.events().len(), SCAN_CEILING + 1);
+    }
+
+    // 14d. a failed durable write leaves no partial batch, no advanced
+    //      cursor, and no trusted fingerprint; the same process retries
+    //      without a restart and still drains the backlog exactly once.
+    #[test]
+    fn failed_bounded_write_retries_in_the_same_process() {
+        let fix = fixture("failed-in-process");
+        seed_old(&fix);
+        let (store, dir) = store_at("failed-in-process-store", Some(fix.path()));
+        enable(&store);
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Baseline { .. }
+        ));
+        let before = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
+        assert_eq!(before.state, SourceState::Ok);
+        let coverage = |store: &UsageIntelligenceStore| {
+            store
+                .aggregate(UsageRange::Today, Some(NOW_MS))
+                .source_coverage
+                .into_iter()
+                .find(|source| source.source == USAGE_SOURCE_OPENCODE)
+                .unwrap()
+                .coverage
+        };
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..=SCAN_CEILING as i64 {
+            fix.insert_assistant(
+                &format!("msg-in-process-{index:07}"),
+                "ses",
+                NOW_MS - 30 * MIN + index,
+                &AssistantFixture::completed(NOW_MS - 31 * MIN + index),
+            );
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+
+        // Make the store path unwritable in the shape that fails the
+        // replacement, keeping the previous durable file aside.
+        let store_path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let saved = dir.path().join("saved.json");
+        let durable_before = std::fs::read_to_string(&store_path).unwrap();
+        std::fs::rename(&store_path, &saved).unwrap();
+        std::fs::create_dir(&store_path).unwrap();
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::ReadFailure(_)
+        ));
+
+        // Nothing from the refused batch survived: the cursor keeps its
+        // watermark, gains no resume position, and its old healthy
+        // fingerprint is withdrawn so the next pass re-reads.
+        let failed = store.cursor(USAGE_SOURCE_OPENCODE).unwrap();
+        assert_eq!(failed.state, SourceState::ReadFailure);
+        assert_eq!(failed.watermark_ms, before.watermark_ms);
+        assert!(failed.batch_end.is_none());
+        assert!(failed.fingerprint.is_none());
+        assert!(store.events().is_empty());
+        assert_eq!(coverage(&store), "uncertain");
+        assert_eq!(
+            std::fs::read_to_string(&saved).unwrap(),
+            durable_before,
+            "the refused write never touched the durable file"
+        );
+
+        // Retry in the same process, without reopening the store.
+        std::fs::remove_dir(&store_path).unwrap();
+        std::fs::rename(&saved, &store_path).unwrap();
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Bounded { .. }
+        ));
+        assert_eq!(store.events().len(), SCAN_CEILING);
+        assert_eq!(coverage(&store), "uncertain");
+        assert!(matches!(
+            collect(&store),
+            OpencodeScanOutcome::Collected { .. }
+        ));
+        assert_eq!(coverage(&store), "complete");
+        assert_eq!(store.events().len(), SCAN_CEILING + 1);
+        assert_eq!(
+            store.aggregate(UsageRange::ThirtyDays, None).totals.total_tokens,
+            (SCAN_CEILING + 1) as u64 * 1_850
+        );
+        assert_eq!(collect(&store), OpencodeScanOutcome::Unchanged);
+        assert_eq!(store.events().len(), SCAN_CEILING + 1);
     }
 
     // 15. bounded batches: an oversized backlog commits a deterministic

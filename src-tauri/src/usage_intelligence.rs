@@ -147,6 +147,11 @@ pub const USAGE_SOURCE_CODEX: &str = "codex";
 /// The stable source id of the OpenCode database reader.
 pub const USAGE_SOURCE_OPENCODE: &str = "opencode";
 
+/// Local database sources whose last persisted `Ok` cursor cannot attest to
+/// work attempted after that write. Each restart requires one fresh,
+/// durably committed scan before the cursor can be reported healthy again.
+const RESTART_REVALIDATION_SOURCES: &[&str] = &[USAGE_SOURCE_ZCODE, USAGE_SOURCE_OPENCODE];
+
 /// Clock-skew tolerance for source event timestamps: a row completed
 /// further than this in the future is rejected as implausible.
 pub(crate) const EVENT_FUTURE_TOLERANCE_MS: i64 = 5 * 60_000;
@@ -516,9 +521,9 @@ pub struct UsageIntelligenceStore {
     last_write_ok: std::sync::atomic::AtomicBool,
     failed_bounded_sources: Mutex<std::collections::HashSet<String>>,
     // A persisted successful scan cannot attest to work attempted after it.
-    // Revalidate ZCode after each restart, even if recording a failure was
-    // impossible because storage was unavailable.
-    zcode_restart_unverified: std::sync::atomic::AtomicBool,
+    // Revalidate each local database source after each restart, even if
+    // recording a failure was impossible because storage was unavailable.
+    restart_unverified_sources: Mutex<std::collections::HashSet<String>>,
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
@@ -535,6 +540,12 @@ pub struct UsageIntelligenceStore {
     /// the collection latch across many cycles cannot spawn one retention
     /// thread per cycle.
     retention_in_flight: std::sync::atomic::AtomicBool,
+    /// Test-only crash boundary: invoked at the end of a successful
+    /// [`Self::persist_current`], once the durable replacement and the
+    /// committed snapshot agree. A hook that panics models a process that
+    /// dies between the write and the rest of the scan's bookkeeping.
+    #[cfg(test)]
+    persist_hook: Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl UsageIntelligenceStore {
@@ -562,7 +573,7 @@ impl UsageIntelligenceStore {
             writable: std::sync::atomic::AtomicBool::new(true),
             last_write_ok: std::sync::atomic::AtomicBool::new(true),
             failed_bounded_sources: Mutex::new(std::collections::HashSet::new()),
-            zcode_restart_unverified: std::sync::atomic::AtomicBool::new(false),
+            restart_unverified_sources: Mutex::new(std::collections::HashSet::new()),
             path,
             now_ms,
             zcode_db,
@@ -570,16 +581,25 @@ impl UsageIntelligenceStore {
             opencode_db: production_opencode_db_resolver(),
             collecting: std::sync::atomic::AtomicBool::new(false),
             retention_in_flight: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            persist_hook: Mutex::new(None),
         };
         store.load_from_disk();
-        let revalidate_zcode = store.state.lock().unwrap().cursors.get(USAGE_SOURCE_ZCODE)
-            .is_some_and(|cursor| {
-                cursor.baselined && !cursor.pending_rebaseline && cursor.state == SourceState::Ok
-            });
-        store.zcode_restart_unverified.store(
-            revalidate_zcode,
-            std::sync::atomic::Ordering::SeqCst,
-        );
+        let revalidate_sources = store
+            .state
+            .lock()
+            .unwrap()
+            .cursors
+            .iter()
+            .filter(|(source, cursor)| {
+                RESTART_REVALIDATION_SOURCES.contains(&source.as_str())
+                    && cursor.baselined
+                    && !cursor.pending_rebaseline
+                    && cursor.state == SourceState::Ok
+            })
+            .map(|(source, _)| source.clone())
+            .collect::<std::collections::HashSet<_>>();
+        *store.restart_unverified_sources.lock().unwrap() = revalidate_sources;
         *store.committed.lock().unwrap() = store.state.lock().unwrap().clone();
         // Startup retention: a plane that was closed for longer than the
         // window ages out before the first cycle runs. The committed
@@ -683,6 +703,28 @@ impl UsageIntelligenceStore {
     pub fn last_write_succeeded(&self) -> bool { self.last_write_ok.load(std::sync::atomic::Ordering::SeqCst) }
     pub fn generation_current(&self, generation: u64) -> bool { self.enabled() && self.generation() == generation }
 
+    fn restart_revalidation_applies(source: &str) -> bool {
+        RESTART_REVALIDATION_SOURCES.contains(&source)
+    }
+
+    fn restart_unverified(&self, source: &str) -> bool {
+        Self::restart_revalidation_applies(source)
+            && self
+                .restart_unverified_sources
+                .lock()
+                .unwrap()
+                .contains(source)
+    }
+
+    fn mark_restart_verified(&self, source: &str) {
+        if Self::restart_revalidation_applies(source) {
+            self.restart_unverified_sources
+                .lock()
+                .unwrap()
+                .remove(source);
+        }
+    }
+
     /// The revision, broadcast through the runtime snapshot.
     pub fn revision(&self) -> u64 {
         self.state.lock().unwrap().revision
@@ -697,10 +739,9 @@ impl UsageIntelligenceStore {
     pub fn cursor(&self, source: &str) -> Option<SourceCursor> {
         let mut cursor = self.state.lock().unwrap().cursors.get(source).cloned();
         if let Some(cursor) = &mut cursor {
-            if self.failed_bounded_sources.lock().unwrap().contains(source)
-                || (source == USAGE_SOURCE_ZCODE && cursor.state == SourceState::Ok
-                    && self.zcode_restart_unverified.load(std::sync::atomic::Ordering::SeqCst))
-            {
+            let failed = self.failed_bounded_sources.lock().unwrap().contains(source);
+            let restart_unverified = self.restart_unverified(source);
+            if failed || (cursor.state == SourceState::Ok && restart_unverified) {
                 cursor.state = SourceState::ReadFailure;
                 cursor.fingerprint = None;
             }
@@ -891,9 +932,8 @@ impl UsageIntelligenceStore {
             }
         };
         if changed {
-            if self.persist_current() && source == USAGE_SOURCE_ZCODE {
-                self.zcode_restart_unverified
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            if self.persist_current() {
+                self.mark_restart_verified(source);
                 self.failed_bounded_sources.lock().unwrap().remove(source);
             }
         }
@@ -966,15 +1006,13 @@ impl UsageIntelligenceStore {
         if !self.generation_current(generation) { return Err("Collection invalidated".into()); }
         let stats = self.apply_scan_inner(source, scan, None);
         if !self.last_write_succeeded() {
-            if source == USAGE_SOURCE_ZCODE {
+            if Self::restart_revalidation_applies(source) {
                 self.failed_bounded_sources.lock().unwrap().insert(source.to_string());
             }
             return Err("Collection could not be persisted; cursor retained".into());
         }
         self.failed_bounded_sources.lock().unwrap().remove(source);
-        if source == USAGE_SOURCE_ZCODE {
-            self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.mark_restart_verified(source);
         Ok(stats)
     }
 
@@ -1005,9 +1043,7 @@ impl UsageIntelligenceStore {
             return Err("Collection could not be persisted; cursor retained".into());
         }
         self.failed_bounded_sources.lock().unwrap().remove(source);
-        if source == USAGE_SOURCE_ZCODE {
-            self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
+        self.mark_restart_verified(source);
         Ok(stats)
     }
 
@@ -1193,7 +1229,7 @@ impl UsageIntelligenceStore {
         }
         if !self.last_write_succeeded() { return Err("Could not durably clear Usage Intelligence".into()); }
         self.failed_bounded_sources.lock().unwrap().clear();
-        self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.restart_unverified_sources.lock().unwrap().clear();
         Ok(had_data)
     }
 
@@ -1243,18 +1279,27 @@ impl UsageIntelligenceStore {
         };
 
         let failed = self.failed_bounded_sources.lock().unwrap();
+        let restart_unverified = self.restart_unverified_sources.lock().unwrap();
         for cursor in &mut cursors {
             if failed.contains(&cursor.source) {
                 cursor.state = SourceState::ReadFailure;
                 cursor.detail = Some("Collection could not be persisted; cursor retained".into());
-            } else if cursor.source == USAGE_SOURCE_ZCODE && cursor.state == SourceState::Ok
-                && self.zcode_restart_unverified.load(std::sync::atomic::Ordering::SeqCst)
+            } else if cursor.state == SourceState::Ok
+                && RESTART_REVALIDATION_SOURCES.contains(&cursor.source.as_str())
+                && restart_unverified.contains(&cursor.source)
             {
                 cursor.state = SourceState::ReadFailure;
-                cursor.detail = Some("ZCode coverage requires a successful scan after restart".into());
+                let label = if cursor.source == USAGE_SOURCE_ZCODE {
+                    "ZCode"
+                } else {
+                    "OpenCode"
+                };
+                cursor.detail = Some(format!(
+                    "{label} coverage requires a successful scan after restart"
+                ));
             }
         }
-        drop(failed);
+        drop((failed, restart_unverified));
 
         // Codex rollout records predate a trustworthy owner binding. Keep
         // them in the store so existing data is not destroyed, but exclude
@@ -1432,7 +1477,48 @@ impl UsageIntelligenceStore {
             *state = self.committed.lock().unwrap().clone();
             state.revision = revision;
         }
+        // The durable file and the in-memory state agree from here on; a
+        // test hook that panics now models a process dying before the
+        // scan's remaining bookkeeping (return value, source state marks)
+        // could run.
+        #[cfg(test)]
+        self.run_persist_hook();
         persisted
+    }
+
+    /// Installs the test-only crash boundary fired after a successful
+    /// durable replacement. Passing `None` disarms it.
+    #[cfg(test)]
+    pub(crate) fn set_persist_hook(
+        &self,
+        hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        *self.persist_hook.lock().unwrap() = hook;
+    }
+
+    /// Runs the test-only crash boundary. The closure is cloned out from
+    /// under the lock first so a panicking hook cannot poison the slot and
+    /// a later pass can still observe it.
+    #[cfg(test)]
+    fn run_persist_hook(&self) {
+        let hook = self.persist_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Test-only recovery after a simulated interruption: the aborted
+    /// scan unwound while holding the operation lock, so its mutexes are
+    /// poisoned. A real crash discards the process; a test that keeps it
+    /// alive must clear the poison before driving the next scan.
+    #[cfg(test)]
+    pub(crate) fn recover_after_interrupted_persist(&self) {
+        self.operation.clear_poison();
+        self.state.clear_poison();
+        self.committed.clear_poison();
+        self.failed_bounded_sources.clear_poison();
+        self.restart_unverified_sources.clear_poison();
+        self.persist_hook.clear_poison();
     }
 }
 
