@@ -157,6 +157,16 @@ export function useSettings() {
   }, []);
   const publishStartupError = useCallback(
     (owner: string, message: string, action: number | null = null) => {
+      // A newer action already published its own result. An older failure
+      // must not overwrite it: the newer action is the one the user made
+      // last, and its message is the current one.
+      if (
+        action !== null &&
+        startupErrorAction.current !== null &&
+        startupErrorAction.current > action
+      ) {
+        return;
+      }
       // A late failure from an action that a successful reset superseded is
       // obsolete. It must not resurrect either an error or an unknown scope.
       if (
@@ -269,7 +279,24 @@ export function useSettings() {
   const accountsEdit = useRef(0);
   const usageEdit = useRef(0);
   const refreshEdit = useRef(0);
-  const resetsPending = useRef(0);
+  // Every explicit change of the launch-at-startup state - a toggle and a
+  // reset - takes ownership of that state. A late answer (the startup probe
+  // or the recovery read of a failed write) may only apply its result while
+  // its own generation is still the newest one.
+  const launchAtStartupEdit = useRef(0);
+  // One counter for every operation that keeps the startup state in flux:
+  // an explicit autostart toggle and a reset. The pending flag stays set
+  // while at least one of them runs, so an operation that finishes cannot
+  // clear the flag while another one is still pending.
+  const startupOperations = useRef(0);
+  const beginStartupOperation = useCallback(() => {
+    startupOperations.current += 1;
+    if (startupOperations.current === 1) setStartupPending(true);
+  }, []);
+  const endStartupOperation = useCallback(() => {
+    startupOperations.current -= 1;
+    if (startupOperations.current === 0) setStartupPending(false);
+  }, []);
   // Every operation that can change Rust-owned preferences shares one tail.
   // In particular, a reset can no longer overtake a reordered account write,
   // and an edit invoked after reset is appended after the reset defaults.
@@ -505,9 +532,15 @@ export function useSettings() {
     if (!isRunningInTauri()) return;
     let cancelled = false;
     const token = beginScopeCheck("launchAtStartup");
+    // An explicit edit that starts while the probe is in flight owns the
+    // launch-at-startup state. The probe may only correct the stored
+    // preference while it is still the newest answer, so a late reply can
+    // never overwrite a newer edit.
+    const edit = launchAtStartupEdit.current;
     isEnabled()
       .then((enabled) => {
         if (cancelled) return;
+        if (launchAtStartupEdit.current !== edit) return;
         // The OS answered, so the stored preference can be compared with it.
         settleScopeCheck("launchAtStartup", token, true);
         setSettings((prev) => {
@@ -566,7 +599,10 @@ export function useSettings() {
     // Only this action's own message is dropped. A concurrent action may
     // not clear another action's error or its unresolved state.
     clearStartupError("launchAtStartup", action);
-    setStartupPending(true);
+    // This edit owns the launch-at-startup state from now on: a late answer
+    // from the startup probe or from an older write may not overwrite it.
+    const edit = ++launchAtStartupEdit.current;
+    beginStartupOperation();
     const token = beginScopeCheck("launchAtStartup");
     const previous = settingsRef.current.launchAtStartup;
     setSettings((prev) => {
@@ -575,56 +611,74 @@ export function useSettings() {
       return next;
     });
     try {
-      if (launchAtStartup) {
-        await enable();
-      } else {
-        await disable();
-      }
-      // The OS accepted the change, so the scope is confirmed again.
-      settleScopeCheck("launchAtStartup", token, true);
-    } catch (error) {
-      const reason = error instanceof Error ? error.message : String(error);
-      // The setter may have failed before or after the OS applied the
-      // change, so the last value this WebView saw proves nothing. Only a
-      // fresh read of the OS state tells what is actually saved.
-      const recovered = await readAutostartState();
-      if (recovered === null) {
-        // Neither the write nor a read produced evidence: the scope stays
-        // explicitly unknown and the UI says so.
-        settleScopeCheck("launchAtStartup", token, false);
-        setSettings((prev) => {
-          const next = { ...prev, launchAtStartup: previous };
-          saveSettings(next);
-          return next;
-        });
-        publishStartupError(
-          "launchAtStartup",
-          `${reasonSentence(reason)} The launch-at-startup setting could not be applied and its saved state could not be verified.`,
-          action,
-        );
-        return;
-      }
-      settleScopeCheck("launchAtStartup", token, true);
-      // The canonical state is known, so it replaces the failed intent.
-      setSettings((prev) => {
-        if (prev.launchAtStartup === recovered) return prev;
-        const next = { ...prev, launchAtStartup: recovered };
-        saveSettings(next);
-        return next;
+      // The OS entry is shared state, so the write joins the same queue the
+      // reset uses. A toggle and a reset then have one deterministic order:
+      // a reset can no longer report success while a pending enable would
+      // still turn the entry on afterwards.
+      await queueRuntimePreferenceWrite(async () => {
+        try {
+          if (launchAtStartup) {
+            await enable();
+          } else {
+            await disable();
+          }
+          // The OS accepted the change, so the scope is confirmed again.
+          settleScopeCheck("launchAtStartup", token, true);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : String(error);
+          // The setter may have failed before or after the OS applied the
+          // change, so the last value this WebView saw proves nothing. Only
+          // a fresh read of the OS state tells what is actually saved. The
+          // read stays inside the queued transaction, so no reset can slip
+          // between the failed write and the authoritative answer.
+          const recovered = await readAutostartState();
+          if (recovered === null) {
+            // Neither the write nor a read produced evidence: the scope
+            // stays explicitly unknown and the UI says so.
+            settleScopeCheck("launchAtStartup", token, false);
+            if (edit === launchAtStartupEdit.current) {
+              setSettings((prev) => {
+                const next = { ...prev, launchAtStartup: previous };
+                saveSettings(next);
+                return next;
+              });
+            }
+            publishStartupError(
+              "launchAtStartup",
+              `${reasonSentence(reason)} The launch-at-startup setting could not be applied and its saved state could not be verified.`,
+              action,
+            );
+            return;
+          }
+          settleScopeCheck("launchAtStartup", token, true);
+          // The canonical state is known, so it replaces the failed intent -
+          // unless a newer edit already owns the value.
+          if (edit === launchAtStartupEdit.current) {
+            setSettings((prev) => {
+              if (prev.launchAtStartup === recovered) return prev;
+              const next = { ...prev, launchAtStartup: recovered };
+              saveSettings(next);
+              return next;
+            });
+          }
+          publishStartupError(
+            "launchAtStartup",
+            `${reasonSentence(reason)} The launch-at-startup setting could not be applied; it is currently ${recovered ? "on" : "off"}.`,
+            action,
+          );
+        }
       });
-      publishStartupError(
-        "launchAtStartup",
-        `${reasonSentence(reason)} The launch-at-startup setting could not be applied; it is currently ${recovered ? "on" : "off"}.`,
-        action,
-      );
     } finally {
-      setStartupPending(false);
+      endStartupOperation();
     }
   }, [
     beginPreferenceAction,
     beginScopeCheck,
+    beginStartupOperation,
     clearStartupError,
+    endStartupOperation,
     publishStartupError,
+    queueRuntimePreferenceWrite,
     readAutostartState,
     settleScopeCheck,
   ]);
@@ -1135,6 +1189,10 @@ export function useSettings() {
     const resetAccountsEdit = ++accountsEdit.current;
     const resetUsageEdit = ++usageEdit.current;
     const resetRefreshEdit = ++refreshEdit.current;
+    // The reset owns the launch-at-startup state from now on: a late answer
+    // from a toggle that started earlier may not overwrite the default the
+    // reset writes.
+    const resetLaunchEdit = ++launchAtStartupEdit.current;
     // The reset verifies every scope, so it owns their verdicts from here on.
     // An action that starts later takes the scope over and this reset's
     // verdict for it is ignored.
@@ -1152,7 +1210,7 @@ export function useSettings() {
     const { settings: defaults } = resetPreferenceStores();
     setSettings(defaults);
     if (!isRunningInTauri()) return { ok: true, removed: true };
-    if (resetsPending.current++ === 0) setStartupPending(true);
+    beginStartupOperation();
     const operation = queueRuntimePreferenceWrite(async () => {
       const unverified: PreferenceScope[] = [];
       let autostartError: string | null = null;
@@ -1190,13 +1248,16 @@ export function useSettings() {
               resetScopeTokens.launchAtStartup,
               true,
             );
-            // The canonical OS state replaces the default the reset wrote.
-            setSettings((prev) => {
-              if (prev.launchAtStartup === recovered) return prev;
-              const next = { ...prev, launchAtStartup: recovered };
-              saveSettings(next);
-              return next;
-            });
+            // The canonical OS state replaces the default the reset wrote -
+            // unless a newer edit already owns the value.
+            if (resetLaunchEdit === launchAtStartupEdit.current) {
+              setSettings((prev) => {
+                if (prev.launchAtStartup === recovered) return prev;
+                const next = { ...prev, launchAtStartup: recovered };
+                saveSettings(next);
+                return next;
+              });
+            }
             autostartDetail =
               `${reasonSentence(autostartError)} The launch-at-startup entry could not be turned off; it is currently ${recovered ? "on" : "off"}.`;
           }
@@ -1413,7 +1474,7 @@ export function useSettings() {
         clearStartupError("reset", resetAction);
         return { ok: true, removed: true } as const;
       } finally {
-        if (--resetsPending.current === 0) setStartupPending(false);
+        endStartupOperation();
       }
     });
     try {
@@ -1435,8 +1496,10 @@ export function useSettings() {
     applyOperational,
     beginPreferenceAction,
     beginScopeCheck,
+    beginStartupOperation,
     clearStartupError,
     clearSupersededPreferenceErrors,
+    endStartupOperation,
     publishStartupError,
     queueRuntimePreferenceWrite,
     readAutostartState,

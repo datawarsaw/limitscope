@@ -955,3 +955,306 @@ describe("preference reset recovery", () => {
     });
   });
 });
+
+describe("autostart ordering and concurrency", () => {
+  it("runs a pending autostart enable before the reset that follows it", async () => {
+    // The OS entry is modelled explicitly: the change only takes effect when
+    // the call finishes, so a toggle that lands after the reset would leave
+    // the entry on while the reset reported success.
+    let osAutostart = false;
+    const autostartCalls: string[] = [];
+    const enableStarted = deferred<void>();
+    const enableGate = deferred<void>();
+    vi.mocked(isEnabled).mockImplementation(async () => osAutostart);
+    vi.mocked(enable).mockImplementation(async () => {
+      autostartCalls.push("enable:start");
+      enableStarted.resolve(undefined);
+      await enableGate.promise;
+      osAutostart = true;
+      autostartCalls.push("enable:end");
+    });
+    vi.mocked(disable).mockImplementation(async () => {
+      autostartCalls.push("disable:start");
+      osAutostart = false;
+      autostartCalls.push("disable:end");
+    });
+
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    let toggle!: Promise<void>;
+    act(() => {
+      toggle = result.current.setLaunchAtStartup(true);
+    });
+    await act(async () => {
+      await enableStarted.promise;
+    });
+
+    let resetSettled = false;
+    let resetPromise!: Promise<
+      Awaited<ReturnType<typeof result.current.resetPreferences>>
+    >;
+    act(() => {
+      resetPromise = result.current.resetPreferences().then((outcome) => {
+        resetSettled = true;
+        return outcome;
+      });
+    });
+
+    // The reset waits for the pending toggle: it may neither report success
+    // nor turn the entry off before the enable has finished.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(resetSettled).toBe(false);
+    expect(autostartCalls).toEqual(["enable:start"]);
+    expect(result.current.startupPending).toBe(true);
+
+    enableGate.resolve(undefined);
+    let outcome: Awaited<typeof resetPromise> | undefined;
+    await act(async () => {
+      await toggle;
+      outcome = await resetPromise;
+    });
+
+    expect(outcome).toEqual({ ok: true, removed: true });
+    // The enable finished before the reset turned the entry off again, so the
+    // OS state matches the default the reset reports.
+    expect(autostartCalls).toEqual([
+      "enable:start",
+      "enable:end",
+      "disable:start",
+      "disable:end",
+    ]);
+    expect(osAutostart).toBe(false);
+    expect(result.current.settings.launchAtStartup).toBe(false);
+    expect(stored().launchAtStartup).toBe(false);
+    expect(result.current.unverifiedPreferences).not.toContain(
+      "launchAtStartup",
+    );
+    expect(result.current.startupError).toBeNull();
+    expect(result.current.startupPending).toBe(false);
+  });
+
+  it("drops the error of a toggle that the following reset supersedes", async () => {
+    vi.mocked(enable).mockRejectedValueOnce(new Error("access denied"));
+    vi.mocked(isEnabled).mockImplementation(async () => false);
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    await act(async () => {
+      await result.current.setLaunchAtStartup(true);
+    });
+    expect(result.current.startupError).toContain("access denied");
+
+    let outcome: Awaited<ReturnType<typeof result.current.resetPreferences>> | undefined;
+    await act(async () => {
+      outcome = await result.current.resetPreferences();
+    });
+
+    // The confirmed reset supersedes the older failure, so its message is
+    // gone and the default is not presented as an unknown state.
+    expect(outcome).toEqual({ ok: true, removed: true });
+    expect(result.current.startupError).toBeNull();
+    expect(result.current.unverifiedPreferences).toEqual([]);
+    expect(result.current.settings).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("keeps the startup pending flag while a reset and an autostart toggle overlap", async () => {
+    const resetStarted = deferred<void>();
+    const resetGate = deferred<void>();
+    const enableStarted = deferred<void>();
+    const enableGate = deferred<void>();
+    const base = mocks.invoke.getMockImplementation()!;
+    let quotaWrites = 0;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_quota_notifications_enabled") {
+        quotaWrites += 1;
+        if (quotaWrites === 1) {
+          resetStarted.resolve(undefined);
+          await resetGate.promise;
+        }
+      }
+      return base(command, args);
+    });
+    vi.mocked(enable).mockImplementation(async () => {
+      enableStarted.resolve(undefined);
+      await enableGate.promise;
+    });
+
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    let resetPromise!: Promise<
+      Awaited<ReturnType<typeof result.current.resetPreferences>>
+    >;
+    act(() => {
+      resetPromise = result.current.resetPreferences();
+    });
+    await act(async () => {
+      await resetStarted.promise;
+    });
+    expect(result.current.startupPending).toBe(true);
+
+    // This toggle starts while the reset is still running. It is queued
+    // behind the reset, so it is still pending when the reset finishes.
+    let toggle!: Promise<void>;
+    act(() => {
+      toggle = result.current.setLaunchAtStartup(true);
+    });
+
+    resetGate.resolve(undefined);
+    await act(async () => {
+      await enableStarted.promise;
+    });
+
+    // The reset is done, the toggle is not: the pending flag must stay set
+    // until the last overlapping operation finishes.
+    expect(result.current.startupPending).toBe(true);
+
+    enableGate.resolve(undefined);
+    await act(async () => {
+      await toggle;
+      await resetPromise;
+    });
+
+    expect(result.current.startupPending).toBe(false);
+    // The toggle started after the reset, so its value is the current one.
+    expect(result.current.settings.launchAtStartup).toBe(true);
+    expect(stored().launchAtStartup).toBe(true);
+  });
+
+  it("does not let the late startup probe overwrite a newer autostart edit", async () => {
+    const probeGate = deferred<boolean>();
+    vi.mocked(isEnabled).mockImplementationOnce(() => probeGate.promise);
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    await act(async () => {
+      await result.current.setLaunchAtStartup(true);
+    });
+    expect(result.current.settings.launchAtStartup).toBe(true);
+
+    // The probe answers with the state it saw before the edit.
+    probeGate.resolve(false);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(result.current.settings.launchAtStartup).toBe(true);
+    expect(stored().launchAtStartup).toBe(true);
+    expect(result.current.unverifiedPreferences).not.toContain(
+      "launchAtStartup",
+    );
+    expect(result.current.startupError).toBeNull();
+  });
+
+  it("keeps a newer autostart failure that follows a confirmed reset", async () => {
+    const resetStarted = deferred<void>();
+    const resetGate = deferred<void>();
+    const base = mocks.invoke.getMockImplementation()!;
+    let quotaWrites = 0;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_quota_notifications_enabled") {
+        quotaWrites += 1;
+        if (quotaWrites === 1) {
+          resetStarted.resolve(undefined);
+          await resetGate.promise;
+        }
+      }
+      return base(command, args);
+    });
+    vi.mocked(enable).mockRejectedValue(new Error("access denied"));
+    vi.mocked(isEnabled).mockImplementation(async () => false);
+
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    let resetPromise!: Promise<
+      Awaited<ReturnType<typeof result.current.resetPreferences>>
+    >;
+    act(() => {
+      resetPromise = result.current.resetPreferences();
+    });
+    await act(async () => {
+      await resetStarted.promise;
+    });
+
+    // This newer action starts while the reset is in flight. Its failure must
+    // survive the reset success that precedes its queued write.
+    act(() => {
+      void result.current.setLaunchAtStartup(true);
+    });
+    expect(result.current.startupPending).toBe(true);
+
+    resetGate.resolve(undefined);
+    let outcome: Awaited<typeof resetPromise> | undefined;
+    await act(async () => {
+      outcome = await resetPromise;
+    });
+    expect(outcome).toEqual({ ok: true, removed: true });
+
+    await waitFor(() => {
+      expect(result.current.startupError).toContain("access denied");
+    });
+    expect(result.current.unverifiedPreferences).not.toContain(
+      "launchAtStartup",
+    );
+    // The failed write was rolled back to the state the OS reports.
+    expect(result.current.settings.launchAtStartup).toBe(false);
+    expect(result.current.startupPending).toBe(false);
+  });
+
+  it("does not let the reset recovery overwrite a newer autostart edit", async () => {
+    let osAutostart = true;
+    const recoveryStarted = deferred<void>();
+    const recoveryGate = deferred<boolean>();
+    vi.mocked(isEnabled)
+      // The startup probe answers.
+      .mockImplementationOnce(async () => osAutostart)
+      // The recovery read after the failed disable waits.
+      .mockImplementationOnce(async () => {
+        recoveryStarted.resolve(undefined);
+        return recoveryGate.promise;
+      });
+    vi.mocked(disable)
+      // The reset cannot turn the entry off.
+      .mockRejectedValueOnce(new Error("registry entry is locked"))
+      // The newer toggle turns it off.
+      .mockImplementationOnce(async () => {
+        osAutostart = false;
+      });
+
+    const { result } = renderHook(() => useSettings());
+    await hydrated(result);
+
+    let resetPromise!: Promise<
+      Awaited<ReturnType<typeof result.current.resetPreferences>>
+    >;
+    act(() => {
+      resetPromise = result.current.resetPreferences();
+    });
+    await act(async () => {
+      await recoveryStarted.promise;
+    });
+
+    // This newer edit owns the launch-at-startup state while the reset is
+    // still recovering.
+    act(() => {
+      void result.current.setLaunchAtStartup(false);
+    });
+
+    recoveryGate.resolve(true);
+    let outcome: Awaited<typeof resetPromise> | undefined;
+    await act(async () => {
+      outcome = await resetPromise;
+    });
+
+    // The reset could not turn the entry off, but the newer edit owns the
+    // state: the recovered "on" must not overwrite it.
+    expect(outcome).toEqual({ ok: false });
+    expect(result.current.settings.launchAtStartup).toBe(false);
+    expect(stored().launchAtStartup).toBe(false);
+    expect(osAutostart).toBe(false);
+  });
+});
