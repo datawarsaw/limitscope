@@ -23,6 +23,16 @@ const mocks = vi.hoisted(() => ({
   }),
   pickUsageExportDirectory: vi.fn().mockResolvedValue(null),
   refresh: vi.fn(),
+  syncRefreshInterval: vi.fn(),
+  providerUsageOptions: undefined as { onAttach?: () => void } | undefined,
+  unverifiedPreferences: [] as Array<
+    | "launchAtStartup"
+    | "quotaNotifications"
+    | "walletMonitoring"
+    | "refreshIntervalMinutes"
+    | "codexAccounts"
+    | "usageIntelligence"
+  >,
 }));
 
 vi.mock("./lib/diagnosticsExport", () => ({
@@ -66,23 +76,28 @@ vi.mock("./hooks/useSettings", () => ({
     setQuotaPerspective: mocks.setQuotaPerspective,
     setCodexAccount: mocks.setCodexAccount,
     resetPreferences: mocks.resetPreferences,
+    syncRefreshInterval: mocks.syncRefreshInterval,
     startupPending: false,
     startupError: null,
+    unverifiedPreferences: mocks.unverifiedPreferences,
   }),
 }));
 
 vi.mock("./hooks/useProviderUsage", () => ({
-  useProviderUsage: () => ({
-    usages: [],
-    loading: false,
-    lastUpdatedAt: new Date("2026-09-28T21:58:00"),
-    refresh: mocks.refresh,
-    refreshOverdue: false,
-    stale: false,
-    staleMinutes: 0,
-    historyRevision: 1,
-    usageIntelligenceRevision: 0,
-  }),
+  useProviderUsage: (options?: { onAttach?: () => void }) => {
+    mocks.providerUsageOptions = options;
+    return {
+      usages: [],
+      loading: false,
+      lastUpdatedAt: new Date("2026-09-28T21:58:00"),
+      refresh: mocks.refresh,
+      refreshOverdue: false,
+      stale: false,
+      staleMinutes: 0,
+      historyRevision: 1,
+      usageIntelligenceRevision: 0,
+    };
+  },
 }));
 
 vi.mock("./hooks/useNow", () => ({
@@ -111,6 +126,7 @@ describe("settings destination", () => {
   });
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.unverifiedPreferences = [];
   });
 
   it("keeps settings controls absent until the destination opens", () => {
@@ -491,5 +507,74 @@ describe("settings destination", () => {
     expect(
       button.getAttribute("aria-pressed"),
     ).toBe("true");
+  });
+
+  it("shows that the saved launch-at-startup state could not be verified", () => {
+    mocks.unverifiedPreferences = ["launchAtStartup"];
+    render(<App />);
+    openSettings();
+    expect(
+      screen.getByText(
+        "The saved state of launch at startup could not be verified.",
+      ),
+    ).toBeTruthy();
+    const control = screen.getByRole("switch", {
+      name: "Launch LimitScope when Windows starts",
+    });
+    expect(control.getAttribute("data-unverified")).toBe("true");
+  });
+
+  it("hands the refresh cadence to the runtime through the settings lane", () => {
+    render(<App />);
+    // The settings lane owns the write queue, so the dashboard window is the
+    // only one that may hand the persisted cadence over to the runtime.
+    expect(mocks.providerUsageOptions?.onAttach).toBe(
+      mocks.syncRefreshInterval,
+    );
+  });
+
+  it("offers a retry when the saved auto-refresh runtime state is unknown", () => {
+    mocks.unverifiedPreferences = ["refreshIntervalMinutes"];
+    render(<App />);
+    openSettings();
+
+    expect(
+      screen.getByText(
+        "The saved state of refresh interval could not be verified.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry runtime sync" }),
+    );
+    expect(mocks.syncRefreshInterval).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no verification note while every scope is confirmed", () => {
+    render(<App />);
+    openSettings();
+    expect(
+      screen.queryByText(/The saved state of .* could not be verified\./),
+    ).toBeNull();
+    const control = screen.getByRole("switch", {
+      name: "Launch LimitScope when Windows starts",
+    });
+    expect(control.hasAttribute("data-unverified")).toBe(false);
+  });
+
+  it("shows verification notes for the remaining unverified scopes", () => {
+    mocks.unverifiedPreferences = ["quotaNotifications", "usageIntelligence"];
+    render(<App />);
+    openSettings();
+    expect(
+      screen.getByText(
+        "The saved state of quota notifications could not be verified.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    expect(
+      screen.getByText(
+        "The saved state of Usage Intelligence could not be verified.",
+      ),
+    ).toBeTruthy();
   });
 });

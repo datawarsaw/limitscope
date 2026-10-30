@@ -1248,6 +1248,25 @@ body {
   font-size: 10px;
 }
 
+/* A preference whose saved state could not be verified. The value shown next
+   to the note is the last known one, not a confirmed one, so the note speaks
+   in the error color instead of the faint one. */
+.setting-note-unverified {
+  color: var(--red);
+}
+
+.setting-retry-btn {
+  align-self: flex-start;
+  border: 0;
+  background: transparent;
+  color: var(--teal);
+  padding: 0;
+  font: inherit;
+  font-size: 10px;
+  text-decoration: underline;
+  cursor: pointer;
+}
+
 .clear-history-btn {
   flex: none;
   border: 1px solid var(--card-border);

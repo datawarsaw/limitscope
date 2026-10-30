@@ -252,7 +252,13 @@ describe("useSettings reset preferences", () => {
     });
 
     expect(outcome).toEqual({ ok: false });
-    expect(result.current.startupError).toBe("registry entry is locked");
+    // The failed write is recovered with a read of the OS state, so the
+    // message names the state the OS really has instead of the raw error
+    // alone.
+    expect(result.current.startupError).toBe(
+      "registry entry is locked. The launch-at-startup entry could not be turned off; it is currently off.",
+    );
+    expect(result.current.unverifiedPreferences).toEqual([]);
   });
 
   it("resets the stores without OS interaction outside Tauri", async () => {

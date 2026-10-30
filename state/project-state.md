@@ -8,6 +8,21 @@
 
 ## Current status
 
+- 0.8.24 release-blocking reliability and IPC remediation (local work,
+  not released): OpenCode bounded scans commit the backlog diagnostic with
+  the batch and cursor, and revalidate coverage after restart. Preference
+  reset reconciles independently persisted settings after failures and marks
+  values that cannot be verified; refresh interval writes are ordered with
+  reset and failed startup handoff preserves the saved choice. Cache deletion
+  errors propagate, and new
+  Codex account settings reject colliding homes. Tauri application ACLs
+  restrict sensitive commands by window; dispatch was exercised with Tauri
+  2.12.0 MockRuntime, not a native WebView2 session. Existing conflicting
+  account files are not migrated. Release remains HOLD and the existing Human
+  Acceptance record is unchanged. The previous intermittent parallel Grok
+  Bot test issue remains known; a separate serial test of Codex identity
+  failed once and passed on isolated and full-suite retry.
+
 - Final 0.8.24 reliability remediation (local source candidate, not released):
   Usage Intelligence retention runs independently of source scans, bounded
   ZCode batches persist their coverage state with their cursor, and failed

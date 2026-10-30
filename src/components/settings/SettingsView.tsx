@@ -37,6 +37,10 @@ import {
   type CodexAccountSettings,
 } from "../../lib/codexAccounts";
 import { CODEX_PROVIDER_ID } from "../../lib/providerIds";
+import {
+  preferenceScopeUnverifiedNote,
+  type PreferenceScope,
+} from "../../lib/preferenceScopes";
 import type { ApiWallet, ProviderUsage } from "../../types";
 import type { ReleaseNote, SafeUpdateError, UpdatePhase } from "../../lib/updater";
 import type { LocalDataClearResult } from "../../lib/localData";
@@ -45,6 +49,8 @@ export type SettingsViewProps = {
   settings: Settings;
   setLaunchAtStartup: (launchAtStartup: boolean) => void;
   setRefreshInterval: (minutes: RefreshIntervalMinutes) => void;
+  /** Re-send the persisted interval after a failed startup hand-off. */
+  syncRefreshInterval?: () => void;
   setTheme: (theme: Theme) => void;
   setQuotaNotifications: (enabled: boolean) => void;
   setUsageIntelligence: (enabled: boolean) => void;
@@ -74,6 +80,13 @@ export type SettingsViewProps = {
   resetPreferences: () => Promise<LocalDataClearResult> | LocalDataClearResult;
   startupPending: boolean;
   startupError: string | null;
+  /**
+   * Preference groups whose saved state could not be verified. The switch
+   * next to such a group shows the last known value, so the note says that
+   * the value is not confirmed instead of leaving the stale value to speak
+   * for itself.
+   */
+  unverifiedPreferences?: readonly PreferenceScope[];
   /** Full provider registry (hidden providers keep their preferences rows). */
   usages: readonly ProviderUsage[];
   /** Registered wallets ( collectors plus the disabled OpenAI placeholder). */
@@ -99,6 +112,7 @@ export function SettingsView({
   settings,
   setLaunchAtStartup,
   setRefreshInterval,
+  syncRefreshInterval,
   setTheme,
   setQuotaNotifications,
   setUsageIntelligence,
@@ -111,6 +125,7 @@ export function SettingsView({
   resetPreferences,
   startupPending,
   startupError,
+  unverifiedPreferences,
   usages,
   wallets,
   visibleUsages,
@@ -146,6 +161,15 @@ export function SettingsView({
 
   // Transient feedback when hiding the final visible provider is refused.
   const [providerPrefsNote, setProviderPrefsNote] = useState<string | null>(null);
+
+  // The visible note of a scope whose saved state could not be verified.
+  const unverifiedScopes = new Set<PreferenceScope>(unverifiedPreferences ?? []);
+  const unverifiedNote = (scope: PreferenceScope) =>
+    unverifiedScopes.has(scope) ? (
+      <span className="setting-note setting-note-unverified" role="status">
+        {preferenceScopeUnverifiedNote(scope)}
+      </span>
+    ) : null;
 
   const handleDiagnosticsExport = useCallback(async () => {
     setDiagnosticsSaving(true);
@@ -236,23 +260,33 @@ export function SettingsView({
           General
         </h3>
         <label className="setting-row">
-          <span className="setting-label">
-            Launch LimitScope when Windows starts
+          <span className="setting-copy">
+            <span className="setting-label">
+              Launch LimitScope when Windows starts
+            </span>
+            {unverifiedNote("launchAtStartup")}
           </span>
           <input
             type="checkbox"
             role="switch"
+            aria-label="Launch LimitScope when Windows starts"
             checked={settings.launchAtStartup}
             disabled={startupPending}
+            data-unverified={unverifiedScopes.has("launchAtStartup") ? "true" : undefined}
             onChange={(event) => void setLaunchAtStartup(event.target.checked)}
           />
         </label>
         <label className="setting-row">
-          <span className="setting-label">Quota notifications</span>
+          <span className="setting-copy">
+            <span className="setting-label">Quota notifications</span>
+            {unverifiedNote("quotaNotifications")}
+          </span>
           <input
             type="checkbox"
             role="switch"
+            aria-label="Quota notifications"
             checked={settings.quotaNotifications}
+            data-unverified={unverifiedScopes.has("quotaNotifications") ? "true" : undefined}
             onChange={(event) => setQuotaNotifications(event.target.checked)}
           />
         </label>
@@ -273,11 +307,31 @@ export function SettingsView({
             ))}
           </div>
         </fieldset>
-        <label className="setting-row">
-          <span className="setting-label">Auto-refresh</span>
+        {/* The retry control is a sibling of the select, not a descendant of a
+            label that wraps it: a button inside that label would take the
+            label text as its own accessible name. */}
+        <div className="setting-row">
+          <span className="setting-copy">
+            <label className="setting-label" htmlFor="setting-refresh-interval">
+              Auto-refresh
+            </label>
+            {unverifiedNote("refreshIntervalMinutes")}
+            {unverifiedScopes.has("refreshIntervalMinutes") &&
+            syncRefreshInterval ? (
+              <button
+                type="button"
+                className="setting-retry-btn"
+                onClick={syncRefreshInterval}
+              >
+                Retry runtime sync
+              </button>
+            ) : null}
+          </span>
           <select
+            id="setting-refresh-interval"
             aria-label="Auto-refresh"
             value={settings.refreshIntervalMinutes}
+            data-unverified={unverifiedScopes.has("refreshIntervalMinutes") ? "true" : undefined}
             onChange={(event) =>
               setRefreshInterval(Number(event.target.value) as RefreshIntervalMinutes)
             }
@@ -288,7 +342,7 @@ export function SettingsView({
               </option>
             ))}
           </select>
-        </label>
+        </div>
         <label className="setting-row">
           <span className="setting-label">Theme</span>
           <select
@@ -406,6 +460,7 @@ export function SettingsView({
             Floating bar controls the wallet's place in the floating API
             Wallets card, and a hidden wallet keeps being monitored.
           </p>
+          {unverifiedNote("walletMonitoring")}
           {wallets.length === 0 ? (
             <p className="providers-prefs-note">No wallets registered.</p>
           ) : (
@@ -491,6 +546,7 @@ export function SettingsView({
             shares one account's login with another. Every account's quota is
             read separately; limits are never combined.
           </p>
+          {unverifiedNote("codexAccounts")}
           <ul className="providers-prefs-list">
             {settings.codexAccounts.accounts.map((account) => {
               const configured = isCodexAccountConfigured(account);
@@ -595,12 +651,14 @@ export function SettingsView({
               from tools like ZCode, on this device only. Never reads
               prompt or response content.
             </span>
+            {unverifiedNote("usageIntelligence")}
           </span>
           <input
             type="checkbox"
             role="switch"
             aria-label="Usage Intelligence"
             checked={settings.usageIntelligence === true}
+            data-unverified={unverifiedScopes.has("usageIntelligence") ? "true" : undefined}
             onChange={(event) => setUsageIntelligence(event.target.checked)}
           />
         </label>

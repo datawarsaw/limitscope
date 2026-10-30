@@ -434,4 +434,3 @@ fn remote_origin_cannot_reach_app_commands() {
     );
     println!("remote origin: get_runtime_snapshot from https://attacker.example/ -> {error}");
 }
-
