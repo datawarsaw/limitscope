@@ -314,21 +314,50 @@ fn codex_homes_collide(primary: &ResolvedCodexHome, secondary: &ResolvedCodexHom
     if primary.existing != secondary.existing {
         return false;
     }
-    if primary.pending == secondary.pending {
-        return true;
+    match compare_pending_paths(&primary.pending, &secondary.pending) {
+        PendingComparison::Equal => true,
+        PendingComparison::Distinct => false,
+        PendingComparison::CaseOnly => {
+            // Only the case differs. On a case-insensitive volume that is one
+            // entry; in a case-sensitive directory it is two. The directory
+            // itself decides, and the conservative reading stands when it
+            // cannot be asked.
+            directory_resolves_case_insensitively(&primary.existing).unwrap_or(true)
+        }
     }
-    if !primary
-        .pending
+}
+
+/// How the not-yet-existing tails of two codex homes relate to each other.
+enum PendingComparison {
+    /// The same tail: one and the same directory.
+    Equal,
+    /// Different tails: two different directories.
+    Distinct,
+    /// The same tail written in a different case: one directory on a
+    /// case-insensitive volume, two on a case-sensitive one.
+    CaseOnly,
+}
+
+/// Compares the parts of two codex homes that do not exist yet.
+fn compare_pending_paths(primary: &[String], secondary: &[String]) -> PendingComparison {
+    // The tails have the same depth only when the two homes can denote the
+    // same directory. `zip` stops at the shorter side, so an equal prefix of
+    // unequal length would compare as equal while one home actually sits
+    // below the other.
+    if primary.len() != secondary.len() {
+        return PendingComparison::Distinct;
+    }
+    if primary == secondary {
+        return PendingComparison::Equal;
+    }
+    if primary
         .iter()
-        .zip(&secondary.pending)
+        .zip(secondary)
         .all(|(left, right)| left.eq_ignore_ascii_case(right))
     {
-        return false;
+        return PendingComparison::CaseOnly;
     }
-    // Only the case differs. On a case-insensitive volume that is one entry;
-    // in a case-sensitive directory it is two. The directory itself decides,
-    // and the conservative reading stands when it cannot be asked.
-    directory_resolves_case_insensitively(&primary.existing).unwrap_or(true)
+    PendingComparison::Distinct
 }
 
 /// Whether the directory resolves an entry written in a different case to the
@@ -811,6 +840,71 @@ mod tests {
         )
         .expect_err("equivalent normalized homes must be rejected");
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_tails_of_unequal_depth_are_never_the_same_directory() {
+        assert!(matches!(
+            compare_pending_paths(&[], &["beta".to_string()]),
+            PendingComparison::Distinct
+        ));
+        assert!(matches!(
+            compare_pending_paths(
+                &["missing".to_string(), "alpha".to_string()],
+                &[
+                    "missing".to_string(),
+                    "alpha".to_string(),
+                    "beta".to_string()
+                ]
+            ),
+            PendingComparison::Distinct
+        ));
+        assert!(matches!(
+            compare_pending_paths(&["shared".to_string()], &["shared".to_string()]),
+            PendingComparison::Equal
+        ));
+        assert!(matches!(
+            compare_pending_paths(&["Shared".to_string()], &["shared".to_string()]),
+            PendingComparison::CaseOnly
+        ));
+    }
+
+    #[test]
+    fn an_existing_home_and_the_directory_below_it_are_distinct_homes() {
+        let root = temp_dir("home-nested-existing");
+        let shared = root.join("shared");
+        fs::create_dir_all(shared.join("nested")).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        accounts[1].codex_home = shared.join("nested").to_string_lossy().into();
+
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("a subdirectory is a different credential home");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_home_that_does_not_exist_yet_is_not_a_collision_with_its_parent() {
+        let root = temp_dir("home-nested-pending");
+        let shared = root.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        accounts[1].codex_home = shared.join("nested").to_string_lossy().into();
+
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("a not yet created subdirectory is a different credential home");
+
+        accounts[0].codex_home = root.join("missing").join("alpha").to_string_lossy().into();
+        accounts[1].codex_home = root
+            .join("missing")
+            .join("alpha")
+            .join("beta")
+            .to_string_lossy()
+            .into();
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("two not yet created tails of different depth are different homes");
         let _ = fs::remove_dir_all(root);
     }
 
