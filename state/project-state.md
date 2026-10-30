@@ -8,6 +8,15 @@
 
 ## Current status
 
+- Release pipeline trust isolation is a local, unreleased candidate: validation
+  runs on a separate runner without release secrets or shared artifacts/caches;
+  the release runner checks the exact source and lockfiles, builds with locked
+  Cargo resolution, and requires cryptographic updater-signature verification
+  before draft activation. Build-time dependencies and the signing runner remain
+  trusted; test isolation does not establish that tinypool is non-exploitable.
+  Dependency findings are not accepted. Release remains HOLD; Human Acceptance
+  remains accepted and unchanged. See `docs/ci-and-release.md`.
+
 - npm dependency remediation (2026-10-30, local, not released): npm 12
   lifecycle policy approves only `esbuild@0.21.5`; lockfile updates remove
   the `source-map-js` and `undici` advisories. Six dev-dependency packages

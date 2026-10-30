@@ -8,11 +8,8 @@ name: Release
 # repository holds the source and signing secrets; only the signed installer,
 # signature, and latest.json are published to the companion.
 #
-# Release publication uses atomic ordering:
-#   1. Create release and upload installer + .sig (exact artifacts, sizes verified)
-#   2. Verify availability of uploaded release assets (exact name set + byte sizes)
-#   3. Upload latest.json LAST so the feed never points to missing assets.
-#   4. Verify the final asset set and feed content after publication.
+# Validation and release use independent GitHub-hosted runners, without shared
+# caches or validation artifacts. Publication stages and verifies a draft before activation.
 #
 # Hardened pre-RC (v0.8):
 #   - Tag/ref/HEAD identity: the run must check out GITHUB_SHA, the operator
@@ -82,8 +79,61 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validation:
+    name: Validate exact source without release credentials
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact workflow commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify requested commit
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ inputs.expected_head_sha }}
+        run: |
+          [[ "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$GITHUB_SHA" = "$EXPECTED_HEAD_SHA"
+      - name: Setup Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 24.19.0
+      - name: Install and verify npm
+        shell: bash
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/npm12" npm@12.0.2 --ignore-scripts
+          export PATH="$(cygpath -u "$RUNNER_TEMP")/npm12:$PATH"
+          test "$(node --version)" = v24.19.0
+          test "$(npm --version)" = 12.0.2
+          echo "$RUNNER_TEMP/npm12" >> "$GITHUB_PATH"
+      - name: Install frontend dependencies with strict script approval
+        run: npm ci --strict-allow-scripts
+      - name: Setup pinned Rust 1.98.1 (MSVC)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: 1.98.1
+      - name: Rust tests
+        working-directory: src-tauri
+        run: cargo test --locked
+      - name: Check release workflow isolation
+        run: node --test scripts/release-workflow-check.mjs
+      - name: Frontend tests
+        run: npm test
+      - name: Test interrupted publication without network
+        run: npm test -- scripts/publish-release.test.mjs
+      - name: Frontend build
+        run: npm run build
+      - name: Secret scan
+        run: npm run scan:secrets
+
   windows:
-    name: Build, sign, publish update feed
+    name: Build, sign, verify and publish update feed
+    needs: validation
     runs-on: windows-latest
     timeout-minutes: 60
     permissions:
@@ -94,22 +144,12 @@ jobs:
       TZ: Europe/Warsaw
 
     steps:
-      - name: Verify release PAT is configured
-        env:
-          RELEASES_PAT: ${{ secrets.RELEASES_PAT }}
-        run: |
-          if ([string]::IsNullOrEmpty($env:RELEASES_PAT)) {
-            Write-Host "Missing repository secret: RELEASES_PAT"
-            Write-Host "Set it under Settings > Secrets and variables > Actions, then re-run."
-            Write-Host "See docs/updater-production.md 'Required CI secrets'."
-            exit 1
-          }
-
       # The source repository is public, so tag lookup does not need a token
       # persisted in .git/config for later steps.
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       # The release channel is derived from the version shape, never chosen:
@@ -140,7 +180,7 @@ jobs:
           echo "checkout HEAD:    $ACTUAL_SHA"
           echo "workflow SHA:     $GITHUB_SHA"
           echo "requested SHA:    $EXPECTED_HEAD_SHA"
-          if [ -z "$EXPECTED_HEAD_SHA" ]; then
+          if [[ ! "$EXPECTED_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
             echo "FAIL: expected_head_sha input is required."
             exit 1
           fi
@@ -172,12 +212,16 @@ jobs:
             if (!m) { console.error("rate-limits package not found in src-tauri/Cargo.lock"); process.exit(1); }
             console.log(m[1]);
           ')
+          NPM_LOCK_VERSION=$(node -p "require('./package-lock.json').version")
+          NPM_ROOT_VERSION=$(node -p "require('./package-lock.json').packages[''].version")
           PRODUCT_NAME=$(node -p "require('./src-tauri/tauri.conf.json').productName")
           MAIN_BINARY=$(node -p "require('./src-tauri/tauri.conf.json').mainBinaryName")
           fail=false
           for surface in \
             "src-tauri/tauri.conf.json $CONF_VERSION" \
             "package.json $PKG_VERSION" \
+            "package-lock.json $NPM_LOCK_VERSION" \
+            "package-lock.json:root $NPM_ROOT_VERSION" \
             "src-tauri/Cargo.toml $CARGO_VERSION" \
             "src-tauri/Cargo.lock $LOCK_VERSION"
           do
@@ -202,61 +246,49 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 24
-          cache: npm
+          node-version: 24.19.0
 
-      - name: Install frontend dependencies
-        run: npm ci
+      - name: Install and verify npm
+        shell: bash
+        run: |
+          npm install --global --prefix "$RUNNER_TEMP/npm12" npm@12.0.2 --ignore-scripts
+          export PATH="$(cygpath -u "$RUNNER_TEMP")/npm12:$PATH"
+          test "$(node --version)" = v24.19.0
+          test "$(npm --version)" = 12.0.2
+          echo "$RUNNER_TEMP/npm12" >> "$GITHUB_PATH"
+
+      - name: Install frontend dependencies with strict script approval
+        run: npm ci --strict-allow-scripts
 
       - name: Setup pinned Rust 1.98.1 (MSVC)
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10-16
         with:
           toolchain: 1.98.1
 
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: src-tauri
+      - name: Verify tracked source and lockfiles after installation
+        shell: bash
+        run: |
+          git diff --exit-code
+          git diff --cached --exit-code
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
 
-      - name: Frontend tests
-        run: npm test
+      - name: Build unsigned NSIS installer with locked Cargo dependencies
+        shell: bash
+        run: npm run tauri build -- --no-sign -- --locked
 
-      - name: Rust tests (live tests are #[ignore]d)
-        working-directory: src-tauri
-        run: cargo test --locked
-
-      - name: Frontend build (tsc + vite)
-        run: npm run build
-
-      # The signing env makes the bundler emit <installer>.sig next to the
-      # setup.exe. The private key exists only in this step's environment.
-      # Any stale installer/signature from a previous run of the same version
-      # is removed first so a re-run can never publish a stale artifact.
-      - name: Tauri build (signed NSIS installer)
+      - name: Sign exact installer
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         shell: bash
         run: |
-          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ] || [ -z "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD" ]; then
-            echo "FAIL: signing secrets are not configured."
-            echo "Set TAURI_SIGNING_PRIVATE_KEY and TAURI_SIGNING_PRIVATE_KEY_PASSWORD; see docs/updater-production.md 'Required CI secrets'."
-            exit 1
-          fi
-          BUNDLE_DIR="src-tauri/target/release/bundle/nsis"
-          EXPECTED_INSTALLER="LimitScope_${VERSION}_x64-setup.exe"
-          rm -f "$BUNDLE_DIR/$EXPECTED_INSTALLER" "$BUNDLE_DIR/$EXPECTED_INSTALLER.sig"
-          npm run tauri build
-          INSTALLER="$BUNDLE_DIR/$EXPECTED_INSTALLER"
-          if [ ! -f "$INSTALLER" ]; then
-            echo "Expected installer was not produced: $INSTALLER"
-            ls -la "$BUNDLE_DIR" || true
-            exit 1
-          fi
-          if [ ! -f "${INSTALLER}.sig" ]; then
-            echo "Signing installer with tauri signer..."
-            npx tauri signer sign --app-version "$VERSION" "$INSTALLER"
-          fi
+          set -euo pipefail
+          test -n "$TAURI_SIGNING_PRIVATE_KEY"
+          test -n "$TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
+          INSTALLER="src-tauri/target/release/bundle/nsis/LimitScope_${VERSION}_x64-setup.exe"
+          test -f "$INSTALLER"
+          test ! -e "${INSTALLER}.sig"
+          ./node_modules/.bin/tauri signer sign --app-version "$VERSION" "$INSTALLER"
 
       # Exact artifact selection: address the installer by its exact name and
       # require the bundle directory to hold exactly one installer, so no
@@ -365,8 +397,8 @@ jobs:
         env:
           RELEASE_NOTES: ${{ inputs.notes }}
 
-      - name: Test interrupted publication without network
-        run: npm test -- scripts/publish-release.test.mjs
+      - name: Verify updater signature before publication
+        run: node scripts/verify-release-signature.mjs
 
       - name: Stage complete draft, verify bytes, then activate
         env:

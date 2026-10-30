@@ -8,8 +8,7 @@ import { describe, expect, it } from "vitest";
  * The release workflow is release tooling, so it has no runtime tests; these
  * deterministic assertions pin the invariants the v0.8 release depends on:
  * tag/ref/HEAD identity, version-surface agreement, exact artifact
- * selection, SHA-256/size traceability, atomic publication ordering
- * (latest.json LAST), and the updater key/endpoint contract. They also pin
+ * selection, SHA-256/size traceability, draft verification before activation, and the updater key/endpoint contract. They also pin
  * the derived RC channel contract: the channel comes from the version shape
  * (no operator toggle), the RC companion release is created with --prerelease
  * from the initial creation call and asserted before any asset upload, and
@@ -68,7 +67,7 @@ describe("release workflow hardening", () => {
     expect(yml).toContain('"$INSTALLER_PATH"');
     expect(yml).toContain('"$SIG_PATH"');
     expect(stepIndex("resolve exact release artifacts")).toBeGreaterThan(
-      stepIndex("tauri build"),
+      stepIndex("build unsigned NSIS"),
     );
   });
 
@@ -100,7 +99,7 @@ describe("release workflow hardening", () => {
     expect(yml).toContain("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}");
     expect(yml).toContain("${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}");
     expect(yml).toContain("${{ secrets.RELEASES_PAT }}");
-    expect(yml).toContain('npx tauri signer sign --app-version "$VERSION"');
+    expect(yml).toContain('./node_modules/.bin/tauri signer sign --app-version "$VERSION"');
     // The feed carries only the Tauri-required metadata: no hashes or extra
     // platforms are smuggled into latest.json. (The SHA-256 manifest is
     // run-local traceability and must stay out of the published feed.)

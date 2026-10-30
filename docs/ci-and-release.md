@@ -200,3 +200,28 @@ in its gate section. Release closeout is verified GitHub release provenance
 v0.8 runbook's Phase 5); this repository keeps no separate post-release state
 ledger. Do not add release publishing, tag pushing, or signing to this
 workflow without explicitly revisiting that policy and the required secrets.
+
+
+## Release trust boundary (0.8.24 local candidate)
+
+The manually dispatched release uses separate GitHub-hosted Windows runners.
+`validation` receives no signing key or companion publication token and uploads
+no artifacts or caches; its success is required before `windows` can start.
+The release runner checks out the workflow SHA, verifies the operator SHA and
+version tag, installs the locked dependencies with npm 12 strict script approval,
+and builds with Cargo `--locked`. Both runners pin Node 24.19.0 and npm 12.0.2.
+CI uses the same npm policy and locked Cargo resolution for the Tauri bundle.
+
+The build runs without signing credentials. Only the signing step receives the
+key; the companion token is limited to the publication step. The exact installer
+and updater signature must verify cryptographically against the embedded trust
+root before publication. The publication step also checks the artifact hashes,
+feed URL and signature, then stages and re-downloads all three assets from a
+private draft before activation. Stable and RC behavior remains unchanged.
+
+This boundary assumes GitHub-hosted runner isolation and trusts the source,
+runner image, actions, registries, approved install scripts and build tools.
+A compromised build process on the signing runner could persist or tamper with
+subsequent steps, including access to secrets; separation of the validation job
+only contains the test process and does not remediate tinypool or accept any
+remaining vulnerability. Release remains HOLD, with Human Acceptance unchanged.
