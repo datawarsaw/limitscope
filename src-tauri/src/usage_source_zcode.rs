@@ -1590,6 +1590,81 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_backlog_write_restart_and_retry_preserve_coverage_and_events() {
+        let fix = fixture("failed-restart-db");
+        insert_completed(&fix.connection, "old");
+        let db_path = fix.path();
+        let (store, dir) = store_at("failed-restart-store", Some(db_path.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        let coverage = |store: &crate::usage_intelligence::UsageIntelligenceStore| {
+            store.aggregate(UsageRange::Today, Some(NOW_MS)).source_coverage
+                .into_iter().find(|c| c.source == USAGE_SOURCE_ZCODE).unwrap().coverage
+        };
+        assert_eq!(coverage(&store), "complete");
+        fix.connection.execute_batch("BEGIN").unwrap();
+        for index in 0..=SCAN_CEILING {
+            insert(&fix.connection, &format!("retry-{index:07}"), "account:zai-individual-coding-plan",
+                "GLM-5.3", "completed", Some(NOW_MS - 30_000 + index as i64), 1, 1, 0, 0, 0, 2);
+        }
+        fix.connection.execute_batch("COMMIT").unwrap();
+        let path = dir.path().join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME);
+        let saved = dir.path().join("saved.json");
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(collect(&store), ZcodeScanOutcome::ReadFailure(_)));
+        assert_eq!(coverage(&store), "uncertain");
+        assert!(store.events().is_empty());
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        drop(store);
+        let retry_db_path = db_path.clone();
+        let reopened = crate::usage_intelligence::UsageIntelligenceStore::open_with(
+            path.clone(), fixed_clock(), Box::new(move || Some(retry_db_path.clone())));
+        assert_eq!(coverage(&reopened), "uncertain");
+        // A second failed write must not clear the restart guard, even when
+        // no recovery diagnostic can be persisted either.
+        std::fs::rename(&path, &saved).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(collect(&reopened), ZcodeScanOutcome::ReadFailure(_)));
+        assert_eq!(coverage(&reopened), "uncertain");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(&saved, &path).unwrap();
+        drop(reopened);
+        let reopened = crate::usage_intelligence::UsageIntelligenceStore::open_with(
+            path, fixed_clock(), Box::new(move || Some(db_path.clone())));
+        assert_eq!(coverage(&reopened), "uncertain");
+        assert!(matches!(collect(&reopened), ZcodeScanOutcome::Bounded { .. }));
+        assert_eq!(coverage(&reopened), "uncertain");
+        assert!(matches!(collect(&reopened), ZcodeScanOutcome::Collected { .. }));
+        assert_eq!(coverage(&reopened), "complete");
+        assert_eq!(reopened.events().len(), SCAN_CEILING + 1);
+        let _ = collect(&reopened);
+        assert_eq!(reopened.events().len(), SCAN_CEILING + 1);
+    }
+
+    #[test]
+    fn healthy_restart_revalidates_without_losing_historical_coverage() {
+        let fix = fixture("healthy-restart-db");
+        insert_completed(&fix.connection, "old");
+        let db_path = fix.path();
+        let (store, dir) = store_at("healthy-restart-store", Some(db_path.clone()));
+        enable(&store);
+        assert!(matches!(collect(&store), ZcodeScanOutcome::Baseline { .. }));
+        drop(store);
+        let reopened = crate::usage_intelligence::UsageIntelligenceStore::open_with(
+            dir.path().join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME),
+            fixed_clock(), Box::new(move || Some(db_path.clone())));
+        let coverage = |store: &crate::usage_intelligence::UsageIntelligenceStore| {
+            store.aggregate(UsageRange::Today, Some(NOW_MS)).source_coverage
+                .into_iter().find(|c| c.source == USAGE_SOURCE_ZCODE).unwrap().coverage
+        };
+        assert_eq!(coverage(&reopened), "uncertain");
+        assert!(matches!(collect(&reopened), ZcodeScanOutcome::Collected { .. }));
+        assert_eq!(coverage(&reopened), "complete");
+    }
+
     // 10a. a restart between bounded scans resumes from the persisted
     //      position: no loss, no duplication, exact-once totals.
     #[test]

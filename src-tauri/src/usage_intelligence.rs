@@ -515,6 +515,10 @@ pub struct UsageIntelligenceStore {
     writable: std::sync::atomic::AtomicBool,
     last_write_ok: std::sync::atomic::AtomicBool,
     failed_bounded_sources: Mutex<std::collections::HashSet<String>>,
+    // A persisted successful scan cannot attest to work attempted after it.
+    // Revalidate ZCode after each restart, even if recording a failure was
+    // impossible because storage was unavailable.
+    zcode_restart_unverified: std::sync::atomic::AtomicBool,
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
@@ -558,6 +562,7 @@ impl UsageIntelligenceStore {
             writable: std::sync::atomic::AtomicBool::new(true),
             last_write_ok: std::sync::atomic::AtomicBool::new(true),
             failed_bounded_sources: Mutex::new(std::collections::HashSet::new()),
+            zcode_restart_unverified: std::sync::atomic::AtomicBool::new(false),
             path,
             now_ms,
             zcode_db,
@@ -567,6 +572,14 @@ impl UsageIntelligenceStore {
             retention_in_flight: std::sync::atomic::AtomicBool::new(false),
         };
         store.load_from_disk();
+        let revalidate_zcode = store.state.lock().unwrap().cursors.get(USAGE_SOURCE_ZCODE)
+            .is_some_and(|cursor| {
+                cursor.baselined && !cursor.pending_rebaseline && cursor.state == SourceState::Ok
+            });
+        store.zcode_restart_unverified.store(
+            revalidate_zcode,
+            std::sync::atomic::Ordering::SeqCst,
+        );
         *store.committed.lock().unwrap() = store.state.lock().unwrap().clone();
         // Startup retention: a plane that was closed for longer than the
         // window ages out before the first cycle runs. The committed
@@ -683,8 +696,11 @@ impl UsageIntelligenceStore {
     /// The persisted cursor of one source, when a baseline exists.
     pub fn cursor(&self, source: &str) -> Option<SourceCursor> {
         let mut cursor = self.state.lock().unwrap().cursors.get(source).cloned();
-        if self.failed_bounded_sources.lock().unwrap().contains(source) {
-            if let Some(cursor) = &mut cursor {
+        if let Some(cursor) = &mut cursor {
+            if self.failed_bounded_sources.lock().unwrap().contains(source)
+                || (source == USAGE_SOURCE_ZCODE && cursor.state == SourceState::Ok
+                    && self.zcode_restart_unverified.load(std::sync::atomic::Ordering::SeqCst))
+            {
                 cursor.state = SourceState::ReadFailure;
                 cursor.fingerprint = None;
             }
@@ -875,7 +891,11 @@ impl UsageIntelligenceStore {
             }
         };
         if changed {
-            self.persist_current();
+            if self.persist_current() && source == USAGE_SOURCE_ZCODE {
+                self.zcode_restart_unverified
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                self.failed_bounded_sources.lock().unwrap().remove(source);
+            }
         }
     }
 
@@ -945,8 +965,16 @@ impl UsageIntelligenceStore {
         let _operation = self.operation.lock().unwrap();
         if !self.generation_current(generation) { return Err("Collection invalidated".into()); }
         let stats = self.apply_scan_inner(source, scan, None);
-        if !self.last_write_succeeded() { return Err("Collection could not be persisted; cursor retained".into()); }
+        if !self.last_write_succeeded() {
+            if source == USAGE_SOURCE_ZCODE {
+                self.failed_bounded_sources.lock().unwrap().insert(source.to_string());
+            }
+            return Err("Collection could not be persisted; cursor retained".into());
+        }
         self.failed_bounded_sources.lock().unwrap().remove(source);
+        if source == USAGE_SOURCE_ZCODE {
+            self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(stats)
     }
 
@@ -977,6 +1005,9 @@ impl UsageIntelligenceStore {
             return Err("Collection could not be persisted; cursor retained".into());
         }
         self.failed_bounded_sources.lock().unwrap().remove(source);
+        if source == USAGE_SOURCE_ZCODE {
+            self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         Ok(stats)
     }
 
@@ -1162,6 +1193,7 @@ impl UsageIntelligenceStore {
         }
         if !self.last_write_succeeded() { return Err("Could not durably clear Usage Intelligence".into()); }
         self.failed_bounded_sources.lock().unwrap().clear();
+        self.zcode_restart_unverified.store(false, std::sync::atomic::Ordering::SeqCst);
         Ok(had_data)
     }
 
@@ -1215,6 +1247,11 @@ impl UsageIntelligenceStore {
             if failed.contains(&cursor.source) {
                 cursor.state = SourceState::ReadFailure;
                 cursor.detail = Some("Collection could not be persisted; cursor retained".into());
+            } else if cursor.source == USAGE_SOURCE_ZCODE && cursor.state == SourceState::Ok
+                && self.zcode_restart_unverified.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                cursor.state = SourceState::ReadFailure;
+                cursor.detail = Some("ZCode coverage requires a successful scan after restart".into());
             }
         }
         drop(failed);
@@ -2185,6 +2222,31 @@ mod tests {
         assert_eq!(persisted.state, SourceState::ScanCeiling);
         assert_eq!(persisted.watermark_ms, NOW_MS - 1_000);
         assert_eq!(reopened.stored_events().len(), 1);
+    }
+
+    #[test]
+    fn failed_unbounded_zcode_write_revokes_complete_until_retry() {
+        let (store, dir) = temp_store("unbounded-write-failure");
+        store.set_enabled(true).unwrap();
+        store.establish_baseline(USAGE_SOURCE_ZCODE, NOW_MS - 60_000, None);
+        let path = dir.path().join(USAGE_INTELLIGENCE_FILE_NAME);
+        let saved = dir.path().join("saved.json");
+        let coverage = |store: &UsageIntelligenceStore| {
+            dto_coverage(&store.aggregate(UsageRange::Today, Some(NOW_MS)), USAGE_SOURCE_ZCODE)
+                .coverage.clone()
+        };
+        assert_eq!(coverage(&store), "complete");
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        let scan = || scan_from(vec![event("zcode:new", "zai", "model", NOW_MS - 1_000)], NOW_MS - 1_000);
+        assert!(store.apply_scan_at(store.generation(), USAGE_SOURCE_ZCODE, scan()).is_err());
+        assert_eq!(coverage(&store), "uncertain");
+        assert!(store.stored_events().is_empty());
+        fs::remove_dir(&path).unwrap();
+        fs::rename(&saved, &path).unwrap();
+        store.apply_scan_at(store.generation(), USAGE_SOURCE_ZCODE, scan()).unwrap();
+        assert_eq!(coverage(&store), "complete");
+        assert_eq!(store.stored_events().len(), 1);
     }
 
     fn event(id: &str, provider: &str, model: &str, event_at: i64) -> UsageEvent {

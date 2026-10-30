@@ -13,8 +13,10 @@
   ZCode batches persist their coverage state with their cursor, and failed
   preference writes restore the last known settings and cache. Unsupported
   account schema versions are reported without rewriting the existing file.
-  A failed bounded write is reported as uncertain for the current session;
-  if storage remains unwritable, that diagnostic cannot survive restart.
+  On restart, a previously healthy ZCode cursor is reported as uncertain
+  until a fresh scan is successfully persisted. This prevents an unrecordable
+  failed write from making an older complete verdict appear current; the
+  stored cursor and historical events are preserved without a schema change.
   The full parallel Rust suite exposed an intermittent unrelated Grok Bot
   scan-slot test failure; the isolated test and serial suite passed.
   The modified code requires subsequent technical review. Release remains
