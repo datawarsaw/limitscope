@@ -335,7 +335,11 @@ export function useSettings() {
                 return next;
               });
               if (!cached) {
-                setStartupError((prev) => prev ?? USAGE_SAVE_ERROR + LOCAL_CACHE_NOTE);
+                setStartupError((prev) =>
+                  prev === USAGE_SAVE_ERROR || prev === null
+                    ? USAGE_SAVE_ERROR + LOCAL_CACHE_NOTE
+                    : prev,
+                );
               }
             })
             .catch(() => {});
@@ -514,7 +518,11 @@ export function useSettings() {
               return next;
             });
             if (!cached) {
-              setStartupError(prev => prev ?? ACCOUNT_SAVE_ERROR + LOCAL_CACHE_NOTE);
+              setStartupError(prev =>
+                prev === ACCOUNT_SAVE_ERROR || prev === null
+                  ? ACCOUNT_SAVE_ERROR + LOCAL_CACHE_NOTE
+                  : prev,
+              );
             }
           }).catch(() => {});
         })

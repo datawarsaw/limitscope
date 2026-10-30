@@ -514,6 +514,7 @@ pub struct UsageIntelligenceStore {
     generation: std::sync::atomic::AtomicU64,
     writable: std::sync::atomic::AtomicBool,
     last_write_ok: std::sync::atomic::AtomicBool,
+    failed_bounded_sources: Mutex<std::collections::HashSet<String>>,
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
     zcode_db: ZcodeDbResolver,
@@ -556,6 +557,7 @@ impl UsageIntelligenceStore {
             generation: std::sync::atomic::AtomicU64::new(0),
             writable: std::sync::atomic::AtomicBool::new(true),
             last_write_ok: std::sync::atomic::AtomicBool::new(true),
+            failed_bounded_sources: Mutex::new(std::collections::HashSet::new()),
             path,
             now_ms,
             zcode_db,
@@ -680,7 +682,14 @@ impl UsageIntelligenceStore {
 
     /// The persisted cursor of one source, when a baseline exists.
     pub fn cursor(&self, source: &str) -> Option<SourceCursor> {
-        self.state.lock().unwrap().cursors.get(source).cloned()
+        let mut cursor = self.state.lock().unwrap().cursors.get(source).cloned();
+        if self.failed_bounded_sources.lock().unwrap().contains(source) {
+            if let Some(cursor) = &mut cursor {
+                cursor.state = SourceState::ReadFailure;
+                cursor.fingerprint = None;
+            }
+        }
+        cursor
     }
 
     /// Whether the next collection pass for this source must (re-)establish
@@ -937,6 +946,7 @@ impl UsageIntelligenceStore {
         if !self.generation_current(generation) { return Err("Collection invalidated".into()); }
         let stats = self.apply_scan_inner(source, scan, None);
         if !self.last_write_succeeded() { return Err("Collection could not be persisted; cursor retained".into()); }
+        self.failed_bounded_sources.lock().unwrap().remove(source);
         Ok(stats)
     }
 
@@ -953,6 +963,10 @@ impl UsageIntelligenceStore {
         }
         let stats = self.apply_scan_inner(source, scan, Some(detail));
         if !self.last_write_succeeded() {
+            self.failed_bounded_sources
+                .lock()
+                .unwrap()
+                .insert(source.to_string());
             // The rollback keeps the old cursor, but its previous `ok`
             // verdict cannot describe the newly discovered backlog.
             if let Some(cursor) = self.state.lock().unwrap().cursors.get_mut(source) {
@@ -962,6 +976,7 @@ impl UsageIntelligenceStore {
             }
             return Err("Collection could not be persisted; cursor retained".into());
         }
+        self.failed_bounded_sources.lock().unwrap().remove(source);
         Ok(stats)
     }
 
@@ -1146,6 +1161,7 @@ impl UsageIntelligenceStore {
             self.persist_current();
         }
         if !self.last_write_succeeded() { return Err("Could not durably clear Usage Intelligence".into()); }
+        self.failed_bounded_sources.lock().unwrap().clear();
         Ok(had_data)
     }
 
@@ -1178,7 +1194,7 @@ impl UsageIntelligenceStore {
             UsageRange::ThirtyDays => (now_ms - 30 * 24 * 60 * 60_000, "30d"),
         };
 
-        let (events, enabled, collection_started_at, cursors, collecting) = {
+        let (events, enabled, collection_started_at, mut cursors, collecting) = {
             let state = self.state.lock().unwrap();
             (
                 state.events.clone(),
@@ -1193,6 +1209,15 @@ impl UsageIntelligenceStore {
                 self.is_collecting(),
             )
         };
+
+        let failed = self.failed_bounded_sources.lock().unwrap();
+        for cursor in &mut cursors {
+            if failed.contains(&cursor.source) {
+                cursor.state = SourceState::ReadFailure;
+                cursor.detail = Some("Collection could not be persisted; cursor retained".into());
+            }
+        }
+        drop(failed);
 
         // Codex rollout records predate a trustworthy owner binding. Keep
         // them in the store so existing data is not destroyed, but exclude
@@ -2140,6 +2165,11 @@ mod tests {
         assert_eq!(failed.watermark_ms, before.watermark_ms);
         assert_eq!(failed.state, SourceState::ReadFailure);
         assert!(store.stored_events().is_empty());
+        assert!(store.set_enabled(false).is_err());
+        assert_eq!(
+            store.cursor(USAGE_SOURCE_ZCODE).unwrap().state,
+            SourceState::ReadFailure
+        );
         fs::remove_dir(&path).unwrap();
         fs::rename(&backup, &path).unwrap();
         store

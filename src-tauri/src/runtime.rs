@@ -5039,6 +5039,16 @@ pub fn get_codex_accounts(
             "Unsupported account settings schema version {version}; existing file preserved"
         ));
     }
+    if handle
+        .core
+        .codex_accounts_store
+        .as_ref()
+        .is_some_and(|store| !store.is_writable())
+    {
+        return Err(
+            "Account settings file is unsupported or unavailable; existing file preserved".into(),
+        );
+    }
     Ok(handle.codex_accounts())
 }
 

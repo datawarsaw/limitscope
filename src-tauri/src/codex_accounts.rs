@@ -193,6 +193,10 @@ impl CodexAccountStore {
         self.unsupported_version
     }
 
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     /// Replaces the configuration and persists it. A failed write keeps the
     /// in-memory state (this session gates on it) and surfaces the error, so
     /// a restart falls back to the defaults rather than to a stale file
@@ -404,6 +408,19 @@ mod tests {
             r#"{ "version": 99, "accounts": [] }"#
         );
         remove_store(&path);
+    }
+
+    #[test]
+    fn missing_or_invalid_version_is_not_writable() {
+        for raw in [r#"{"accounts":[]}"#, r#"{"version":"1","accounts":[]}"#] {
+            let path = store_path("invalid-version");
+            fs::write(&path, raw).unwrap();
+            let store = CodexAccountStore::open(path.clone());
+            assert!(!store.is_writable());
+            assert!(store.set_accounts(&default_accounts()).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+            remove_store(&path);
+        }
     }
 
     #[test]
