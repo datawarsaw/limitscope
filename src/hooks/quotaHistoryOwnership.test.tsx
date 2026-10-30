@@ -87,7 +87,6 @@ describe("quota history ownership (Rust-owned, read-only TS)", () => {
         usedPercent: 42,
         observedAt: CHECKED_AT,
         account: "credential-v1:" + "a".repeat(64),
-        account: "key:3456",
       },
     ]);
     const usages = [seededUsage()];
