@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest";
  *
  * - every capability grant resolves to a command that is actually registered,
  * - the floating bar keeps exactly its read/refresh/lifecycle contract
- *   (including the attach-time refresh-interval push and the locate-ripple
+ *   (without an attach-time refresh-interval push, and with the locate-ripple
  *   overlay creation permission),
  * - every other registered command — history clears, exports, settings
  *   writes, account writes, and the legacy provider fetch commands — is
@@ -29,13 +29,11 @@ const CAPABILITIES_DIR = join(ROOT, "src-tauri", "capabilities");
 /**
  * Commands the floating window actually reaches, derived from its component
  * tree (FloatingQuotaWindow -> useProviderUsage/useSettings,
- * floatingWindowChrome, GrokBotSection, OpenDesignRefreshControl). The
- * refresh-interval push is deliberate: both webviews forward the persisted
- * interval to the Rust runtime on attach, so the floating bar must keep it.
+ * floatingWindowChrome, GrokBotSection, OpenDesignRefreshControl). It mounts
+ * useProviderUsage without onAttach, so the interval belongs to the dashboard.
  */
 const FLOATING_COMMANDS = new Set([
   "get_runtime_snapshot",
-  "set_refresh_interval",
   "request_refresh",
   "request_refresh_on_reconnect",
   "request_wallet_refresh",
@@ -96,6 +94,7 @@ const LEGACY_PROVIDER_FETCHES = [
 
 /** High-impact commands the floating bar must never reach. */
 const FLOATING_DENIED_SAMPLE = [
+  "set_refresh_interval",
   "set_quota_notifications_enabled",
   "set_wallet_monitoring",
   "set_codex_accounts",
@@ -279,6 +278,12 @@ describe("IPC window authorization", () => {
     const usageHook = readFileSync(join(ROOT, "src", "hooks", "useProviderUsage.ts"), "utf8");
     expect(usageHook).toContain('invoke<RuntimeSnapshot>("get_runtime_snapshot")');
     expect(usageHook).not.toContain('invoke("set_refresh_interval"');
+    const floatingView = readFileSync(
+      join(ROOT, "src", "components", "FloatingQuotaWindow.tsx"),
+      "utf8",
+    );
+    expect(floatingView).toContain("} = useProviderUsage();");
+    expect(floatingView).not.toContain("set_refresh_interval");
     const settingsHook = readFileSync(join(ROOT, "src", "hooks", "useSettings.ts"), "utf8");
     expect(settingsHook).toContain('invoke<void>("set_refresh_interval"');
     expect(settingsHook).toContain('invoke<OperationalSettings>("get_operational_settings")');

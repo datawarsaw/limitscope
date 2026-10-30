@@ -9,7 +9,6 @@
     "core:event:allow-listen",
     "allow-runtime-snapshot-read",
     "allow-runtime-refresh",
-    "allow-refresh-interval-set",
     "allow-operational-settings-read",
     "allow-codex-accounts-read",
     "allow-usage-intelligence-read",

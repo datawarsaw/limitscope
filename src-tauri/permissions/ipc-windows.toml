@@ -20,7 +20,7 @@ commands.allow = ["request_refresh", "request_refresh_on_reconnect", "request_wa
 
 [[permission]]
 identifier = "allow-refresh-interval-set"
-description = "Forward the persisted refresh interval to the Rust runtime on attach and change."
+description = "Change the shared runtime refresh interval from the main dashboard."
 commands.allow = ["set_refresh_interval"]
 
 [[permission]]

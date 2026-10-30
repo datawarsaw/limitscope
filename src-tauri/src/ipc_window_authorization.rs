@@ -57,7 +57,7 @@ const COMMANDS: &[(&str, bool, bool)] = &[
     ("request_refresh", true, true),
     ("request_wallet_refresh", true, true),
     ("request_refresh_on_reconnect", true, true),
-    ("set_refresh_interval", true, true),
+    ("set_refresh_interval", true, false),
     ("set_quota_notifications_enabled", true, false),
     ("set_wallet_monitoring", true, false),
     ("get_operational_settings", true, true),
@@ -369,8 +369,8 @@ fn every_registered_command_is_granted_only_where_the_capabilities_say() {
     );
     assert_eq!(
         COMMANDS.iter().filter(|(_, _, floating)| *floating).count(),
-        16,
-        "the floating bar is granted 16 application commands"
+        15,
+        "the floating bar is granted 15 application commands"
     );
     assert_eq!(
         COMMANDS
@@ -410,10 +410,10 @@ fn every_registered_command_is_granted_only_where_the_capabilities_say() {
         COMMANDS.len() * 2,
         "every dispatch produced one verdict"
     );
-    assert_eq!(allowed, 40, "24 dashboard grants + 16 floating grants");
+    assert_eq!(allowed, 39, "24 dashboard grants + 15 floating grants");
     assert_eq!(
-        window_scope, 20,
-        "the 14 dashboard-only and 6 floating-only commands are refused on the other window"
+        window_scope, 21,
+        "the 15 dashboard-only and 6 floating-only commands are refused on the other window"
     );
     assert_eq!(
         unresolved, 10,
