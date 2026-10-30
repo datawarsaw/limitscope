@@ -8,6 +8,13 @@
 
 ## Current status
 
+- npm dependency remediation (2026-10-30, local, not released): npm 12
+  lifecycle policy approves only `esbuild@0.21.5`; lockfile updates remove
+  the `source-map-js` and `undici` advisories. Six dev-dependency packages
+  remain flagged, including critical and high findings requiring explicit
+  remediation or disposition. See `docs/npm-dependency-remediation-v0.8.24.md`.
+  Release remains HOLD; Human Acceptance is unchanged.
+
 - 0.8.24 release-blocking reliability and IPC remediation (local work,
   not released): OpenCode bounded scans commit the backlog diagnostic with
   the batch and cursor, and revalidate coverage after restart. Preference
