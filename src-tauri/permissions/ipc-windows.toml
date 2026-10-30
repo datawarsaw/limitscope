@@ -1,0 +1,111 @@
+# IPC window authorization (P2).
+#
+# Defining an application permission here makes tauri-build emit the app's
+# ACL manifest. Once that manifest exists, every #[tauri::command] is denied
+# unless a capability grants it to the calling window (Tauri enforces the ACL
+# for app commands when the app defines its own permissions). Commands that
+# appear in no permission below stay registered but unreachable from any
+# window; the legacy per-provider fetch commands are intentionally left in
+# that dead-but-registered state.
+
+[[permission]]
+identifier = "allow-runtime-snapshot-read"
+description = "Read the shared runtime snapshot (providers, wallets, identity projections)."
+commands.allow = ["get_runtime_snapshot"]
+
+[[permission]]
+identifier = "allow-runtime-refresh"
+description = "Request refresh cycles from the Rust runtime owner."
+commands.allow = ["request_refresh", "request_refresh_on_reconnect", "request_wallet_refresh"]
+
+[[permission]]
+identifier = "allow-refresh-interval-set"
+description = "Forward the persisted refresh interval to the Rust runtime on attach and change."
+commands.allow = ["set_refresh_interval"]
+
+[[permission]]
+identifier = "allow-operational-settings-read"
+description = "Read Rust-owned operational settings (notifications, wallet monitoring)."
+commands.allow = ["get_operational_settings"]
+
+[[permission]]
+identifier = "allow-operational-settings-manage"
+description = "Change Rust-owned operational settings from the main dashboard."
+commands.allow = ["set_quota_notifications_enabled", "set_wallet_monitoring"]
+
+[[permission]]
+identifier = "allow-codex-accounts-read"
+description = "Read the Rust-owned Codex account configuration."
+commands.allow = ["get_codex_accounts"]
+
+[[permission]]
+identifier = "allow-codex-accounts-manage"
+description = "Change the Rust-owned Codex account configuration from the main dashboard."
+commands.allow = ["set_codex_accounts"]
+
+[[permission]]
+identifier = "allow-usage-intelligence-read"
+description = "Read the Usage Intelligence aggregation and opt-in state."
+commands.allow = ["get_usage_intelligence"]
+
+[[permission]]
+identifier = "allow-usage-intelligence-manage"
+description = "Change or clear Usage Intelligence state from the main dashboard."
+commands.allow = ["set_usage_intelligence_enabled", "clear_usage_intelligence"]
+
+[[permission]]
+identifier = "allow-history-read"
+description = "Read retained quota history."
+commands.allow = ["get_history", "get_history_range"]
+
+[[permission]]
+identifier = "allow-history-manage"
+description = "Clear or import quota history from the main dashboard."
+commands.allow = ["clear_history", "import_legacy_history"]
+
+[[permission]]
+identifier = "allow-usage-analytics-read"
+description = "Read usage analytics aggregates."
+commands.allow = ["get_usage_analytics"]
+
+[[permission]]
+identifier = "allow-provider-cache-manage"
+description = "Clear the provider cache from the main dashboard."
+commands.allow = ["clear_provider_cache"]
+
+[[permission]]
+identifier = "allow-diagnostics-export"
+description = "Export the redacted diagnostics bundle from the main dashboard."
+commands.allow = ["export_diagnostics"]
+
+[[permission]]
+identifier = "allow-usage-export"
+description = "Pick a destination and export usage history from the main dashboard."
+commands.allow = ["pick_usage_export_directory", "export_usage_history"]
+
+[[permission]]
+identifier = "allow-manual-provider-refresh"
+description = "Trigger the explicit Grok Bot / OpenDesign accessibility reads."
+commands.allow = ["refresh_grok_bot_usage", "refresh_opendesign_usage"]
+
+[[permission]]
+identifier = "allow-open-main-window"
+description = "Show and focus the main dashboard window."
+commands.allow = ["open_main_window"]
+
+[[permission]]
+identifier = "allow-floating-drag-lifecycle"
+description = "Attach, detach and restore the Rust-owned floating drag lifecycle."
+commands.allow = [
+  "attach_floating_drag_lifecycle",
+  "detach_floating_drag_lifecycle",
+  "restore_floating_drag_origin",
+]
+
+[[permission]]
+identifier = "allow-floating-monitor-observer"
+description = "Attach and detach the Rust-owned monitor-topology observer."
+commands.allow = [
+  "attach_floating_monitor_observer",
+  "detach_floating_monitor_observer",
+]

@@ -55,6 +55,11 @@ windows = { version = "0.62", features = [
   "Win32_UI_WindowsAndMessaging",
 ] }
 
+[dev-dependencies]
+# Enables tauri::test (MockRuntime plus the IPC dispatch helpers) for the IPC
+# window authorization tests. Test-only; production builds do not include it.
+tauri = { version = "2", features = ["test"] }
+
 [profile.release]
 codegen-units = 1
 lto = true

@@ -7,6 +7,8 @@ mod codex_accounts;
 mod cursor_grok_bot;
 #[cfg(test)]
 mod diagnostic_report;
+#[cfg(test)]
+mod ipc_window_authorization;
 mod diagnostics;
 mod floating_drag;
 mod floating_monitor;
