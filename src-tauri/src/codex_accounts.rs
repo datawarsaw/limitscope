@@ -159,13 +159,20 @@ struct PersistedCodexAccountsEnvelope {
 /// from the settings lane.
 pub struct CodexAccountStore {
     writable: bool,
+    unsupported_version: Option<u64>,
     path: PathBuf,
     accounts: Mutex<Vec<CodexAccountConfig>>,
 }
 
 impl CodexAccountStore {
     pub fn open(path: PathBuf) -> Self {
+        let unsupported_version = fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            .filter(|version| *version != SCHEMA_VERSION as u64);
         let store = Self {
+            unsupported_version,
             writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
                 let normalized = serde_json::to_value(parse_envelope(&value.to_string())).ok();
                 value.get("accounts") == normalized.as_ref()
@@ -180,6 +187,10 @@ impl CodexAccountStore {
     /// The effective configuration, always normalized to the known ids.
     pub fn accounts(&self) -> Vec<CodexAccountConfig> {
         self.accounts.lock().unwrap().clone()
+    }
+
+    pub fn unsupported_version(&self) -> Option<u64> {
+        self.unsupported_version
     }
 
     /// Replaces the configuration and persists it. A failed write keeps the
@@ -386,6 +397,12 @@ mod tests {
         fs::write(&path, r#"{ "version": 99, "accounts": [] }"#).expect("write fixture");
         let store = CodexAccountStore::open(path.clone());
         assert_eq!(store.accounts(), default_accounts());
+        assert_eq!(store.unsupported_version(), Some(99));
+        assert!(store.set_accounts(&default_accounts()).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{ "version": 99, "accounts": [] }"#
+        );
         remove_store(&path);
     }
 

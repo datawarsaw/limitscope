@@ -283,3 +283,261 @@ describe("Rust-owned settings persistence", () => {
     expect(mocks.invoke).not.toHaveBeenCalled();
   });
 });
+
+describe("Rust-owned settings rollback and load diagnostics", () => {
+  const SCHEMA_ERROR =
+    "Unsupported account settings schema version 99; existing file preserved";
+
+  beforeEach(() => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+
+  it("rolls the Usage Intelligence opt-in back in React and the cache when Rust rejects the write", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.settings.usageIntelligence).toBe(true));
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_usage_intelligence_enabled") throw "disk full";
+      return base(command, args);
+    });
+    act(() => result.current.setUsageIntelligence(false));
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Usage Intelligence preference could not be saved",
+      ),
+    );
+    expect(result.current.settings.usageIntelligence).toBe(true);
+    expect(stored().usageIntelligence).toBe(true);
+    expect(rustEnabled).toBe(true);
+  });
+
+  it("keeps the committed Usage Intelligence value when the write and the recovery read both fail", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.settings.usageIntelligence).toBe(true));
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_usage_intelligence_enabled") throw new Error("write failed");
+      if (command === "get_usage_intelligence") throw new Error("recovery read failed");
+      return base(command, args);
+    });
+    act(() => result.current.setUsageIntelligence(false));
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Usage Intelligence preference could not be saved",
+      ),
+    );
+    expect(result.current.settings.usageIntelligence).toBe(true);
+    expect(stored().usageIntelligence).toBe(true);
+    expect(rustEnabled).toBe(true);
+  });
+
+  it("rolls account settings back in React and the cache when Rust rejects the write", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() =>
+      expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts),
+    );
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_codex_accounts") throw new Error("write failed");
+      return base(command, args);
+    });
+    act(() => result.current.setCodexAccount("openai-codex", { alias: "Unsaved" }));
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Account settings could not be saved",
+      ),
+    );
+    expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts);
+    expect(stored().codexAccounts.accounts).toEqual(originalAccounts);
+    expect(rustAccounts).toEqual(originalAccounts);
+  });
+
+  it("keeps the committed accounts when the write and the recovery read both fail", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() =>
+      expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts),
+    );
+    const base = mocks.invoke.getMockImplementation()!;
+    let accountReads = 0;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_codex_accounts") {
+        accountReads += 1;
+        // The read before the write succeeds; the recovery read fails.
+        if (accountReads > 1) throw new Error("recovery read failed");
+      }
+      if (command === "set_codex_accounts") throw new Error("write failed");
+      return base(command, args);
+    });
+    act(() => result.current.setCodexAccount("openai-codex:secondary", { alias: "Lost" }));
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Account settings could not be saved",
+      ),
+    );
+    expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts);
+    expect(stored().codexAccounts.accounts).toEqual(originalAccounts);
+  });
+
+  it("reports a stale local cache without keeping the failed account edit", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() =>
+      expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts),
+    );
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_codex_accounts") throw new Error("write failed");
+      return base(command, args);
+    });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new Error("quota exceeded");
+    });
+    act(() => result.current.setCodexAccount("openai-codex", { alias: "Unsaved" }));
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "local preference cache could not be updated",
+      ),
+    );
+    expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts);
+    expect(rustAccounts).toEqual(originalAccounts);
+  });
+
+  it("rolls queued Usage Intelligence failures back to the pre-edit value before Rust replies", async () => {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+      ...DEFAULT_SETTINGS,
+      codexAccounts: { accounts: originalAccounts },
+      usageIntelligence: true,
+    }));
+    const hydration = deferred<{ enabled: boolean }>();
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_usage_intelligence") return hydration.promise;
+      if (command === "set_usage_intelligence_enabled") throw new Error("write failed");
+      return base(command, args);
+    });
+    const { result } = renderHook(() => useSettings());
+    act(() => {
+      result.current.setUsageIntelligence(false);
+      result.current.setUsageIntelligence(true);
+    });
+    await act(async () => {
+      hydration.reject(new Error("recovery read failed"));
+    });
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Usage Intelligence preference could not be saved",
+      ),
+    );
+    expect(result.current.settings.usageIntelligence).toBe(true);
+    expect(stored().usageIntelligence).toBe(true);
+  });
+
+  it("rolls queued account failures back to the pre-edit configuration before Rust replies", async () => {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify({
+      ...DEFAULT_SETTINGS,
+      codexAccounts: { accounts: originalAccounts },
+      usageIntelligence: true,
+    }));
+    const hydration = deferred<CodexAccountSettings[]>();
+    let accountReads = 0;
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_codex_accounts") {
+        accountReads += 1;
+        return accountReads === 1 ? hydration.promise : structuredClone(originalAccounts);
+      }
+      if (command === "set_codex_accounts") throw new Error("write failed");
+      return base(command, args);
+    });
+    const { result } = renderHook(() => useSettings());
+    act(() => {
+      result.current.setCodexAccount("openai-codex", { alias: "First" });
+      result.current.setCodexAccount("openai-codex", { alias: "Second" });
+    });
+    await act(async () => {
+      hydration.resolve(structuredClone(originalAccounts));
+    });
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Account settings could not be saved",
+      ),
+    );
+    expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts);
+    expect(stored().codexAccounts.accounts).toEqual(originalAccounts);
+  });
+
+  it("keeps a successful Usage Intelligence change while a concurrent account edit rolls back", async () => {
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() =>
+      expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts),
+    );
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "set_codex_accounts") throw new Error("write failed");
+      return base(command, args);
+    });
+    act(() => {
+      result.current.setCodexAccount("openai-codex", { alias: "Unsaved" });
+      result.current.setUsageIntelligence(false);
+    });
+    await waitFor(() =>
+      expect(result.current.startupError).toContain(
+        "Account settings could not be saved",
+      ),
+    );
+    await waitFor(() => expect(rustEnabled).toBe(false));
+    expect(result.current.settings.codexAccounts.accounts).toEqual(originalAccounts);
+    expect(result.current.settings.usageIntelligence).toBe(false);
+    expect(stored().codexAccounts.accounts).toEqual(originalAccounts);
+    expect(stored().usageIntelligence).toBe(false);
+  });
+
+  it("keeps the safe schema message and makes it user-visible", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_codex_accounts") throw SCHEMA_ERROR;
+      return base(command, args);
+    });
+    render(<SettingsNavigation />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Settings" }));
+    await waitFor(() =>
+      expect(screen.getByRole("alert").textContent).toBe(SCHEMA_ERROR),
+    );
+    expect(protectedWrites()).toEqual([]);
+  });
+
+  it("replaces raw account load detail with a generic diagnostic", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_codex_accounts") {
+        throw "C:\\Users\\fixture\\codex-accounts-v1.json: access denied";
+      }
+      return base(command, args);
+    });
+    render(<SettingsNavigation />);
+    fireEvent.click(screen.getByRole("button", { name: "Toggle Settings" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Account settings could not be loaded. Existing account settings were preserved.",
+    );
+    expect(alert.textContent).not.toContain("codex-accounts-v1");
+    expect(protectedWrites()).toEqual([]);
+  });
+
+  it("keeps the unsupported-schema diagnostic when an account edit is refused", async () => {
+    const base = mocks.invoke.getMockImplementation()!;
+    mocks.invoke.mockImplementation(async (command, args) => {
+      if (command === "get_codex_accounts" || command === "set_codex_accounts") {
+        throw SCHEMA_ERROR;
+      }
+      return base(command, args);
+    });
+    const { result } = renderHook(() => useSettings());
+    await waitFor(() => expect(result.current.startupError).toBe(SCHEMA_ERROR));
+    act(() => result.current.setCodexAccount("openai-codex", { alias: "Blocked" }));
+    await waitFor(() =>
+      expect(result.current.settings.codexAccounts.accounts[0].alias).toBe(""),
+    );
+    expect(result.current.startupError).toBe(SCHEMA_ERROR);
+    expect(protectedWrites()).toEqual([]);
+  });
+});

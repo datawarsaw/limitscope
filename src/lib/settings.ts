@@ -230,14 +230,19 @@ export function mergeSettingsWithRaw(
   return JSON.stringify(merged);
 }
 
-export function saveSettings(settings: Settings): void {
+/** Returns false when the WebView cache could not be written (quota, private
+ * mode, or a storage error). The UI keeps its in-memory value; callers that
+ * must explain a stale cache can surface the result. */
+export function saveSettings(settings: Settings): boolean {
   try {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
       mergeSettingsWithRaw(localStorage.getItem(SETTINGS_STORAGE_KEY), settings),
     );
+    return true;
   } catch {
     // Persistence is best-effort; the UI keeps working without it.
+    return false;
   }
 }
 

@@ -8,6 +8,14 @@
 
 ## Current status
 
+- Final 0.8.24 reliability remediation (local source candidate, not released):
+  Usage Intelligence retention runs independently of source scans, bounded
+  ZCode batches persist their coverage state with their cursor, and failed
+  preference writes restore the last known settings and cache. Unsupported
+  account schema versions are reported without rewriting the existing file.
+  The modified code requires subsequent technical review. Release remains
+  HOLD; existing Human Acceptance records are unchanged.
+
 - Reliability remediation (2026-10-29, local source candidate, not released):
   `codex/settings-persistence-hotfix` now includes ordered durable stores,
   generation-fenced background Usage Intelligence, capacity-safe cursors,

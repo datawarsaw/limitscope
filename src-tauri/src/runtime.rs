@@ -5026,8 +5026,20 @@ pub fn set_wallet_monitoring(
 /// owns the effective configuration, so the drawer reads it from here
 /// instead of assuming its own copy is the one in force.
 #[tauri::command]
-pub fn get_codex_accounts(handle: tauri::State<RuntimeHandle>) -> Vec<CodexAccountConfig> {
-    handle.codex_accounts()
+pub fn get_codex_accounts(
+    handle: tauri::State<RuntimeHandle>,
+) -> Result<Vec<CodexAccountConfig>, String> {
+    if let Some(version) = handle
+        .core
+        .codex_accounts_store
+        .as_ref()
+        .and_then(|store| store.unsupported_version())
+    {
+        return Err(format!(
+            "Unsupported account settings schema version {version}; existing file preserved"
+        ));
+    }
+    Ok(handle.codex_accounts())
 }
 
 /// Applies the OpenAI/Codex account configuration (settings drawer).

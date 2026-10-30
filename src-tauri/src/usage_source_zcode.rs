@@ -47,6 +47,8 @@
 //!   duplicates. While a backlog is deferred the late-commit sweep is
 //!   skipped: a late row rides the lookback band until the draining
 //!   scan sweeps it, or ages out (the documented boundary honesty).
+//!   The bounded batch and `scanCeiling` diagnostic are committed together,
+//!   so an unsuccessful write cannot advance the cursor independently.
 //! - The watermark advances through every row of the committed batch —
 //!   accepted and rejected alike. Validation is a deterministic
 //!   function of the row's content, so a permanently malformed row can
@@ -414,42 +416,33 @@ fn collect_from_live(
         }
     }
 
-    let stats = match store.apply_scan_at(generation,
-        USAGE_SOURCE_ZCODE,
-        SourceScan {
-            watermark_ms: new_watermark,
-            fingerprint,
-            rejected,
-            usage_not_reported: 0,
-            events,
-            files: Vec::new(),
-            batch_end,
-        },
-    ) { Ok(stats) => stats, Err(detail) => return ZcodeScanOutcome::ReadFailure(detail) };
+    let scan = SourceScan {
+        watermark_ms: new_watermark,
+        fingerprint,
+        rejected,
+        usage_not_reported: 0,
+        events,
+        files: Vec::new(),
+        batch_end,
+    };
+    // Commit the deferred-backlog diagnostic with the batch and cursor in
+    // one durable replacement. A failed write rolls back all three.
+    let result = if bounded {
+        store.apply_bounded_scan_at(
+            generation, USAGE_SOURCE_ZCODE, scan,
+            format!("backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch (watermark now {new_watermark}) and continue on the next scan"),
+        )
+    } else {
+        store.apply_scan_at(generation, USAGE_SOURCE_ZCODE, scan)
+    };
+    let stats = match result {
+        Ok(stats) => stats,
+        Err(detail) => return ZcodeScanOutcome::ReadFailure(detail),
+    };
     if store.cursor(USAGE_SOURCE_ZCODE).is_some_and(|cursor| cursor.state == SourceState::ScanCeiling) {
         return ZcodeScanOutcome::Bounded {
             accepted: stats.accepted, duplicates: stats.duplicates, rejected: stats.rejected,
             watermark_ms: store.cursor(USAGE_SOURCE_ZCODE).map(|cursor| cursor.watermark_ms).unwrap_or(0),
-        };
-    }
-    if bounded {
-        // Surface the deferred remainder through the existing source
-        // diagnostics; the state heals to `ok` on the scan that drains
-        // the window (apply_scan), and progress is observable through
-        // the advancing watermark.
-        store.mark_source_state_at(generation,
-            USAGE_SOURCE_ZCODE,
-            SourceState::ScanCeiling,
-            Some(format!(
-                "backlog exceeds the {SCAN_CEILING}-row scan bound; committed a bounded batch \
-                 (watermark now {new_watermark}) and continue on the next scan"
-            )),
-        );
-        return ZcodeScanOutcome::Bounded {
-            accepted: stats.accepted,
-            duplicates: stats.duplicates,
-            rejected: stats.rejected,
-            watermark_ms: new_watermark,
         };
     }
     ZcodeScanOutcome::Collected {

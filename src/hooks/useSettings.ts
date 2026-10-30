@@ -34,6 +34,33 @@ import {
 
 
 type OperationalSettings = { revision: number; quotaNotifications: boolean; monitored: Record<string, boolean> };
+
+const USAGE_SAVE_ERROR =
+  "Usage Intelligence preference could not be saved. Please retry.";
+const ACCOUNT_SAVE_ERROR = "Account settings could not be saved. Please retry.";
+const LOCAL_CACHE_NOTE = " The local preference cache could not be updated.";
+const ACCOUNT_LOAD_ERROR_GENERIC =
+  "Account settings could not be loaded. Existing account settings were preserved.";
+
+// Rust rejects an unsupported account store with this exact, already-sanitized
+// sentence. Anything else may contain paths or internal detail, so the UI gets
+// a fixed message instead of the raw IPC error.
+const UNSUPPORTED_ACCOUNT_SCHEMA =
+  /^Unsupported account settings schema version \d+; existing file preserved$/;
+
+function accountLoadErrorText(error: unknown): string {
+  const raw =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : "";
+  const message = raw.trim();
+  return UNSUPPORTED_ACCOUNT_SCHEMA.test(message)
+    ? message
+    : ACCOUNT_LOAD_ERROR_GENERIC;
+}
+
 export function useSettings() {
   const [settings, setSettings] = useState<Settings>(loadSettings);
   const settingsRef = useRef(settings);
@@ -44,6 +71,19 @@ export function useSettings() {
   const usageEdit = useRef(0);
   const accountWrites = useRef<Promise<void>>(Promise.resolve());
   const usageWrites = useRef<Promise<void>>(Promise.resolve());
+  // Last value confirmed by Rust. A failed durable write returns here, so the
+  // React state and this WebView's cache cannot keep an optimistic value even
+  // when the recovery read fails too.
+  const accountsCommitted = useRef<CodexAccountSettings[] | null>(null);
+  const usageCommitted = useRef<boolean | null>(null);
+  // Before the first confirmed Rust reply there is no committed value. The
+  // chain base is the pre-edit value captured when an unresolved edit chain
+  // starts, so a later queued failure can never roll back to another edit's
+  // optimistic value.
+  const accountsBase = useRef<CodexAccountSettings[] | null>(null);
+  const usageBase = useRef<boolean | null>(null);
+  const accountsPending = useRef(0);
+  const usagePending = useRef(0);
 
   const operationalRevision = useRef(-1);
   const operationalWrites = useRef<Promise<void>>(Promise.resolve());
@@ -84,10 +124,13 @@ export function useSettings() {
     void invoke<CodexAccountSettings[]>("get_codex_accounts")
       .then((accounts) => {
         if (cancelled || accountsEdit.current !== accountsVersion) return;
+        accountsCommitted.current = accounts;
         setSettings((prev) => ({ ...prev, codexAccounts: { accounts } }));
       })
       .catch((error) => {
         console.error("Failed to load the OpenAI/Codex account settings", error);
+        if (cancelled) return;
+        setStartupError((prev) => prev ?? accountLoadErrorText(error));
       });
     // Existing read-only projection: never probes sources or starts collection.
     void invoke<{ enabled: boolean }>("get_usage_intelligence", {
@@ -95,6 +138,7 @@ export function useSettings() {
     })
       .then(({ enabled }) => {
         if (cancelled || usageEdit.current !== usageVersion) return;
+        usageCommitted.current = enabled;
         setSettings((prev) => ({ ...prev, usageIntelligence: enabled }));
       })
       .catch((error) => {
@@ -231,17 +275,72 @@ export function useSettings() {
       return next;
     });
     if (isRunningInTauri()) {
+      if (usagePending.current === 0) {
+        usageBase.current = settingsRef.current.usageIntelligence;
+      }
+      usagePending.current += 1;
+      const rollbackValue = () =>
+        usageCommitted.current ?? usageBase.current ?? settingsRef.current.usageIntelligence;
+      const settled = () => {
+        usagePending.current -= 1;
+        if (usagePending.current === 0) usageBase.current = null;
+      };
       // An explicit choice is valid even if the stale cache already had it.
       usageWrites.current = usageWrites.current
-        .then(() => invoke<void>("set_usage_intelligence_enabled", {
-          enabled: usageIntelligence,
-        }))
+        .then(() =>
+          invoke<void>("set_usage_intelligence_enabled", {
+            enabled: usageIntelligence,
+          }).then(() => {
+            usageCommitted.current = usageIntelligence;
+            setStartupError((prev) =>
+              prev === USAGE_SAVE_ERROR || prev === USAGE_SAVE_ERROR + LOCAL_CACHE_NOTE
+                ? null
+                : prev,
+            );
+          }),
+        )
         .catch((error) => {
           console.error("Failed to sync the Usage Intelligence setting", error);
-          setStartupError("Usage Intelligence preference could not be saved. Please retry.");
+          // A newer explicit choice owns the UI; its own write settles it.
+          if (edit !== usageEdit.current) return;
+          // Roll back React and the WebView cache to the last value Rust
+          // confirmed before asking Rust again. If that recovery read also
+          // fails, the committed value is still the honest state.
+          const committed = rollbackValue();
+          const persisted = saveSettings({
+            ...settingsRef.current,
+            usageIntelligence: committed,
+          });
+          // Re-save inside the updater so a concurrent edit's value cannot be
+          // dropped from the merged cache write.
+          setSettings((prev) => {
+            if (prev.usageIntelligence === committed) return prev;
+            const next = { ...prev, usageIntelligence: committed };
+            saveSettings(next);
+            return next;
+          });
+          setStartupError(persisted ? USAGE_SAVE_ERROR : USAGE_SAVE_ERROR + LOCAL_CACHE_NOTE);
           void invoke<{ enabled: boolean }>("get_usage_intelligence", { query: { range: "today" } })
-            .then(value => { if (edit === usageEdit.current) setSettings(prev => ({ ...prev, usageIntelligence: value.enabled })); }).catch(() => {});
-        });
+            .then((value) => {
+              if (edit !== usageEdit.current) return;
+              usageCommitted.current = value.enabled;
+              const cached = saveSettings({
+                ...settingsRef.current,
+                usageIntelligence: value.enabled,
+              });
+              setSettings((prev) => {
+                if (prev.usageIntelligence === value.enabled) return prev;
+                const next = { ...prev, usageIntelligence: value.enabled };
+                saveSettings(next);
+                return next;
+              });
+              if (!cached) {
+                setStartupError((prev) => prev ?? USAGE_SAVE_ERROR + LOCAL_CACHE_NOTE);
+              }
+            })
+            .catch(() => {});
+        })
+        .finally(settled);
     }
   }, []);
 
@@ -341,26 +440,85 @@ export function useSettings() {
         return next;
       });
       if (!isRunningInTauri()) return;
+      if (accountsPending.current === 0) {
+        accountsBase.current = settingsRef.current.codexAccounts.accounts;
+      }
+      accountsPending.current += 1;
+      const rollbackAccounts = () =>
+        accountsCommitted.current ??
+        accountsBase.current ??
+        settingsRef.current.codexAccounts.accounts;
+      const settled = () => {
+        accountsPending.current -= 1;
+        if (accountsPending.current === 0) accountsBase.current = null;
+      };
       accountWrites.current = accountWrites.current
         .then(async () => {
           const current = await invoke<CodexAccountSettings[]>("get_codex_accounts");
           const accounts = withCodexAccount(current, accountId, patch);
-          if (accounts === current) return;
+          if (accounts === current) {
+            accountsCommitted.current = current;
+            return;
+          }
           await invoke("set_codex_accounts", { accounts });
+          accountsCommitted.current = accounts;
           if (edit !== accountsEdit.current) return;
           setSettings((prev) => {
             const next = { ...prev, codexAccounts: { accounts } };
             saveSettings(next);
             return next;
           });
+          setStartupError((prev) =>
+            prev === ACCOUNT_SAVE_ERROR ||
+            prev === ACCOUNT_SAVE_ERROR + LOCAL_CACHE_NOTE ||
+            prev === ACCOUNT_LOAD_ERROR_GENERIC
+              ? null
+              : prev,
+          );
         })
         .catch((error) => {
           console.error("Failed to sync the OpenAI/Codex account settings", error);
-          setStartupError("Account settings could not be saved. Please retry.");
+          if (edit !== accountsEdit.current) return;
+          // Restore the last configuration Rust confirmed, in React and in
+          // this WebView's cache, before the recovery read. A failed recovery
+          // leaves that confirmed configuration in place.
+          const committed = rollbackAccounts();
+          const persistRollback = () => {
+            const persisted = saveSettings({
+              ...settingsRef.current,
+              codexAccounts: { accounts: committed },
+            });
+            setSettings((prev) => {
+              if (prev.codexAccounts.accounts === committed) return prev;
+              const next = { ...prev, codexAccounts: { accounts: committed } };
+              saveSettings(next);
+              return next;
+            });
+            setStartupError((prev) => {
+              // The safe schema diagnostic explains why saving is refused;
+              // a later generic message would hide that cause.
+              if (prev && UNSUPPORTED_ACCOUNT_SCHEMA.test(prev)) return prev;
+              return persisted ? ACCOUNT_SAVE_ERROR : ACCOUNT_SAVE_ERROR + LOCAL_CACHE_NOTE;
+            });
+            return persisted;
+          };
+          persistRollback();
           void invoke<CodexAccountSettings[]>("get_codex_accounts").then(accounts => {
-            if (edit === accountsEdit.current) setSettings(prev => ({ ...prev, codexAccounts: { accounts } }));
+            if (edit !== accountsEdit.current) return;
+            accountsCommitted.current = accounts;
+            const cached = saveSettings({ ...settingsRef.current, codexAccounts: { accounts } });
+            setSettings(prev => {
+              if (prev.codexAccounts.accounts === accounts) return prev;
+              const next = { ...prev, codexAccounts: { accounts } };
+              saveSettings(next);
+              return next;
+            });
+            if (!cached) {
+              setStartupError(prev => prev ?? ACCOUNT_SAVE_ERROR + LOCAL_CACHE_NOTE);
+            }
           }).catch(() => {});
-        });
+        })
+        .finally(settled);
     },
     [],
   );
@@ -476,6 +634,9 @@ export function useSettings() {
       });
       await invoke("set_codex_accounts", { accounts: defaults.codexAccounts.accounts });
       await invoke("set_usage_intelligence_enabled", { enabled: defaults.usageIntelligence });
+      // The reset is the new confirmed Rust state for both protected stores.
+      accountsCommitted.current = defaults.codexAccounts.accounts;
+      usageCommitted.current = defaults.usageIntelligence;
     } catch (error) {
       console.error("Failed to push the reset preferences to the runtime", error);
       return { ok: false };
