@@ -2,8 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
-const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8");
-const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
+const release = readFileSync(new URL("../.github/workflows/release.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8").replace(/\r\n/g, "\n");
 const validation = release.split("  validation:\n")[1].split("\n  windows:\n")[0];
 const signing = release.split("\n  windows:\n")[1];
 
