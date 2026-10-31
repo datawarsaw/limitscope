@@ -105,7 +105,8 @@ export function useQuotaPredictions(
       const legacy = readLegacyHistory();
       if (!legacy.present) return;
       try {
-        await importLegacyHistory(legacy.observations);
+        const imported = await importLegacyHistory(legacy.observations);
+        if (imported.rejected > 0) return;
       } catch (error) {
         console.error("Failed to import the legacy quota history", error);
         return;

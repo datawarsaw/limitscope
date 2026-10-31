@@ -133,21 +133,17 @@ describe("history for current accounts", () => {
     ];
     expect(historyForCurrentAccounts(stored, current)).toEqual([
       observation({ providerId: "codex", windowLabel: "5h", usedPercent: 30 }),
-      observation({ providerId: "opencode-go", windowLabel: "5-hour", usedPercent: 90 }),
     ]);
   });
 
-  it("treats a blank identity token as unattributed", () => {
+  it("rejects history when the current identity is blank", () => {
     const stored = [
       observation({ providerId: "opencode-go", windowLabel: "5-hour", usedPercent: 10 }),
       observation({ providerId: "opencode-go", windowLabel: "5-hour", usedPercent: 20, account: A }),
     ];
-    // A blank token proves nothing, so the provider is treated as
-    // unattributed: unattributed history flows, partitioned history does not.
+    // A blank token proves nothing; neither legacy nor attributed history is eligible.
     const current = usage({ id: "opencode-go", account: { label: "key ••????", identity: "  " } });
-    expect(historyForCurrentAccounts(stored, [current])).toEqual([
-      observation({ providerId: "opencode-go", windowLabel: "5-hour", usedPercent: 10 }),
-    ]);
+    expect(historyForCurrentAccounts(stored, [current])).toEqual([]);
   });
 });
 

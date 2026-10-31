@@ -95,10 +95,10 @@ export function readLegacyHistory(): {
         observations: (parsed as { observations: unknown[] }).observations,
       };
     }
-    return { present: true, observations: [] };
+    return { present: false, observations: [] };
   } catch {
-    // Corrupt JSON: nothing to import, but the key must still go.
-    return { present: true, observations: [] };
+    // Keep malformed migration sources for explicit recovery.
+    return { present: false, observations: [] };
   }
 }
 

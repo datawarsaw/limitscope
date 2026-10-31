@@ -7,12 +7,17 @@ mod codex_accounts;
 mod cursor_grok_bot;
 #[cfg(test)]
 mod diagnostic_report;
+#[cfg(test)]
+mod ipc_window_authorization;
 mod diagnostics;
 mod floating_drag;
 mod floating_monitor;
 mod grok;
 mod grok_bot;
 mod history;
+mod durable_file;
+mod credential_identity;
+mod sqlite_snapshot;
 mod last_good;
 mod local_data;
 mod minimax_token_plan;
@@ -169,6 +174,7 @@ fn main() {
             runtime::set_refresh_interval,
             runtime::set_quota_notifications_enabled,
             runtime::set_wallet_monitoring,
+            runtime::get_operational_settings,
             runtime::get_codex_accounts,
             runtime::set_codex_accounts,
             history::get_history,

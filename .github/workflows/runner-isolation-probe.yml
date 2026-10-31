@@ -1,0 +1,309 @@
+name: Nonproduction runner isolation probe (pull_request)
+
+# NONPRODUCTION probe for LimitScope v0.8.24 release isolation assumptions.
+#
+# Purpose: verify on real GitHub-hosted Windows runners, without touching the
+# production Release workflow, that:
+#   1. Each job runs on an independent hosted runner identity (fresh VM).
+#   2. Every probe job explicitly distinguishes the pull-request merge SHA
+#      from the PR source branch SHA, and verifies the PR source branch tip
+#      sits EXACTLY one commit on top of the pinned release-candidate SHA.
+#   3. No workspace state transfers between jobs (canary planted in job A is
+#      absent in job B's fresh workspace).
+#   4. No release secrets are mounted anywhere in the probe.
+#   5. A downstream job is SKIPPED (not run) after an intentionally failed
+#      validation - mirroring the bare `needs:` shape of release.yml.
+#
+# Trigger model (this file is NOT on the default branch by design):
+#   - `pull_request` workflows execute the workflow file taken from the pull
+#     request's merge ref, so this file never needs to exist on `main`. A
+#     `workflow_dispatch` trigger was deliberately NOT added because dispatch
+#     registration would require the file on the default branch.
+#   - `pull_request_target` is deliberately NOT used: it runs against the
+#     base branch with base-branch token scope. Only plain `pull_request`.
+#   - The per-job `if` guard restricts execution to the designated same-repo
+#     probe branch, so ordinary pull requests to main never run this probe.
+#
+# Hard guarantees by construction:
+#   - References NO secrets (no `secrets:` context anywhere in this file).
+#   - No signing, no installer publication, no release/tag/push operations.
+#   - permissions: contents: read only (workflow level and every job);
+#     checkout persists no credentials; the full fetch is read-only.
+#   - No actions/cache, no artifact upload/download: nothing transfers
+#     between jobs except GitHub's own `needs:` dependency edges.
+#   - Separate concurrency group from the production release
+#     (limitscope-publication).
+#
+# Expected result (a red run is the EXPECTED outcome):
+#   probe_validate SUCCESS -> probe_fresh_and_fail FAILURE (intentional)
+#   -> probe_downstream SKIPPED. The pass criteria are the step-level
+#   assertions, the printed SHA distinction evidence, and the skipped
+#   downstream job - NOT the overall run status.
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runner-isolation-probe
+  cancel-in-progress: false
+
+env:
+  # Pinned LimitScope v0.8.24 release-candidate SHA. The probe branch tip is
+  # ONE nonproduction commit on top of it; every probe job asserts that
+  # parentage and the release candidate's content identity.
+  EXPECTED_SOURCE_SHA: b338ef62d0035b4dd7f95fb47a059da1a76ffb68
+
+jobs:
+  probe_validate:
+    name: Probe A - event SHA checks, clean checkout, no secrets, plant canary
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'probe/hosted-isolation-v0824'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Record event identity and assert the PR source tip is not the release candidate itself
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.EXPECTED_SOURCE_SHA }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_MERGE_COMMIT_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_MERGE_SHA: ${{ github.sha }}
+          PR_HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "probe=probe_validate (event level)"
+            echo "event_name=$GITHUB_EVENT_NAME"
+            echo "pr_number=$PR_NUMBER"
+            echo "pr_head_branch=$PR_HEAD_REF"
+            echo "pr_source_tip=$PR_HEAD_SHA (github.event.pull_request.head.sha)"
+            echo "pr_merge_commit_sha=$PR_MERGE_COMMIT_SHA"
+            echo "pr_base_sha=$PR_BASE_SHA"
+            echo "event_merge_sha=$EVENT_MERGE_SHA (github.sha)"
+            echo "expected_release_candidate=$EXPECTED_SOURCE_SHA"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "FAIL: EXPECTED_SOURCE_SHA is not a 40-hex SHA"; exit 1; }
+          [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "FAIL: PR head SHA is not a 40-hex SHA"; exit 1; }
+          if [ "$PR_HEAD_SHA" = "$EXPECTED_SOURCE_SHA" ]; then
+            echo "FAIL: the PR source branch tip IS the release-candidate SHA."
+            echo "The probe branch must carry one separate NONPRODUCTION commit on top of it."
+            exit 1
+          fi
+          echo "ok: PR source tip is the nonproduction probe commit; release candidate is expected as its parent"
+
+      - name: Checkout the pull request merge ref with full history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify merge SHA vs source branch SHA and release-candidate parentage
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.EXPECTED_SOURCE_SHA }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_MERGE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "checked-out HEAD:    $ACTUAL_SHA"
+          echo "event merge SHA:     $EVENT_MERGE_SHA"
+          echo "pr source tip:       $PR_HEAD_SHA"
+          echo "expected RC parent:  $EXPECTED_SOURCE_SHA"
+          test "$ACTUAL_SHA" = "$EVENT_MERGE_SHA"
+          if git rev-parse -q --verify "$ACTUAL_SHA^2" >/dev/null 2>&1; then
+            SECOND_PARENT=$(git rev-parse "$ACTUAL_SHA^2")
+            test "$SECOND_PARENT" = "$PR_HEAD_SHA"
+            test "$EVENT_MERGE_SHA" != "$PR_HEAD_SHA"
+            echo "ok: true merge commit observed"
+            echo "ok: merge SHA ($EVENT_MERGE_SHA) explicitly differs from source branch SHA ($PR_HEAD_SHA)"
+            echo "ok: merge commit second parent == PR source branch tip"
+          else
+            echo "note: GitHub resolved the merge ref to the source branch tip itself (fast-forward merge)"
+            echo "note: merge SHA == source branch SHA == $EVENT_MERGE_SHA (explicitly recorded)"
+          fi
+          RC_PARENT=$(git rev-parse "$PR_HEAD_SHA^")
+          test "$RC_PARENT" = "$EXPECTED_SOURCE_SHA"
+          echo "ok: PR source tip's first parent is exactly the pinned release-candidate SHA"
+          RC_SUBJECT=$(git log -1 --format=%s "$EXPECTED_SOURCE_SHA")
+          test "$RC_SUBJECT" = "Make the updater signature verifier importable by vitest"
+          echo "ok: release-candidate commit subject matches ($RC_SUBJECT)"
+          grep -q '"version": "0.8.24"' package.json
+          grep -q '"version": "0.8.24"' src-tauri/tauri.conf.json
+          echo "ok: version surfaces carry 0.8.24"
+          test -z "$(git status --porcelain)"
+          echo "ok: clean tree at the checked-out merge ref"
+
+      - name: Assert no release secrets are mounted
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD RELEASES_PAT; do
+            if [ -n "${!v:-}" ]; then
+              echo "FAIL: $v is mounted in a nonproduction probe."
+              exit 1
+            fi
+            echo "ok: $v not present in environment"
+          done
+          if grep -qiE 'extraheader|authorization' .git/config; then
+            echo "FAIL: persisted credentials found in .git/config"
+            exit 1
+          fi
+          echo "ok: no persisted credentials in .git/config"
+
+      - name: Record runner identity (Probe A)
+        shell: bash
+        run: |
+          {
+            echo "probe=probe_validate (runner level)"
+            echo "runner_name=$RUNNER_NAME"
+            echo "runner_environment=$RUNNER_ENVIRONMENT"
+            echo "machine=$(hostname)"
+            echo "image=${ImageOS:-} ${ImageVersion:-}"
+            echo "workspace=$GITHUB_WORKSPACE"
+          } | tee probe-a-identity.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Plant workspace canary
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "canary planted by probe_validate on $RUNNER_NAME at $(date -u +%Y-%m-%dT%H:%M:%SZ)" > probe-canary-a.txt
+          echo "runner-canary $RUNNER_NAME" > "$RUNNER_TEMP/probe-canary-a-temp.txt"
+          test -f probe-canary-a.txt
+          echo "ok: canary planted in workspace and runner temp"
+
+  probe_fresh_and_fail:
+    name: Probe B - fresh runner, no transfer, intentional failure
+    needs: probe_validate
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'probe/hosted-isolation-v0824'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Record event identity (Probe B)
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.EXPECTED_SOURCE_SHA }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_MERGE_SHA: ${{ github.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "probe=probe_fresh_and_fail (event level)"
+            echo "pr_number=$PR_NUMBER"
+            echo "pr_source_tip=$PR_HEAD_SHA (github.event.pull_request.head.sha)"
+            echo "event_merge_sha=$EVENT_MERGE_SHA (github.sha)"
+            echo "expected_release_candidate=$EXPECTED_SOURCE_SHA"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout the pull request merge ref with full history
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify same source parentage and merge SHA distinction on the fresh runner
+        env:
+          EXPECTED_SOURCE_SHA: ${{ env.EXPECTED_SOURCE_SHA }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          EVENT_MERGE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ACTUAL_SHA=$(git rev-parse HEAD)
+          echo "checked-out HEAD:    $ACTUAL_SHA"
+          echo "event merge SHA:     $EVENT_MERGE_SHA"
+          echo "pr source tip:       $PR_HEAD_SHA"
+          echo "expected RC parent:  $EXPECTED_SOURCE_SHA"
+          test "$ACTUAL_SHA" = "$EVENT_MERGE_SHA"
+          if git rev-parse -q --verify "$ACTUAL_SHA^2" >/dev/null 2>&1; then
+            SECOND_PARENT=$(git rev-parse "$ACTUAL_SHA^2")
+            test "$SECOND_PARENT" = "$PR_HEAD_SHA"
+            test "$EVENT_MERGE_SHA" != "$PR_HEAD_SHA"
+            echo "ok: true merge commit observed on the fresh runner too"
+            echo "ok: merge SHA ($EVENT_MERGE_SHA) explicitly differs from source branch SHA ($PR_HEAD_SHA)"
+          else
+            echo "note: fast-forward merge ref on the fresh runner too; merge SHA == source branch SHA == $EVENT_MERGE_SHA (explicitly recorded)"
+          fi
+          RC_PARENT=$(git rev-parse "$PR_HEAD_SHA^")
+          test "$RC_PARENT" = "$EXPECTED_SOURCE_SHA"
+          echo "ok: PR source tip's first parent is exactly the pinned release-candidate SHA"
+          test -z "$(git status --porcelain)"
+          echo "ok: fresh clean checkout"
+
+      - name: Assert no workspace or temp state transferred from Probe A
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -e probe-canary-a.txt ]; then
+            echo "FAIL: workspace canary from Probe A is present in Probe B."
+            exit 1
+          fi
+          if [ -e "$RUNNER_TEMP/probe-canary-a-temp.txt" ]; then
+            echo "FAIL: runner temp canary from Probe A is present in Probe B."
+            exit 1
+          fi
+          echo "ok: no transferred workspace or temp state"
+
+      - name: Assert no release secrets are mounted
+        shell: bash
+        run: |
+          set -euo pipefail
+          for v in TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD RELEASES_PAT; do
+            if [ -n "${!v:-}" ]; then
+              echo "FAIL: $v is mounted in a nonproduction probe."
+              exit 1
+            fi
+            echo "ok: $v not present in environment"
+          done
+
+      - name: Record runner identity (Probe B)
+        shell: bash
+        run: |
+          {
+            echo "probe=probe_fresh_and_fail (runner level)"
+            echo "runner_name=$RUNNER_NAME"
+            echo "runner_environment=$RUNNER_ENVIRONMENT"
+            echo "machine=$(hostname)"
+            echo "image=${ImageOS:-} ${ImageVersion:-}"
+            echo "workspace=$GITHUB_WORKSPACE"
+          } | tee probe-b-identity.txt | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Intentional nonproduction failure (simulated failed validation)
+        shell: bash
+        run: |
+          echo "NONPRODUCTION PROBE: failing on purpose to prove downstream gating."
+          exit 1
+
+  probe_downstream:
+    name: Probe C - must be skipped after failed validation
+    needs: probe_fresh_and_fail
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'probe/hosted-isolation-v0824'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: This step must never execute
+        shell: bash
+        run: |
+          echo "FAIL: probe_downstream executed after a failed upstream job."
+          exit 1

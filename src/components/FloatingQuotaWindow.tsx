@@ -75,6 +75,9 @@ export function FloatingQuotaWindow() {
       ? readDevFixture(window.location.search)
       : null;
   const { settings } = useSettings();
+  // The floating window is a read-only view: it never writes a preference, so
+  // it cannot push a stale cadence into the shared runtime and race the
+  // window that owns preference editing.
   const {
     usages: runtimeUsages,
     wallets: runtimeWallets,
@@ -82,7 +85,7 @@ export function FloatingQuotaWindow() {
     refresh,
     refreshWallet,
     walletRefreshing = false,
-  } = useProviderUsage(settings.refreshIntervalMinutes);
+  } = useProviderUsage();
   const usages = devFixture?.usages ?? runtimeUsages;
   // Wallets are an independent snapshot collection: hidden-provider
   // preferences never filter them, and an older runtime without the field

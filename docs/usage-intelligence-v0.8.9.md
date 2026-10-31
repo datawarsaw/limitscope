@@ -264,7 +264,8 @@ sourceAbsent | schemaUnsupported | readFailure | scanCeiling |
 collectionPaused | ok`, plus the last observation time), and the additive
 `sourceCoverage` array. `scanCeiling` on the row-count-bounded readers
 means a bounded batch was committed and the remainder of an oversized
-backlog continues on subsequent scans — progress, not a failure.
+backlog continues on subsequent scans. Progress is committed, but coverage
+remains uncertain until the backlog is fully scanned.
 `collectionPaused` is the fail-closed enumeration pause (the Codex
 rollout tree above its file ceiling or nested too deeply): the scan
 stops before reading anything, so no prefix was committed and coverage
@@ -286,7 +287,8 @@ uncertain`), and optional `reason`, `coveredFrom` (ISO-8601), and
 | enabled, no baseline (failure-only cursor) | `uncertain` | `noBaseline` | Nothing has ever been collected; never imply zero usage. |
 | enabled, baselined, pending re-baseline | `incomplete` | `pendingRebaseline` | Usage while collection was off is missing; no `coveredFrom`. |
 | enabled, baselined, coverage start later than range start | `incomplete` | `lateBaseline` | Coverage is continuous from `coveredFrom = max(baselinedAt, baselineWatermark)`. |
-| enabled, baselined at or before range start, state `ok` or `scanCeiling` | `complete` | — | `scanCeiling` is committed progress, not a gap. |
+| enabled, baselined at or before range start, state `ok` | `complete` | — | The source scan is current. |
+| enabled, baselined at or before range start, state `scanCeiling` | `uncertain` | `scanCeiling` | A bounded batch was committed, but later events may still be pending. |
 | enabled, baselined at or before range start, state `collectionPaused` | `uncertain` | `collectionPaused` | The scan stopped fail-closed before reading anything; `lastObservedAt` is included and later events may be missing. |
 | enabled, baselined at or before range start, state `sourceAbsent`, `schemaUnsupported`, or `readFailure` | `uncertain` | the wire state string | `lastObservedAt` is included; later events may be missing. |
 

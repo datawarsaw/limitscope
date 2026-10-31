@@ -141,6 +141,11 @@ pub struct ProviderLastGoodStore {
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     state: Mutex<HashMap<String, PersistedProviderState>>,
     wallets: Mutex<HashMap<String, PersistedWalletState>>,
+    /// Test-only fault injected at the cache-file deletion boundary. It is
+    /// absent from production builds, and lets a clear fail with a
+    /// deterministic `PermissionDenied` on any platform and under any user.
+    #[cfg(test)]
+    removal_fault: Mutex<Option<std::io::ErrorKind>>,
 }
 
 impl ProviderLastGoodStore {
@@ -157,6 +162,8 @@ impl ProviderLastGoodStore {
             now,
             state: Mutex::new(HashMap::new()),
             wallets: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            removal_fault: Mutex::new(None),
         };
         store.load_from_disk();
         store
@@ -212,35 +219,61 @@ impl ProviderLastGoodStore {
             .and_then(|()| fs::rename(&temp_path, &self.path))
     }
 
-    /// Clears the recovery cache: the store's in-memory map immediately, the
-    /// persisted file and interrupted-write temp file best-effort. This is
-    /// the owned clear operation for the v0.7 "Provider cache" control.
+    /// Clears the recovery cache: the persisted file, the interrupted-write
+    /// temp file, and the store's in-memory maps. This is the owned clear
+    /// operation for the v0.7 "Provider cache" control.
     ///
     /// Idempotent by construction — a missing cache, an empty cache, and a
     /// cache file that is corrupt all succeed, and none of them is an error.
-    /// Only this store's own file is touched: nothing outside the store path
-    /// is read, removed, or renamed.
+    /// A deletion that fails for any other reason is returned as an error and
+    /// nothing is cleared: while the file remains, a cold start can restore
+    /// exactly the values this operation was asked to drop, so reporting
+    /// success there would be a lie. Only this store's own file is touched:
+    /// nothing outside the store path is read, removed, or renamed.
+    ///
+    /// The durable file is removed first and the in-memory maps are cleared
+    /// only after that succeeded, so a failed deletion leaves memory and disk
+    /// consistent with each other. The interrupted-write temp file is removed
+    /// best-effort: a cold start loads only the cache file above and never
+    /// reads the temp file, so a retained temp file cannot restore a value.
     ///
     /// Returns whether anything was actually held (entries or a file), which
     /// the caller reports as "removed" versus "already empty". The runtime's
     /// current in-session snapshot is deliberately untouched: this clears
     /// what a cold start would hydrate, so the next successful live refresh
     /// repopulates the cache normally instead of resurrecting old entries.
-    pub fn clear(&self) -> bool {
+    pub fn clear(&self) -> Result<bool, std::io::Error> {
         let mut state = self.state.lock().unwrap();
         let mut wallets = self.wallets.lock().unwrap();
         let had_entries = !state.is_empty();
-        state.clear();
         let had_wallets = !wallets.is_empty();
+        let had_file = match self.remove_cache_file() {
+            Ok(()) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        state.clear();
         wallets.clear();
-        let had_file = self.path.exists();
-        let _ = fs::remove_file(&self.path);
         let temp_path = self.path.with_extension("json.tmp");
         let had_temp = temp_path.exists();
         if had_temp {
             let _ = fs::remove_file(&temp_path);
         }
-        had_entries || had_wallets || had_file || had_temp
+        Ok(had_entries || had_wallets || had_file || had_temp)
+    }
+
+    /// The single deletion boundary for the durable cache file. Tests inject
+    /// their failure here: real permissions differ by platform and by user
+    /// (root can delete anything), and a directory in the file's place reports
+    /// whatever the platform calls it, so neither can pin `PermissionDenied`.
+    fn remove_cache_file(&self) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            if let Some(kind) = *self.removal_fault.lock().unwrap() {
+                return Err(std::io::Error::from(kind));
+            }
+        }
+        fs::remove_file(&self.path)
     }
 
     /// Hydrates safe cached ProviderUsageDto entries for known registered providers.
@@ -827,6 +860,22 @@ fn provider_identity_is_current(provider_id: &str, identity: Option<&str>) -> bo
         && suffix
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// Test-only controls for the deletion boundary. Production builds have no
+/// fault field at all and always delete through the real file system.
+#[cfg(test)]
+impl ProviderLastGoodStore {
+    /// Makes every cache-file deletion fail with `kind` until
+    /// [`Self::allow_removal`] is called.
+    pub(crate) fn fail_removal_with(&self, kind: std::io::ErrorKind) {
+        *self.removal_fault.lock().unwrap() = Some(kind);
+    }
+
+    /// Stops injecting deletion failures.
+    pub(crate) fn allow_removal(&self) {
+        *self.removal_fault.lock().unwrap() = None;
+    }
 }
 
 #[cfg(test)]
@@ -2199,8 +2248,58 @@ mod tests {
         assert_eq!(persisted.remaining_usd, Some(0.0));
         assert_eq!(persisted.identity.as_deref(), Some("key:A1"));
 
-        assert!(store.clear(), "the cache had entries to clear");
+        assert!(store.clear().unwrap(), "the cache had entries to clear");
         assert!(store.get_persisted_wallet("openrouter").is_none());
+    }
+
+    #[test]
+    fn clear_of_a_missing_cache_file_is_an_idempotent_success() {
+        let dir = tempdir::temp_dir("clear-missing-file");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+
+        assert!(!store.clear().unwrap(), "nothing was there to remove");
+        assert!(!store.clear().unwrap(), "a repeated clear stays a success");
+        assert!(!path.exists(), "a clear never creates the cache file");
+
+        // A missing parent directory is the same NotFound case, not an error.
+        let nested = dir.path().join("absent").join(LAST_GOOD_FILE_NAME);
+        let nested_store = ProviderLastGoodStore::open_with_clock(nested.clone(), Box::new(fixed_now));
+        assert!(!nested_store.clear().unwrap(), "a missing parent is still NotFound");
+        assert!(!nested.exists());
+    }
+
+    #[test]
+    fn clear_propagates_permission_denied_from_the_deletion_boundary() {
+        let dir = tempdir::temp_dir("clear-permission-denied");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        store.record_success(
+            ProviderKind::Codex,
+            &sample_usage(ProviderKind::Codex, 41.0, Some("2026-09-29T15:00:00Z")),
+        );
+        assert!(path.exists(), "a recorded cache is persisted");
+
+        store.fail_removal_with(std::io::ErrorKind::PermissionDenied);
+        let error = store
+            .clear()
+            .expect_err("a denied deletion must not report success");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            store.get_persisted("openai-codex").is_some(),
+            "a failed deletion keeps memory and disk consistent"
+        );
+        assert!(path.exists(), "the undeletable cache file remains in place");
+        let cold_start = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
+        assert!(
+            cold_start.get_persisted("openai-codex").is_some(),
+            "the retained file is what a cold start would restore"
+        );
+
+        store.allow_removal();
+        assert!(store.clear().unwrap(), "a permitted retry clears the entry");
+        assert!(store.get_persisted("openai-codex").is_none());
+        assert!(!path.exists());
     }
 
     // 24b. an envelope written before the currency-aware schema carries only

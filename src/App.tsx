@@ -65,8 +65,10 @@ export default function App() {
     setCodexAccount,
     setQuotaPerspective,
     resetPreferences,
+    syncRefreshInterval,
     startupPending,
     startupError,
+    unverifiedPreferences,
   } = useSettings();
   const {
     usages: runtimeUsages,
@@ -80,7 +82,11 @@ export default function App() {
     historyRevision,
     usageIntelligenceRevision,
   } =
-    useProviderUsage(settings.refreshIntervalMinutes);
+    // The runtime owns the refresh cadence. The persisted interval reaches
+    // it through the settings lane, which owns the write queue: the hook
+    // itself never writes a preference, so no window can race a reset or
+    // overwrite a newer edit with a stale copy of the cadence.
+    useProviderUsage({ onAttach: syncRefreshInterval });
   // Dev-only visual fixtures (`?fixture=…` in `npm run dev`); null in any
   // production or test run. See src/dev/usageFixtures.ts.
   const devFixture =
@@ -297,6 +303,7 @@ export default function App() {
               settings={settings}
               setLaunchAtStartup={setLaunchAtStartup}
               setRefreshInterval={setRefreshInterval}
+              syncRefreshInterval={syncRefreshInterval}
               setTheme={setTheme}
               setQuotaNotifications={setQuotaNotifications}
               setUsageIntelligence={setUsageIntelligence}
@@ -309,6 +316,7 @@ export default function App() {
               resetPreferences={resetPreferences}
               startupPending={startupPending}
               startupError={startupError}
+              unverifiedPreferences={unverifiedPreferences}
               usages={usages}
               wallets={wallets}
               visibleUsages={visibleUsages}

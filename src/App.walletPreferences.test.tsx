@@ -72,6 +72,7 @@ function wallets(): ApiWallet[] {
 
 function expandDrawer() {
   fireEvent.click(screen.getByRole('button', { name: 'Settings' }));
+  fireEvent.click(screen.getByRole('button', { name: 'Providers & Wallets' }));
 }
 
 function walletGroup() {

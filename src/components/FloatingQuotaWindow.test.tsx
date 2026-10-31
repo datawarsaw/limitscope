@@ -20,8 +20,10 @@ vi.mock("../hooks/useSettings", () => ({
 }));
 
 vi.mock("../hooks/useProviderUsage", () => ({
-  useProviderUsage: () => ({
-    usages: [
+  useProviderUsage: (options?: { onAttach?: () => void }) => {
+    mocks.providerUsageOptions = options;
+    return {
+      usages: [
       {
         id: "zai",
         name: "Z.ai",
@@ -42,12 +44,13 @@ vi.mock("../hooks/useProviderUsage", () => ({
       },
       ...mocks.extraProviders,
     ],
-    wallets: mocks.wallets,
-    loading: false,
-    refresh: vi.fn(),
-    refreshWallet: mocks.refreshWallet,
-    walletRefreshing: false,
-  }),
+      wallets: mocks.wallets,
+      loading: false,
+      refresh: vi.fn(),
+      refreshWallet: mocks.refreshWallet,
+      walletRefreshing: false,
+    };
+  },
 }));
 
 vi.mock("../lib/floatingWindowChrome", () => ({
@@ -113,6 +116,7 @@ const mocks = vi.hoisted(() => ({
   onReconciled: undefined as
     | undefined
     | ((action: { kind: string }) => void),
+  providerUsageOptions: undefined as undefined | { onAttach?: () => void },
 }));
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
@@ -441,6 +445,14 @@ describe("FloatingQuotaWindow provider preferences", () => {
       (element) => element.getAttribute("data-provider-id"),
     );
     expect(ids).toEqual(["grok", "zai"]);
+  });
+
+  it("never hands a preference write over to the shared runtime", async () => {
+    await renderWindow();
+    // The floating window is a read-only view: it must not push its copy of
+    // the refresh cadence into the runtime and race the window that owns
+    // preference editing.
+    expect(mocks.providerUsageOptions?.onAttach).toBeUndefined();
   });
 });
 

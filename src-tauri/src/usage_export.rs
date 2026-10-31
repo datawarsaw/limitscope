@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 
 use crate::diagnostics::sanitize_text;
 use crate::history::{parse_epoch_ms, QuotaObservation};
@@ -261,20 +261,19 @@ fn build_usage_export_content(
     }
 }
 
-fn write_export(path: &Path, content: &str, format: UsageExportFormat) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| sanitize_text(&error.to_string()))?;
-    }
-    let ext = match format {
-        UsageExportFormat::Csv => "csv.tmp",
-        UsageExportFormat::Json => "json.tmp",
-    };
-    let temp = path.with_extension(ext);
-    fs::write(&temp, content).map_err(|error| sanitize_text(&error.to_string()))?;
-    if let Err(error) = fs::rename(&temp, path) {
-        // The final file is untouched; the staging file must not linger.
-        let _ = fs::remove_file(&temp);
-        return Err(sanitize_text(&error.to_string()));
+fn write_export(path: &Path, content: &str, _format: UsageExportFormat) -> Result<(), String> {
+    crate::durable_file::replace(path, content.as_bytes()).map_err(|_| "Could not save export".to_string())
+}
+
+fn export_grants() -> &'static std::sync::Mutex<std::collections::HashMap<String, PathBuf>> {
+    static GRANTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> = std::sync::OnceLock::new();
+    GRANTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn authorized_export_directory(window: &str, directory: &str) -> Result<(), String> {
+    let canonical = fs::canonicalize(directory).map_err(|_| "Export folder unavailable")?;
+    if export_grants().lock().unwrap().get(window) != Some(&canonical) {
+        return Err("Choose the export folder using the native folder picker first".into());
     }
     Ok(())
 }
@@ -339,6 +338,18 @@ pub(crate) fn resolve_export_destination(
         return Err("The selected export destination is unavailable".to_string());
     }
     let path = dir.join(&name);
+    if let Ok(metadata) = fs::symlink_metadata(&path) {
+        #[cfg(windows)]
+        let reparse = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0
+        };
+        #[cfg(not(windows))]
+        let reparse = false;
+        if !metadata.is_file() || metadata.file_type().is_symlink() || reparse {
+            return Err("Export destination must be a regular file".into());
+        }
+    }
     if path.exists() && !confirm_overwrite {
         return Ok(ExportDestination::ConfirmOverwrite {
             path,
@@ -352,24 +363,30 @@ pub(crate) fn resolve_export_destination(
 /// user either picks a folder or cancels (None). There is deliberately no
 /// save-file dialog on this path anymore — see the module documentation.
 #[tauri::command]
-pub async fn pick_usage_export_directory(app: AppHandle) -> Result<Option<String>, String> {
+pub async fn pick_usage_export_directory(app: AppHandle, window: tauri::WebviewWindow) -> Result<Option<String>, String> {
     let selected = app
         .dialog()
         .file()
         .set_title("Choose export folder")
         .blocking_pick_folder();
     let path = selected.and_then(|selection| selection.into_path().ok());
+    let mut grants = export_grants().lock().unwrap();
+    grants.remove(window.label());
+    let path = path.map(fs::canonicalize).transpose().map_err(|_| "Export folder unavailable")?;
+    if let Some(path) = &path { grants.insert(window.label().to_string(), path.clone()); }
     Ok(path.map(|path| path.to_string_lossy().into_owned()))
 }
 
 #[tauri::command]
 pub async fn export_usage_history(
+    window: tauri::WebviewWindow,
     handle: tauri::State<'_, RuntimeHandle>,
     format: String,
     directory: String,
     file_name: String,
     confirm_overwrite: bool,
 ) -> Result<ExportUsageResult, String> {
+    authorized_export_directory(window.label(), &directory)?;
     let export_format =
         UsageExportFormat::parse(&format).ok_or_else(|| "Unsupported export format".to_string())?;
     let Some(store) = handle.history_store() else {
@@ -397,7 +414,24 @@ pub async fn export_usage_history(
             file_name: Some(file_name),
         }),
         ExportDestination::Write(path) => {
-            write_export(&path, &content, export_format)?;
+            let replacing = path.exists();
+            if replacing && !window.dialog()
+                .message("Replace the existing export file?")
+                .title(path.file_name().and_then(|name| name.to_str()).unwrap_or("Export"))
+                .buttons(MessageDialogButtons::OkCancel)
+                .blocking_show() {
+                return Ok(ExportUsageResult { status: "cancelled", file_name: None });
+            }
+            if replacing {
+                write_export(&path, &content, export_format)?;
+            } else {
+                use std::io::Write;
+                // create_new refuses a file created between destination validation and write.
+                let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&path)
+                    .map_err(|_| "Export destination changed; choose the destination again")?;
+                file.write_all(content.as_bytes()).and_then(|()| file.sync_all())
+                    .map_err(|_| "Could not finish the export")?;
+            }
             Ok(ExportUsageResult {
                 status: "saved",
                 file_name: path
@@ -447,6 +481,19 @@ mod tests {
         TempDir { path }
     }
 
+
+    #[test]
+    fn export_grant_is_bound_to_native_window_and_exact_directory() {
+        let dir = temp_test_dir("grant");
+        let other = temp_test_dir("other-grant");
+        let window = format!("fixture-{}", uuid::Uuid::new_v4());
+        assert!(authorized_export_directory(&window, &dir.path.to_string_lossy()).is_err());
+        export_grants().lock().unwrap().insert(window.clone(), fs::canonicalize(&dir.path).unwrap());
+        assert!(authorized_export_directory(&window, &dir.path.to_string_lossy()).is_ok());
+        assert!(authorized_export_directory(&window, &other.path.to_string_lossy()).is_err());
+        assert!(authorized_export_directory("another-window", &dir.path.to_string_lossy()).is_err());
+        export_grants().lock().unwrap().remove(&window);
+    }
 
     fn parse_csv_test_rows(csv: &str) -> Vec<Vec<String>> {
         let mut rows = Vec::new();
