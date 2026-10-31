@@ -29,7 +29,7 @@ test("signing key is scoped to signing and signature check precedes publication"
   assert.equal((release.match(/secrets\.TAURI_SIGNING_PRIVATE_KEY_PASSWORD\b/g) ?? []).length, 1);
   assert.ok(signing.indexOf("Build unsigned NSIS") < signing.indexOf("Sign exact installer"));
   assert.ok(signing.indexOf("Verify updater signature before publication") < signing.indexOf("Stage complete draft"));
-  assert.match(signing, /tauri build -- --no-sign -- --locked/);
-  assert.match(ci, /tauri build -- -- --locked/);
+  assert.match(signing, /\.\/node_modules\/\.bin\/tauri build --no-sign -- --locked/);
+  assert.match(ci, /\.\/node_modules\/\.bin\/tauri build -- --locked/);
   assert.doesNotMatch(signing, /npm test/);
 });

@@ -138,9 +138,10 @@ describe("CI wiring", () => {
 
   it("does not bundle on the ordinary path", () => {
     expect(ciJobs.windows).not.toContain("tauri build");
-    // The bundling command runs exactly once (the header comment mentions it).
-    expect(workflow.match(/^ {8}run: npm run tauri build -- -- --locked$/gm)).toHaveLength(1);
-    expect(ciJobs["bundling-verification"]).toContain("npm run tauri build");
+    // The bundling command runs exactly once (the header comment mentions it),
+    // invoked directly so the `--` that hands `--locked` to Cargo survives.
+    expect(workflow.match(/^ {8}run: \.\/node_modules\/\.bin\/tauri build -- --locked$/gm)).toHaveLength(1);
+    expect(ciJobs["bundling-verification"]).toContain("./node_modules/.bin/tauri build");
   });
 
   it("runs the bundling verification only when the detector says so", () => {

@@ -274,7 +274,10 @@ jobs:
 
       - name: Build unsigned NSIS installer with locked Cargo dependencies
         shell: bash
-        run: npm run tauri build -- --no-sign -- --locked
+        # The Tauri CLI is invoked directly (as for `tauri signer sign` below)
+        # because `npm run` swallows `--` separators, which dropped the `--`
+        # that hands `--locked` to Cargo.
+        run: ./node_modules/.bin/tauri build --no-sign -- --locked
 
       - name: Sign exact installer
         env:

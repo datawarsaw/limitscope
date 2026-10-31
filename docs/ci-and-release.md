@@ -37,7 +37,7 @@ bundling-specific input changed:
 
 | Gate | Command |
 |------|---------|
-| Full Tauri release build + NSIS bundling | `npm run tauri build` |
+| Full Tauri release build + NSIS bundling | `./node_modules/.bin/tauri build -- --locked` |
 | Upload installer artifact | `src-tauri/target/release/bundle/nsis/*-setup.exe` (`if-no-files-found: error`) |
 
 Two jobs implement this:
@@ -49,7 +49,7 @@ Two jobs implement this:
    (`github.event.before`). When no base can be resolved (unborn ref, force
    push, fetch failure) it prints a warning and emits `true`, so bundling
    verification fails closed rather than silently skipping.
-2. `bundling-verification` (**Windows**) carries the `npm run tauri build`
+2. `bundling-verification` (**Windows**) carries the Tauri
    bundling step and the installer upload. Its job-level
    `if: needs.bundling-inputs.outputs.run_bundling == 'true'` means the job is
    **skipped**, not left pending, when nothing relevant changed.
@@ -107,13 +107,16 @@ cargo test --locked        # from src-tauri/
 npm test
 npm run build
 npm run scan:secrets
-npm run tauri build        # only when a bundling input changed
+./node_modules/.bin/tauri build -- --locked   # only when a bundling input changed
 ```
 
 The installer appears under `src-tauri/target/release/bundle/nsis/`.
-`npm run tauri build` internally re-runs `npm run build` as Tauri's
+The Tauri build internally re-runs `npm run build` as Tauri's
 `beforeBuildCommand`, so the ordinary `npm run build` gate is a fast-failing
-type-check and the bundling job repeats it by design.
+type-check and the bundling job repeats it by design. The Tauri CLI is invoked
+directly (`./node_modules/.bin/tauri build -- --locked`) because `npm run`
+swallows `--` separators, which would drop the `--` that hands `--locked` to
+Cargo.
 
 To see the bundling decision locally, pipe changed paths into the gate:
 
