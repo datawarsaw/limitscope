@@ -11,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   setQuotaNotifications: vi.fn(),
   setUsageIntelligence: vi.fn(),
   setProviderHidden: vi.fn(),
+  setCodexAccount: vi.fn(),
   moveProvider: vi.fn(),
   setQuotaPerspective: vi.fn(),
   resetPreferences: vi.fn(async () => ({ ok: true, removed: true })),
@@ -22,6 +23,16 @@ const mocks = vi.hoisted(() => ({
   }),
   pickUsageExportDirectory: vi.fn().mockResolvedValue(null),
   refresh: vi.fn(),
+  syncRefreshInterval: vi.fn(),
+  providerUsageOptions: undefined as { onAttach?: () => void } | undefined,
+  unverifiedPreferences: [] as Array<
+    | "launchAtStartup"
+    | "quotaNotifications"
+    | "walletMonitoring"
+    | "refreshIntervalMinutes"
+    | "codexAccounts"
+    | "usageIntelligence"
+  >,
 }));
 
 vi.mock("./lib/diagnosticsExport", () => ({
@@ -63,25 +74,30 @@ vi.mock("./hooks/useSettings", () => ({
     setProviderHidden: mocks.setProviderHidden,
     moveProvider: mocks.moveProvider,
     setQuotaPerspective: mocks.setQuotaPerspective,
-    setCodexAccount: vi.fn(),
+    setCodexAccount: mocks.setCodexAccount,
     resetPreferences: mocks.resetPreferences,
+    syncRefreshInterval: mocks.syncRefreshInterval,
     startupPending: false,
     startupError: null,
+    unverifiedPreferences: mocks.unverifiedPreferences,
   }),
 }));
 
 vi.mock("./hooks/useProviderUsage", () => ({
-  useProviderUsage: () => ({
-    usages: [],
-    loading: false,
-    lastUpdatedAt: new Date("2026-09-28T21:58:00"),
-    refresh: mocks.refresh,
-    refreshOverdue: false,
-    stale: false,
-    staleMinutes: 0,
-    historyRevision: 1,
-    usageIntelligenceRevision: 0,
-  }),
+  useProviderUsage: (options?: { onAttach?: () => void }) => {
+    mocks.providerUsageOptions = options;
+    return {
+      usages: [],
+      loading: false,
+      lastUpdatedAt: new Date("2026-09-28T21:58:00"),
+      refresh: mocks.refresh,
+      refreshOverdue: false,
+      stale: false,
+      staleMinutes: 0,
+      historyRevision: 1,
+      usageIntelligenceRevision: 0,
+    };
+  },
 }));
 
 vi.mock("./hooks/useNow", () => ({
@@ -110,6 +126,7 @@ describe("settings destination", () => {
   });
   beforeEach(() => {
     vi.clearAllMocks();
+    mocks.unverifiedPreferences = [];
   });
 
   it("keeps settings controls absent until the destination opens", () => {
@@ -133,17 +150,10 @@ describe("settings destination", () => {
     expect(screen.getByText(/Updated/)).toBeTruthy();
   });
 
-  it("opens on Settings click and exposes every control in four groups", () => {
+  it("opens Settings and exposes controls in three sections", () => {
     render(<App />);
     openSettings();
-    for (const heading of [
-      "General",
-      "Providers & Wallets",
-      "Data & Privacy",
-      "Support",
-    ]) {
-      expect(screen.getByRole("heading", { name: heading })).toBeTruthy();
-    }
+    expect(screen.getByRole("heading", { name: "General", level: 2 })).toBeTruthy();
     expect(
       screen.getByRole("switch", {
         name: "Launch LimitScope when Windows starts",
@@ -155,6 +165,8 @@ describe("settings destination", () => {
     expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
     expect(screen.getByLabelText("Theme")).toBeTruthy();
     expect(screen.getByRole("radiogroup", { name: "Quota display" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Check for updates" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     expect(
       screen.getByRole("switch", { name: "Usage Intelligence" }),
     ).toBeTruthy();
@@ -176,13 +188,31 @@ describe("settings destination", () => {
     expect(
       screen.getByRole("button", { name: "Export diagnostics" }),
     ).toBeTruthy();
-    expect(
-      screen.getByRole("button", { name: "Check for updates" }),
-    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Providers & Wallets" }));
     // The wallet feature keeps a named seam inside its group.
     expect(
       screen.getByRole("group", { name: "API wallets" }),
     ).toBeTruthy();
+  });
+
+  it("keeps Codex account configuration connected after section navigation", () => {
+    render(<App />);
+    openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Providers & Wallets" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Codex home of the Second account OpenAI / Codex account" }), { target: { value: "C:\\codex-secondary" } });
+    expect(mocks.setCodexAccount).toHaveBeenCalledWith("openai-codex:secondary", { codexHome: "C:\\codex-secondary" });
+  });
+
+  it("preserves an unfinished confirmation when switching sections", () => {
+    render(<App />);
+    openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    fireEvent.click(screen.getByRole("button", { name: "Clear usage history" }));
+    expect(screen.getByText("Clear usage history?")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "General" }));
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    expect(screen.getByText("Clear usage history?")).toBeTruthy();
+    expect(mocks.clearLocalHistory).not.toHaveBeenCalled();
   });
 
   it("returns to the Usage overview on the Usage button", () => {
@@ -215,6 +245,7 @@ describe("settings destination", () => {
     expect(mocks.setTheme).toHaveBeenCalledWith("oled");
     fireEvent.click(screen.getByRole("radio", { name: "Remaining" }));
     expect(mocks.setQuotaPerspective).toHaveBeenCalledWith("remaining");
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("switch", { name: "Usage Intelligence" }));
     expect(mocks.setUsageIntelligence).toHaveBeenCalledWith(true);
   });
@@ -222,6 +253,7 @@ describe("settings destination", () => {
   it("confirms a clear before clearing the usage history", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(
       screen.getByRole("button", { name: "Clear usage history" }),
     );
@@ -240,6 +272,7 @@ describe("settings destination", () => {
   it("clears the provider cache and resets preferences from the same section", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
 
     fireEvent.click(
       screen.getByRole("button", { name: "Clear provider cache" }),
@@ -268,6 +301,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(mocks.exportDiagnostics).toHaveBeenCalledWith({
       launchAtStartup: false,
@@ -302,6 +336,7 @@ describe("settings destination", () => {
     );
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export diagnostics" }));
     expect(await screen.findByText("Could not export diagnostics.")).toBeTruthy();
     expect(screen.queryByText(/must-not-render/)).toBeNull();
@@ -318,6 +353,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     const save = screen.getByRole("button", { name: "Save" });
     expect(save.hasAttribute("disabled")).toBe(true);
@@ -348,6 +384,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export JSON" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -364,6 +401,7 @@ describe("settings destination", () => {
     );
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -387,6 +425,7 @@ describe("settings destination", () => {
       .mockResolvedValueOnce({ status: "saved", fileName: "existing.csv" });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -410,6 +449,7 @@ describe("settings destination", () => {
     });
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await screen.findByText("C:\\Exports");
@@ -425,6 +465,7 @@ describe("settings destination", () => {
   it("closes the chooser without invoking when cancelled", async () => {
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(mocks.exportUsageHistory).not.toHaveBeenCalled();
@@ -437,6 +478,7 @@ describe("settings destination", () => {
     mocks.pickUsageExportDirectory.mockResolvedValueOnce(null);
     render(<App />);
     openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     fireEvent.click(screen.getByRole("button", { name: "Export CSV" }));
     fireEvent.click(screen.getByRole("button", { name: "Choose folder…" }));
     await waitFor(() =>
@@ -465,5 +507,74 @@ describe("settings destination", () => {
     expect(
       button.getAttribute("aria-pressed"),
     ).toBe("true");
+  });
+
+  it("shows that the saved launch-at-startup state could not be verified", () => {
+    mocks.unverifiedPreferences = ["launchAtStartup"];
+    render(<App />);
+    openSettings();
+    expect(
+      screen.getByText(
+        "The saved state of launch at startup could not be verified.",
+      ),
+    ).toBeTruthy();
+    const control = screen.getByRole("switch", {
+      name: "Launch LimitScope when Windows starts",
+    });
+    expect(control.getAttribute("data-unverified")).toBe("true");
+  });
+
+  it("hands the refresh cadence to the runtime through the settings lane", () => {
+    render(<App />);
+    // The settings lane owns the write queue, so the dashboard window is the
+    // only one that may hand the persisted cadence over to the runtime.
+    expect(mocks.providerUsageOptions?.onAttach).toBe(
+      mocks.syncRefreshInterval,
+    );
+  });
+
+  it("offers a retry when the saved auto-refresh runtime state is unknown", () => {
+    mocks.unverifiedPreferences = ["refreshIntervalMinutes"];
+    render(<App />);
+    openSettings();
+
+    expect(
+      screen.getByText(
+        "The saved state of refresh interval could not be verified.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry runtime sync" }),
+    );
+    expect(mocks.syncRefreshInterval).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows no verification note while every scope is confirmed", () => {
+    render(<App />);
+    openSettings();
+    expect(
+      screen.queryByText(/The saved state of .* could not be verified\./),
+    ).toBeNull();
+    const control = screen.getByRole("switch", {
+      name: "Launch LimitScope when Windows starts",
+    });
+    expect(control.hasAttribute("data-unverified")).toBe(false);
+  });
+
+  it("shows verification notes for the remaining unverified scopes", () => {
+    mocks.unverifiedPreferences = ["quotaNotifications", "usageIntelligence"];
+    render(<App />);
+    openSettings();
+    expect(
+      screen.getByText(
+        "The saved state of quota notifications could not be verified.",
+      ),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    expect(
+      screen.getByText(
+        "The saved state of Usage Intelligence could not be verified.",
+      ),
+    ).toBeTruthy();
   });
 });

@@ -34,8 +34,9 @@
 //! # Idempotency
 //!
 //! Every clear is idempotent. A missing file, an empty store, or a corrupt
-//! file all succeed; `removed: false` means "there was nothing to remove",
-//! never an error.
+//! file all succeed; `removed: false` means "there was nothing to remove".
+//! A deletion that fails is returned to the caller, never reported as a
+//! successful clear.
 
 use std::sync::Arc;
 
@@ -65,20 +66,33 @@ pub struct LocalDataClearOutcome {
 /// preferences, and every credential store are untouched — this command
 /// takes no arguments and acts only on the store the runtime already owns.
 #[tauri::command]
-pub fn clear_provider_cache(handle: tauri::State<RuntimeHandle>) -> LocalDataClearOutcome {
+pub fn clear_provider_cache(
+    handle: tauri::State<RuntimeHandle>,
+) -> Result<LocalDataClearOutcome, String> {
+    let outcome = clear_provider_cache_in(handle.last_good_store())?;
     // Lane B: the cache clear also drops held suspicious-drop candidates so
-    // no gated window survives a data reset (see runtime::RuntimeCore).
+    // no gated window survives a data reset (see runtime::RuntimeCore). The
+    // `?` above keeps that promise tied to a durable clear: a rejected
+    // deletion leaves the candidates in place too.
     handle.clear_pending_confirmations();
-    clear_provider_cache_in(handle.last_good_store())
+    Ok(outcome)
 }
 
 /// The command body without the Tauri state, so the clear is testable
 /// against a real store on a temp path.
-fn clear_provider_cache_in(store: Option<&Arc<ProviderLastGoodStore>>) -> LocalDataClearOutcome {
-    LocalDataClearOutcome {
+fn clear_provider_cache_in(
+    store: Option<&Arc<ProviderLastGoodStore>>,
+) -> Result<LocalDataClearOutcome, String> {
+    let removed = match store {
+        Some(store) => store
+            .clear()
+            .map_err(|_| "Could not durably clear provider cache".to_string())?,
+        None => false,
+    };
+    Ok(LocalDataClearOutcome {
         category: PROVIDER_CACHE_CATEGORY,
-        removed: store.map(|store| store.clear()).unwrap_or(false),
-    }
+        removed,
+    })
 }
 
 #[cfg(test)]
@@ -205,7 +219,7 @@ mod tests {
         );
         assert!(path.exists(), "a successful record persists the cache");
 
-        let outcome = clear_provider_cache_in(Some(&store));
+        let outcome = clear_provider_cache_in(Some(&store)).unwrap();
         assert_eq!(outcome.category, PROVIDER_CACHE_CATEGORY);
         assert!(outcome.removed, "a populated cache reports what it removed");
         assert!(!path.exists(), "the persisted cache file is gone");
@@ -246,7 +260,7 @@ mod tests {
         let before = core.snapshot().providers;
         assert_eq!(before[0].limits[0].used_percent, 65.0);
 
-        let outcome = clear_provider_cache_in(Some(&store));
+        let outcome = clear_provider_cache_in(Some(&store)).unwrap();
         assert!(outcome.removed);
         assert_eq!(core.snapshot().providers, before);
         assert!(!path.exists());
@@ -268,7 +282,7 @@ mod tests {
     fn clear_missing_cache_succeeds() {
         let dir = tempdir::temp_dir("clear-missing");
         let store = store_at(dir.path().join(LAST_GOOD_FILE_NAME));
-        let outcome = clear_provider_cache_in(Some(&store));
+        let outcome = clear_provider_cache_in(Some(&store)).unwrap();
         assert_eq!(outcome.category, PROVIDER_CACHE_CATEGORY);
         assert!(!outcome.removed, "nothing was there to remove");
     }
@@ -281,7 +295,7 @@ mod tests {
         fs::write(&path, b"{ not json at all").unwrap();
         let store = store_at(path.clone());
 
-        let outcome = clear_provider_cache_in(Some(&store));
+        let outcome = clear_provider_cache_in(Some(&store)).unwrap();
         assert!(outcome.removed, "the corrupt file counted as present");
         assert!(!path.exists(), "a corrupt cache cannot block its own removal");
     }
@@ -297,8 +311,8 @@ mod tests {
             &sample_usage(ProviderKind::Zai, 10.0, Some("2026-09-29T18:00:00Z")),
         );
 
-        assert!(clear_provider_cache_in(Some(&store)).removed);
-        let second = clear_provider_cache_in(Some(&store));
+        assert!(clear_provider_cache_in(Some(&store)).unwrap().removed);
+        let second = clear_provider_cache_in(Some(&store)).unwrap();
         assert!(!second.removed, "the second clear found nothing and still succeeded");
         assert!(!path.exists());
     }
@@ -325,7 +339,7 @@ mod tests {
             &sample_usage(ProviderKind::Codex, 7.0, Some("2026-09-29T15:00:00Z")),
         );
 
-        clear_provider_cache_in(Some(&store));
+        clear_provider_cache_in(Some(&store)).unwrap();
 
         assert!(!cache_path.exists(), "the owned cache file is cleared");
         for (name, body) in sentinels {
@@ -342,8 +356,42 @@ mod tests {
     // 6. a runtime without a cache store degrades to a successful no-op
     #[test]
     fn clear_without_a_store_succeeds() {
-        let outcome = clear_provider_cache_in(None);
+        let outcome = clear_provider_cache_in(None).unwrap();
         assert_eq!(outcome.category, PROVIDER_CACHE_CATEGORY);
         assert!(!outcome.removed);
+    }
+
+    // 7. a permission-denied deletion is surfaced and leaves the retained
+    //    cache intact, so no caller can report a successful clear.
+    #[test]
+    fn clear_reports_a_permission_denied_deletion_without_dropping_memory() {
+        let dir = tempdir::temp_dir("clear-permission-denied");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = store_at(path.clone());
+        store.record_success(
+            ProviderKind::Codex,
+            &sample_usage(ProviderKind::Codex, 31.0, Some("2026-09-29T15:00:00Z")),
+        );
+        assert!(path.exists(), "a successful record persists the cache");
+
+        // Injected at the deletion boundary, not simulated with file-system
+        // permissions: a directory in the file's place is not
+        // `PermissionDenied`, and real permissions differ by platform and by
+        // user (root deletes anything).
+        store.fail_removal_with(std::io::ErrorKind::PermissionDenied);
+
+        let error = clear_provider_cache_in(Some(&store))
+            .expect_err("a denied deletion must reject the clear");
+        assert_eq!(error, "Could not durably clear provider cache");
+        assert!(
+            store.get_persisted("openai-codex").is_some(),
+            "failed deletion must not make the in-memory cache diverge from disk"
+        );
+        assert!(path.exists(), "the undeletable cache file remains in place");
+
+        store.allow_removal();
+        let outcome = clear_provider_cache_in(Some(&store)).unwrap();
+        assert!(outcome.removed, "a permitted retry clears the retained entry");
+        assert!(!path.exists());
     }
 }

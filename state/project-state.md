@@ -8,6 +8,103 @@
 
 ## Current status
 
+- Release pipeline trust isolation is a local, unreleased candidate: validation
+  runs on a separate runner without release secrets or shared artifacts/caches;
+  the release runner checks the exact source and lockfiles, builds with locked
+  Cargo resolution, and requires cryptographic updater-signature verification
+  before draft activation. Build-time dependencies and the signing runner remain
+  trusted; test isolation does not establish that tinypool is non-exploitable.
+  Dependency findings are not accepted. Release remains HOLD; Human Acceptance
+  remains accepted and unchanged. See `docs/ci-and-release.md`.
+
+- npm dependency remediation (2026-10-30, local, not released): npm 12
+  lifecycle policy approves only `esbuild@0.21.5`; lockfile updates remove
+  the `source-map-js` and `undici` advisories. Six dev-dependency packages
+  remain flagged, including critical and high findings requiring explicit
+  remediation or disposition. See `docs/npm-dependency-remediation-v0.8.24.md`.
+  Release remains HOLD; Human Acceptance is unchanged.
+
+- 0.8.24 release-blocking reliability and IPC remediation (local work,
+  not released): OpenCode bounded scans commit the backlog diagnostic with
+  the batch and cursor, and revalidate coverage after restart. Preference
+  reset reconciles independently persisted settings after failures and marks
+  values that cannot be verified; refresh interval writes are ordered with
+  reset and failed startup handoff preserves the saved choice. Cache deletion
+  errors propagate, and new
+  Codex account settings reject colliding homes. Tauri application ACLs
+  restrict sensitive commands by window; dispatch was exercised with Tauri
+  2.12.0 MockRuntime, not a native WebView2 session. Existing conflicting
+  account files are not migrated. Release remains HOLD and the existing Human
+  Acceptance record is unchanged. The previous intermittent parallel Grok
+  Bot test issue remains known; a separate serial test of Codex identity
+  failed once and passed on isolated and full-suite retry.
+
+- Final 0.8.24 reliability remediation (local source candidate, not released):
+  Usage Intelligence retention runs independently of source scans, bounded
+  ZCode batches persist their coverage state with their cursor, and failed
+  preference writes restore the last known settings and cache. Unsupported
+  account schema versions are reported without rewriting the existing file.
+  On restart, a previously healthy ZCode cursor is reported as uncertain
+  until a fresh scan is successfully persisted. This prevents an unrecordable
+  failed write from making an older complete verdict appear current; the
+  stored cursor and historical events are preserved without a schema change.
+  The full parallel Rust suite exposed an intermittent unrelated Grok Bot
+  scan-slot test failure; the isolated test and serial suite passed.
+  The modified code requires subsequent technical review. Release remains
+  HOLD; existing Human Acceptance records are unchanged.
+
+- Reliability remediation (2026-10-29, local source candidate, not released):
+  `codex/settings-persistence-hotfix` now includes ordered durable stores,
+  generation-fenced background Usage Intelligence, capacity-safe cursors,
+  non-destructive recovery, in-memory SQLite snapshots, Rust-owned operational
+  settings, complete-credential account fingerprints, native export grants and
+  draft-first release publication. Qwen quota stays visible, but new history and
+  prediction attribution are disabled until a trustworthy identity exists.
+  See `docs/reliability-remediation-contract.md`; final candidate/evidence are in
+  ignored `artifacts/reliability-remediation/HANDOFF.md` in the same worktree.
+  The earlier 0.8.24 installer/signature below are superseded for the changed
+  source and remain untouched. Installed 0.8.23 and live data are unchanged.
+  Runtime implementation: `02eab88cddc83c6bbcb1a2f5afd0c60eb28bb91d`;
+  publication implementation: `80029088c9ee60797396eedf073fa742ccc6c2e4`.
+  Local validation: 1090 Rust PASS / 18 live ignored, 1414 frontend PASS,
+  production build and cargo check PASS. Global formatting remains non-clean.
+  Independent exact-head review and Human Acceptance remain separate gates.
+
+- v0.8.24 local release preparation (2026-10-29): reuse
+  `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, branch
+  `codex/settings-persistence-hotfix`, from hotfix
+  `1d6c96a03d7559ff48740633c68a416e260541f3` and parent Settings Redesign
+  candidate `10e7325b1f4636fc82ce1e8859053bdcf4739dfd`. The five canonical
+  version files now identify 0.8.24; see `docs/release-notes-v0.8.24.md`.
+  Local build, integrity evidence and installation/rollback handoff belong
+  under the ignored `artifacts/release-v0.8.24/` directory in that worktree.
+  This entry records preparation, not a successful build or delivery;
+  consult its local verification report for the observed packaging result.
+  Installed 0.8.23, live profile, credentials, recovery evidence and public
+  distribution are outside the mutation scope. Hotfix Human Acceptance,
+  native 0.8.24 validation and installation authorization remain pending.
+
+- Settings persistence hotfix (2026-10-29, not released): branch
+  `codex/settings-persistence-hotfix`, worktree
+  `C:/AI/Token_Monitor_worktrees/settings-persistence-hotfix`, is based on
+  the clean v0.8.23 candidate `10e7325b1f4636fc82ce1e8859053bdcf4739dfd`.
+  Account configuration and Usage Intelligence opt-in are read from Rust
+  on WebView initialization; cached/default values no longer invoke their
+  Rust setters on attach or storage events. Explicit changes still use
+  the existing setters. This does not restore overwritten configuration,
+  alter account isolation or modify the installed app. That implementation commit included no version bump,
+  installer, signing, publication or installation; local 0.8.24 release
+  preparation is recorded separately above. Human
+  Acceptance remains pending. See section 8 of
+  `docs/settings-persistence-contract-v0.6.md` for the cause, regression
+  coverage and compatibility limits.
+
+- Settings redesign candidate (not released): branch `codex/settings-redesign`
+  is based on `v0.8.22` (`956fdadb4ac4f481c76da587dcca386a41d3ff7a`).
+  Settings now uses General, Providers & Wallets, and Data & Privacy sections.
+  Provider switches control floating-bar visibility, while existing wallet and
+  Codex account monitoring remain separate. Human Acceptance is pending.
+
 - v0.8.16 released: the combined floating-experience, monitor-recovery,
   DeepSeek-wallet and MiniMax-quota work is on `main`. Release commit
   `c597bc1f318bc9227bc64b48087b61ecb89dd31b`, annotated tag `v0.8.16`, published

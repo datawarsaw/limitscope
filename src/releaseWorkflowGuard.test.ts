@@ -8,8 +8,7 @@ import { describe, expect, it } from "vitest";
  * The release workflow is release tooling, so it has no runtime tests; these
  * deterministic assertions pin the invariants the v0.8 release depends on:
  * tag/ref/HEAD identity, version-surface agreement, exact artifact
- * selection, SHA-256/size traceability, atomic publication ordering
- * (latest.json LAST), and the updater key/endpoint contract. They also pin
+ * selection, SHA-256/size traceability, draft verification before activation, and the updater key/endpoint contract. They also pin
  * the derived RC channel contract: the channel comes from the version shape
  * (no operator toggle), the RC companion release is created with --prerelease
  * from the initial creation call and asserted before any asset upload, and
@@ -68,7 +67,7 @@ describe("release workflow hardening", () => {
     expect(yml).toContain('"$INSTALLER_PATH"');
     expect(yml).toContain('"$SIG_PATH"');
     expect(stepIndex("resolve exact release artifacts")).toBeGreaterThan(
-      stepIndex("tauri build"),
+      stepIndex("build unsigned NSIS"),
     );
   });
 
@@ -87,21 +86,10 @@ describe("release workflow hardening", () => {
     expect(manifestIndex).toBeGreaterThan(uploadIndex);
   });
 
-  it("keeps atomic publication ordering: latest.json goes last", () => {
-    const publish = stepIndex("publish installer & signature");
-    const scan = stepIndex("scan build outputs for secrets");
-    const feed = stepIndex("generate update feed metadata");
-    const uploadFeed = stepIndex("publish update feed (latest.json) LAST");
-    const verifyFinal = stepIndex("verify final asset set and published feed");
-    expect(scan).toBeGreaterThan(stepIndex("record artifact SHA-256 and sizes"));
-    expect(feed).toBeGreaterThan(scan);
-    expect(publish).toBeGreaterThan(feed);
-    expect(uploadFeed).toBeGreaterThan(publish);
-    expect(verifyFinal).toBeGreaterThan(uploadFeed);
-    expect(yml.indexOf("gh release create")).toBeLessThan(yml.indexOf("gh release upload"));
-    // latest.json is uploaded with --clobber in its own step, after the
-    // exact-asset verification of the installer and signature.
-    expect(yml).toMatch(/--clobber \\\r?\n\s+latest\.json/);
+  it("stages the full release only after local integrity checks", () => {
+    expect(stepIndex("stage complete draft")).toBeGreaterThan(stepIndex("generate update feed metadata"));
+    expect(stepIndex("stage complete draft")).toBeGreaterThan(stepIndex("scan build outputs for secrets"));
+    expect(yml).toContain("run: node scripts/publish-release.mjs");
   });
 
   it("preserves the updater key, endpoint, and feed contract", () => {
@@ -111,7 +99,7 @@ describe("release workflow hardening", () => {
     expect(yml).toContain("${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}");
     expect(yml).toContain("${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}");
     expect(yml).toContain("${{ secrets.RELEASES_PAT }}");
-    expect(yml).toContain('npx tauri signer sign --app-version "$VERSION"');
+    expect(yml).toContain('./node_modules/.bin/tauri signer sign --app-version "$VERSION"');
     // The feed carries only the Tauri-required metadata: no hashes or extra
     // platforms are smuggled into latest.json. (The SHA-256 manifest is
     // run-local traceability and must stay out of the published feed.)
@@ -135,37 +123,14 @@ describe("release workflow hardening", () => {
     expect(yml).not.toMatch(/prerelease[^\n]*[=:][^\n]*input/i); // no operator prerelease toggle
   });
 
-  it("creates the RC as a prerelease atomically and asserts state before any asset upload", () => {
-    const publishStep = yml.slice(yml.indexOf("Step 1 & 2"));
-    const create = publishStep.indexOf("gh release create");
-    const prerelease = publishStep.indexOf("--prerelease");
-    const assertBeforeUpload = publishStep.indexOf("Asserting prerelease state before uploading any assets");
-    const pin = publishStep.indexOf("gh api -X PATCH");
-    const upload = publishStep.indexOf("gh release upload");
-    expect(create).toBeGreaterThan(0);
-    expect(prerelease).toBeGreaterThan(create);
-    expect(prerelease).toBeLessThan(assertBeforeUpload);
-    expect(assertBeforeUpload).toBeLessThan(pin);
-    expect(pin).toBeLessThan(upload);
-    // The assert helper rejects anything that is not a published prerelease.
-    expect(yml).toContain("state.isPrerelease !== true || state.isDraft !== false");
-    expect(yml.match(/assert_rc_prerelease_state\b/g)).toHaveLength(3); // definition + 2 calls
-    // Second isolation lock: make_latest=false (drafts/prereleases cannot be latest).
-    expect(yml).toContain("-f make_latest=false");
+  it("serializes all versions without cancelling an active publication", () => {
+    expect(yml).toContain("group: limitscope-publication");
+    expect(yml).toContain("cancel-in-progress: false");
   });
 
-  it("keeps the stable publication path unchanged and the RC feed release-scoped", () => {
-    // The stable branch still creates the release WITH its two assets in one
-    // atomic call, exactly as before the RC mode existed.
-    const stableBranch = yml.slice(yml.indexOf("Stable channel: creating release"));
-    expect(stableBranch).toContain("gh release create \"v$VERSION\"");
-    expect(stableBranch).toContain('"$INSTALLER_PATH"');
-    expect(stableBranch).toContain('"$SIG_PATH"');
-    expect(stableBranch).not.toContain("--prerelease");
-    // Publication ordering is channel-neutral: the RC's latest.json is an
-    // asset of the RC release only (no global RC feed pointer exists).
-    const step = yml.slice(yml.indexOf("Step 1 & 2"), yml.indexOf("Step 3 - Publish update feed"));
-    expect(step).not.toContain("releases/latest");
+  it("runs deterministic publication interruption tests before activation", () => {
+    expect(stepIndex("test interrupted publication")).toBeLessThan(stepIndex("stage complete draft"));
+    expect(yml).toContain("npm test -- scripts/publish-release.test.mjs");
     expect(yml).toContain("scripts/update-harness.mjs");
   });
 });

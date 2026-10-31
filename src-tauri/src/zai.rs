@@ -70,6 +70,8 @@ pub struct ZaiLimitWindow {
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ZaiAccount {
+    #[serde(skip)]
+    pub identity: Option<String>,
     pub key_hint: String,
 }
 
@@ -141,7 +143,7 @@ fn account_hint(key: &str) -> Option<String> {
 /// like-for-like. The hint identifies the *credential*, which is exactly
 /// what the resolution loop attempts — candidate by candidate.
 fn key_identity(key: &ZaiKey) -> Option<String> {
-    account_hint(&key.0).map(|hint| format!("key:{hint}"))
+    Some(crate::credential_identity::fingerprint("zai", &key.0))
 }
 
 // ---------- upstream response (only the fields we consume; extra ignored) ----------
@@ -808,7 +810,7 @@ async fn resolve_usage(
             Ok(limits) => {
                 return Ok(ZaiUsage {
                     limits,
-                    account: account_hint(&key.0).map(|key_hint| ZaiAccount { key_hint }),
+                    account: account_hint(&key.0).map(|key_hint| ZaiAccount { identity: key_identity(key), key_hint }),
                 });
             }
             // This key was refused; try the next candidate (e.g. the team
@@ -1591,7 +1593,7 @@ mod tests {
         let usage = ZaiUsage {
             limits: parse_windows(current_shape_body().to_string().as_bytes())
                 .unwrap(),
-            account: account_hint(key).map(|key_hint| ZaiAccount { key_hint }),
+            account: account_hint(key).map(|key_hint| ZaiAccount { identity: Some(crate::credential_identity::fingerprint("zai", key)), key_hint }),
         };
         let wire = serde_json::to_string(&usage).unwrap();
         assert!(wire.contains("usedPercent"), "wire format must be camelCase: {wire}");
@@ -1699,7 +1701,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "not_entitled");
-        assert_eq!(error.identity_hint.as_deref(), Some("key:9012"));
+        assert_eq!(error.identity_hint, Some(crate::credential_identity::fingerprint("zai", "key-two-wxyz9012")));
 
         // Refusal followed by a non-credential failure: the in-flight
         // candidate is attributed, not the refused one.
@@ -1713,7 +1715,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "network");
-        assert_eq!(error.identity_hint.as_deref(), Some("key:9012"));
+        assert_eq!(error.identity_hint, Some(crate::credential_identity::fingerprint("zai", "key-two-wxyz9012")));
     }
 
     #[tokio::test]
@@ -1743,7 +1745,7 @@ mod tests {
             "{}",
             error.message
         );
-        assert_eq!(error.identity_hint.as_deref(), Some("key:6789"));
+        assert_eq!(error.identity_hint, Some(crate::credential_identity::fingerprint("zai", "echo-key-value-0123456789")));
     }
 
     #[tokio::test]
@@ -1760,7 +1762,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "network");
-        assert_eq!(error.identity_hint.as_deref(), Some("key:1234"));
+        assert_eq!(error.identity_hint, Some(crate::credential_identity::fingerprint("zai", "key-one-abcd1234")));
     }
 
     #[tokio::test]
@@ -1774,7 +1776,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.code, "auth_invalid");
-        assert_eq!(error.identity_hint, None);
+        assert_eq!(error.identity_hint, Some(crate::credential_identity::fingerprint("zai", "short-key")));
 
         let usage = resolve_usage(
             &[ZaiKey("short-key".to_string())],
@@ -1791,9 +1793,9 @@ mod tests {
     fn identity_format_matches_the_success_attribution_input() {
         assert_eq!(
             key_identity(&ZaiKey("abcd1234efgh5678".to_string())),
-            Some("key:5678".to_string())
+            Some(crate::credential_identity::fingerprint("zai", "abcd1234efgh5678"))
         );
-        assert_eq!(key_identity(&ZaiKey("short-key".to_string())), None);
+        assert_eq!(key_identity(&ZaiKey("short-key".to_string())), Some(crate::credential_identity::fingerprint("zai", "short-key")));
     }
 
     /// The usage wire carries only the masked hint — never the key.
@@ -1801,8 +1803,7 @@ mod tests {
     fn usage_attribution_carries_only_the_key_tail() {
         let usage = ZaiUsage {
             limits: vec![window()],
-            account: Some(ZaiAccount {
-                key_hint: "5678".to_string(),
+            account: Some(ZaiAccount { identity: None, key_hint: "5678".to_string(),
             }),
         };
         let wire = serde_json::to_string(&usage).unwrap();

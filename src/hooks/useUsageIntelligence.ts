@@ -1,3 +1,5 @@
+import { listen } from "@tauri-apps/api/event";
+import { isRunningInTauri } from "../lib/runtime";
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   loadUsageIntelligence,
@@ -91,6 +93,27 @@ export function useUsageIntelligence(
     revisionRef.current = revision;
     if (!firstSight || queryKey !== keyRef.current) runQuery(queryKey, query);
   }, [enabled, revision, queryKey, query, runQuery]);
+
+  useEffect(() => {
+    if (!enabled || !isRunningInTauri()) return;
+    let cancelled = false;
+    const subscription = listen<number>("usage-intelligence-changed", event => {
+      if (cancelled || (revisionRef.current !== null && event.payload <= revisionRef.current)) return;
+      revisionRef.current = event.payload;
+      runQuery(queryKey, query);
+    });
+    return () => { cancelled = true; void subscription.then(unlisten => unlisten()).catch(() => {}); };
+  }, [enabled, queryKey, query, runQuery]);
+
+  useEffect(() => {
+    if (!enabled) {
+      ++requestRef.current;
+      keyRef.current = "";
+      revisionRef.current = null;
+      setState(IDLE);
+    }
+    return () => { ++requestRef.current; };
+  }, [enabled]);
 
   const retry = useCallback(() => {
     if (enabled) runQuery(queryKey, query);

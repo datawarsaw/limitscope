@@ -27,7 +27,7 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,268 @@ pub fn normalize_accounts(accounts: &[CodexAccountConfig]) -> Vec<CodexAccountCo
     out
 }
 
+/// Rejects a configuration in which both Codex accounts resolve to the same
+/// credential home. The comparison uses canonical paths where possible and a
+/// lexical fallback for paths that do not exist yet, so alternate separators,
+/// `.`/`..`, trailing separators, and Windows path aliases cannot bypass it.
+///
+/// The environment is passed in so tests never consult the process home
+/// directory, `CODEX_HOME`, or the real working directory.
+fn validate_codex_home_collisions_in(
+    accounts: &[CodexAccountConfig],
+    ambient_codex_home: Option<&str>,
+    user_home: &Path,
+    current_dir: &Path,
+) -> io::Result<()> {
+    let Some(primary) = accounts
+        .iter()
+        .find(|account| account.account_id == PRIMARY_ACCOUNT_ID)
+    else {
+        return Ok(());
+    };
+    let Some(secondary) = accounts
+        .iter()
+        .find(|account| account.account_id == SECONDARY_ACCOUNT_ID)
+    else {
+        return Ok(());
+    };
+    if secondary.codex_home.trim().is_empty() {
+        return Ok(());
+    }
+
+    let primary_home = if primary.codex_home.trim().is_empty() {
+        default_primary_codex_home(ambient_codex_home, user_home, current_dir)
+    } else {
+        PathBuf::from(primary.codex_home.trim())
+    };
+    let secondary_home = PathBuf::from(secondary.codex_home.trim());
+    let primary_key = resolve_codex_home(&primary_home, current_dir);
+    let secondary_key = resolve_codex_home(&secondary_home, current_dir);
+    if codex_homes_collide(&primary_key, &secondary_key) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Primary and secondary Codex accounts must use different Codex home directories",
+        ));
+    }
+    Ok(())
+}
+
+fn default_primary_codex_home(
+    ambient_codex_home: Option<&str>,
+    user_home: &Path,
+    current_dir: &Path,
+) -> PathBuf {
+    if let Some(ambient) = ambient_codex_home
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        let ambient = absolute_codex_home_path(Path::new(ambient), current_dir);
+        if ambient.is_dir() {
+            return ambient;
+        }
+    }
+    user_home.join(".codex")
+}
+
+fn absolute_codex_home_path(path: &Path, current_dir: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir.join(path)
+    }
+}
+
+/// A Codex home resolved for a collision comparison.
+///
+/// The comparison is deliberately split in two. The part of the path that
+/// exists on disk is compared through its canonical path: the canonical form
+/// carries the spelling the filesystem actually uses, so one directory keeps
+/// one identity however it is written, while two real directories that differ
+/// only in case inside a case-sensitive directory keep their own identity.
+/// The part that does not exist yet is compared component by component.
+struct ResolvedCodexHome {
+    /// The volume or share the home lives on. Volume names are not
+    /// case-sensitive, so this is compared in lower case.
+    root: String,
+    /// The canonical path of the deepest existing ancestor, empty when no
+    /// component of the path exists.
+    existing: PathBuf,
+    /// The components below `existing` that do not exist yet.
+    pending: Vec<String>,
+}
+
+fn resolve_codex_home(path: &Path, current_dir: &Path) -> ResolvedCodexHome {
+    let absolute = absolute_codex_home_path(path, current_dir);
+    let (root, components) = lexical_codex_home_components(&absolute);
+
+    let mut existing = PathBuf::new();
+    let mut existing_len = 0usize;
+    for index in 0..components.len() {
+        let mut candidate = PathBuf::new();
+        if !root.is_empty() {
+            candidate.push(&root);
+        }
+        for component in &components[..=index] {
+            candidate.push(component);
+        }
+        // A component that does not exist rules out every deeper one, so the
+        // first failure ends the walk.
+        let Ok(canonical) = fs::canonicalize(&candidate) else {
+            break;
+        };
+        existing = canonical;
+        existing_len = index + 1;
+    }
+
+    ResolvedCodexHome {
+        root,
+        existing,
+        pending: components[existing_len..].to_vec(),
+    }
+}
+
+/// The lexical form of a path: absolute, with `.` and `..` resolved and with
+/// the trailing dots and spaces the filesystem ignores trimmed from the
+/// component names. The case of the components is preserved: only the
+/// filesystem can tell a case-sensitive directory apart.
+fn lexical_codex_home_components(path: &Path) -> (String, Vec<String>) {
+    let mut root = String::new();
+    let mut components: Vec<String> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                root = prefix.as_os_str().to_string_lossy().to_lowercase();
+            }
+            Component::RootDir => {
+                root.push(std::path::MAIN_SEPARATOR);
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                components.pop();
+            }
+            Component::Normal(part) => {
+                let name = normalize_codex_home_component(&part.to_string_lossy());
+                if !name.is_empty() {
+                    components.push(name);
+                }
+            }
+        }
+    }
+    (root, components)
+}
+
+#[cfg(windows)]
+fn normalize_codex_home_component(component: &str) -> String {
+    // Win32 ignores trailing dots and spaces in a directory name.
+    component
+        .trim_end_matches(|character| character == '.' || character == ' ')
+        .to_string()
+}
+
+#[cfg(not(windows))]
+fn normalize_codex_home_component(component: &str) -> String {
+    component.to_string()
+}
+
+/// Whether both accounts would end up using the same credential home.
+fn codex_homes_collide(primary: &ResolvedCodexHome, secondary: &ResolvedCodexHome) -> bool {
+    if primary.root != secondary.root {
+        return false;
+    }
+    if primary.existing != secondary.existing {
+        return false;
+    }
+    match compare_pending_paths(&primary.pending, &secondary.pending) {
+        PendingComparison::Equal => true,
+        PendingComparison::Distinct => false,
+        PendingComparison::CaseOnly => {
+            // Only the case differs. On a case-insensitive volume that is one
+            // entry; in a case-sensitive directory it is two. The directory
+            // itself decides, and the conservative reading stands when it
+            // cannot be asked.
+            directory_resolves_case_insensitively(&primary.existing).unwrap_or(true)
+        }
+    }
+}
+
+/// How the not-yet-existing tails of two codex homes relate to each other.
+enum PendingComparison {
+    /// The same tail: one and the same directory.
+    Equal,
+    /// Different tails: two different directories.
+    Distinct,
+    /// The same tail written in a different case: one directory on a
+    /// case-insensitive volume, two on a case-sensitive one.
+    CaseOnly,
+}
+
+/// Compares the parts of two codex homes that do not exist yet.
+fn compare_pending_paths(primary: &[String], secondary: &[String]) -> PendingComparison {
+    // The tails have the same depth only when the two homes can denote the
+    // same directory. `zip` stops at the shorter side, so an equal prefix of
+    // unequal length would compare as equal while one home actually sits
+    // below the other.
+    if primary.len() != secondary.len() {
+        return PendingComparison::Distinct;
+    }
+    if primary == secondary {
+        return PendingComparison::Equal;
+    }
+    if primary
+        .iter()
+        .zip(secondary)
+        .all(|(left, right)| left.eq_ignore_ascii_case(right))
+    {
+        return PendingComparison::CaseOnly;
+    }
+    PendingComparison::Distinct
+}
+
+/// Whether the directory resolves an entry written in a different case to the
+/// same entry. `None` when the directory cannot answer: no entry to compare,
+/// or no access to it.
+fn directory_resolves_case_insensitively(directory: &Path) -> Option<bool> {
+    let entries = fs::read_dir(directory).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(variant) = case_variant(&name) else {
+            continue;
+        };
+        let original = fs::canonicalize(directory.join(&name)).ok();
+        let spelled_differently = fs::canonicalize(directory.join(&variant)).ok();
+        match (original, spelled_differently) {
+            (Some(original), Some(spelled_differently)) => {
+                return Some(original == spelled_differently);
+            }
+            // The differently spelled name does not resolve, so this
+            // directory tells the two names apart.
+            (Some(_), None) => return Some(false),
+            (None, _) => continue,
+        }
+    }
+    None
+}
+
+/// The same name with the case of its first ASCII letter flipped, if it has
+/// one.
+fn case_variant(name: &str) -> Option<String> {
+    let mut variant = String::with_capacity(name.len());
+    let mut flipped = false;
+    for character in name.chars() {
+        if !flipped && character.is_ascii_alphabetic() {
+            variant.push(if character.is_ascii_uppercase() {
+                character.to_ascii_lowercase()
+            } else {
+                character.to_ascii_uppercase()
+            });
+            flipped = true;
+        } else {
+            variant.push(character);
+        }
+    }
+    flipped.then_some(variant)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedCodexAccountsEnvelope {
@@ -158,13 +420,25 @@ struct PersistedCodexAccountsEnvelope {
 /// honors the configured accounts) and rewritten on every applied change
 /// from the settings lane.
 pub struct CodexAccountStore {
+    writable: bool,
+    unsupported_version: Option<u64>,
     path: PathBuf,
     accounts: Mutex<Vec<CodexAccountConfig>>,
 }
 
 impl CodexAccountStore {
     pub fn open(path: PathBuf) -> Self {
+        let unsupported_version = fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<serde_json::Value>(&raw).ok())
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            .filter(|version| *version != SCHEMA_VERSION as u64);
         let store = Self {
+            unsupported_version,
+            writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
+                let normalized = serde_json::to_value(parse_envelope(&value.to_string())).ok();
+                value.get("accounts") == normalized.as_ref()
+            }),
             path,
             accounts: Mutex::new(default_accounts()),
         };
@@ -177,37 +451,57 @@ impl CodexAccountStore {
         self.accounts.lock().unwrap().clone()
     }
 
+    pub fn unsupported_version(&self) -> Option<u64> {
+        self.unsupported_version
+    }
+
+    pub fn is_writable(&self) -> bool {
+        self.writable
+    }
+
     /// Replaces the configuration and persists it. A failed write keeps the
     /// in-memory state (this session gates on it) and surfaces the error, so
     /// a restart falls back to the defaults rather than to a stale file
     /// silently contradicting the UI.
+    ///
+    /// A collision between the two accounts' Codex homes is rejected before
+    /// anything is locked or written, so neither memory nor disk changes.
     pub fn set_accounts(&self, accounts: &[CodexAccountConfig]) -> Result<(), io::Error> {
-        let normalized = normalize_accounts(accounts);
-        {
-            let mut state = self.accounts.lock().unwrap();
-            if *state == normalized {
-                return Ok(());
-            }
-            *state = normalized;
-        }
-        self.persist()
+        let ambient_codex_home = std::env::var("CODEX_HOME").ok();
+        let user_home = std::env::home_dir().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Could not locate the user home directory",
+            )
+        })?;
+        let current_dir = std::env::current_dir()?;
+        self.set_accounts_in(accounts, ambient_codex_home.as_deref(), &user_home, &current_dir)
     }
 
-    fn persist(&self) -> Result<(), io::Error> {
+    /// The write path with the environment supplied by the caller, so tests
+    /// exercise the same validation and persistence without reading the
+    /// process home directory, `CODEX_HOME`, or the real working directory.
+    fn set_accounts_in(
+        &self,
+        accounts: &[CodexAccountConfig],
+        ambient_codex_home: Option<&str>,
+        user_home: &Path,
+        current_dir: &Path,
+    ) -> Result<(), io::Error> {
+        if !self.writable { return Err(io::Error::other("Unsupported or unavailable account store")); }
+        let normalized = normalize_accounts(accounts);
+        validate_codex_home_collisions_in(&normalized, ambient_codex_home, user_home, current_dir)?;
+        let mut state = self.accounts.lock().unwrap();
         let envelope = PersistedCodexAccountsEnvelope {
             version: SCHEMA_VERSION,
-            accounts: serde_json::to_value(self.accounts())
-                .ok()
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default(),
+            accounts: serde_json::to_value(&normalized)?.as_array().cloned().unwrap_or_default(),
         };
-        let json = serde_json::to_string_pretty(&envelope)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let json = serde_json::to_vec(&envelope)?;
+        if fs::read(&self.path).ok().as_deref() != Some(json.as_slice()) {
+            crate::durable_file::replace(&self.path, &json)?;
         }
-        fs::write(&temp_path, json.as_bytes()).and_then(|()| fs::rename(&temp_path, &self.path))
+        *state = normalized;
+        Ok(())
     }
 
     fn load_from_disk(&self) {
@@ -292,6 +586,68 @@ mod tests {
         let _ = fs::remove_file(path.with_extension("json.tmp"));
     }
 
+    fn temp_dir(tag: &str) -> PathBuf {
+        let path = store_path(tag).with_extension("dir");
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    /// A hermetic environment for the write path: no test consults the
+    /// process home directory, the ambient `CODEX_HOME`, or the real working
+    /// directory, and nothing here points at a production path.
+    fn test_context(root: &Path) -> (PathBuf, PathBuf) {
+        (root.join("user"), root.to_path_buf())
+    }
+
+    /// Applies accounts through the production validation and persistence path
+    /// with that hermetic context.
+    fn apply(
+        store: &CodexAccountStore,
+        accounts: &[CodexAccountConfig],
+        root: &Path,
+    ) -> io::Result<()> {
+        let (user_home, current_dir) = test_context(root);
+        store.set_accounts_in(accounts, None, &user_home, &current_dir)
+    }
+
+    #[test]
+    fn applying_defaults_after_semantic_corruption_really_repairs_disk() {
+        let path = store_path("defaults-after-corruption");
+        let root = temp_dir("defaults-after-corruption-context");
+        fs::write(&path, r#"{"version":1,"accounts":"broken"}"#).unwrap();
+        let store = CodexAccountStore::open(path.clone());
+        apply(&store, &store.accounts(), &root).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(value["accounts"].is_array());
+        // Remove only this fixture's preserved recovery copies.
+        for entry in fs::read_dir(path.parent().unwrap()).unwrap().filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{}.recovery-", path.file_stem().unwrap().to_string_lossy())) {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn failed_write_does_not_change_memory_and_identical_retry_succeeds() {
+        let root = temp_dir("failed-retry-context");
+        let path = store_path("failed-retry");
+        let store = CodexAccountStore::open(path.clone());
+        let before = store.accounts();
+        let mut accounts = before.clone();
+        accounts[0].alias = "Retry".into();
+        fs::create_dir(&path).unwrap();
+        assert!(apply(&store, &accounts, &root).is_err());
+        assert_eq!(store.accounts(), before);
+        fs::remove_dir(&path).unwrap();
+        apply(&store, &accounts, &root).unwrap();
+        assert_eq!(CodexAccountStore::open(path.clone()).accounts(), accounts);
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn a_missing_file_starts_with_the_default_accounts() {
         let path = store_path("missing");
@@ -305,18 +661,50 @@ mod tests {
     }
 
     #[test]
+    fn startup_reads_preserve_main_cowork_and_explicit_edits_still_persist() {
+        let root = temp_dir("startup-read-context");
+        let path = store_path("startup-read");
+        let mut accounts = default_accounts();
+        accounts[0].alias = "Main".to_string();
+        accounts[0].codex_home = "C:\\fixture\\main".to_string();
+        accounts[1].alias = "Cowork".to_string();
+        accounts[1].codex_home = "C:\\fixture\\cowork".to_string();
+        accounts[1].monitored = false;
+        apply(&CodexAccountStore::open(path.clone()), &accounts, &root)
+            .expect("persist fixture");
+        let before = fs::read(&path).expect("read fixture");
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+
+        let startup = CodexAccountStore::open(path.clone());
+        assert_eq!(startup.accounts(), accounts);
+        assert_eq!(startup.accounts(), accounts, "reopening Settings only reads");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        let mut edited = startup.accounts();
+        edited[0].alias = "Main edited".to_string();
+        apply(&startup, &edited, &root).expect("explicit edit");
+        assert_eq!(CodexAccountStore::open(path.clone()).accounts(), edited);
+        assert_eq!(edited[1], accounts[1], "the other account stays isolated");
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn applied_accounts_round_trip_through_the_file() {
+        let root = temp_dir("roundtrip-context");
         let path = store_path("roundtrip");
         let store = CodexAccountStore::open(path.clone());
         let mut accounts = default_accounts();
         accounts[1].alias = "Work".to_string();
         accounts[1].codex_home = "C:\\\\codex-home-second".to_string();
         accounts[1].monitored = false;
-        store.set_accounts(&accounts).expect("persist");
+        apply(&store, &accounts, &root).expect("persist");
 
         let reopened = CodexAccountStore::open(path.clone());
         assert_eq!(reopened.accounts(), accounts);
         remove_store(&path);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -330,11 +718,34 @@ mod tests {
 
     #[test]
     fn a_foreign_version_file_degrades_to_the_defaults() {
+        let root = temp_dir("version-context");
         let path = store_path("version");
         fs::write(&path, r#"{ "version": 99, "accounts": [] }"#).expect("write fixture");
         let store = CodexAccountStore::open(path.clone());
         assert_eq!(store.accounts(), default_accounts());
+        assert_eq!(store.unsupported_version(), Some(99));
+        assert!(apply(&store, &default_accounts(), &root).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{ "version": 99, "accounts": [] }"#
+        );
         remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn missing_or_invalid_version_is_not_writable() {
+        let root = temp_dir("invalid-version-context");
+        for raw in [r#"{"accounts":[]}"#, r#"{"version":"1","accounts":[]}"#] {
+            let path = store_path("invalid-version");
+            fs::write(&path, raw).unwrap();
+            let store = CodexAccountStore::open(path.clone());
+            assert!(!store.is_writable());
+            assert!(apply(&store, &default_accounts(), &root).is_err());
+            assert_eq!(fs::read_to_string(&path).unwrap(), raw);
+            remove_store(&path);
+        }
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -413,16 +824,248 @@ mod tests {
     }
 
     #[test]
+    fn dot_and_parent_segments_cannot_bypass_codex_home_collision_check() {
+        let root = temp_dir("home-dotdot");
+        let shared = root.join("homes");
+        fs::create_dir_all(shared.join("nested")).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.join("nested").join("..").to_string_lossy().into();
+        accounts[1].codex_home = shared.to_string_lossy().into();
+
+        let error = validate_codex_home_collisions_in(
+            &accounts,
+            None,
+            &root.join("user"),
+            &root,
+        )
+        .expect_err("equivalent normalized homes must be rejected");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn pending_tails_of_unequal_depth_are_never_the_same_directory() {
+        assert!(matches!(
+            compare_pending_paths(&[], &["beta".to_string()]),
+            PendingComparison::Distinct
+        ));
+        assert!(matches!(
+            compare_pending_paths(
+                &["missing".to_string(), "alpha".to_string()],
+                &[
+                    "missing".to_string(),
+                    "alpha".to_string(),
+                    "beta".to_string()
+                ]
+            ),
+            PendingComparison::Distinct
+        ));
+        assert!(matches!(
+            compare_pending_paths(&["shared".to_string()], &["shared".to_string()]),
+            PendingComparison::Equal
+        ));
+        assert!(matches!(
+            compare_pending_paths(&["Shared".to_string()], &["shared".to_string()]),
+            PendingComparison::CaseOnly
+        ));
+    }
+
+    #[test]
+    fn an_existing_home_and_the_directory_below_it_are_distinct_homes() {
+        let root = temp_dir("home-nested-existing");
+        let shared = root.join("shared");
+        fs::create_dir_all(shared.join("nested")).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        accounts[1].codex_home = shared.join("nested").to_string_lossy().into();
+
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("a subdirectory is a different credential home");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_home_that_does_not_exist_yet_is_not_a_collision_with_its_parent() {
+        let root = temp_dir("home-nested-pending");
+        let shared = root.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        accounts[1].codex_home = shared.join("nested").to_string_lossy().into();
+
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("a not yet created subdirectory is a different credential home");
+
+        accounts[0].codex_home = root.join("missing").join("alpha").to_string_lossy().into();
+        accounts[1].codex_home = root
+            .join("missing")
+            .join("alpha")
+            .join("beta")
+            .to_string_lossy()
+            .into();
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("two not yet created tails of different depth are different homes");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_separator_and_trailing_dot_aliases_collide() {
+        let root = temp_dir("home-windows-alias");
+        let shared = root.join("Shared");
+        fs::create_dir_all(&shared).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        let alias = shared.to_string_lossy().replace('\\', "/").to_uppercase();
+        accounts[1].codex_home = format!("{alias}.");
+
+        let error = validate_codex_home_collisions_in(
+            &accounts,
+            None,
+            &root.join("user"),
+            &root,
+        )
+        .expect_err("Windows path aliases must be treated as one home");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_sensitive_directory_keeps_distinct_codex_homes() {
+        let root = temp_dir("home-windows-case-sensitive");
+        let status = std::process::Command::new("fsutil")
+            .args(["file", "setCaseSensitiveInfo"])
+            .arg(&root)
+            .arg("enable")
+            .status()
+            .expect("fsutil must be available to enable directory case sensitivity");
+        if !status.success() {
+            let _ = fs::remove_dir_all(root);
+            return;
+        }
+
+        let upper = root.join("Shared");
+        let lower = root.join("shared");
+        fs::create_dir(&upper).unwrap();
+        fs::create_dir(&lower).unwrap();
+        assert_ne!(
+            fs::canonicalize(&upper).unwrap(),
+            fs::canonicalize(&lower).unwrap(),
+            "the fixture must contain two case-distinct directories"
+        );
+
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = upper.to_string_lossy().into();
+        accounts[1].codex_home = lower.to_string_lossy().into();
+        validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root)
+            .expect("case-distinct existing homes are different directories");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn case_variant_flips_the_first_ascii_letter_in_either_direction() {
+        assert_eq!(case_variant("shared"), Some("Shared".to_string()));
+        assert_eq!(case_variant("Shared"), Some("shared".to_string()));
+        assert_eq!(case_variant("123"), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn codex_home_paths_remain_case_sensitive_off_windows() {
+        let root = temp_dir("home-case-sensitive");
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = root.join("Shared").to_string_lossy().into();
+        accounts[1].codex_home = root.join("shared").to_string_lossy().into();
+
+        validate_codex_home_collisions_in(
+            &accounts,
+            None,
+            &root.join("user"),
+            &root,
+        )
+        .expect("case-distinct homes are distinct on this platform");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn primary_default_home_cannot_be_reused_by_secondary() {
+        let root = temp_dir("home-default");
+        let user_home = root.join("user");
+        let fallback = user_home.join(".codex");
+        fs::create_dir_all(fallback.join("nested")).unwrap();
+        let current_dir = root.as_path();
+        let mut accounts = default_accounts();
+        accounts[1].codex_home = fallback.join("nested").join("..").to_string_lossy().into();
+
+        let default_collision =
+            validate_codex_home_collisions_in(&accounts, None, &user_home, current_dir);
+        assert!(default_collision.is_err());
+
+        let ambient = root.join("ambient");
+        fs::create_dir_all(ambient.join("nested")).unwrap();
+        accounts[1].codex_home = ambient.join("nested").join("..").to_string_lossy().into();
+        let ambient_collision = validate_codex_home_collisions_in(
+            &accounts,
+            Some(ambient.to_string_lossy().as_ref()),
+            &user_home,
+            current_dir,
+        );
+        assert!(ambient_collision.is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn colliding_codex_homes_are_rejected_before_persisting() {
+        let root = temp_dir("home-store-collision");
+        let shared = root.join("shared");
+        let path = store_path("home-store-collision");
+        let store = CodexAccountStore::open(path.clone());
+        let before = store.accounts();
+        let mut accounts = before.clone();
+        accounts[0].codex_home = shared.to_string_lossy().into();
+        accounts[1].codex_home = shared.join(".").to_string_lossy().into();
+
+        let error = apply(&store, &accounts, &root)
+            .expect_err("the store must reject a credential-home collision");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(store.accounts(), before);
+        assert!(!path.exists(), "validation happens before persistence");
+
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn distinct_codex_homes_persist_without_rewriting_the_paths() {
+        let root = temp_dir("home-store-distinct");
+        let path = store_path("home-store-distinct");
+        let store = CodexAccountStore::open(path.clone());
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = root.join("main").to_string_lossy().into();
+        accounts[1].codex_home = root.join("cowork").to_string_lossy().into();
+
+        apply(&store, &accounts, &root)
+            .expect("distinct homes are valid");
+        assert_eq!(store.accounts(), accounts);
+        assert_eq!(CodexAccountStore::open(path.clone()).accounts(), accounts);
+
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn applying_the_same_accounts_is_a_no_op_and_rewrites_nothing() {
+        let root = temp_dir("idempotent-context");
         let path = store_path("idempotent");
         let store = CodexAccountStore::open(path.clone());
         let mut accounts = default_accounts();
         accounts[1].codex_home = "C:\\\\codex-home-second".to_string();
-        store.set_accounts(&accounts).expect("first apply");
+        apply(&store, &accounts, &root).expect("first apply");
         let written = fs::metadata(&path).expect("file exists");
 
         std::thread::sleep(std::time::Duration::from_millis(20));
-        store.set_accounts(&accounts).expect("second apply");
+        apply(&store, &accounts, &root).expect("second apply");
         let metadata = fs::metadata(&path).expect("file exists");
         assert_eq!(
             written.modified().unwrap(),
@@ -430,5 +1073,6 @@ mod tests {
             "an unchanged configuration must not rewrite the store"
         );
         remove_store(&path);
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -37,7 +37,7 @@ bundling-specific input changed:
 
 | Gate | Command |
 |------|---------|
-| Full Tauri release build + NSIS bundling | `npm run tauri build` |
+| Full Tauri release build + NSIS bundling | `./node_modules/.bin/tauri build -- --locked` |
 | Upload installer artifact | `src-tauri/target/release/bundle/nsis/*-setup.exe` (`if-no-files-found: error`) |
 
 Two jobs implement this:
@@ -49,7 +49,7 @@ Two jobs implement this:
    (`github.event.before`). When no base can be resolved (unborn ref, force
    push, fetch failure) it prints a warning and emits `true`, so bundling
    verification fails closed rather than silently skipping.
-2. `bundling-verification` (**Windows**) carries the `npm run tauri build`
+2. `bundling-verification` (**Windows**) carries the Tauri
    bundling step and the installer upload. Its job-level
    `if: needs.bundling-inputs.outputs.run_bundling == 'true'` means the job is
    **skipped**, not left pending, when nothing relevant changed.
@@ -107,13 +107,16 @@ cargo test --locked        # from src-tauri/
 npm test
 npm run build
 npm run scan:secrets
-npm run tauri build        # only when a bundling input changed
+./node_modules/.bin/tauri build -- --locked   # only when a bundling input changed
 ```
 
 The installer appears under `src-tauri/target/release/bundle/nsis/`.
-`npm run tauri build` internally re-runs `npm run build` as Tauri's
+The Tauri build internally re-runs `npm run build` as Tauri's
 `beforeBuildCommand`, so the ordinary `npm run build` gate is a fast-failing
-type-check and the bundling job repeats it by design.
+type-check and the bundling job repeats it by design. The Tauri CLI is invoked
+directly (`./node_modules/.bin/tauri build -- --locked`) because `npm run`
+swallows `--` separators, which would drop the `--` that hands `--locked` to
+Cargo.
 
 To see the bundling decision locally, pipe changed paths into the gate:
 
@@ -200,3 +203,28 @@ in its gate section. Release closeout is verified GitHub release provenance
 v0.8 runbook's Phase 5); this repository keeps no separate post-release state
 ledger. Do not add release publishing, tag pushing, or signing to this
 workflow without explicitly revisiting that policy and the required secrets.
+
+
+## Release trust boundary (0.8.24 local candidate)
+
+The manually dispatched release uses separate GitHub-hosted Windows runners.
+`validation` receives no signing key or companion publication token and uploads
+no artifacts or caches; its success is required before `windows` can start.
+The release runner checks out the workflow SHA, verifies the operator SHA and
+version tag, installs the locked dependencies with npm 12 strict script approval,
+and builds with Cargo `--locked`. Both runners pin Node 24.19.0 and npm 12.0.2.
+CI uses the same npm policy and locked Cargo resolution for the Tauri bundle.
+
+The build runs without signing credentials. Only the signing step receives the
+key; the companion token is limited to the publication step. The exact installer
+and updater signature must verify cryptographically against the embedded trust
+root before publication. The publication step also checks the artifact hashes,
+feed URL and signature, then stages and re-downloads all three assets from a
+private draft before activation. Stable and RC behavior remains unchanged.
+
+This boundary assumes GitHub-hosted runner isolation and trusts the source,
+runner image, actions, registries, approved install scripts and build tools.
+A compromised build process on the signing runner could persist or tamper with
+subsequent steps, including access to secrets; separation of the validation job
+only contains the test process and does not remediate tinypool or accept any
+remaining vulnerability. Release remains HOLD, with Human Acceptance unchanged.

@@ -1,5 +1,6 @@
 /**
- * Persisted, UI-owned model of the two configured OpenAI/Codex accounts.
+ * UI model of the two configured OpenAI/Codex accounts. In Tauri the
+ * persisted Rust configuration is authoritative; WebView storage is a cache.
  *
  * Each account has its own CODEX_HOME, so each `auth.json` can be read
  * independently. The primary account falls back to the default Codex home,

@@ -6,6 +6,10 @@ import { isCodexProviderId } from "../lib/providerIds";
 
 const SNAPSHOT_EVENT = "runtime://snapshot";
 const CYCLE_STARTED_EVENT = "runtime://cycle-started";
+// Fallback cadence for the moment before the first snapshot arrives. It
+// never decides the outcome: without a snapshot there is no successful cycle
+// to age, so the readout is measured from the attach instant.
+const DEFAULT_REFRESH_INTERVAL_MINUTES = 5;
 // How often the "stale" relative-time readout is re-rendered.
 const CLOCK_TICK_MS = 30 * 1000;
 // Auth files can change without starting a provider cycle or emitting a
@@ -34,8 +38,9 @@ type CodexSlotEntry = {
  *
  * - subscribes to runtime events and pulls the current snapshot once on
  *   attach (the `seq` guard makes pull/event ordering irrelevant);
- * - pushes the persisted refresh interval to the runtime on attach and on
- *   every settings change — no provider timer lives in TS anymore;
+ * - runs the optional attach hand-off exactly once, so the settings lane
+ *   can push the persisted refresh interval to the runtime through its own
+ *   write queue — no provider timer lives in TS anymore;
  * - `refresh` requests a runtime cycle (one owner, all windows update from
  *   the same snapshot fan-out).
  *
@@ -43,7 +48,17 @@ type CodexSlotEntry = {
  * (main dashboard, floating quota bar) keep their exact view semantics —
  * while duplicate per-window provider cycles are gone.
  */
-export function useProviderUsage(refreshIntervalMinutes: number) {
+export type ProviderUsageOptions = {
+  /**
+   * Runs once when the hook attaches. The settings lane uses it to hand the
+   * persisted refresh interval over to the runtime. The hook itself never
+   * writes a preference: a write from here would land outside the settings
+   * write queue and could survive a reset or overwrite a newer edit.
+   */
+  onAttach?: () => void;
+};
+
+export function useProviderUsage(options?: ProviderUsageOptions) {
   const [snapshot, setSnapshot] = useState<RuntimeSnapshot | null>(null);
   // Optimistic loading for a just-requested cycle; the runtime's
   // cycle-started/snapshot events take over from there.
@@ -361,12 +376,18 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
     invalidateCodexUsage,
   ]);
 
-  // The runtime owns the timer; TS only forwards the persisted interval
-  // (kept in localStorage by settings.ts) at attach and on every change.
+  // The runtime owns the timer and the settings lane owns the queue that
+  // writes it. This hook only runs the hand-off once, so the interval is
+  // written exactly like every other preference: ordered against a reset,
+  // fenced against a newer edit, and never sent by a second window.
+  const onAttach = options?.onAttach;
+  const attached = useRef(false);
   useEffect(() => {
+    if (attached.current) return;
+    attached.current = true;
     if (!isRunningInTauri()) return;
-    void invoke("set_refresh_interval", { minutes: refreshIntervalMinutes });
-  }, [refreshIntervalMinutes]);
+    onAttach?.();
+  }, [onAttach]);
 
   // Resilience trigger (v0.5): after connectivity returns, ask the shared
   // runtime for one cycle. JS is only a trigger — the Rust runtime is the
@@ -463,8 +484,15 @@ export function useProviderUsage(refreshIntervalMinutes: number) {
 
   // Data counts as stale after 2 × configured refresh interval without a
   // successful refresh; "min ago" is measured from the last successful
-  // runtime cycle, or from attach if none has happened yet.
-  const staleAfterMs = refreshIntervalMinutes * 2 * 60 * 1000;
+  // runtime cycle, or from attach if none has happened yet. The runtime owns
+  // the cadence, so its own snapshot decides the threshold - a window's copy
+  // of the preference could still be an unapplied edit.
+  const runtimeIntervalMinutes = snapshot?.refreshIntervalMinutes;
+  const effectiveIntervalMinutes =
+    typeof runtimeIntervalMinutes === "number" && runtimeIntervalMinutes > 0
+      ? runtimeIntervalMinutes
+      : DEFAULT_REFRESH_INTERVAL_MINUTES;
+  const staleAfterMs = effectiveIntervalMinutes * 2 * 60 * 1000;
   const referenceAt = lastUpdatedAt?.getTime() ?? attachAt;
   const staleMinutes = Math.max(0, Math.floor((now - referenceAt) / 60000));
   const stale = now - referenceAt > staleAfterMs;

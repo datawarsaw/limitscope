@@ -46,6 +46,7 @@ function okUsage(checkedAt: string): ProviderUsage {
     status: "ok",
     health: "live",
     checkedAt,
+    account: { label: "fixture", identity: "credential-v1:" + "a".repeat(64) },
     limits: [{ label: "5-hour", usedPercent: 42, resetAt: "2026-09-29T13:00:00.000Z" }],
   };
 }
@@ -85,7 +86,7 @@ describe("quota history ownership (Rust-owned, read-only TS)", () => {
         windowLabel: "5-hour",
         usedPercent: 42,
         observedAt: CHECKED_AT,
-        account: "key:3456",
+        account: "credential-v1:" + "a".repeat(64),
       },
     ]);
     const usages = [seededUsage()];
@@ -157,6 +158,7 @@ describe("quota history ownership (Rust-owned, read-only TS)", () => {
         windowLabel: "5-hour",
         usedPercent: 42,
         observedAt: CHECKED_AT,
+        account: "credential-v1:" + "a".repeat(64),
       },
     ]);
     const usages = [seededUsage()];
@@ -219,6 +221,15 @@ describe("legacy localStorage migration", () => {
     rerender({ revision: 3 });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(mocks.importLegacyHistory).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves the original legacy source when only part of it could be imported", async () => {
+    mocks.readLegacyHistory.mockReturnValue({ present: true, observations: [{providerId:"zai"}, {broken:true}] });
+    mocks.importLegacyHistory.mockResolvedValue({ accepted:1, rejected:1 });
+    renderHook(() => useQuotaPredictions([seededUsage()], NOW_MS, 1));
+    await waitFor(() => expect(mocks.importLegacyHistory).toHaveBeenCalled());
+    await act(async () => {});
+    expect(mocks.removeLegacyHistory).not.toHaveBeenCalled();
   });
 
   it("leaves the legacy key in place when the import fails, without crashing", async () => {

@@ -144,12 +144,14 @@ afterEach(() => {
 
 describe("useProviderUsage (shared runtime consumer)", () => {
   it("pulls the snapshot once on attach and never invokes provider commands", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.usages).toHaveLength(1);
     const commands = mocks.invocations.map((call) => call.command);
     expect(commands).toContain("get_runtime_snapshot");
-    expect(commands).toContain("set_refresh_interval");
+    // The cadence belongs to the settings lane: this hook never writes a
+    // preference, so no window can push a stale copy into the runtime.
+    expect(commands).not.toContain("set_refresh_interval");
     // Fetching is Rust-owned: no provider command may ever come from TS.
     expect(commands.filter((c) => c.startsWith("get_") && c !== "get_runtime_snapshot")).toEqual([]);
     expect(result.current.refreshOverdue).toBe(false);
@@ -159,7 +161,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   it("periodically re-reads the runtime projection without requesting collection", async () => {
     vi.useFakeTimers();
     try {
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -196,7 +198,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         () => olderRead.promise,
         () => newestRead.promise,
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -245,7 +247,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
     const delayedInitialRead = deferred<RuntimeSnapshot>();
     const zai = currentSnapshot().providers[0];
     mocks.snapshotResponses.push(() => delayedInitialRead.promise);
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
 
     // Production order is listener first, pull second. The mock invoke is
     // already pending when the event arrives, so the response is genuinely
@@ -279,7 +281,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
     mocks.snapshotResponses.push(() =>
       snapshotWith({ providers: [codexUsage(14, "account-a"), zai] }),
     );
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.usages[0]?.limits[0]?.usedPercent).toBe(14);
 
@@ -298,7 +300,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         () => snapshotWith({ providers: [codexUsage(14, "account-a"), zai] }),
         () => delayedRead.promise,
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -341,7 +343,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   });
 
   it("applies runtime snapshot events and closes the loading span", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     act(() => mocks.cycleStartedState.handler?.());
     expect(result.current.loading).toBe(true);
@@ -351,7 +353,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   });
 
   it("ignores snapshots older than the newest applied one (seq guard)", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     emitSnapshot(snapshotWith({ seq: 3, providers: [], cycleSucceeded: false }));
     expect(result.current.usages).toHaveLength(0);
@@ -363,7 +365,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   it.each(["error", "cooldown", "stale", "paused"] as const)(
     "keeps each Codex account's retained reading isolated through a %s snapshot",
     async (state) => {
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await waitFor(() => expect(result.current.loading).toBe(false));
       const ids = ["openai-codex", "openai-codex:secondary"];
       for (const affected of [0, 1]) {
@@ -399,7 +401,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   );
 
   it("refresh requests go to the runtime, not to provider adapters", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     act(() => result.current.refresh());
     expect(result.current.loading).toBe(true);
@@ -430,7 +432,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
           wallets: [wallet],
         }),
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -489,7 +491,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         ],
       }),
     );
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
  await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.usages.map((usage) => usage.id)).toEqual([
       "openai-codex",
@@ -529,7 +531,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         ],
       }),
     );
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     // The runtime observed that the secondary slot has no usable login. It
@@ -557,7 +559,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         codexIdentityStates: [codexState("openai-codex", 5, "user-a")],
       }),
     );
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.usages[0]?.limits[0]?.usedPercent).toBe(14);
 
@@ -601,7 +603,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         }),
         () => delayedRead.promise,
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -652,7 +654,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         () => slowRead.promise,
         () => followUp.promise,
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await act(async () => {
         await Promise.resolve();
         await Promise.resolve();
@@ -690,7 +692,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
         codexIdentityStates: [codexState("openai-codex", 5, "user-a")],
       }),
     );
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(
       result.current.usages.find((usage) => usage.id === "openai-codex")?.limits[0]?.usedPercent,
@@ -730,7 +732,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
       codexIdentityStates: [primaryState, codexState(secondary.id, 5, "user-a")],
     });
     mocks.snapshotResponses.push(() => original);
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.usages.find((usage) => usage.id === secondary.id)?.limits[0]?.usedPercent).toBe(14);
 
@@ -771,7 +773,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
       mocks.snapshotResponses.push(() =>
         Promise.reject(new Error("snapshot read failed")),
       );
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       await waitFor(() => expect(result.current.loading).toBe(false));
       expect(result.current.usages).toEqual([]);
     } finally {
@@ -780,7 +782,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   });
 
   it("refreshes a wallet through its own busy state and applies its snapshot", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.wallets).toEqual([]);
 
@@ -813,7 +815,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   });
 
   it("the reconnect trigger only asks the shared runtime for one cycle", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     await waitFor(() => expect(result.current.loading).toBe(false));
     mocks.invocations.length = 0;
     // Both webviews run this hook, so bursts are expected — each `online`
@@ -831,25 +833,30 @@ describe("useProviderUsage (shared runtime consumer)", () => {
     expect(result.current.usages).toHaveLength(1);
   });
 
-  it("forwards the persisted refresh interval on attach and on change", async () => {
-    const { rerender } = renderHook(({ minutes }) => useProviderUsage(minutes), {
-      initialProps: { minutes: 5 },
-    });
-    await waitFor(() =>
-      expect(mocks.invocations.some((c) => c.command === "set_refresh_interval")).toBe(true),
-    );
-    rerender({ minutes: 15 });
-    await waitFor(() =>
-      expect(
-        mocks.invocations.some((c) => c.command === "set_refresh_interval" && c.args !== undefined),
-      ).toBe(true),
-    );
-    const intervalCalls = mocks.invocations.filter((c) => c.command === "set_refresh_interval");
-    expect(intervalCalls.at(-1)?.args).toEqual({ minutes: 15 });
+  it("runs the attach hand-off exactly once and never writes a preference", async () => {
+    const onAttach = vi.fn();
+    const { rerender } = renderHook(() => useProviderUsage({ onAttach }));
+    await waitFor(() => expect(onAttach).toHaveBeenCalledTimes(1));
+    rerender();
+    await waitFor(() => expect(onAttach).toHaveBeenCalledTimes(1));
+    // The hand-off is the settings lane's job: the hook writes nothing, so a
+    // cadence can never land outside the queue that orders it against a
+    // reset or a newer edit.
+    expect(
+      mocks.invocations.some((call) => call.command.startsWith("set_")),
+    ).toBe(false);
+  });
+
+  it("stays read-only when no attach hand-off is given", async () => {
+    const { result } = renderHook(() => useProviderUsage());
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(
+      mocks.invocations.some((call) => call.command.startsWith("set_")),
+    ).toBe(false);
   });
 
   it("exposes the runtime's history revision, null before the first snapshot", async () => {
-    const { result } = renderHook(() => useProviderUsage(5));
+    const { result } = renderHook(() => useProviderUsage());
     expect(result.current.historyRevision).toBeNull();
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.historyRevision).toBe(0);
@@ -860,7 +867,7 @@ describe("useProviderUsage (shared runtime consumer)", () => {
   it("projects staleness from the runtime's last successful cycle", async () => {
     vi.useFakeTimers({ now: Date.parse("2026-09-29T13:00:00.000Z") });
     try {
-      const { result } = renderHook(() => useProviderUsage(5));
+      const { result } = renderHook(() => useProviderUsage());
       // Flush the subscribe+pull microtasks (fake timers keep waitFor's
       // intervals from advancing).
       await act(async () => {});
