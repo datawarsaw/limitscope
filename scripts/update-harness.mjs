@@ -42,8 +42,9 @@
  * The implementation lives in ./update-harness-lib.mjs, which must stay
  * shebang-free: vite's transform pipeline hoists imports above a leading
  * hashbang, producing an invalid token mid-module, so vitest cannot import
- * a shebang-bearing module (this also breaks the pre-existing
- * verify-release-signature.test.mjs collection).
+ * a shebang-bearing module (the same defect previously broke
+ * verify-release-signature.test.mjs collection until that script was split
+ * the same way).
  */
 
 import { pathToFileURL } from "node:url";

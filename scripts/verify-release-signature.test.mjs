@@ -9,7 +9,7 @@ import {
   decodeCanonicalBase64,
   normalizeSignature,
   readTrustRoot,
-} from "./verify-release-signature.mjs";
+} from "./verify-release-signature-lib.mjs";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SCRIPT = path.join(REPO_ROOT, "scripts", "verify-release-signature.mjs");
