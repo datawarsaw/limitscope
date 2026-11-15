@@ -145,6 +145,8 @@ struct StoreState {
     /// Monotonic counter, bumped on every state change. Broadcast in the
     /// runtime snapshot so consumers re-pull only when history changed.
     revision: u64,
+    legacy_cleared: bool,
+    legacy_imported: bool,
 }
 
 /// The quota history store: bounded state behind a small mutex, persisted to
@@ -190,7 +192,7 @@ impl QuotaHistoryStore {
     /// (or empty), and the sanitized state is written back so degradation
     /// does not survive to the next session. Never crashes startup.
     fn load_from_disk(&self) {
-        let raw = match fs::read_to_string(&self.path) {
+        let bytes = match fs::read(&self.path) {
             Ok(raw) => raw,
             // Absent (first run, or cleared) and unreadable both start from
             // empty; the next write re-seeds the file either way.
@@ -200,6 +202,18 @@ impl QuotaHistoryStore {
                 }
                 return;
             },
+        };
+        let raw = match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => {
+                let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+                if crate::durable_file::replace(&backup, &error.into_bytes()).is_err() {
+                    self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                self.persist(&[]);
+                return;
+            }
         };
         let unsupported = serde_json::from_str::<Value>(&raw).ok().is_some_and(|value| {
             !matches!(value.get("version").and_then(Value::as_u64), Some(1 | 2))
@@ -222,6 +236,8 @@ impl QuotaHistoryStore {
         {
             let mut state = self.state.lock().unwrap();
             state.observations = retained.clone();
+            state.legacy_cleared = parsed.legacy_cleared;
+            state.legacy_imported = parsed.legacy_imported;
         }
         if degraded {
             // Self-heal: persist the sanitized state so corruption,
@@ -365,10 +381,12 @@ impl QuotaHistoryStore {
     /// Failure preserves the previous file and is returned to the caller.
     pub fn clear(&self) -> Result<(), String> {
         let _operation = self.operation.lock().unwrap();
-        if !self.persist(&[]) { return Err("Could not durably clear quota history".into()); }
+        if !self.persist_with_markers(&[], true, true) { return Err("Could not durably clear quota history".into()); }
         {
             let mut state = self.state.lock().unwrap();
             state.observations.clear();
+            state.legacy_cleared = true;
+            state.legacy_imported = true;
             state.revision += 1;
         }
         Ok(())
@@ -414,13 +432,16 @@ impl QuotaHistoryStore {
         let (merged, _changed) = {
             let mut state = self.state.lock().unwrap();
             let mut all = state.observations.clone();
-            all.extend(valid.iter().cloned());
+            if !state.legacy_cleared && !state.legacy_imported {
+                all.extend(valid.iter().cloned());
+            }
             let merged = apply_retention(all, now_ms);
             let changed = merged != state.observations;
             if changed {
                 state.observations = merged.clone();
                 state.revision += 1;
             }
+            state.legacy_imported = true;
             (merged, changed)
         };
         let persisted = self.persist(&merged);
@@ -437,9 +458,18 @@ impl QuotaHistoryStore {
     /// write to a temp file in the same directory, then rename over the
     /// target (Windows `MoveFileEx` semantics replace the existing file).
     fn persist(&self, observations: &[QuotaObservation]) -> bool {
+        let state = self.state.lock().unwrap();
+        let markers = (state.legacy_cleared, state.legacy_imported);
+        drop(state);
+        self.persist_with_markers(observations, markers.0, markers.1)
+    }
+
+    fn persist_with_markers(&self, observations: &[QuotaObservation], legacy_cleared: bool, legacy_imported: bool) -> bool {
         let envelope = HistoryEnvelope {
             version: BLOB_VERSION,
             observations: observations.to_vec(),
+            legacy_cleared,
+            legacy_imported,
         };
         let Ok(json) = serde_json::to_string(&envelope) else {
             return false;
@@ -458,6 +488,10 @@ impl QuotaHistoryStore {
 struct HistoryEnvelope {
     version: u32,
     observations: Vec<QuotaObservation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_cleared: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_imported: bool,
 }
 
 // ---------- validation (exact TS `normalizeObservation` parity) ----------
@@ -798,6 +832,8 @@ fn parse_blob(raw: &str) -> ParsedBlob {
         observations,
         total: entries.len(),
         healthy,
+        legacy_cleared: blob.get("legacy_cleared").and_then(Value::as_bool).unwrap_or(false),
+        legacy_imported: blob.get("legacy_imported").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -805,6 +841,8 @@ struct ParsedBlob {
     observations: Vec<QuotaObservation>,
     total: usize,
     healthy: bool,
+    legacy_cleared: bool,
+    legacy_imported: bool,
 }
 
 impl ParsedBlob {
@@ -813,6 +851,8 @@ impl ParsedBlob {
             observations: Vec::new(),
             total,
             healthy: false,
+            legacy_cleared: false,
+            legacy_imported: false,
         }
     }
 }
@@ -1324,6 +1364,62 @@ mod tests {
         assert!(store.record(vec![changed]).persisted);
         let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
         assert_eq!(reopened.history()[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn integration_history_clear_suppresses_legacy_replay_after_restart() {
+        let (store, _dir) = temp_store("integration-clear-marker");
+        let legacy = serde_json::json!([{ "providerId": "zai", "windowLabel": "5-hour", "usedPercent": 30.0, "observedAt": CHECKED_AT }]);
+        assert!(store.import_legacy(&legacy).persisted);
+        store.clear().unwrap();
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        assert!(reopened.import_legacy(&legacy).persisted);
+        assert!(reopened.history().is_empty());
+        // 0.8.24's schema ignores unknown JSON fields and can still read rows.
+        #[derive(Deserialize)]
+        struct PreviousEnvelope { version: u32, observations: Vec<QuotaObservation> }
+        let rollback: PreviousEnvelope = serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(rollback.version, 2);
+        assert!(rollback.observations.is_empty());
+    }
+
+    #[test]
+    fn integration_credential_identities_partition_history_across_restart() {
+        let (store, _dir) = temp_store("integration-credential-history");
+        for provider in ["zai", "opencode-go", "grok"] {
+            for key in ["synthetic-first-1234", "synthetic-second-1234"] {
+                let mut row = observation(provider, "weekly", 10.0, CHECKED_AT);
+                row.account = Some(crate::credential_identity::fingerprint(provider, key));
+                assert!(store.record(vec![row]).persisted);
+            }
+        }
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        let rows = reopened.history();
+        assert_eq!(rows.len(), 6);
+        for provider in ["zai", "opencode-go", "grok"] {
+            for key in ["synthetic-first-1234", "synthetic-second-1234"] {
+                let identity = crate::credential_identity::fingerprint(provider, key);
+                assert_eq!(rows.iter().filter(|row| row.provider_id == provider && row.account.as_deref() == Some(&identity)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn integration_history_non_utf8_is_preserved_and_future_schema_is_write_blocked() {
+        let dir = tempdir::temp_dir("integration-corrupt");
+        let path = dir.path().join(HISTORY_FILE_NAME);
+        let corrupt = [0xff, 0x00, 0xfe];
+        fs::write(&path, corrupt).unwrap();
+        let store = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
+        assert!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.path() != path && fs::read(entry.path()).ok().as_deref() == Some(&corrupt)));
+        assert!(store.record(vec![observation("zai", "weekly", 5.0, CHECKED_AT)]).persisted);
+        let future = br#"{"version":999,"observations":[]}"#;
+        fs::write(&path, future).unwrap();
+        let blocked = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
+        assert!(!blocked.record(vec![observation("zai", "weekly", 5.0, CHECKED_AT)]).persisted);
+        assert!(blocked.clear().is_err());
+        assert_eq!(fs::read(path).unwrap(), future);
     }
 
     #[test]

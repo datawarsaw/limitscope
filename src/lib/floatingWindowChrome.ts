@@ -102,6 +102,8 @@ let deferredResize: {
   docked: boolean;
   revision: number;
 } | null = null;
+// Local subscribers belong to recovery observers and are removed on detach.
+const dragIdleListeners = new Set<() => void>();
 
 function ownsPlacement(revision: number, docked: boolean): boolean {
   return revision === placementRevision &&
@@ -669,6 +671,7 @@ export async function attachFloatingChrome(
     if (nativeDragSession === session) nativeDragSession = null;
     publishGesturePreview(null);
     flushDeferredResize();
+    for (const listener of dragIdleListeners) listener();
   };
 
   const cancelNativeDrag = (session: NativeDragSession) => {
@@ -1416,6 +1419,16 @@ export const FLOATING_MONITOR_TOPOLOGY_EVENT = "floating://monitor-topology";
 export const TRAY_LOCATE_FLOATING_EVENT = "tray://locate-floating";
 
 /**
+ * How often a deferred reconcile re-checks whether the chrome has concluded
+ * a released drag, and the total budget for that wait. The chrome's
+ * conclusion takes a few async steps; the budget exists only so a wedged
+ * session cannot keep the poll alive forever.
+ */
+const DRAG_IDLE_POLL_MS = 25;
+const DRAG_IDLE_BUDGET_MS = 1000;
+const RECONCILE_RETRY_DELAY_MS = 250;
+
+/**
  * Reads the currently available monitors as work areas, with the platform's
  * monitor identity attached.
  *
@@ -1489,26 +1502,22 @@ async function recordCurrentPlacementMonitor(): Promise<void> {
  * the bar returns to its intended spot as soon as the intended monitor is
  * back. Only the live window position changes.
  */
-async function applyRecovery(action: RecoveryAction): Promise<boolean> {
+async function applyRecovery(action: RecoveryAction, isCurrent: () => boolean): Promise<boolean> {
   if (action.kind !== "move") return false;
-  if (nativeDragSession?.streamActive) {
+  if (!isCurrent()) {
     // A user drag owns the placement; recovery must not fight it.
     return false;
   }
-  const revision = placementRevision;
   const run = resizeQueue.then(async () => {
-    if (!ownsPlacement(revision, loadFloatingQuotaPrefs().dock === "top")) {
-      return;
-    }
+    if (!isCurrent()) return false;
     // The free bar's committed point must not be undone by a recovery
     // move: clear it, or the next resize would pull the bar back to the
     // pre-recovery position.
     if (!action.reanchor) freePosition = null;
-    await positionFloatingWindow(action.x, action.y);
+    return positionFloatingWindow(action.x, action.y, isCurrent);
   });
-  resizeQueue = run.catch(() => {});
-  await run;
-  return true;
+  resizeQueue = run.then(() => {}, () => {});
+  return run;
 }
 
 /**
@@ -1519,15 +1528,24 @@ async function applyRecovery(action: RecoveryAction): Promise<boolean> {
  * placement is never modified here.
  */
 export async function reconcileFloatingPlacement(): Promise<RecoveryAction> {
+  return (await reconcileFloatingPlacementCurrent(() => true)) ?? { kind: "none" };
+}
+
+async function reconcileFloatingPlacementCurrent(isActive: () => boolean): Promise<RecoveryAction | null> {
   if (!isTauriRuntime()) return { kind: "none" };
+  const revision = placementRevision;
+  const isCurrent = () => isActive() && revision === placementRevision && !nativeDragSession?.streamActive;
+  if (!isCurrent()) return null;
   const prefs = loadFloatingQuotaPrefs();
   const areas = await readMonitorWorkAreas();
+  if (!isCurrent()) return null;
   if (areas.length === 0) return { kind: "unplaceable" };
   const win = getCurrentWindow();
   const [position, size] = await Promise.all([
     win.outerPosition(),
     win.outerSize(),
   ]);
+  if (!isCurrent()) return null;
   const action = reconcilePlacement({
     intent: {
       dock: prefs.dock,
@@ -1541,7 +1559,7 @@ export async function reconcileFloatingPlacement(): Promise<RecoveryAction> {
     identity: prefs.monitor,
   });
   if (action.kind === "move") {
-    await applyRecovery(action);
+    if (!(await applyRecovery(action, isCurrent))) return null;
   }
   return action;
 }
@@ -1583,9 +1601,14 @@ export function attachMonitorRecovery(
    * A reconcile that arrived while the user was dragging is deferred, not
    * dropped: the drag owns the placement until it ends, and a cancelled
    * drag restores the *pre-drag* point — which may be on a monitor that is
-   * still away. The retry therefore waits for the gesture's terminal.
+   * still away. The retry therefore waits for the gesture's terminal, and
+   * then for the chrome to actually conclude it (see retryWhenIdle).
    */
   let deferred = false;
+  // Deadline for the wait below, armed by the drag's terminal event.
+  let idleDeadline = 0;
+  let reconcileRevision = 0;
+  let retriesRemaining = 1;
 
   const reconcile = async () => {
     clearTimer();
@@ -1598,15 +1621,59 @@ export function attachMonitorRecovery(
     }
     changes = 0;
     deferred = false;
+    const revision = ++reconcileRevision;
     try {
-      const action = await reconcileFloatingPlacement();
-      if (active) onReconciled?.(action);
+      const action = await reconcileFloatingPlacementCurrent(() => active && revision === reconcileRevision);
+      if (!active || revision !== reconcileRevision) return;
+      if (action) onReconciled?.(action);
+      else {
+        deferred = true;
+        if (!nativeDragSession?.streamActive) {
+          idleDeadline = Date.now() + DRAG_IDLE_BUDGET_MS;
+          retryWhenIdle();
+        }
+      }
     } catch (error) {
+      if (!active || revision !== reconcileRevision) return;
+      deferred = true;
       console.warn("Floating window could not reconcile its placement", error);
+      if (retriesRemaining > 0) {
+        retriesRemaining--;
+        timer = window.setTimeout(() => {
+          timer = null;
+          retryWhenIdle();
+        }, RECONCILE_RETRY_DELAY_MS);
+      }
     }
   };
 
+  /**
+   * The chrome concludes a released drag asynchronously: the move worker
+   * must settle before `streamActive` clears, so the terminal event reaches
+   * this observer while the session is still marked active — a reconcile
+   * fired directly from it would only defer again, with nothing left to
+   * retry it. Poll briefly for the true conclusion instead. The budget
+   * bounds the wait, so a wedged session cannot loop forever; past it the
+   * retry stays deferred; the local conclusion callback wakes it even if
+   * the worker finishes after the budget, without continuing to poll.
+   */
+  const retryWhenIdle = () => {
+    clearTimer();
+    if (!active) return;
+    if (!nativeDragSession?.streamActive) {
+      void reconcile();
+      return;
+    }
+    if (Date.now() >= idleDeadline) return;
+    timer = window.setTimeout(() => {
+      timer = null;
+      retryWhenIdle();
+    }, DRAG_IDLE_POLL_MS);
+  };
+
   const schedule = () => {
+    reconcileRevision++;
+    retriesRemaining = 1;
     clearTimer();
     const now = Date.now();
     if (changes === 0) {
@@ -1636,19 +1703,25 @@ export function attachMonitorRecovery(
       }),
     );
     // The drag's terminal: a deferred reconcile runs once the user has
-    // let go of the bar.
+    // let go of the bar — and once the chrome has truly concluded it.
     unlistens.push(
       listen(FLOATING_DRAG_LIFECYCLE_EVENT, ({ payload }) => {
         if (!active || !deferred) return;
         const phase = (payload as { phase?: string } | undefined)?.phase;
         if (phase !== "end") return;
-        deferred = false;
-        void reconcile();
+        retriesRemaining = 1;
+        idleDeadline = Date.now() + DRAG_IDLE_BUDGET_MS;
+        retryWhenIdle();
       }),
     );
   } catch (error) {
     console.warn("Floating window could not subscribe to topology events", error);
   }
+
+  const onDragIdle = () => {
+    if (active && deferred && changes === 0 && !nativeDragSession?.streamActive) retryWhenIdle();
+  };
+  dragIdleListeners.add(onDragIdle);
 
   // The native observer is attached after the listener, so a topology
   // change that arrives during startup is never missed.
@@ -1671,6 +1744,7 @@ export function attachMonitorRecovery(
 
   return () => {
     active = false;
+    dragIdleListeners.delete(onDragIdle);
     clearTimer();
     for (const unlisten of unlistens) {
       unlisten.then((fn) => fn()).catch(() => {});

@@ -19,7 +19,7 @@ const windowLabel = { current: "main" };
 const mocks = vi.hoisted(() => ({
   loadRuntimeHistory: vi.fn(async () => [] as QuotaObservation[]),
   clearRuntimeHistory: vi.fn(async () => {}),
-  importLegacyHistory: vi.fn(async () => ({ accepted: 2, rejected: 0 })),
+  importLegacyHistory: vi.fn(async () => ({ persisted: true, accepted: 2, rejected: 0 })),
   readLegacyHistory: vi.fn((): { present: boolean; observations: unknown[] } => ({
     present: false,
     observations: [],
@@ -67,7 +67,7 @@ beforeEach(() => {
   windowLabel.current = "main";
   mocks.loadRuntimeHistory.mockClear().mockResolvedValue([]);
   mocks.clearRuntimeHistory.mockClear();
-  mocks.importLegacyHistory.mockClear().mockResolvedValue({ accepted: 2, rejected: 0 });
+  mocks.importLegacyHistory.mockClear().mockResolvedValue({ persisted: true, accepted: 2, rejected: 0 });
   mocks.readLegacyHistory.mockClear().mockReturnValue({ present: false, observations: [] });
   mocks.removeLegacyHistory.mockClear();
 });
@@ -79,6 +79,19 @@ afterEach(() => {
 });
 
 describe("quota history ownership (Rust-owned, read-only TS)", () => {
+  it.each(["rejected", "unpersisted"])("keeps the legacy source when import is %s", async (failure) => {
+    const raw = '[{"providerId":"zai"}]';
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, raw);
+    mocks.readLegacyHistory.mockReturnValue({ present: true, observations: [{ providerId: "zai" }] });
+    if (failure === "rejected") mocks.importLegacyHistory.mockRejectedValueOnce(new Error("write failed"));
+    else mocks.importLegacyHistory.mockResolvedValueOnce({ persisted: false, accepted: 1, rejected: 0 });
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    renderHook(() => useQuotaPredictions([], NOW_MS));
+    await waitFor(() => expect(log).toHaveBeenCalled());
+    expect(mocks.removeLegacyHistory).not.toHaveBeenCalled();
+    expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBe(raw);
+  });
+
   it("reads history from the Rust runtime on attach", async () => {
     mocks.loadRuntimeHistory.mockResolvedValue([
       {
@@ -174,7 +187,7 @@ describe("quota history ownership (Rust-owned, read-only TS)", () => {
     // Rust clear_history is the backend; the legacy blob cannot re-import
     // behind the clear.
     await waitFor(() => expect(mocks.clearRuntimeHistory).toHaveBeenCalled());
-    expect(mocks.removeLegacyHistory).toHaveBeenCalled();
+    expect(mocks.removeLegacyHistory).not.toHaveBeenCalled();
     // The in-memory history drops immediately: predictions are gone from
     // the UI without waiting for a runtime cycle.
     expect(result.current.predictionFor("opencode-go", "5-hour")).toBeUndefined();
@@ -190,46 +203,41 @@ describe("quota history ownership (Rust-owned, read-only TS)", () => {
 });
 
 describe("legacy localStorage migration", () => {
-  it("imports the legacy blob once and removes the key on success", async () => {
-    // Model the real storage: once the key is removed, later mounts read
-    // `present: false` and never import again.
-    let legacyPresent = true;
+  it("does not reimport after clear even if the History marker is lost", async () => {
+    const observations = [{ providerId: "zai" }];
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, JSON.stringify(observations));
+    let marker = false;
     mocks.readLegacyHistory.mockImplementation(() => ({
-      present: legacyPresent,
-      observations: legacyPresent
-        ? [{ providerId: "zai", windowLabel: "5-hour", usedPercent: 30, observedAt: CHECKED_AT }]
-        : [],
+      present: localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY) !== null,
+      observations,
     }));
-    mocks.removeLegacyHistory.mockImplementation(() => {
-      legacyPresent = false;
-    });
-    const usages = [seededUsage()];
-    renderHook(() => useQuotaPredictions(usages, NOW_MS, 1));
+    mocks.clearRuntimeHistory.mockImplementationOnce(async () => { marker = true; });
+    const first = renderHook(() => useQuotaPredictions([], NOW_MS));
     await waitFor(() => expect(mocks.importLegacyHistory).toHaveBeenCalledTimes(1));
-    expect(mocks.importLegacyHistory).toHaveBeenCalledWith([
-      { providerId: "zai", windowLabel: "5-hour", usedPercent: 30, observedAt: CHECKED_AT },
-    ]);
-    await waitFor(() => expect(mocks.removeLegacyHistory).toHaveBeenCalled());
+    await act(async () => {
+      expect(await first.result.current.clearLocalHistory()).toEqual({ ok: true, removed: true });
+    });
+    expect(marker).toBe(true);
     expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBeNull();
-
-    // Remount (another attach of the main view): the key is gone, so the
-    // migration never runs again — even with revisions still arriving.
-    const { rerender } = renderHook(
-      ({ revision }) => useQuotaPredictions(usages, NOW_MS, revision),
-      { initialProps: { revision: 2 } },
-    );
-    rerender({ revision: 3 });
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    first.unmount();
+    marker = false; // Simulate loss of the persisted History marker.
+    renderHook(() => useQuotaPredictions([], NOW_MS));
+    await waitFor(() => expect(mocks.readLegacyHistory).toHaveBeenCalledTimes(2));
+    expect(marker).toBe(false);
     expect(mocks.importLegacyHistory).toHaveBeenCalledTimes(1);
   });
 
-  it("preserves the original legacy source when only part of it could be imported", async () => {
-    mocks.readLegacyHistory.mockReturnValue({ present: true, observations: [{providerId:"zai"}, {broken:true}] });
-    mocks.importLegacyHistory.mockResolvedValue({ accepted:1, rejected:1 });
-    renderHook(() => useQuotaPredictions([seededUsage()], NOW_MS, 1));
-    await waitFor(() => expect(mocks.importLegacyHistory).toHaveBeenCalled());
-    await act(async () => {});
+  it("retains the legacy blob and retries on a later attach", async () => {
+    const raw = '[{"providerId":"zai"}]';
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, raw);
+    mocks.readLegacyHistory.mockReturnValue({ present: true, observations: [{ providerId: "zai" }] });
+    const first = renderHook(() => useQuotaPredictions([], NOW_MS));
+    await waitFor(() => expect(mocks.importLegacyHistory).toHaveBeenCalledTimes(1));
+    first.unmount();
+    renderHook(() => useQuotaPredictions([], NOW_MS));
+    await waitFor(() => expect(mocks.importLegacyHistory).toHaveBeenCalledTimes(2));
     expect(mocks.removeLegacyHistory).not.toHaveBeenCalled();
+    expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBe(raw);
   });
 
   it("leaves the legacy key in place when the import fails, without crashing", async () => {

@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { clearRuntimeHistory, removeLegacyHistory } from "./historyClient";
+import { clearRuntimeHistory } from "./historyClient";
+import { LEGACY_QUOTA_HISTORY_KEY } from "./quotaHistory";
 import { isRunningInTauri } from "./runtime";
 import {
   clearExecutionRunsState,
@@ -200,15 +201,15 @@ export async function clearProviderCache(): Promise<LocalDataClearResult> {
 }
 
 /**
- * Clears the Rust-owned quota history plus the retired legacy localStorage
- * blob. The Rust store's canonical `clear_history` command is the production
+ * Clears the Rust-owned quota history and suppresses replay of the retained
+ * legacy localStorage source. The Rust store's canonical `clear_history` command is the production
  * clear path, so its invariants (memory + file, revision bump) are used
  * rather than a file deletion here.
  */
 export async function clearUsageHistoryStore(): Promise<LocalDataClearResult> {
   try {
     await clearRuntimeHistory();
-    removeLegacyHistory();
+    localStorage.removeItem(LEGACY_QUOTA_HISTORY_KEY);
     return { ok: true, removed: true };
   } catch (error) {
     console.error("Failed to clear the quota history", error);

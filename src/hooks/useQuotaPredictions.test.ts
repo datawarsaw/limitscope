@@ -35,7 +35,7 @@ const ACCOUNT_B = "key:bbbb";
 const mocks = vi.hoisted(() => ({
   loadRuntimeHistory: vi.fn(async () => [] as QuotaObservation[]),
   clearRuntimeHistory: vi.fn(async () => {}),
-  importLegacyHistory: vi.fn(async () => ({ accepted: 0, rejected: 0 })),
+  importLegacyHistory: vi.fn(async () => ({ persisted: true, accepted: 0, rejected: 0 })),
   readLegacyHistory: vi.fn(() => ({ present: false, observations: [] })),
   removeLegacyHistory: vi.fn(() => {}),
 }));

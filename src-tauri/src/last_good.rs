@@ -138,6 +138,7 @@ pub struct PersistedLastGoodEnvelope {
 
 pub struct ProviderLastGoodStore {
     path: PathBuf,
+    writable: bool,
     now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     state: Mutex<HashMap<String, PersistedProviderState>>,
     wallets: Mutex<HashMap<String, PersistedWalletState>>,
@@ -158,6 +159,9 @@ impl ProviderLastGoodStore {
         now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     ) -> Self {
         let store = Self {
+            writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
+                parse_envelope(&value.to_string()).2
+            }),
             path,
             now,
             state: Mutex::new(HashMap::new()),
@@ -200,6 +204,9 @@ impl ProviderLastGoodStore {
         state: &HashMap<String, PersistedProviderState>,
         wallets: &HashMap<String, PersistedWalletState>,
     ) -> Result<(), std::io::Error> {
+        if !self.writable {
+            return Err(std::io::Error::other("Unsupported or unavailable last-good store"));
+        }
         let mut providers: Vec<PersistedProviderState> = state.values().cloned().collect();
         providers.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         let mut wallet_entries: Vec<PersistedWalletState> = wallets.values().cloned().collect();
@@ -243,6 +250,9 @@ impl ProviderLastGoodStore {
     /// what a cold start would hydrate, so the next successful live refresh
     /// repopulates the cache normally instead of resurrecting old entries.
     pub fn clear(&self) -> Result<bool, std::io::Error> {
+        if !self.writable {
+            return Err(std::io::Error::other("Unsupported or unavailable last-good store"));
+        }
         let mut state = self.state.lock().unwrap();
         let mut wallets = self.wallets.lock().unwrap();
         let had_entries = !state.is_empty();
@@ -1795,6 +1805,8 @@ mod tests {
 
         let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
         assert!(store.get_persisted("openai-codex").is_none());
+        assert!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.path() != path && fs::read(entry.path()).ok().as_deref() == Some(b"{not valid json at all")));
 
         // Saving a valid entry heals the file
         store.record_success(ProviderKind::Codex, &sample_usage(ProviderKind::Codex, 33.0, Some("2026-09-29T16:00:00Z")));
@@ -1823,6 +1835,9 @@ mod tests {
 
         let store = ProviderLastGoodStore::open_with_clock(path.clone(), Box::new(fixed_now));
         assert!(store.get_persisted("openai-codex").is_none(), "foreign version must degrade to empty");
+        assert!(store.persist().is_err());
+        assert!(store.clear().is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), envelope.to_string());
     }
 
     // 16. unknown provider dropped

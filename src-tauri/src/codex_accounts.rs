@@ -435,10 +435,15 @@ impl CodexAccountStore {
             .filter(|version| *version != SCHEMA_VERSION as u64);
         let store = Self {
             unsupported_version,
-            writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
-                let normalized = serde_json::to_value(parse_envelope(&value.to_string())).ok();
-                value.get("accounts") == normalized.as_ref()
-            }),
+            // Account configuration is not disposable: any malformed,
+            // incomplete or foreign envelope stays in place and read-only.
+            writable: match fs::read(&path) {
+                Err(error) => error.kind() == io::ErrorKind::NotFound,
+                Ok(raw) => serde_json::from_slice::<serde_json::Value>(&raw).ok().is_some_and(|value| {
+                    value.get("version").and_then(serde_json::Value::as_u64) == Some(SCHEMA_VERSION as u64)
+                        && value.get("accounts") == serde_json::to_value(parse_envelope(&value.to_string())).ok().as_ref()
+                }),
+            },
             path,
             accounts: Mutex::new(default_accounts()),
         };
@@ -612,14 +617,13 @@ mod tests {
     }
 
     #[test]
-    fn applying_defaults_after_semantic_corruption_really_repairs_disk() {
+    fn applying_defaults_after_semantic_corruption_is_denied_without_changing_disk() {
         let path = store_path("defaults-after-corruption");
         let root = temp_dir("defaults-after-corruption-context");
         fs::write(&path, r#"{"version":1,"accounts":"broken"}"#).unwrap();
         let store = CodexAccountStore::open(path.clone());
-        apply(&store, &store.accounts(), &root).unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(value["accounts"].is_array());
+        assert!(apply(&store, &store.accounts(), &root).is_err());
+        assert_eq!(fs::read(&path).unwrap(), br#"{"version":1,"accounts":"broken"}"#);
         // Remove only this fixture's preserved recovery copies.
         for entry in fs::read_dir(path.parent().unwrap()).unwrap().filter_map(Result::ok) {
             if entry.file_name().to_string_lossy().starts_with(&format!("{}.recovery-", path.file_stem().unwrap().to_string_lossy())) {
@@ -628,6 +632,24 @@ mod tests {
         }
         remove_store(&path);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn integration_corrupt_partial_and_future_accounts_refuse_writes() {
+        let root = temp_dir("integration-invalid-accounts-context");
+        for (index, raw) in [
+            &b"{\"version\":1,\"accounts\":["[..],
+            &b"{\"version\":1}"[..],
+            &b"{\"version\":999,\"accounts\":[]}"[..],
+        ].into_iter().enumerate() {
+            let path = root.join(format!("accounts-{index}.json"));
+            fs::write(&path, raw).unwrap();
+            let store = CodexAccountStore::open(path.clone());
+            assert!(!store.is_writable());
+            assert!(apply(&store, &store.accounts(), &root).is_err());
+            assert_eq!(fs::read(path).unwrap(), raw);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

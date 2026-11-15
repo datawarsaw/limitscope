@@ -12,6 +12,7 @@ import { isTauriRuntime } from "./floatingWindowChrome";
 
 /** Outcome of the one-time legacy localStorage import. */
 export type ImportOutcome = {
+  persisted: boolean;
   accepted: number;
   rejected: number;
 };
@@ -65,7 +66,7 @@ export async function clearRuntimeHistory(): Promise<void> {
 export async function importLegacyHistory(
   observations: readonly unknown[],
 ): Promise<ImportOutcome> {
-  if (!isTauriRuntime()) return { accepted: 0, rejected: 0 };
+  if (!isTauriRuntime()) throw new Error("Quota history persistence is unavailable");
   return invoke<ImportOutcome>("import_legacy_history", { observations });
 }
 
