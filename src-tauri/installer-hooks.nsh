@@ -86,12 +86,14 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; Autostart migration: only an existing old entry proves the user had
-  ; Autostart migration from the value captured in PREINSTALL (see above):
-  ; a captured entry proves the user had autostart enabled; a fresh install
-  ; captured nothing and has nothing to move.
+  ; Reconcile enabled autostart from the captured legacy entry or an existing
+  ; same-brand entry. With neither entry, leave autostart disabled.
+  ReadRegStr $R0 HKCU "${LIMITSCOPE_RUN_KEY}" "${LIMITSCOPE_RUN_NAME}"
   ${If} $R7 != ""
     DeleteRegValue HKCU "${LIMITSCOPE_RUN_KEY}" "${LIMITSCOPE_OLD_RUN_NAME}"
+  ${EndIf}
+  ${If} $R7 != ""
+  ${OrIf} $R0 != ""
     WriteRegStr HKCU "${LIMITSCOPE_RUN_KEY}" "${LIMITSCOPE_RUN_NAME}" '"$INSTDIR\LimitScope.exe" --hidden'
   ${EndIf}
 !macroend
