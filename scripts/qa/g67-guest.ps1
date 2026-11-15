@@ -70,10 +70,10 @@ function LaunchWait([string]$exe,[string]$stage){
  if((Apps).Count){throw 'APP_PROCESSES_REMAIN'}
 }
 $seed=[ordered]@{
- 'wallet-preferences-v1.json'='{"version":1,"monitored":{"openrouter":true,"deepseek":true}}'
- 'provider-last-good-v1.json'='{"version":1,"providers":[{"providerId":"zai","providerName":"Z.ai","account":{"label":"Account A","identity":"key:1234"},"limits":[{"label":"5-hour limit","usedPercent":42.5,"resetAt":"2026-09-29T16:00:00Z"}],"lastSuccessfulAt":"2026-09-29T11:55:00.000Z"}]}'
- 'usage-intelligence-v1.json'='{"version":1,"enabled":true,"collectionStartedAt":1789292100000,"events":[],"cursors":[]}'
- 'quota-history-v1.json'='{"version":2,"observations":[{"providerId":"zai","windowLabel":"5-hour","usedPercent":30.0,"observedAt":"2026-09-29T11:55:00.000Z","resetAt":"2026-09-29T16:00:00Z"}]}'
+ 'wallet-preferences-v1.json'='{"version":1,"monitored":{"openrouter":true,"deepseek":false}}'
+ 'provider-last-good-v1.json'=('{"version":1,"providers":[{"providerId":"zai","providerName":"Z.ai","account":{"label":"Account A","identity":"key:1234"},"limits":[{"label":"5-hour limit","usedPercent":42.5,"resetAt":"2026-09-29T16:00:00Z"}],"lastSuccessfulAt":"2026-09-29T11:55:00.000Z"}]}'.Replace('2026-09-29T11:55:00.000Z',([DateTime]::UtcNow.AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',[Globalization.CultureInfo]::InvariantCulture))).Replace('2026-09-29T16:00:00Z',([DateTime]::UtcNow.AddHours(4).ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture))))
+ 'usage-intelligence-v1.json'=('{"version":1,"enabled":true,"collectionStartedAt":1789292100000,"events":[],"cursors":[]}'.Replace('1789292100000',([DateTimeOffset]::UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds().ToString([Globalization.CultureInfo]::InvariantCulture))))
+ 'quota-history-v1.json'=('{"version":2,"observations":[{"providerId":"zai","windowLabel":"5-hour","usedPercent":30.0,"observedAt":"2026-09-29T11:55:00.000Z","resetAt":"2026-09-29T16:00:00Z"}]}'.Replace('2026-09-29T11:55:00.000Z',([DateTime]::UtcNow.AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ss.fffZ',[Globalization.CultureInfo]::InvariantCulture))).Replace('2026-09-29T16:00:00Z',([DateTime]::UtcNow.AddHours(4).ToString('yyyy-MM-ddTHH:mm:ssZ',[Globalization.CultureInfo]::InvariantCulture))))
 }
 function DataSnapshot([string]$label){
  $rows=@(foreach($name in $seed.Keys){$p=Join-Path $r.data_directory $name;if(Test-Path -LiteralPath $p){$f=Get-Item -LiteralPath $p;[ordered]@{name=$name;bytes=$f.Length;sha256=(Get-FileHash -LiteralPath $p).Hash;content=[IO.File]::ReadAllText($p)}}else{[ordered]@{name=$name;missing=$true}}})
