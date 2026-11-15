@@ -577,3 +577,100 @@ describe("token usage section", () => {
     expect(screen.queryByRole("alert")).toBeNull();
   });
 });
+
+describe("token usage daily chart provider scope", () => {
+  function group(provider: string, totalTokens: number) {
+    return {
+      provider,
+      events: 1,
+      inputTokens: totalTokens,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens,
+      models: [
+        {
+          model: `${provider}-model`,
+          events: 1,
+          inputTokens: totalTokens,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          totalTokens,
+        },
+      ],
+    };
+  }
+
+  // zai = 100 tokens, codex = 900 tokens. The backend's daily projection is
+  // global — it carries no provider attribution — so its one day is 1000.
+  function mixed(): UsageIntelligence {
+    return intelligence({
+      eventsInRange: 2,
+      groups: [group("zai", 100), group("openai-codex", 900)],
+      daily: [
+        {
+          date: "2026-10-06",
+          observed: true,
+          events: 2,
+          totalTokens: 1000,
+          beforeCollection: false,
+        },
+      ],
+    });
+  }
+
+  function dailyCellLabels(): string[] {
+    const grid = screen.queryByRole("list", { name: "Daily reported token activity" });
+    if (!grid) return [];
+    return within(grid)
+      .queryAllByRole("listitem")
+      .map((cell) => cell.getAttribute("aria-label") ?? "");
+  }
+
+  it("never charts global daily totals under a single-provider scope", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        scopeProviderId="zai"
+        loader={vi.fn(async () => mixed())}
+      />,
+    );
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    // Table and KPIs are scoped to zai: 100 reported tokens.
+    expect(within(kpis).getByText("100")).toBeTruthy();
+    const table = screen.getByRole("table");
+    expect(within(table).queryByText("codex-model")).toBeNull();
+
+    // The displayed chart data must not carry the global (zai + codex) day.
+    const labels = dailyCellLabels();
+    expect(labels.some((label) => label.includes("1000 reported tokens"))).toBe(false);
+    // Nor any day total that disagrees with the scoped KPIs.
+    expect(labels.filter((label) => /reported tokens across/.test(label))).toEqual([]);
+
+    // The scope gap is stated, not hidden.
+    const daily = screen.getByRole("region", { name: "Daily activity" });
+    expect(
+      within(daily).getByText(/not broken down by provider/i),
+    ).toBeTruthy();
+  });
+
+  it("keeps the daily chart in all-providers scope, matching the KPIs", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        scopeProviderId={null}
+        loader={vi.fn(async () => mixed())}
+      />,
+    );
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    expect(within(kpis).getByText("1000")).toBeTruthy();
+    const labels = dailyCellLabels();
+    expect(labels).toHaveLength(1);
+    expect(labels[0]).toContain("1000 reported tokens across 2 recorded events");
+  });
+});

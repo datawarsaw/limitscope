@@ -459,6 +459,32 @@ describe("Usage view presentation semantics", () => {
     expect(onScopeProvider).toHaveBeenCalledWith(null);
   });
 
+  it("does not present the previous provider's analytics when the new provider's query fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    loader.mockImplementation(async (query: UsageAnalyticsQuery) => {
+      if (query.providerId === "grok") throw new Error("grok history unavailable");
+      return makeAnalytics();
+    });
+    const { rerender } = renderView({ scopeProviderId: "zai" });
+    await screen.findByText("Peak observed");
+    rerender(
+      <UsageView
+        usages={usages}
+        scopeProviderId="grok"
+        onScopeProvider={vi.fn()}
+        historyRevision={1}
+        loader={loader}
+      />,
+    );
+    await screen.findByText(/Usage history could not be loaded\. grok history unavailable/);
+    expect(loader).toHaveBeenLastCalledWith({ range: "24h", providerId: "grok" });
+    // The zai projection is gone: no summary, no trend, no heatmap under grok.
+    expect(screen.queryByText("Peak observed")).toBeNull();
+    expect(screen.queryByText("Usage trend")).toBeNull();
+    expect(screen.queryByText("Updating…")).toBeNull();
+    vi.mocked(console.error).mockRestore();
+  });
+
   it("filters by window from the runtime's own quota windows", async () => {
     const user = userEvent.setup();
     renderView();

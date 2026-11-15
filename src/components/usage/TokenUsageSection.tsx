@@ -530,7 +530,22 @@ export function TokenUsageSection({
             </section>
           </div>
 
-          <UsageDailyActivity days={data.daily} />
+          {/* The daily projection is global — it carries no provider
+              attribution — so it is charted only in the all-providers
+              scope. Under a provider scope it would contradict the scoped
+              table and KPIs; the gap is stated instead of mislabeled. */}
+          {scopeProviderId === null ? (
+            <UsageDailyActivity days={data.daily} />
+          ) : (
+            <section className="usage-panel usage-daily" aria-label="Daily activity">
+              <h3 className="panel-heading">Daily activity</h3>
+              <p className="usage-daily-note" role="note">
+                Daily activity is available for all providers only — locally
+                collected daily totals are not broken down by provider.
+                Select All providers to see it.
+              </p>
+            </section>
+          )}
         </>
       ) : null}
     </section>

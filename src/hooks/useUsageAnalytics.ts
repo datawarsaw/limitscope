@@ -62,6 +62,25 @@ function scopeKey(scope: CodexScope): string {
   );
 }
 
+/**
+ * The display scope a payload is bound to: the Codex identity scope plus
+ * the query's subject filters (provider, account, window). A payload is
+ * only ever presented under the scope it was requested for — a provider or
+ * account switch clears it, and a failed query for the new scope never
+ * falls back to the previous scope's projection. The range is deliberately
+ * excluded: switching 24h/7d for the same subject keeps the prior payload
+ * on screen (marked refreshing) instead of flashing empty.
+ */
+function displayScopeKey(query: UsageAnalyticsQuery, scope: CodexScope): string {
+  return JSON.stringify([
+    scopeKey(scope),
+    query.providerId ?? null,
+    query.account ?? null,
+    query.exactAccount ?? null,
+    query.windowLabel ?? null,
+  ]);
+}
+
 export function useUsageAnalytics(
   query: UsageAnalyticsQuery,
   enabled: boolean,
@@ -70,8 +89,11 @@ export function useUsageAnalytics(
   identityScope: CodexScope = [],
 ): UsageAnalyticsView {
   const [state, setState] = useState<UsageAnalyticsState>(IDLE);
-  // The scope the currently displayed payload was computed under.
-  const [dataScope, setDataScope] = useState<string>(scopeKey(identityScope));
+  // The display scope (identity + subject filters) the currently displayed
+  // payload was requested under.
+  const [dataScope, setDataScope] = useState<string>(() =>
+    displayScopeKey(query, identityScope),
+  );
   // Key of the request whose response is currently allowed to land.
   const keyRef = useRef<string>("");
   const requestRef = useRef(0);
@@ -80,8 +102,8 @@ export function useUsageAnalytics(
   const scopeRef = useRef<CodexScope>(identityScope);
   scopeRef.current = identityScope;
 
-  const currentScopeKey = scopeKey(identityScope);
-  const queryKey = JSON.stringify([query, currentScopeKey]);
+  const currentScopeKey = displayScopeKey(query, identityScope);
+  const queryKey = JSON.stringify([query, scopeKey(identityScope)]);
 
   const runQuery = useCallback(
     (key: string, currentQuery: UsageAnalyticsQuery) => {
