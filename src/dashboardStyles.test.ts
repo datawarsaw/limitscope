@@ -53,24 +53,53 @@ describe("dashboard layout styles", () => {
     );
   });
 
+  // Measured at the documented 360px minimum: the one-line header overlaps
+  // the Settings nav button with the Run button (the lead shrinks via
+  // min-width: 0 but its flex:none children do not), so clicks near the
+  // Settings edge land on Run. The narrow layout wraps the header actions to
+  // a second right-aligned row; medium and wide keep the single-line header.
+  it("wraps the header actions to a right-aligned second row in narrow mode", () => {
+    const narrowHeader = withoutComments.match(
+      /\.app\[data-layout="narrow"\]\s*\.header\s*\{[^}]*\}/,
+    )?.[0];
+    expect(narrowHeader).toBeDefined();
+    expect(narrowHeader).toContain("flex-wrap: wrap");
+    const narrowActions = withoutComments.match(
+      /\.app\[data-layout="narrow"\]\s*\.header-actions\s*\{[^}]*\}/,
+    )?.[0];
+    expect(narrowActions).toBeDefined();
+    expect(narrowActions).toContain("margin-left: auto");
+  });
+
+  it("keeps the base header a single non-wrapping line for medium and wide", () => {
+    // The bare .header rule is the medium/wide contract: no wrap, so the
+    // actions stay in the header's top-right corner above the dashboard.
+    const baseHeader = withoutComments.match(/(?:^|\n)\.header\s*\{[^}]*\}/)?.[0];
+    expect(baseHeader).toBeDefined();
+    expect(baseHeader).not.toContain("flex-wrap");
+  });
+
   // W02 (v0.9): Settings is a navigation destination rendered inside the
   // scrolling dashboard column; the page itself must never push the utility
   // bar out of a short viewport, so the footer keeps its fixed height and
-  // every destination stays single-column in the wider layout modes.
+  // the destination stays single-column in every layout mode.
   it("keeps the settings page inside the scrolling destination column", () => {
     expect(withoutComments).toMatch(/\.settings-view\s*\{/);
     expect(withoutComments).toMatch(/\.settings-section\s*\{/);
-    for (const view of ["usage", "settings"]) {
+    expect(withoutComments).toMatch(
+      /\.app\[data-view="settings"\]\s*\.dashboard\s*\{[^}]*grid-template-areas:\s*"main"/,
+    );
+    // Insights keeps the provider rail next to its main column in the wider
+    // layout modes; the analytics surface never merges the two zones.
+    for (const layout of ["medium", "wide"]) {
       expect(withoutComments).toMatch(
         new RegExp(
-          `\\.app\\[data-view="${view}"\\]\\[data-layout="wide"\\] \\.dashboard`,
+          `\\.app\\[data-view="insights"\\]\\[data-layout="${layout}"\\] \\.dashboard\\s*\\{[^}]*grid-template-areas:\\s*"rail main"`,
         ),
       );
     }
-    const singleColumn = withoutComments.match(
-      /\.app\[data-view="usage"\]\[data-layout="wide"\] \.dashboard,\s*[^{]*\{[^}]*\}/,
-    )?.[0] ?? "";
-    expect(singleColumn).toContain('grid-template-areas: "main"');
+    const dashboardBlock = withoutComments.match(/\.dashboard\s*\{[^}]*\}/)?.[0] ?? "";
+    expect(dashboardBlock).toContain("overflow-y: auto");
     const utilityBlock = withoutComments.match(/\.utility-bar\s*\{[^}]*\}/)?.[0] ?? "";
     expect(utilityBlock).toContain("flex: none");
   });

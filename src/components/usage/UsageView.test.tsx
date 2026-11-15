@@ -528,6 +528,20 @@ describe("Usage view presentation semantics", () => {
     expect(screen.getByText(/2 more windows/)).toBeTruthy();
   });
 
+  it("renders large per-window charts when scoped to one provider", async () => {
+    loader.mockImplementation(async () =>
+      makeAnalytics({
+        trends: [makeSeries({ windowLabel: "5-hour window" }), makeSeries()],
+      }),
+    );
+    renderView({ scopeProviderId: "openai-codex" });
+    await screen.findByText("Usage trend");
+    // The provider scope earns the large charts; the small multiples grid
+    // (and its bounded-remainder note) is the all-providers presentation.
+    expect(document.querySelectorAll("figure.large-trend-chart")).toHaveLength(2);
+    expect(document.querySelectorAll("figure.usage-trend-card")).toHaveLength(0);
+  });
+
   it("shows the error state with retry when the analytics query fails", async () => {
     loader.mockImplementation(async () => {
       throw new Error("history store unavailable");

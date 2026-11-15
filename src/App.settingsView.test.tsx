@@ -215,13 +215,17 @@ describe("settings destination", () => {
     expect(mocks.clearLocalHistory).not.toHaveBeenCalled();
   });
 
-  it("returns to the Usage overview on the Usage button", () => {
+  it("returns to Status and Insights from Settings", () => {
     render(<App />);
     openSettings();
     expect(screen.getByLabelText("Theme")).toBeTruthy();
-    fireEvent.click(screen.getByRole("button", { name: "Usage" }));
+    fireEvent.click(screen.getByRole("button", { name: "Insights" }));
     expect(screen.queryByLabelText("Theme")).toBeNull();
-    expect(screen.getByLabelText("Usage overview")).toBeTruthy();
+    expect(screen.getByRole("main", { name: "Insights" })).toBeTruthy();
+    openSettings();
+    fireEvent.click(screen.getByRole("button", { name: "Status" }));
+    expect(screen.queryByLabelText("Theme")).toBeNull();
+    expect(screen.queryByRole("main", { name: "Settings" })).toBeNull();
   });
 
   it("still fires the existing setting callbacks", () => {

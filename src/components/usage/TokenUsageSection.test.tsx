@@ -445,6 +445,40 @@ describe("token usage section", () => {
     expect(await screen.findByText(/ZCode: collecting · last observed/i)).toBeTruthy();
   });
 
+  it("restores the v0.9 KPI strip and model ranking with expand", async () => {
+    const user = userEvent.setup();
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => withData())}
+      />,
+    );
+    // The KPIs carry the honesty qualifiers and reflect the table's scope.
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    expect(within(kpis).getByText("Reported tokens")).toBeTruthy();
+    expect(within(kpis).getByText("124.1K")).toBeTruthy();
+    expect(
+      within(kpis).getByText("observed as reported — not your total usage"),
+    ).toBeTruthy();
+    expect(within(kpis).getAllByText("2")).toHaveLength(2);
+    expect(
+      within(kpis).getByText("recorded completions — not every API request"),
+    ).toBeTruthy();
+    expect(within(kpis).getByText("distinct models across providers")).toBeTruthy();
+    // Ranking: heaviest model first; expanding it discloses the breakdown
+    // and the recorded-event note.
+    const models = screen.getByLabelText("Models");
+    expect(within(models).getAllByText("76.6K").length).toBeGreaterThan(0);
+    await user.click(
+      within(models).getByRole("button", { name: /GLM-5\.3-Flash/ }),
+    );
+    expect(within(models).getByText("Reasoning")).toBeTruthy();
+    expect(
+      within(models).getByText(/1 recorded event · Z\.ai \(ZCode\)/),
+    ).toBeTruthy();
+  });
+
   it("reports each source's diagnostics independently", async () => {
     const data = intelligence({
       ...withData(),
@@ -472,7 +506,74 @@ describe("token usage section", () => {
         loader={vi.fn(async () => data)}
       />,
     );
-    const sources = await screen.findByText(/ZCode: collecting · last observed/);
-    expect(sources.textContent).toContain("Codex: source not found");
+    // The restored v0.9 diagnostics panel lists each source on its own row.
+    const sources = await screen.findByLabelText("Collection sources");
+    expect(within(sources).getByText(/ZCode: collecting · last observed/)).toBeTruthy();
+    expect(within(sources).getByText(/Codex: source not found/)).toBeTruthy();
+  });
+
+  // 0.8.24 protections carried over from the former Usage overview: a failed
+  // local write and a scan-ceiling backlog are disclosed, never hidden.
+  it("alerts when locally collected usage could not be saved", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({ ...withData(), lastWriteSucceeded: false }))}
+      />,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Local usage could not be saved");
+    // The collected totals stay visible beside the alert.
+    expect(screen.getByRole("group", { name: "Token usage summary" })).toBeTruthy();
+  });
+
+  it("alerts when local usage persistence is unavailable even with no rows", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () =>
+          intelligence({ persistenceAvailable: false }),
+        )}
+      />,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Local usage could not be saved");
+  });
+
+  it("discloses a scan-ceiling backlog in the coverage banner", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({
+          ...withData(),
+          sourceCoverage: [
+            { source: "opencode", coverage: "incomplete" as const, reason: "scanCeiling" as const },
+          ],
+        }))}
+      />,
+    );
+    const note = await screen.findByRole("note", { name: "History coverage" });
+    expect(note.textContent).toContain(
+      "OpenCode — collection has a recoverable backlog",
+    );
+  });
+
+  it("does not raise a persistence alert for a healthy store", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({
+          ...withData(),
+          persistenceAvailable: true,
+          lastWriteSucceeded: true,
+        }))}
+      />,
+    );
+    await screen.findByRole("group", { name: "Token usage summary" });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

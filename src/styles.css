@@ -122,6 +122,18 @@ body {
   border-bottom: 1px solid var(--divider);
 }
 
+/* Measured at the documented 360px minimum: the one-line header cannot fit
+   the title, the view nav and the actions. In the narrow layout the actions
+   wrap to a second, right-aligned row instead; medium and wide keep the
+   single-line header. */
+.app[data-layout="narrow"] .header {
+  flex-wrap: wrap;
+}
+
+.app[data-layout="narrow"] .header-actions {
+  margin-left: auto;
+}
+
 .title {
   margin: 0;
   font-size: 15px;
@@ -471,7 +483,7 @@ body {
 }
 
 .primary-window {
-  margin: 12px 0 0;
+  margin: 10px 0 0;
   font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.6px;
@@ -486,14 +498,16 @@ body {
   margin-top: 1px;
 }
 
-/* The one dominant metric: large, tabular, neutral — severity lives on the
+/* v0.9: the Status header is compact by design — the history chart below is
+   the visual anchor, and the floating bar already owns the large gauge
+   treatment. The number stays tabular and neutral; severity lives on the
    meter and in the attention rail, never as a wall of red. */
 .primary-percent {
-  font-size: 40px;
-  line-height: 1.15;
+  font-size: 24px;
+  line-height: 1.2;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
-  letter-spacing: -0.5px;
+  letter-spacing: -0.3px;
 }
 
 .primary-limit-reached {
@@ -503,9 +517,9 @@ body {
 }
 
 .primary-bar {
-  height: 8px;
-  margin-top: 6px;
-  border-radius: 4px;
+  height: 6px;
+  margin-top: 5px;
+  border-radius: 3px;
 }
 
 .primary-reset {
@@ -1811,13 +1825,21 @@ body {
   box-shadow: inset 0 0 0 1px var(--accent-border);
 }
 
-/* The Usage-first main window has one destination column in every layout —
-   live quotas belong to the floating bar, so the rail and attention zones
-   never open here and the destination gets the full width. */
-.app[data-view="usage"][data-layout="medium"] .dashboard,
-.app[data-view="usage"][data-layout="wide"] .dashboard,
-.app[data-view="settings"][data-layout="medium"] .dashboard,
-.app[data-view="settings"][data-layout="wide"] .dashboard {
+/* Insights keeps the rail (provider scope) and drops the attention zone, so
+   the analytics surface gets the full main column. */
+.app[data-view="insights"][data-layout="medium"] .dashboard {
+  grid-template-columns: 172px minmax(0, 1fr);
+  grid-template-areas: "rail main";
+}
+
+.app[data-view="insights"][data-layout="wide"] .dashboard {
+  grid-template-columns: 176px minmax(0, 1fr);
+  grid-template-areas: "rail main";
+}
+
+/* Settings is a full-width page: no provider rail, one main column in every
+   layout mode, so the sections keep their reading width. */
+.app[data-view="settings"] .dashboard {
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas: "main";
 }
@@ -3336,3 +3358,70 @@ body {
 .provider-prefs-head span:first-child { flex: 1 1 auto; }
 .provider-prefs-head span:nth-child(2) { width: 52px; text-align: right; }
 .provider-prefs-head span:last-child { width: 52px; text-align: center; }
+
+/* ---------------------------------------------------------------
+ * v0.9 Status view — the hero history chart.
+ * --------------------------------------------------------------- */
+.status-history {
+  background: var(--card);
+  -webkit-backdrop-filter: var(--card-backdrop);
+  backdrop-filter: var(--card-backdrop);
+  border: 1px solid var(--card-border);
+  border-radius: 10px;
+  padding: 12px 14px 13px;
+}
+
+.status-history-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.status-history-head .panel-heading {
+  margin: 0;
+}
+
+.status-history-charts {
+  display: grid;
+  gap: 14px;
+}
+
+/* Large per-window charts (Status hero + provider-scoped Insights). */
+.usage-trend-large {
+  display: grid;
+  gap: 14px;
+}
+
+.large-trend-chart {
+  margin: 0;
+  min-width: 0;
+}
+
+.large-trend-title {
+  margin: 0 0 6px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-chart.large-chart .usage-chart-line {
+  stroke-width: 2.2;
+}
+
+/* The hero chart's guide reads at a glance: a touch more presence than the
+   small multiples' guide, still never a severity color. */
+.usage-chart.large-chart .usage-chart-guide {
+  opacity: 0.8;
+}
+
+.usage-chart-axis-label {
+  fill: var(--text-dim);
+  font-size: 10px;
+  text-anchor: end;
+  font-variant-numeric: tabular-nums;
+}

@@ -176,8 +176,8 @@ describe("local data × usage (scenarios 6-11)", () => {
 
     // The Usage destination (an independent data plane) is unaffected by a
     // quota-history clear.
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 
   it("8. settings survive a history clear", async () => {
@@ -227,8 +227,8 @@ describe("local data × usage (scenarios 6-11)", () => {
 
     expect(mocks.historyCleared).toBe(false);
     // The Usage destination still renders.
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 
   it("11. reset preferences preserves execution runs", async () => {
@@ -332,8 +332,8 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     await screen.findByText("Execution runs cleared.");
 
     expect(mocks.historyCleared).toBe(false);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 });
 
@@ -341,8 +341,8 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
   it("15+16. a run started on Usage stays active across the Settings round-trip", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
-    // Usage is the landing destination.
-    expect(screen.getByLabelText("Usage overview")).toBeTruthy();
+    // Status is the landing destination (provider status + history chart).
+    expect(screen.getByRole("region", { name: "Quota history" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Execution run" }));
     await user.click(screen.getByRole("button", { name: "Start run" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
@@ -352,7 +352,7 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
       screen.getByRole("button", { name: /Execution run in progress, running for/ }),
     ).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
     expect(persistedRuns().activeRun).not.toBeNull();
   });
@@ -389,7 +389,7 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     view.rerender(<App />);
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     await user.click(screen.getByRole("button", { name: "Finish run" }));
 
     const summary = within(screen.getByLabelText("Execution summary"));
@@ -409,8 +409,10 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     // The open panel (and its recent-run history) survives the round trip.
+    expect(screen.getByText("Recent runs (1)")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Status" }));
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
   });
 });
@@ -509,8 +511,8 @@ describe("ProviderUsage DTO coexistence (scenarios 21-23)", () => {
       }),
     ).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
     // The reset-credit payload travels with the usage object untouched.
     expect(mocks.usages[0]?.resetCredits?.bankedCredits).toBe(3);
     expect(mocks.usages[0]?.planType).toBe("team");

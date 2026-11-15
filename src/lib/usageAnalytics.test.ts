@@ -7,7 +7,7 @@ const { invoke } = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
 
-import { codexScopeIsCurrentOrNewer, loadUsageAnalytics } from "./usageAnalytics";
+import { codexFenceScope, codexScopeIsCurrentOrNewer, loadUsageAnalytics } from "./usageAnalytics";
 
 describe("usageAnalytics client contract", () => {
   beforeEach(() => {
@@ -49,6 +49,18 @@ describe("usageAnalytics client contract", () => {
 });
 
 describe("the Codex identity scope fence", () => {
+  it("fences unobserved slots even when another slot has runtime state", () => {
+    const observed = [{ providerId: "openai-codex", generation: 3, identity: "credential-v1:a" }];
+    const scope = codexFenceScope([
+      { id: "openai-codex" },
+      { id: "openai-codex:other" },
+      { id: "grok" },
+    ], observed);
+    expect(scope).toEqual([
+      ...observed,
+      { providerId: "openai-codex:other", generation: 0, identity: null },
+    ]);
+  });
   const slot = (providerId: string, generation: number, identity: string | null) => ({
     providerId,
     generation,
