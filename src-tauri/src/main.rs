@@ -18,6 +18,8 @@ mod history;
 mod durable_file;
 mod credential_identity;
 mod sqlite_snapshot;
+#[cfg(test)]
+mod store_safety_fixtures;
 mod last_good;
 mod local_data;
 mod minimax_token_plan;

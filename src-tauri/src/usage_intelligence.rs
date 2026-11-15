@@ -811,8 +811,7 @@ impl UsageIntelligenceStore {
             return;
         }
         let Ok(parsed) = serde_json::from_str::<UsageIntelligenceEnvelope>(&raw) else {
-            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
-            if crate::durable_file::replace(&backup, raw.as_bytes()).is_err() {
+            if crate::durable_file::preserve_copy(&self.path, raw.as_bytes()).is_err() {
                 self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
             }
             return;
@@ -847,8 +846,7 @@ impl UsageIntelligenceStore {
             state.revision += 1;
         }
         if degraded {
-            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
-            if crate::durable_file::replace(&backup, raw.as_bytes()).is_err() {
+            if crate::durable_file::preserve_copy(&self.path, raw.as_bytes()).is_err() {
                 self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
             }
         }

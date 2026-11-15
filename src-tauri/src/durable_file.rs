@@ -35,6 +35,43 @@ pub(crate) fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Keeps an exact `<stem>.recovery-<uuid>.json` sibling copy of `raw`. A
+/// sibling copy already holding exactly these bytes is reused, so a store
+/// that reloads the same degraded bytes on every start does not accumulate
+/// duplicates; an existing copy is never overwritten. A new copy must read
+/// back byte-for-byte, otherwise it is removed and the caller fails closed.
+pub(crate) fn preserve_copy(path: &Path, raw: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing store directory"))?;
+    let stem = path
+        .file_stem()
+        .ok_or_else(|| io::Error::other("missing store file name"))?
+        .to_string_lossy();
+    let prefix = format!("{stem}.recovery-");
+    if let Ok(entries) = fs::read_dir(parent) {
+        for entry in entries.filter_map(Result::ok) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with(&prefix)
+                && name.ends_with(".json")
+                && fs::read(entry.path()).is_ok_and(|bytes| bytes == raw)
+            {
+                return Ok(());
+            }
+        }
+    }
+    let copy = path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+    if copy.exists() {
+        return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+    }
+    replace(&copy, raw)?;
+    if fs::read(&copy)? != raw {
+        let _ = fs::remove_file(&copy);
+        return Err(io::Error::other("recovery copy did not verify"));
+    }
+    Ok(())
+}
+
 /// Preserve unreadable/unknown schemas in place; malformed JSON gets a durable
 /// recovery copy before a caller may initialize defaults.
 pub(crate) fn prepare_json(
@@ -89,6 +126,33 @@ mod tests {
         fs::write(&path, future).unwrap();
         assert!(!prepare_json(&path, &[1], |_| true));
         assert_eq!(fs::read(&path).unwrap(), future);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn preserve_copy_reuses_exact_copy_and_never_overwrites_others() {
+        let dir =
+            std::env::temp_dir().join(format!("limitscope-preserve-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join("store-v1.json");
+        let other_store = dir.join("other-v1.recovery-x.json");
+        let older = dir.join("store-v1.recovery-older.json");
+        fs::write(&other_store, b"{ bad").unwrap();
+        fs::write(&older, b"older").unwrap();
+        let copies = || {
+            fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().starts_with("store-v1.recovery-"))
+                .count()
+        };
+        preserve_copy(&path, b"{ bad").unwrap();
+        assert_eq!(copies(), 2, "another store's identical copy is not reused");
+        preserve_copy(&path, b"{ bad").unwrap();
+        preserve_copy(&path, b"older").unwrap();
+        assert_eq!(copies(), 2, "exact copies are reused, not duplicated");
+        assert_eq!(fs::read(&older).unwrap(), b"older");
+        assert_eq!(fs::read(&other_store).unwrap(), b"{ bad");
         fs::remove_dir_all(dir).unwrap();
     }
 }
