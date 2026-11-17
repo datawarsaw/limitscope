@@ -28,6 +28,27 @@ export { CODEX_PROVIDER_ID };
 /** Clock-skew tolerance mirroring the Rust freshness check (5 minutes). */
 const FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
 
+const creditExpiryFormat = new Intl.DateTimeFormat(undefined, {
+  year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+});
+
+/** Display only a future UTC deadline from a fresh, same-request observation. */
+export function formatCreditExpiry(
+  credits: CodexResetCredits | undefined,
+  nowMs: number = Date.now(),
+): string {
+  const unknown = "Expiry not reported";
+  if (!credits || credits.source !== "codex-wham-usage"
+    || !isValidCount(credits.bankedCredits) || credits.bankedCredits === 0
+    || !isResetCreditsFresh(credits.checkedAt, nowMs)) return unknown;
+  const iso = credits.nextCreditExpiresAt;
+  if (typeof iso !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/.test(iso)) return unknown;
+  const time = Date.parse(iso);
+  if (!Number.isFinite(time) || time <= nowMs
+    || new Date(time).toISOString().slice(0, 19) !== iso.slice(0, 19)) return unknown;
+  return `Next credit expiry ${creditExpiryFormat.format(new Date(time))}`;
+}
+
 function isValidCount(value: unknown): value is number {
   return (
     typeof value === "number" &&

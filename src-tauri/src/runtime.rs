@@ -5909,6 +5909,7 @@ mod tests {
             reset_credits: Some(CodexResetCredits {
                 banked_credits: banked,
                 currently_applicable: applicable,
+                next_credit_expires_at: Some("2026-10-04T12:00:00Z".into()),
                 checked_at: checked_at.to_string(),
                 source: crate::codex::RESET_CREDITS_SOURCE,
             }),
@@ -5935,6 +5936,7 @@ mod tests {
         let credits = dto.reset_credits.expect("credits must propagate");
         assert_eq!(credits.banked_credits, 3);
         assert_eq!(credits.currently_applicable, Some(0));
+        assert_eq!(credits.next_credit_expires_at.as_deref(), Some("2026-10-04T12:00:00Z"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import type { ProviderUsage } from "../types";
 import { floatingQuotaItems } from "../lib/floatingQuota";
+import { formatCreditExpiry } from "../lib/resetCredits";
 import { FloatingProviderPopover } from "./FloatingProviderPopover";
 
 const now = new Date("2026-09-30T12:00:00Z");
@@ -18,6 +19,35 @@ function card(item: ReturnType<typeof floatingQuotaItems>[number]) {
 afterEach(cleanup);
 
 describe("floating Codex reset bank", () => {
+  it("replaces only the third bank line, isolates dates per account and suppresses elapsed dates", () => {
+    const primaryCredits = { ...credits(3, 0), nextCreditExpiresAt: "2026-10-04T12:00:00Z" };
+    const secondaryCredits = { ...credits(1), nextCreditExpiresAt: "2026-10-05T12:00:00Z" };
+    const [primary, secondary] = floatingQuotaItems([
+      usage("openai-codex", "Personal", primaryCredits),
+      usage("openai-codex:secondary", "CoWork", secondaryCredits),
+    ]);
+    const view = render(card(primary));
+    const shell = view.container.firstElementChild?.className;
+    const check = (value: typeof primaryCredits | typeof secondaryCredits) => {
+      const section = screen.getByRole("region", { name: "Codex reset credits" });
+      expect(section.querySelectorAll("p")).toHaveLength(3);
+      expect(section.querySelectorAll("p")[2].textContent).toBe(formatCreditExpiry(value, now.getTime()));
+      expect(section.querySelector("button")).toBeNull();
+      expect(view.container.firstElementChild?.className).toBe(shell);
+    };
+    check(primaryCredits);
+    view.rerender(card(secondary)); check(secondaryCredits);
+    expect(view.container.textContent).not.toContain(formatCreditExpiry(primaryCredits, now.getTime()));
+    const [countOnly] = floatingQuotaItems([usage("openai-codex:secondary", "CoWork", credits(1))]);
+    view.rerender(card(countOnly));
+    expect(screen.getByText("Expiry not reported")).toBeTruthy();
+    const [elapsed] = floatingQuotaItems([usage("openai-codex", "Personal", {
+      ...credits(3), nextCreditExpiresAt: now.toISOString(),
+    })]);
+    view.rerender(card(elapsed));
+    expect(screen.getByText("Expiry not reported")).toBeTruthy();
+    expect(view.container.textContent).not.toMatch(/expired at/i);
+  });
   it("keeps independent balances and identities when switching and swapping accounts", () => {
     const [primary, secondary] = floatingQuotaItems([
       usage("openai-codex", "Personal", credits(3, 0)),

@@ -212,6 +212,7 @@ async fn in_flight_result_cannot_commit_after_switch_or_pause() {
         std::fs::write(&auth_file, fixture_auth("user-a", workspace)).unwrap();
         let mut accounts = codex_accounts::default_accounts();
         accounts[0].codex_home = dir.to_string_lossy().into_owned();
+        accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         let specs = codex_specs_with_fetch(&accounts, {
@@ -422,6 +423,7 @@ async fn returning_to_an_earlier_user_does_not_revive_its_old_reading() {
 
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = home.to_string_lossy().into_owned();
+    accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
     let specs = specs_for(&accounts, quota_body(38));
     let mut core = RuntimeCore::with_injections(specs.clone(), 5, Box::new(|| 0), Box::new(Utc::now));
     core.codex_identity_resolver = Some(Arc::new(codex::current_codex_identity));
@@ -472,6 +474,7 @@ async fn a_result_started_under_an_older_generation_cannot_commit_after_a_move()
 
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = home.to_string_lossy().into_owned();
+    accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let specs = codex_specs_with_fetch(&accounts, {
@@ -543,6 +546,7 @@ async fn a_session_change_before_the_mutations_writes_no_history_cache_or_notifi
 
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = home.to_string_lossy().into_owned();
+    accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let specs = codex_specs_with_fetch(&accounts, {
@@ -624,6 +628,7 @@ async fn a_cached_reading_from_another_user_is_neither_restored_nor_kept() {
 
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = home.to_string_lossy().into_owned();
+    accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
     let specs = specs_for(&accounts, quota_body(38));
     let store = Arc::new(ProviderLastGoodStore::open(cache_path.clone()));
     let mut core =
@@ -675,6 +680,7 @@ async fn unrelated_provider_activity_does_not_discard_valid_codex_history() {
 
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = home.to_string_lossy().into_owned();
+    accounts[1].codex_home.clear(); // Synthetic primary only; never resolve the default CoWork home.
     let mut specs = specs_for(&accounts, quota_body(38));
     specs.push(unrelated_spec(ProviderKind::Zai, 12.0));
     let history = Arc::new(QuotaHistoryStore::open(dir.join("history.json")));

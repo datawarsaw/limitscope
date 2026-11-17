@@ -8,6 +8,17 @@
 
 ## Current status
 
+- Codex Reset Bank expiration (2026-11-17): local implementation candidate
+  adds one optional same-request details GET through the existing Rust HTTP
+  client, with a 5-second deadline and bounded body/list. WHAM usage remains
+  sole count/applicability authority. Only a complete identity-bound list can
+  supply `nextCreditExpiresAt`; unknown details preserve `Expiry not reported`.
+  This internal endpoint is optional and has no external API guarantee. No
+  persistence, App Server runtime, redemption, compact-bar or release changes.
+  See `docs/codex-reset-credits-v0.7.md`; exact local commit and validation are
+  in `docs/HANDOFF-codex-reset-expiration-candidate.md` in the candidate worktree.
+  Independent review, Human Acceptance and release remain separate gates.
+
 - Release pipeline trust isolation is a local, unreleased candidate: validation
   runs on a separate runner without release secrets or shared artifacts/caches;
   the release runner checks the exact source and lockfiles, builds with locked

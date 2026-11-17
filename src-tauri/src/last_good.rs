@@ -1255,6 +1255,7 @@ mod tests {
         live.reset_credits = Some(CodexResetCredits {
             banked_credits: 3,
             currently_applicable: Some(0),
+            next_credit_expires_at: Some("2026-10-04T12:00:00Z".into()),
             checked_at: "2026-09-29T12:00:00.000Z".to_string(),
             source: RESET_CREDITS_SOURCE,
         });

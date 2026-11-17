@@ -20,6 +20,11 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 const USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+// Internal upstream endpoint, NOT a supported external API. Best-effort only.
+const RESET_CREDITS_URL: &str = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits";
+const CREDIT_DETAILS_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_CREDIT_DETAILS_BYTES: usize = 128 * 1024;
+const MAX_CREDIT_ROWS: usize = 256;
 const USER_AGENT: &str = concat!("rate-limits/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const CODEX_IDENTITY_PREFIX: &str = "chatgpt-v2:";
@@ -87,16 +92,16 @@ pub struct CodexUsage {
 /// credits — it is NOT a count of replenishments available now, NOT a count
 /// of windows/resets/history transitions, and must never be derived from
 /// them. currently_applicable is the separate applicability field when
-/// the backend reports one; absent means unknown, never zero. There is no
-/// expiry here: per-credit expirations live only in the read-only
-/// reset-credit details endpoint, which this capability deliberately does
-/// not call (smallest surface: the usage payload alone).
+/// the backend reports one; absent means unknown, never zero. Optional expiry
+/// is proven from a complete detail list within this SAME usage observation.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CodexResetCredits {
     pub banked_credits: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub currently_applicable: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_credit_expires_at: Option<String>,
     /// RFC 3339 UTC time of the observation. Consumers must treat the count
     /// as current only within RESET_CREDITS_TTL_SECS of this stamp.
     pub checked_at: String,
@@ -270,9 +275,134 @@ fn parse_reset_credits(
     Some(CodexResetCredits {
         banked_credits,
         currently_applicable: strict_count(summary.applicable_available_count.as_ref()),
+        next_credit_expires_at: None,
         checked_at: now.to_rfc3339_opts(SecondsFormat::Secs, true),
         source: RESET_CREDITS_SOURCE,
     })
+}
+
+/// No coercion, unit guessing, relative dates or local-time interpretation.
+fn credit_timestamp(value: &Value) -> Option<DateTime<Utc>> {
+    let time = if let Some(seconds) = value.as_i64() {
+        DateTime::from_timestamp(seconds, 0)?
+    } else {
+        let text = value.as_str()?;
+        if !matches!(text.as_bytes().get(10), Some(b'T' | b't')) {
+            return None;
+        }
+        DateTime::parse_from_rfc3339(text).ok()?.with_timezone(&Utc)
+    };
+    // Positive Unix time, bounded to RFC3339's four-digit years / JS dates.
+    (time.timestamp() > 0 && time.timestamp() < 253_402_300_800).then_some(time)
+}
+
+/// Prove completeness against WHAM, never take the first N detail rows.
+/// IDs remain local and only serve to reject duplicate rows masquerading as
+/// a complete list. Unknown schemas/status/type/time fail closed.
+fn next_credit_expiry(
+    body: &[u8],
+    banked: u32,
+    account_id: &str,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if banked == 0 || banked as usize > MAX_CREDIT_ROWS || body.len() > MAX_CREDIT_DETAILS_BYTES {
+        return None;
+    }
+    let details: Value = serde_json::from_slice(body).ok()?;
+    let details = details.as_object()?;
+    if let Some(count) = details.get("available_count") {
+        if strict_count(Some(count))? != banked {
+            return None;
+        }
+    }
+    if let Some(account) = details.get("account_id") {
+        if account.as_str()? != account_id {
+            return None;
+        }
+    }
+    let rows = details.get("credits")?.as_array()?;
+    if rows.len() > MAX_CREDIT_ROWS {
+        return None;
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut available = 0;
+    let mut nearest: Option<DateTime<Utc>> = None;
+    for row in rows {
+        let row = row.as_object()?;
+        let id = row.get("id")?.as_str()?;
+        if id.trim().is_empty() || !ids.insert(id) {
+            return None;
+        }
+        if row.get("reset_type")?.as_str()? != "codex_rate_limits" {
+            return None;
+        }
+        match row.get("status")?.as_str()? {
+            "redeeming" | "redeemed" => continue,
+            "available" => {}
+            _ => return None,
+        }
+        available += 1;
+        let granted = credit_timestamp(row.get("granted_at")?)?;
+        // Explicit null is nonexpiring upstream, never a numeric deadline.
+        // Conservatively withhold the global nearest for any null/missing time.
+        let expires = credit_timestamp(row.get("expires_at")?)?;
+        if granted > now || expires <= now || expires < granted {
+            return None;
+        }
+        nearest = Some(nearest.map_or(expires, |old| old.min(expires)));
+    }
+    if available != banked {
+        return None;
+    }
+    Some(nearest?.to_rfc3339_opts(SecondsFormat::AutoSi, true))
+}
+
+/// Same-request enrichment only. A count-only refresh always starts without
+/// expiry; checked_at is never advanced to make retained detail data fresh.
+async fn enrich_credit_expiry<F, Fut, I>(
+    usage: &mut CodexUsage,
+    auth: &CodexAuth,
+    read_details: F,
+    current_identity: I,
+) where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<Vec<u8>>>,
+    I: FnOnce() -> Option<String>,
+{
+    let Some(credits) = usage.reset_credits.as_mut() else {
+        return;
+    };
+    credits.next_credit_expires_at = None;
+    let Some(account_id) = auth
+        .account_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    else {
+        return;
+    };
+    let Some(identity) = auth.identity.as_deref() else {
+        return;
+    };
+    // reset_credits exists only after usage's explicit served account was
+    // bound to this auth scope. The full digest also binds user + workspace.
+    if credits.banked_credits == 0
+        || credits.banked_credits as usize > MAX_CREDIT_ROWS
+        || usage.account.as_ref().and_then(|a| a.identity.as_deref()) != Some(identity)
+        || !reset_credits_fresh(&credits.checked_at, Utc::now())
+    {
+        return;
+    }
+    let Some(body) = read_details().await else {
+        return;
+    };
+    if current_identity().as_deref() != Some(identity) {
+        return;
+    }
+    let now = Utc::now();
+    if reset_credits_fresh(&credits.checked_at, now) {
+        credits.next_credit_expires_at =
+            next_credit_expiry(&body, credits.banked_credits, account_id, now);
+    }
 }
 
 fn window_label(limit_window_seconds: Option<i64>) -> String {
@@ -602,6 +732,7 @@ fn http_client() -> Result<&'static reqwest::Client, ProviderError> {
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .build()
             .map_err(|error| error.to_string())
     }) {
@@ -611,6 +742,66 @@ fn http_client() -> Result<&'static reqwest::Client, ProviderError> {
             format!("Could not initialize HTTP client: {error}"),
         )),
     }
+}
+
+fn credit_details_request(
+    client: &reqwest::Client,
+    auth: &CodexAuth,
+    url: &str,
+) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .bearer_auth(&auth.access_token)
+        .header(
+            "chatgpt-account-id",
+            auth.account_id.as_deref().unwrap_or_default(),
+        )
+        .header("accept", "application/json")
+        .timeout(CREDIT_DETAILS_TIMEOUT)
+}
+
+async fn read_credit_details(
+    request: reqwest::RequestBuilder,
+    #[cfg(all(test, windows))] mut audit: Option<&mut credit_expiry_uat::Audit<'_>>,
+) -> Option<Vec<u8>> {
+    // The timeout covers headers AND the streamed body. Nothing from this
+    // optional response (including HTTP errors) reaches logs or diagnostics.
+    let result = tokio::time::timeout(CREDIT_DETAILS_TIMEOUT, async {
+        let response = request.send().await;
+        #[cfg(all(test, windows))]
+        if let Some(audit) = audit.as_deref_mut() {
+            audit.detail_status = response.as_ref().ok().map(reqwest::Response::status);
+            audit.observe_detail_error(response.as_ref().err());
+        }
+        let mut response = response.ok()?;
+        if !response.status().is_success()
+            || response
+                .content_length()
+                .is_some_and(|len| len > MAX_CREDIT_DETAILS_BYTES as u64)
+        {
+            return None;
+        }
+        let mut body = Vec::new();
+        loop {
+            let chunk = response.chunk().await;
+            #[cfg(all(test, windows))]
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.observe_detail_error(chunk.as_ref().err());
+            }
+            let Some(chunk) = chunk.ok()? else { break };
+            if chunk.len() > MAX_CREDIT_DETAILS_BYTES - body.len() {
+                return None;
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Some(body)
+    })
+    .await;
+    #[cfg(all(test, windows))]
+    if let Some(audit) = audit {
+        audit.detail_timeout |= result.is_err();
+    }
+    result.ok().flatten()
 }
 
 fn unexpected_usage_response(reason: &str) -> ProviderError {
@@ -639,7 +830,14 @@ fn parse_usage_response(
     now: DateTime<Utc>,
     local_account: Option<&str>,
 ) -> Result<CodexUsage, ProviderError> {
-    parse_usage_response_with_identity(body, now, local_account, None)
+    parse_usage_response_with_identity(
+        body,
+        now,
+        local_account,
+        None,
+        #[cfg(windows)]
+        None,
+    )
 }
 
 fn parse_usage_response_with_identity(
@@ -647,11 +845,20 @@ fn parse_usage_response_with_identity(
     now: DateTime<Utc>,
     local_account: Option<&str>,
     identity: Option<String>,
+    #[cfg(all(test, windows))] audit: Option<&mut credit_expiry_uat::Audit<'_>>,
 ) -> Result<CodexUsage, ProviderError> {
     let parsed: UsageResponse = serde_json::from_slice(body)
         .map_err(|_| unexpected_usage_response("no known windows found."))?;
     let observed_account = parsed.account_id.as_deref();
     let local_account = local_account.map(str::trim).filter(|id| !id.is_empty());
+    #[cfg(all(test, windows))]
+    if let Some(audit) = audit {
+        if !audit.bind_usage(observed_account, local_account) {
+            return Err(unexpected_usage_response(
+                "The served workspace could not be bound.",
+            ));
+        }
+    }
     if let (Some(observed), Some(local)) = (observed_account, local_account) {
         if observed.trim() != local {
             return Err(ProviderError::new(
@@ -700,10 +907,21 @@ fn parse_usage_response_with_identity(
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_collect(auth_json: &str, body: &[u8], now: DateTime<Utc>) -> Result<CodexUsage, ProviderError> {
+pub(crate) fn fixture_collect(
+    auth_json: &str,
+    body: &[u8],
+    now: DateTime<Utc>,
+) -> Result<CodexUsage, ProviderError> {
     let auth = parse_auth(auth_json)?;
-    parse_usage_response_with_identity(body, now, auth.account_id.as_deref(), auth.identity.clone())
-        .map_err(|error| error.with_identity_hint(auth.identity))
+    parse_usage_response_with_identity(
+        body,
+        now,
+        auth.account_id.as_deref(),
+        auth.identity.clone(),
+        #[cfg(windows)]
+        None,
+    )
+    .map_err(|error| error.with_identity_hint(auth.identity))
 }
 
 // ---------- fetch + command ----------
@@ -711,17 +929,74 @@ pub(crate) fn fixture_collect(auth_json: &str, body: &[u8], now: DateTime<Utc>) 
 async fn fetch_codex_usage(codex_home: Option<&str>) -> Result<CodexUsage, ProviderError> {
     let dir = resolve_codex_home(codex_home)?;
     let auth = load_auth(&dir)?;
+    fetch_codex_usage_in(
+        &dir,
+        &auth,
+        #[cfg(all(test, windows))]
+        None,
+    )
+    .await
+}
+
+async fn fetch_codex_usage_in(
+    dir: &Path,
+    auth: &CodexAuth,
+    #[cfg(all(test, windows))] mut audit: Option<&mut credit_expiry_uat::Audit<'_>>,
+) -> Result<CodexUsage, ProviderError> {
     // Final-boundary value scrub (`secret_scrub`): the access token is alive
     // for this whole fetch, so any exact occurrence of it in a failure
     // message is removed before the error leaves the adapter.
-    fetch_usage_for_auth(&auth).await.map_err(|error| {
+    let mut usage = fetch_usage_for_auth(
+        auth,
+        #[cfg(all(test, windows))]
+        audit.as_deref_mut(),
+    )
+    .await
+    .map_err(|error| {
         crate::secret_scrub::scrub_provider_error(error, &[auth.access_token.as_str()])
-    })
+    })?;
+    enrich_credit_expiry(
+        &mut usage,
+        auth,
+        || async {
+            let client = http_client().ok()?;
+            let url = RESET_CREDITS_URL;
+            #[cfg(all(test, windows))]
+            let (client, url) = audit
+                .as_ref()
+                .and_then(|a| a.fixture)
+                .map_or((client, url), |(client, _, details_url)| {
+                    (client, details_url)
+                });
+            #[cfg(all(test, windows))]
+            if let Some(audit) = audit.as_deref_mut() {
+                audit.detail_attempted();
+            }
+            let body = read_credit_details(
+                credit_details_request(client, auth, url),
+                #[cfg(all(test, windows))]
+                audit.as_deref_mut(),
+            )
+            .await;
+            #[cfg(all(test, windows))]
+            if let (Some(audit), Some(body)) = (audit, body.as_deref()) {
+                audit.bind_details(body, auth.account_id.as_deref());
+            }
+            body
+        },
+        // Re-read the SAME resolved directory, never an ambient fallback.
+        || load_auth(dir).ok().and_then(|latest| latest.identity),
+    )
+    .await;
+    Ok(usage)
 }
 
 /// The usage fetch for an already-resolved credential. No token refresh: an
 /// expired session fails here and stays failed until Codex itself re-auths.
-async fn fetch_usage_for_auth(auth: &CodexAuth) -> Result<CodexUsage, ProviderError> {
+async fn fetch_usage_for_auth(
+    auth: &CodexAuth,
+    #[cfg(all(test, windows))] mut audit: Option<&mut credit_expiry_uat::Audit<'_>>,
+) -> Result<CodexUsage, ProviderError> {
     let identity = auth.identity.clone();
     // authoritative check (401/403 below).
     if let Some(exp) = jwt_expiry(&auth.access_token) {
@@ -731,14 +1006,24 @@ async fn fetch_usage_for_auth(auth: &CodexAuth) -> Result<CodexUsage, ProviderEr
     }
 
     let client = http_client().map_err(|error| error.with_identity_hint(identity.clone()))?;
+    let url = USAGE_URL;
+    #[cfg(all(test, windows))]
+    let (client, url) = audit
+        .as_ref()
+        .and_then(|a| a.fixture)
+        .map_or((client, url), |(client, usage_url, _)| (client, usage_url));
     let mut request = client
-        .get(USAGE_URL)
+        .get(url)
         .bearer_auth(&auth.access_token)
         .header("accept", "application/json");
     if let Some(account_id) = &auth.account_id {
         request = request.header("chatgpt-account-id", account_id);
     }
 
+    #[cfg(all(test, windows))]
+    if let Some(audit) = audit.as_deref_mut() {
+        audit.usage_attempted();
+    }
     let response = request.send().await.map_err(|error| {
         crate::provider_error::transport_failure(
             "network",
@@ -748,6 +1033,10 @@ async fn fetch_usage_for_auth(auth: &CodexAuth) -> Result<CodexUsage, ProviderEr
         .with_identity_hint(identity.clone())
     })?;
     let status = response.status();
+    #[cfg(all(test, windows))]
+    if let Some(audit) = audit.as_deref_mut() {
+        audit.usage_status = Some(status);
+    }
     let retry_after =
         crate::provider_error::retry_after_header(response.headers()).map(String::from);
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -778,6 +1067,8 @@ async fn fetch_usage_for_auth(auth: &CodexAuth) -> Result<CodexUsage, ProviderEr
         Utc::now(),
         auth.account_id.as_deref(),
         identity.clone(),
+        #[cfg(all(test, windows))]
+        audit,
     )
     .map_err(|error| error.with_identity_hint(identity.clone()))
 }
@@ -798,6 +1089,14 @@ pub async fn get_codex_usage_for(codex_home: Option<&str>) -> Result<CodexUsage,
 }
 
 // ---------- tests ----------
+
+#[cfg(test)]
+#[path = "codex_credit_expiry_tests.rs"]
+mod credit_expiry_tests;
+
+#[cfg(all(test, windows))]
+#[path = "codex_credit_expiry_uat.rs"]
+mod credit_expiry_uat;
 
 #[cfg(test)]
 mod tests {
@@ -1834,7 +2133,13 @@ mod tests {
             account_id: Some("acct-1234567890abcd".to_string()),
             identity: Some(identity.clone()),
         };
-        let failure = fetch_usage_for_auth(&auth).await.unwrap_err();
+        let failure = fetch_usage_for_auth(
+            &auth,
+            #[cfg(windows)]
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(failure.code, "auth_expired");
         assert_eq!(failure.identity_hint.as_deref(), Some(identity.as_str()));
 
@@ -1848,6 +2153,8 @@ mod tests {
             Utc::now(),
             auth.account_id.as_deref(),
             Some(identity.clone()),
+            #[cfg(windows)]
+            None,
         )
         .unwrap();
         assert_eq!(

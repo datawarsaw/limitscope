@@ -1192,6 +1192,7 @@ mod tests {
         credited.reset_credits = Some(CodexResetCredits {
             banked_credits: 3,
             currently_applicable: Some(0),
+            next_credit_expires_at: Some("2026-10-04T12:00:00Z".into()),
             checked_at: "2026-09-29T11:55:00.000Z".to_string(),
             source: RESET_CREDITS_SOURCE,
         });
@@ -1205,6 +1206,7 @@ mod tests {
         let raw = serde_json::to_string(&normalize_provider(source, now())).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let credits = parsed.get("resetCredits").expect("credits must project");
+        assert!(credits.get("nextCreditExpiresAt").is_none());
         assert_eq!(
             credits.get("bankedCredits").and_then(|v| v.as_u64()),
             Some(3)

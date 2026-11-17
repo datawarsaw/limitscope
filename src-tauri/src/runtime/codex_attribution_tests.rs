@@ -44,6 +44,7 @@ fn usage(index: usize, increment: f64) -> CodexUsage {
         reset_credits: Some(CodexResetCredits {
             banked_credits: [2, 7][index],
             currently_applicable: None,
+            next_credit_expires_at: Some(["2026-10-29T12:00:00Z", "2026-10-30T12:00:00Z"][index].into()),
             checked_at: now().to_rfc3339(),
             source: codex::RESET_CREDITS_SOURCE,
         }),
@@ -59,6 +60,10 @@ fn assert_own_reading(dto: &ProviderUsageDto, index: usize, increment: f64) {
         Some(identity(index).as_str())
     );
     assert_eq!(dto.limits[0].reset_at, None);
+    if let Some(credits) = &dto.reset_credits {
+        assert_eq!(credits.next_credit_expires_at.as_deref(),
+            Some(["2026-10-29T12:00:00Z", "2026-10-30T12:00:00Z"][index]));
+    }
 }
 
 fn core(specs: Vec<ProviderSpec>, clock: &Arc<Mutex<DateTime<Utc>>>) -> RuntimeCore {
