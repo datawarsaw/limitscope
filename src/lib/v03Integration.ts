@@ -25,6 +25,11 @@ function validTime(value: string | undefined): string | undefined {
   return value;
 }
 
+export function claudeTimesNote(times: ProviderUsage["claudeStatuslineTimes"], now: Date): string {
+  const age = (value?: string) => validTime(value) ? formatAge(value!, now) : "Unknown";
+  return `Last statusLine event: ${age(times?.receiptAt)} · 5h usage changed: ${age(times?.fiveHourChangedAt)} · 7d usage changed: ${age(times?.sevenDayChangedAt)} · Local event does not confirm a quota refresh`;
+}
+
 /**
  * Narrows persisted history to the accounts that are current right now, so
  * predictions can never blend two accounts of one provider (MIC-297 follow-up:
@@ -157,14 +162,7 @@ function sourceNoteText(
 ): string {
   if (status.label === "Mock") return "Deterministic sample data";
   if (usage.id === "claude-code") {
-    // Passive source: the reading only advances while Claude Code runs its
-    // status line hook, so say how old it is and why it may not move.
-    if (status.label === "Unavailable") return "Waiting for Claude Code status line data";
-    const received = validTime(usage.sourceUpdatedAt);
-    if (received && usage.limits.length > 0 && usage.health !== "error") {
-      return `Updated ${formatAge(received, now)} from Claude Code · new quota data requires Claude Code activity`;
-    }
-    if (status.label === "Last known") return "Source update time unknown";
+    return claudeTimesNote(usage.claudeStatuslineTimes, now);
   }
   if (status.label === "Unavailable") return "Provider data unavailable";
   if (status.label === "Cooldown") {

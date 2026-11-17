@@ -664,6 +664,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: Some("fresh"),
             reset_credits: None,

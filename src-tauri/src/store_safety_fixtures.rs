@@ -108,6 +108,7 @@ fn zai_usage(percent: f64) -> ProviderUsageDto {
         error: None,
         error_category: None,
         error_http_status: None,
+        claude_statusline_times: None,
         source_updated_at: None,
         data_freshness: None,
         reset_credits: None,

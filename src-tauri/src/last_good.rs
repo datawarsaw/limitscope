@@ -386,6 +386,7 @@ impl ProviderLastGoodStore {
                 error: None,
                 error_category: None,
                 error_http_status: None,
+                claude_statusline_times: None,
                 source_updated_at: persisted.source_updated_at.clone().or_else(|| Some(persisted.last_successful_at.clone())),
                 data_freshness: Some("stale"),
                 // v0.7 banked credits never hydrate: a credit count is only
@@ -985,6 +986,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: None,
             reset_credits: None,
