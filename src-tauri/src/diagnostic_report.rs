@@ -165,7 +165,7 @@ fn validated_scope(json: &str, ids: &[&str], today: &str) -> Result<ReleaseScope
         // Require a fresh explicit recertification for each release day (UTC).
         if entry.date != today { return Err("scope date must be today in UTC".into()); }
         let reason = entry.reason.trim();
-        if reason.is_empty() || reason.len() > 200 || reason.chars().any(|c| c.is_control())
+        if reason.is_empty() || reason.chars().count() > 200 || reason.chars().any(|c| c.is_control())
             || secret_shaped_material(reason).is_some() {
             return Err("invalid scope reason".into());
         }
@@ -457,6 +457,22 @@ mod tests {
             json.replace("}]}", "},{\"id\":\"openai-codex\",\"state\":\"ACTIVE\",\"date\":\"2026-11-17\",\"reason\":\"duplicate\"}]}"),
             "not json".to_string(),
         ] { assert!(validated_scope(&invalid, &ids, date).is_err(), "accepted {invalid}"); }
+    }
+
+    #[test]
+    fn release_scope_reason_counts_unicode_characters() {
+        let ids = ["zai"];
+        let date = "2026-11-17";
+        for (length, valid) in [(200, true), (201, false)] {
+            let json = serde_json::json!({
+                "schemaVersion": 1,
+                "providers": [{
+                    "id": "zai", "state": "INACTIVE", "date": date,
+                    "reason": "\u{0105}".repeat(length)
+                }]
+            }).to_string();
+            assert_eq!(validated_scope(&json, &ids, date).is_ok(), valid);
+        }
     }
 
     #[test]
