@@ -247,6 +247,12 @@ export function UsageOverview({
         </p>
       ) : null}
 
+      {data && (data.persistenceAvailable === false || data.lastWriteSucceeded === false) ? (
+        <p className="usage-refresh-error" role="alert">
+          Local usage could not be saved. Collection progress is retained for retry; totals may be incomplete.
+        </p>
+      ) : null}
+
       {data !== null && providerRows.length === 0 ? (
         <div className="usage-panel usage-empty">
           <p>No locally collected token usage yet.</p>
@@ -542,6 +548,8 @@ function coverageDetail(coverage: UsageSourceCoverage): string {
       return coverage.lastObservedAt
         ? `may be missing events after ${formatSinceDate(coverage.lastObservedAt)}`
         : "recent events may be missing";
+    case "scanCeiling":
+      return "collection has a recoverable backlog";
     case "collectionPaused":
       return coverage.lastObservedAt
         ? `collection is paused — events after ${formatSinceDate(coverage.lastObservedAt)} may be missing`

@@ -48,7 +48,9 @@ export function historyForCurrentAccounts(
     }
   }
   return history.filter((observation) => {
+    if (observation.providerId === "qwen-token-plan") return false;
     const identity = currentIdentity.get(observation.providerId);
+    if (["zai", "opencode-go", "grok"].includes(observation.providerId) && !identity) return false;
     return observation.account === identity;
   });
 }

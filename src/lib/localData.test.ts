@@ -5,6 +5,7 @@ import {
   FLOATING_PREFS_STORAGE_KEY,
 } from "./floatingWindowPrefs";
 import { DEFAULT_SETTINGS, SETTINGS_STORAGE_KEY } from "./settings";
+import { LEGACY_QUOTA_HISTORY_KEY } from "./quotaHistory";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(async () => ({ category: "providerCache", removed: true })),
@@ -87,17 +88,39 @@ describe("clearProviderCache", () => {
 describe("clearUsageHistoryStore", () => {
   it("clears the Rust history store through its canonical command", async () => {
     simulateTauri();
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, "legacy");
+    const remove = vi.spyOn(Storage.prototype, "removeItem");
     await expect(clearUsageHistoryStore()).resolves.toEqual({ ok: true, removed: true });
     expect(mocks.clearRuntimeHistory).toHaveBeenCalledTimes(1);
-    expect(mocks.removeLegacyHistory).toHaveBeenCalledTimes(1);
+    expect(remove).toHaveBeenCalledWith(LEGACY_QUOTA_HISTORY_KEY);
+    expect(mocks.clearRuntimeHistory.mock.invocationCallOrder[0]).toBeLessThan(remove.mock.invocationCallOrder[0]);
+    expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBeNull();
+    expect(mocks.removeLegacyHistory).not.toHaveBeenCalled();
+    remove.mockRestore();
   });
 
   it("never reports success when the history store fails", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, "legacy");
+    const remove = vi.spyOn(Storage.prototype, "removeItem");
     mocks.clearRuntimeHistory.mockRejectedValueOnce(new Error("history store down"));
 
     await expect(clearUsageHistoryStore()).resolves.toEqual({ ok: false });
+    expect(remove).not.toHaveBeenCalled();
+    expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBe("legacy");
+    remove.mockRestore();
     spy.mockRestore();
+  });
+
+  it("reports failure if legacy source removal throws after Rust clear", async () => {
+    localStorage.setItem(LEGACY_QUOTA_HISTORY_KEY, "legacy");
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const remove = vi.spyOn(Storage.prototype, "removeItem").mockImplementation(() => { throw new Error("storage unavailable"); });
+    await expect(clearUsageHistoryStore()).resolves.toEqual({ ok: false });
+    expect(mocks.clearRuntimeHistory.mock.invocationCallOrder[0]).toBeLessThan(remove.mock.invocationCallOrder[0]);
+    expect(localStorage.getItem(LEGACY_QUOTA_HISTORY_KEY)).toBe("legacy");
+    remove.mockRestore();
+    log.mockRestore();
   });
 
   it("does not touch the provider cache", async () => {

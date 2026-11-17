@@ -1,7 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { AttentionRail } from "./components/dashboard/AttentionRail";
 import { ExecutionRunPanel } from "./components/dashboard/ExecutionRunPanel";
+import { PrimaryQuotaPanel } from "./components/dashboard/PrimaryQuotaPanel";
+import { ProviderRail } from "./components/dashboard/ProviderRail";
+import { QuotaWindowList } from "./components/dashboard/QuotaWindowList";
+import { StatusHistoryChart } from "./components/status/StatusHistoryChart";
 import { SettingsView } from "./components/settings/SettingsView";
-import { UsageOverview } from "./components/usage/UsageOverview";
+import { UsageView } from "./components/usage/UsageView";
 import { useNow } from "./hooks/useNow";
 import { useDashboardLayout } from "./hooks/useDashboardLayout";
 import { useExecutionRuns } from "./hooks/useExecutionRuns";
@@ -12,7 +23,10 @@ import { useProviderUsage } from "./hooks/useProviderUsage";
 import { useSettings } from "./hooks/useSettings";
 import { useUpdater } from "./hooks/useUpdater";
 import { formatTime } from "./lib/format";
-import { defaultSelectedProviderId } from "./lib/dashboard";
+import {
+  attentionItems,
+  defaultSelectedProviderId,
+} from "./lib/dashboard";
 import { formatRunElapsed } from "./lib/executionRuns";
 import { readDevFixture } from "./dev/usageFixtures";
 import { orderVisibleProviders } from "./lib/providerPreferences";
@@ -35,20 +49,27 @@ function RefreshIcon() {
 }
 
 /**
- * v0.9 main window: the primary navigation is Usage | Settings.
+ * v0.9 main window: the primary navigation is Status | Insights | Settings.
  *
- * The floating bar stays the product's primary interface for live quotas,
- * resets, and wallets; the main window is a calm overview of locally
- * observed AI usage. Usage (the default) is one coherent surface over the
- * Usage Intelligence projection — reported tokens, events, model and source
- * rankings, an honest collection context, and the Daily activity heatmap.
- * Settings is a dedicated page (formerly the bottom drawer)
- * organized into General, Providers & Wallets, Data & Privacy, and Support.
+ * Status is the calm, chart-led landing view: the provider rail selects a
+ * provider, a compact status header carries the essential quota context, a
+ * prominent history chart shows how that provider's quota windows moved,
+ * and the needs-attention rail keeps the glanceable warnings. The floating
+ * bar stays the product's primary interface for live quotas and wallets.
  *
- * App owns only orchestration — runtime data, the active view, and the
- * structural layout — while focused components render each destination.
- * Every state semantic (fresh/stale/error/unknown, retained last-good,
- * prediction gating) is consumed, not redefined.
+ * Insights is the analytics surface over the backend quota-history
+ * projection plus the Usage Intelligence token plane (KPIs, model and
+ * source rankings, coverage honesty, daily activity).
+ *
+ * Settings is a dedicated page organized into General, Providers & Wallets,
+ * Data & Privacy, and Support. Its persisted values stay owned by the Rust
+ * settings lane (useSettings): no view here writes a preference directly.
+ *
+ * App owns only orchestration — runtime data, the selected provider, the
+ * active view, and the structural layout — while focused components render
+ * each zone. Every state semantic (fresh/stale/error/unknown, retained
+ * last-good, prediction gating, Codex identity fencing) is consumed, not
+ * redefined.
  */
 export default function App() {
   const {
@@ -65,8 +86,10 @@ export default function App() {
     setCodexAccount,
     setQuotaPerspective,
     resetPreferences,
+    syncRefreshInterval,
     startupPending,
     startupError,
+    unverifiedPreferences,
   } = useSettings();
   const {
     usages: runtimeUsages,
@@ -79,8 +102,13 @@ export default function App() {
     staleMinutes,
     historyRevision,
     usageIntelligenceRevision,
+    codexIdentityStates,
   } =
-    useProviderUsage(settings.refreshIntervalMinutes);
+    // The runtime owns the refresh cadence. The persisted interval reaches
+    // it through the settings lane, which owns the write queue: the hook
+    // itself never writes a preference, so no window can race a reset or
+    // overwrite a newer edit with a stale copy of the cadence.
+    useProviderUsage({ onAttach: syncRefreshInterval });
   // Dev-only visual fixtures (`?fixture=…` in `npm run dev`); null in any
   // production or test run. See src/dev/usageFixtures.ts.
   const devFixture =
@@ -92,7 +120,8 @@ export default function App() {
   const wallets = runtimeWallets ?? [];
   // Local wall clock for the reset countdowns; no provider refetch involved.
   const nowMs = useNow();
-  const { historyUnavailable, clearLocalHistory } =
+  const now = new Date(nowMs);
+  const { predictionFor, historyUnavailable, clearLocalHistory } =
     useQuotaPredictions(usages, nowMs, historyRevision);
   const layout = useDashboardLayout();
   const {
@@ -133,9 +162,10 @@ export default function App() {
   }, []);
 
   // Presentation order: canonical registry (snapshot) order shaped by the
-  // visibility/order preferences. The floating bar and the run panel read
-  // this list - never the raw snapshot - while runtime-owned concerns
-  // (history, predictions, notifications) keep the full `usages` above.
+  // visibility/order preferences. Everything that navigates, selects, or
+  // summarizes providers reads this list - never the raw snapshot - while
+  // runtime-owned concerns (history, predictions, notifications) keep the
+  // full `usages` above.
   const registryIds = usages.map((usage) => usage.id);
   const visibleUsages = orderVisibleProviders(
     usages,
@@ -144,28 +174,52 @@ export default function App() {
     settings.providerPreferences,
   );
 
-  // Without the dashboard rail, the run panel anchors on the deterministic
-  // default (highest usable primary percent, the quota strip's concept) and
-  // offers its own provider select for explicit choices.
+  // Provider selection: null until the user picks. Until then - and whenever
+  // the picked provider is not visible - the deterministic default anchors
+  // the view (highest usable primary percent). An explicit selection sticks
+  // across refreshes; it is view state only and deliberately not persisted.
+  const [selectedByUser, setSelectedByUser] = useState<string | null>(null);
   const fallbackId = defaultSelectedProviderId(visibleUsages);
-  const selectedUsage = visibleUsages.find((usage) => usage.id === fallbackId);
+  const selectedId =
+    selectedByUser !== null &&
+    visibleUsages.some((usage) => usage.id === selectedByUser)
+      ? selectedByUser
+      : fallbackId;
+  const selectedUsage = visibleUsages.find((usage) => usage.id === selectedId);
+  const selectProvider = (providerId: string) => setSelectedByUser(providerId);
 
-  // Primary product navigation: Usage | Settings. Usage-first: the usage
-  // overview is the landing view; legacy dev-URL values ("overview",
-  // "insights") map to it so existing fixture links keep working.
-  const [view, setView] = useState<"usage" | "settings">(() => {
-    if (
-      import.meta.env.DEV &&
-      typeof window !== "undefined"
-    ) {
+  // Primary product navigation: Status | Insights | Settings. Insights keeps
+  // its own provider scope (all providers by default; the rail narrows it);
+  // a rail pick in Insights also becomes the Status selection so the provider
+  // context is shared. Legacy dev-URL values ("overview", "usage") still map
+  // so existing fixture links keep working.
+  const [view, setView] = useState<"status" | "insights" | "settings">(() => {
+    if (import.meta.env.DEV && typeof window !== "undefined") {
       const param = new URLSearchParams(window.location.search).get("view");
+      if (param === "insights" || param === "usage") return "insights";
       if (param === "settings") return "settings";
-      if (param === "usage" || param === "overview" || param === "insights") {
-        return "usage";
-      }
     }
-    return "usage";
+    return "status";
   });
+  // The dashboard grid is one persistent scroll container; only its children
+  // swap with the view. Reset the scroll position when (and only when) the
+  // view changes so a page scrolled down in Status never opens Insights
+  // mid-page. Focus stays on the header button that switched the view.
+  const dashboardRef = useRef<HTMLDivElement>(null);
+  const viewAtLastRender = useRef(view);
+  useLayoutEffect(() => {
+    if (viewAtLastRender.current === view) return;
+    viewAtLastRender.current = view;
+    const dashboard = dashboardRef.current;
+    if (dashboard) dashboard.scrollTop = 0;
+  }, [view]);
+  const [usageScopeProviderId, setUsageScopeProviderId] = useState<
+    string | null
+  >(null);
+  const selectUsageScope = (providerId: string) => {
+    setSelectedByUser(providerId);
+    setUsageScopeProviderId(providerId);
+  };
 
   // CSS defaults the document to graphite; this swaps in a stored non-default
   // theme right after mount and keeps the attribute in sync on every switch.
@@ -176,6 +230,14 @@ export default function App() {
   // W01: keep the window inside its monitor's work area at launch, on DPI
   // change, and after monitor loss. Clamp-only, no-op outside Tauri.
   useEffect(() => attachMainWindowBounds(), []);
+
+  // The attention rail is a presentation surface: hidden providers stay out
+  // of the rail, but their notification behavior is unchanged (Rust lane).
+  const attention = attentionItems(
+    visibleUsages,
+    predictionFor,
+    settings.quotaPerspective,
+  );
 
   const updatedLabel = refreshOverdue
     ? "Refresh overdue"
@@ -194,10 +256,18 @@ export default function App() {
             <button
               type="button"
               className="view-nav-btn"
-              aria-pressed={view === "usage"}
-              onClick={() => setView("usage")}
+              aria-pressed={view === "status"}
+              onClick={() => setView("status")}
             >
-              Usage
+              Status
+            </button>
+            <button
+              type="button"
+              className="view-nav-btn"
+              aria-pressed={view === "insights"}
+              onClick={() => setView("insights")}
+            >
+              Insights
             </button>
             <button
               type="button"
@@ -269,25 +339,8 @@ export default function App() {
         />
       ) : null}
 
-      <div className="dashboard">
-        {view === "usage" ? (
-          <main
-            id="usage-panel"
-            className="provider-main usage-main"
-            aria-label="Usage"
-          >
-            <UsageOverview
-              enabled={
-                devFixture?.usageIntelligenceEnabled ??
-                settings.usageIntelligence === true
-              }
-              revision={usageIntelligenceRevision}
-              loader={devFixture?.intelligenceLoader}
-              onOpenSettings={() => setView("settings")}
-              nowMs={nowMs}
-            />
-          </main>
-        ) : (
+      <div className="dashboard" ref={dashboardRef}>
+        {view === "settings" ? (
           <main
             id="settings-panel"
             className="provider-main settings-main"
@@ -297,6 +350,7 @@ export default function App() {
               settings={settings}
               setLaunchAtStartup={setLaunchAtStartup}
               setRefreshInterval={setRefreshInterval}
+              syncRefreshInterval={syncRefreshInterval}
               setTheme={setTheme}
               setQuotaNotifications={setQuotaNotifications}
               setUsageIntelligence={setUsageIntelligence}
@@ -309,6 +363,7 @@ export default function App() {
               resetPreferences={resetPreferences}
               startupPending={startupPending}
               startupError={startupError}
+              unverifiedPreferences={unverifiedPreferences}
               usages={usages}
               wallets={wallets}
               visibleUsages={visibleUsages}
@@ -326,6 +381,81 @@ export default function App() {
               onDismissUpdate={dismissUpdate}
             />
           </main>
+        ) : (
+          <>
+            <ProviderRail
+              usages={visibleUsages}
+              selectedId={view === "insights" ? usageScopeProviderId : selectedId}
+              onSelect={view === "insights" ? selectUsageScope : selectProvider}
+              orientation={layout === "narrow" ? "horizontal" : "vertical"}
+              controlsId={view === "insights" ? "usage-panel" : "provider-panel"}
+              perspective={settings.quotaPerspective}
+            />
+            {view === "insights" ? (
+              <main
+                id="usage-panel"
+                className="provider-main usage-main"
+                aria-label="Insights"
+              >
+                <UsageView
+                  usages={usages}
+                  scopeProviderId={usageScopeProviderId}
+                  onScopeProvider={setUsageScopeProviderId}
+                  historyRevision={historyRevision}
+                  perspective={settings.quotaPerspective}
+                  loader={devFixture?.loader}
+                  usageIntelligenceEnabled={
+                    devFixture?.usageIntelligenceEnabled ??
+                    settings.usageIntelligence === true
+                  }
+                  usageIntelligenceRevision={usageIntelligenceRevision}
+                  usageIntelligenceLoader={devFixture?.intelligenceLoader}
+                  codexIdentityStates={codexIdentityStates}
+                  onOpenSettings={() => setView("settings")}
+                />
+              </main>
+            ) : (
+              <>
+                <main
+                  id="provider-panel"
+                  className="provider-main"
+                  role="tabpanel"
+                  aria-labelledby={
+                    selectedId ? `provider-tab-${selectedId}` : undefined
+                  }
+                >
+                  {selectedUsage ? (
+                    <>
+                      <PrimaryQuotaPanel
+                        usage={selectedUsage}
+                        now={now}
+                        predictionFor={predictionFor}
+                        perspective={settings.quotaPerspective}
+                      />
+                      <StatusHistoryChart
+                        usage={selectedUsage}
+                        historyRevision={historyRevision}
+                        perspective={settings.quotaPerspective}
+                        loader={devFixture?.loader}
+                        codexIdentityStates={codexIdentityStates}
+                      />
+                      <QuotaWindowList
+                        usage={selectedUsage}
+                        now={now}
+                        predictionFor={predictionFor}
+                        perspective={settings.quotaPerspective}
+                      />
+                    </>
+                  ) : (
+                    <div className="empty">Loading provider data…</div>
+                  )}
+                </main>
+                {visibleUsages.length > 0 ? (
+                  <AttentionRail items={attention} onSelect={selectProvider} />
+                ) : null}
+              </>
+            )}
+          </>
         )}
       </div>
 

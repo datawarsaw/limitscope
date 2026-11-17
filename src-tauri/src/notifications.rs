@@ -193,7 +193,9 @@ struct StateBlob {
 /// behind a mutex, one JSON file, and an injected delivery sink (the native
 /// Tauri notifier in production; a collector in tests).
 pub struct NotificationLane {
+    writable: bool,
     state: Mutex<LaneState>,
+    operation: Mutex<()>,
     path: PathBuf,
     sink: Box<dyn Fn(&[QuotaNotification]) + Send + Sync>,
 }
@@ -202,7 +204,9 @@ impl NotificationLane {
     /// Opens (and loads/heals) the lane at the given app-data path.
     pub fn open(path: PathBuf, sink: Box<dyn Fn(&[QuotaNotification]) + Send + Sync>) -> Self {
         let lane = Self {
+            writable: crate::durable_file::prepare_json(&path, &[BLOB_VERSION as u64], |value| parse_blob(&value.to_string()).2),
             state: Mutex::new(LaneState::default()),
+            operation: Mutex::new(()),
             path,
             sink,
         };
@@ -226,7 +230,8 @@ impl NotificationLane {
         state.windows = windows;
         if !healthy {
             drop(state);
-            self.persist();
+            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+            if self.writable && crate::durable_file::replace(&backup, raw.as_bytes()).is_ok() { self.persist(); }
         }
     }
 
@@ -237,19 +242,17 @@ impl NotificationLane {
     /// interval). Persisted here too, so the scheduler's immediate startup
     /// cycle — which can run before any webview attaches — respects the
     /// user's choice.
-    pub fn set_enabled(&self, enabled: bool) {
-        let changed = {
-            let mut state = self.state.lock().unwrap();
-            if state.enabled == enabled {
-                false
-            } else {
-                state.enabled = enabled;
-                true
-            }
-        };
-        if changed {
-            self.persist();
+    pub fn set_enabled(&self, enabled: bool) { let _ = self.try_set_enabled(enabled); }
+
+    pub fn try_set_enabled(&self, enabled: bool) -> Result<(), String> {
+        let _operation = self.operation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = self.state.lock().unwrap().enabled;
+        self.state.lock().unwrap().enabled = enabled;
+        if !self.persist() {
+            self.state.lock().unwrap().enabled = previous;
+            return Err("Could not persist notification preference".into());
         }
+        Ok(())
     }
 
     /// Test-only read of the persisted toggle.
@@ -283,6 +286,7 @@ impl NotificationLane {
     /// per-cycle cap. Delivered notifications are persisted as fired before
     /// the sink is called, so a crash between the two cannot duplicate them.
     pub fn process(&self, usages: &[ProviderUsageDto], now: DateTime<Utc>) -> Vec<QuotaNotification> {
+        let _operation = self.operation.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now_ms = now.timestamp_millis();
         // One eligibility definition, shared with history recording.
         let observations = observations_from_usages(usages);
@@ -591,7 +595,8 @@ impl NotificationLane {
     /// Serializes the bounded state and replaces the file atomically-ish:
     /// temp file in the same directory, then rename (Windows `MoveFileEx`
     /// semantics replace the existing file).
-    fn persist(&self) {
+    fn persist(&self) -> bool {
+        if !self.writable { return false; }
         let (enabled, mut windows) = {
             let state = self.state.lock().unwrap();
             (state.enabled, state.windows.values().cloned().collect::<Vec<_>>())
@@ -607,14 +612,8 @@ impl NotificationLane {
             enabled,
             windows,
         };
-        let Ok(json) = serde_json::to_string(&blob) else {
-            return;
-        };
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&temp_path, json).and_then(|()| fs::rename(&temp_path, &self.path));
+        let Ok(json) = serde_json::to_vec(&blob) else { return false; };
+        crate::durable_file::replace(&self.path, &json).is_ok()
     }
 }
 

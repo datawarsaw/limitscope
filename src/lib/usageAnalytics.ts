@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { isTauriRuntime } from "./floatingWindowChrome";
-import type { CodexIdentityState } from "../types";
+import type { CodexIdentityState, ProviderUsage } from "../types";
+import { isCodexProviderId } from "./providerIds";
 
 export type UsageAnalyticsRange = "24h" | "7d";
 export type UsageResultExactness = "exact" | "lowerBound";
@@ -144,6 +145,19 @@ export function codexScopeIsCurrentOrNewer(response: CodexScope | undefined, exp
     if (seen.generation < state.generation) return false;
     return seen.identity === state.identity;
   });
+}
+
+/** Fence every visible Codex slot, including slots not yet observed by runtime. */
+export function codexFenceScope(
+  usages: ReadonlyArray<Pick<ProviderUsage, "id" | "account">>,
+  observed: CodexScope | undefined,
+): CodexScope {
+  const scope: CodexIdentityState[] = [...(observed ?? [])];
+  for (const usage of usages) {
+    if (!isCodexProviderId(usage.id) || scope.some((state) => state.providerId === usage.id)) continue;
+    scope.push({ providerId: usage.id, generation: 0, identity: usage.account?.identity ?? null });
+  }
+  return scope;
 }
 
 /** Reads the deterministic analytics projection from the Rust history store. */

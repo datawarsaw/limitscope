@@ -40,7 +40,9 @@ export type Settings = {
   /**
    * Usage Intelligence opt-in (v0.8.9): collecting reported token usage
    * from local AI tool databases (ZCode first). Opt-in is enforced in the
-   * Rust store — while false, no local source is probed at all.
+   * Rust store — while false, no local source is probed at all. In Tauri,
+   * this WebView value is only a cache; useSettings reads the Rust value
+   * at startup and only explicit user actions write it back.
    */
   usageIntelligence: boolean;
   /**
@@ -70,9 +72,10 @@ export type Settings = {
    * each with its own credential reference (the Codex home that holds its
    * own `auth.json`), its own alias and its own monitoring flag.
    *
-   * The configuration is mirrored into a persisted Rust store, so a
-   * configured second account is collected from the startup cycle on and a
-   * paused account is never polled at all.
+   * Rust owns the persisted configuration. This WebView copy is a cache,
+   * hydrated from Rust without writing on attach. A configured second
+   * account is collected from the startup cycle on and a paused account
+   * is never polled at all.
    */
   codexAccounts: CodexAccountPreferences;
 };
@@ -227,14 +230,19 @@ export function mergeSettingsWithRaw(
   return JSON.stringify(merged);
 }
 
-export function saveSettings(settings: Settings): void {
+/** Returns false when the WebView cache could not be written (quota, private
+ * mode, or a storage error). The UI keeps its in-memory value; callers that
+ * must explain a stale cache can surface the result. */
+export function saveSettings(settings: Settings): boolean {
   try {
     localStorage.setItem(
       SETTINGS_STORAGE_KEY,
       mergeSettingsWithRaw(localStorage.getItem(SETTINGS_STORAGE_KEY), settings),
     );
+    return true;
   } catch {
     // Persistence is best-effort; the UI keeps working without it.
+    return false;
   }
 }
 

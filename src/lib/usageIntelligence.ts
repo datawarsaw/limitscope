@@ -77,7 +77,8 @@ export type UsageSourceCoverage = {
     | "sourceAbsent"
     | "schemaUnsupported"
     | "readFailure"
-    | "collectionPaused";
+    | "collectionPaused"
+    | "scanCeiling";
   /** First instant continuously covered (late-baseline verdicts only). */
   coveredFrom?: string;
   /** Last successful observation; events after it may be missing. */
@@ -101,6 +102,8 @@ export type UsageDailyDay = {
 };
 
 export type UsageIntelligence = {
+  persistenceAvailable?: boolean;
+  lastWriteSucceeded?: boolean;
   schemaVersion: 1;
   range: UsageIntelligenceRange;
   rangeStart: string;

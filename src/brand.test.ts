@@ -98,16 +98,18 @@ describe("LimitScope brand identity", () => {
     for (const file of listFiles(ROOT, [".ts", ".tsx", ".rs", ".html", ".json", ".nsh", ".mjs", ".toml"])) {
       const relative = file.slice(ROOT.length).replaceAll("\\", "/");
       // Docs/state are historical records; generated platform icons are
-      // binary. The guardrail itself and the installer's migration logic are
-      // the two places the old name must remain as a literal. Everything
-      // else is current product surface.
+      // binary. The guardrail itself, the installer's migration logic, and
+      // the integration installer-identity fixture (which needs the legacy
+      // name for v0.8.24→0.8.25 migration tests) are the places the old name
+      // must remain as a literal. Everything else is current product surface.
       if (
         relative.startsWith("docs/") ||
         relative.startsWith("state/") ||
         relative.startsWith("artifacts/") ||
         relative.startsWith("src-tauri/target/") ||
         relative === "src/brand.test.ts" ||
-        relative === "src-tauri/installer-hooks.nsh"
+        relative === "src-tauri/installer-hooks.nsh" ||
+        relative === "scripts/integration-installer-identity.node.mjs"
       ) {
         continue;
       }

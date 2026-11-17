@@ -8,16 +8,24 @@ import {
   usageSourceStateText,
   type UsageIntelligenceLoader,
   type UsageIntelligenceRange,
+  type UsageModelBreakdown,
+  type UsageSourceCoverage,
+  type UsageSourceDiagnostics,
 } from "../../lib/usageIntelligence";
 import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
+import { UsageDailyActivity } from "./UsageDailyActivity";
 
 /**
- * Usage Intelligence (v0.8.9): the minimal Today / 7d / 30d view over
- * reported token usage collected locally, grouped by provider and model.
+ * Usage Intelligence (v0.8.9): the Today / 7d / 30d view over reported
+ * token usage collected locally, grouped by provider and model. It carries
+ * the restored v0.9 Usage-first pieces — the KPI strip, the model ranking
+ * with per-model expand, and the collection-source diagnostics — scoped
+ * like the table: a narrowed provider scope ranks that provider's models
+ * only, while collection diagnostics stay global.
  *
  * Honesty rules, enforced everywhere below:
  * - these are reported tokens collected locally — never account quota,
- *   billing usage, exact spend, or complete history;
+ *   billing usage, exact spend, or complete history; the KPIs say so;
  * - while the opt-in toggle is off, the section explains and never
  *   queries (mirroring the backend's no-probe-while-disabled contract);
  * - an empty view states when local collection started rather than
@@ -25,11 +33,66 @@ import { useUsageIntelligence } from "../../hooks/useUsageIntelligence";
  * - a range reaching further back than collection itself discloses that
  *   ("Collected locally since …", plus the incomplete qualifier);
  * - only sources with collected data get provider groups; there are no
- *   empty Codex / OpenCode placeholders.
+ *   empty Codex / OpenCode placeholders; source failures and
+ *   completions-without-reported-usage stay visible;
+ * - a source whose history is incomplete for the range says so in the
+ *   per-source coverage banner (v0.9), and the local-days token-activity
+ *   heatmap shows observed activity without zero-filling unobserved days.
  *
- * Optimized for fast comparison: one dense table, compact K/M/B numbers,
- * no decorative charts.
+ * Optimized for fast comparison: one dense table, compact K/M/B numbers.
  */
+
+/** Ranking rows stay compact; the full model list opens on demand. */
+const MAX_VISIBLE_MODELS = 6;
+
+type ModelRow = UsageModelBreakdown & { provider: string };
+
+/** Dot tone for a source's diagnostic state; failures stay visible. */
+function sourceTone(state: UsageSourceDiagnostics["state"]): string {
+  switch (state) {
+    case "ok":
+    case "collecting":
+      return "status-ok";
+    case "disabled":
+    case "sourceAbsent":
+      return "status-unknown";
+    default:
+      return "status-error";
+  }
+}
+
+/** Per-source collection diagnostics; also the standalone empty-state list. */
+function SourceDiagnosticsList({
+  sources,
+  standalone = false,
+}: {
+  sources: UsageSourceDiagnostics[];
+  standalone?: boolean;
+}) {
+  if (sources.length === 0) return null;
+  return (
+    <ul
+      className={`usage-sources-list${standalone ? " usage-sources-standalone" : ""}`}
+      aria-label="Collection sources"
+    >
+      {sources.map((source) => (
+        <li key={source.source} className="usage-source-row">
+          <span className={`status-dot ${sourceTone(source.state)}`} aria-hidden="true" />
+          <span className="usage-source-copy">
+            {sourceLabel(source.source)}: {usageSourceStateText(source.state)}
+            {source.lastObservedAt
+              ? ` · last observed ${formatSinceDate(source.lastObservedAt)}`
+              : ""}
+            {source.lastScan?.usageNotReported
+              ? ` · ${source.lastScan.usageNotReported} completions reported no usage`
+              : ""}
+          </span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function TokenUsageSection({
   enabled,
   revision,
@@ -49,6 +112,8 @@ export function TokenUsageSection({
   onOpenSettings?: () => void;
 }) {
   const [range, setRange] = useState<UsageIntelligenceRange>("today");
+  const [expandedModel, setExpandedModel] = useState<string | null>(null);
+  const [showAllModels, setShowAllModels] = useState(false);
 
   const query = useMemo(
     () => ({
@@ -66,6 +131,66 @@ export function TokenUsageSection({
     if (scopeProviderId === null) return data.groups;
     return data.groups.filter((group) => group.provider === scopeProviderId);
   }, [data, scopeProviderId]);
+
+  // Restored v0.9 ranking: heaviest models first, provider-qualified so the
+  // same model identity can appear under two providers as distinct rows.
+  const modelRows = useMemo<ModelRow[]>(() => {
+    const rows = groups.flatMap((group) =>
+      group.models.map((model) => ({ ...model, provider: group.provider })),
+    );
+    rows.sort((a, b) => b.totalTokens - a.totalTokens);
+    return rows;
+  }, [groups]);
+
+  const providerRows = useMemo(
+    () => [...groups].sort((a, b) => b.totalTokens - a.totalTokens),
+    [groups],
+  );
+
+  // Sums over the scoped groups: the KPIs describe what the table shows.
+  // All-providers scope reconciles with the payload totals.
+  const scopedTotals = useMemo(
+    () =>
+      groups.reduce(
+        (acc, group) => ({
+          events: acc.events + group.events,
+          totalTokens: acc.totalTokens + group.totalTokens,
+        }),
+        { events: 0, totalTokens: 0 },
+      ),
+    [groups],
+  );
+
+  // Distinct model identities, not provider-qualified rows (the same model
+  // can surface under several providers — each row stays in the ranking).
+  const modelsObserved = new Set(modelRows.map((row) => row.model)).size;
+  const maxModelTokens = modelRows[0]?.totalTokens ?? 0;
+  const maxProviderTokens = providerRows[0]?.totalTokens ?? 0;
+  const hiddenModelCount = Math.max(
+    0,
+    modelRows.length - (showAllModels ? modelRows.length : MAX_VISIBLE_MODELS),
+  );
+  const visibleModelRows = showAllModels
+    ? modelRows
+    : modelRows.slice(0, MAX_VISIBLE_MODELS);
+
+  // Both instants are canonical RFC-3339 UTC strings of the same shape, so
+  // the comparison is exact: the range reaches before collection only when
+  // the first global baseline is later than the selected range start.
+  const rangePredatesCollection =
+    data?.collectionStartedAt !== undefined &&
+    data.collectionStartedAt > data.rangeStart;
+
+  // Per-source coverage honesty (v0.9): a source whose history is not
+  // complete for the range says so, instead of the totals silently
+  // implying the whole period was observed.
+  const affectedCoverage = useMemo(
+    () =>
+      data?.sourceCoverage?.filter(
+        (coverage) => coverage.coverage !== "complete",
+      ) ?? [],
+    [data],
+  );
 
   const rangeLabel = range === "today" ? "Today" : range === "7d" ? "7 days" : "30 days";
 
@@ -147,6 +272,27 @@ export function TokenUsageSection({
         </div>
       ) : null}
 
+      {affectedCoverage.length > 0 ? (
+        <p className="usage-subtitle" role="note" aria-label="History coverage">
+          <strong>History coverage:</strong>{" "}
+          {affectedCoverage
+            .map(
+              (coverage) =>
+                `${sourceLabel(coverage.source)} — ${coverageDetail(coverage)}`,
+            )
+            .join("; ")}
+          . Reported totals show what was collected, not the full period.
+        </p>
+      ) : null}
+
+      {data !== null &&
+      (data.persistenceAvailable === false || data.lastWriteSucceeded === false) ? (
+        <p className="usage-refresh-error" role="alert">
+          Local usage could not be saved. Collection progress is retained for
+          retry; totals may be incomplete.
+        </p>
+      ) : null}
+
       {data !== null && groups.length === 0 ? (
         <div className="token-usage-empty">
           <p>
@@ -162,6 +308,12 @@ export function TokenUsageSection({
         </div>
       ) : null}
 
+      {/* Restored v0.9 diagnostics: a source that collects but has no data
+          yet stays visible instead of looking absent. */}
+      {data !== null && groups.length === 0 ? (
+        <SourceDiagnosticsList sources={data.sources} standalone />
+      ) : null}
+
       {groups.length > 0 && data !== null ? (
         <>
           {intelligence.error ? (
@@ -169,6 +321,50 @@ export function TokenUsageSection({
               Could not refresh token usage: {intelligence.error}
             </p>
           ) : null}
+
+          <div className="usage-kpis" role="group" aria-label="Token usage summary">
+            <div className="usage-kpi">
+              <span className="usage-kpi-label">Reported tokens</span>
+              <span className="usage-kpi-value">
+                {formatTokens(scopedTotals.totalTokens)}
+              </span>
+              <span className="usage-kpi-sub">
+                observed as reported — not your total usage
+              </span>
+            </div>
+            <div className="usage-kpi">
+              <span className="usage-kpi-label">Usage events</span>
+              <span className="usage-kpi-value">{scopedTotals.events}</span>
+              <span className="usage-kpi-sub">
+                recorded completions — not every API request
+              </span>
+            </div>
+            <div className="usage-kpi">
+              <span className="usage-kpi-label">Models observed</span>
+              <span className="usage-kpi-value">{modelsObserved}</span>
+              <span className="usage-kpi-sub">
+                {modelsObserved === 1
+                  ? "1 distinct model"
+                  : "distinct models across providers"}
+              </span>
+            </div>
+            <div className="usage-kpi">
+              <span className="usage-kpi-label">Collection</span>
+              <span className="usage-kpi-value usage-kpi-date">
+                {data.collectionStartedAt
+                  ? `since ${formatSinceDate(data.collectionStartedAt)}`
+                  : "not started"}
+              </span>
+              <span className="usage-kpi-sub">
+                {data.incompleteHistory
+                  ? rangePredatesCollection
+                    ? "range reaches before collection started"
+                    : "history is incomplete for this range"
+                  : `covers the ${rangeLabel} range`}
+              </span>
+            </div>
+          </div>
+
           <div className="token-usage-table" role="table" aria-label={`Token usage by provider and model (${rangeLabel})`}>
             <div className="token-usage-row token-usage-header" role="row">
               <span className="token-usage-model" role="columnheader">Model</span>
@@ -205,18 +401,151 @@ export function TokenUsageSection({
               </div>
             ))}
           </div>
-          {data.sources.length > 0 ? (
-            <p className="token-usage-sources">
-              {data.sources
-                .map(
-                  (source) =>
-                    `${sourceLabel(source.source)}: ${usageSourceStateText(source.state)}${
-                      source.lastObservedAt ? ` · last observed ${formatSinceDate(source.lastObservedAt)}` : ""
-                    }`,
-                )
-                .join(" · ")}
-            </p>
-          ) : null}
+
+          <div className="usage-rankings">
+            <section className="usage-panel usage-ranking" aria-label="Models">
+              <h3 className="panel-heading">Models</h3>
+              <ul className="ranking-list">
+                {visibleModelRows.map((row) => {
+                  const key = `${row.provider}|${row.model}`;
+                  const expanded = expandedModel === key;
+                  return (
+                    <li key={key} className="ranking-item">
+                      <button
+                        type="button"
+                        className="ranking-row"
+                        aria-expanded={expanded}
+                        onClick={() => setExpandedModel(expanded ? null : key)}
+                      >
+                        <span className="ranking-line">
+                          <span className="ranking-name" title={row.model}>
+                            {row.model}
+                          </span>
+                          <span className="ranking-value">
+                            {formatTokens(row.totalTokens)}
+                          </span>
+                        </span>
+                        <span className="ranking-bar-track" aria-hidden="true">
+                          <span
+                            className="ranking-bar-fill"
+                            style={{
+                              width:
+                                maxModelTokens > 0
+                                  ? `${Math.max(2, (row.totalTokens / maxModelTokens) * 100)}%`
+                                  : "0%",
+                            }}
+                          />
+                        </span>
+                      </button>
+                      {expanded ? (
+                        <div className="model-detail">
+                          <div className="model-detail-grid">
+                            <span className="model-detail-cell">
+                              <span className="model-detail-label">Input</span>
+                              <span className="model-detail-value">
+                                {formatTokens(row.inputTokens)}
+                              </span>
+                            </span>
+                            <span className="model-detail-cell">
+                              <span className="model-detail-label">Cached</span>
+                              <span className="model-detail-value">
+                                {formatTokens(cachedTokens(row))}
+                              </span>
+                            </span>
+                            <span className="model-detail-cell">
+                              <span className="model-detail-label">Output</span>
+                              <span className="model-detail-value">
+                                {formatTokens(row.outputTokens)}
+                              </span>
+                            </span>
+                            <span className="model-detail-cell">
+                              <span className="model-detail-label">Reasoning</span>
+                              <span className="model-detail-value">
+                                {formatTokens(row.reasoningTokens)}
+                              </span>
+                            </span>
+                          </div>
+                          <p className="model-detail-note">
+                            {row.events} recorded{" "}
+                            {row.events === 1 ? "event" : "events"} ·{" "}
+                            {usageProviderLabel(row.provider)}
+                          </p>
+                        </div>
+                      ) : null}
+                    </li>
+                  );
+                })}
+              </ul>
+              {hiddenModelCount > 0 ? (
+                <button
+                  type="button"
+                  className="ranking-more"
+                  onClick={() => setShowAllModels(true)}
+                >
+                  Show {hiddenModelCount} more{" "}
+                  {hiddenModelCount === 1 ? "model" : "models"}
+                </button>
+              ) : null}
+            </section>
+
+            <section
+              className="usage-panel usage-ranking"
+              aria-label="Usage sources"
+            >
+              <h3 className="panel-heading">Sources</h3>
+              <ul className="ranking-list">
+                {providerRows.map((group) => (
+                  <li
+                    key={group.provider}
+                    className="ranking-item ranking-item-static"
+                  >
+                    <span className="ranking-line">
+                      <span className="ranking-name">
+                        {usageProviderLabel(group.provider)}
+                      </span>
+                      <span className="ranking-value">
+                        {formatTokens(group.totalTokens)}
+                      </span>
+                    </span>
+                    <span className="ranking-bar-track" aria-hidden="true">
+                      <span
+                        className="ranking-bar-fill"
+                        style={{
+                          width:
+                            maxProviderTokens > 0
+                              ? `${Math.max(2, (group.totalTokens / maxProviderTokens) * 100)}%`
+                              : "0%",
+                        }}
+                      />
+                    </span>
+                    <span className="ranking-sub">
+                      {group.models.length}{" "}
+                      {group.models.length === 1 ? "model" : "models"} ·{" "}
+                      {group.events} {group.events === 1 ? "event" : "events"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              <SourceDiagnosticsList sources={data.sources} />
+            </section>
+          </div>
+
+          {/* The daily projection is global — it carries no provider
+              attribution — so it is charted only in the all-providers
+              scope. Under a provider scope it would contradict the scoped
+              table and KPIs; the gap is stated instead of mislabeled. */}
+          {scopeProviderId === null ? (
+            <UsageDailyActivity days={data.daily} />
+          ) : (
+            <section className="usage-panel usage-daily" aria-label="Daily activity">
+              <h3 className="panel-heading">Daily activity</h3>
+              <p className="usage-daily-note" role="note">
+                Daily activity is available for all providers only — locally
+                collected daily totals are not broken down by provider.
+                Select All providers to see it.
+              </p>
+            </section>
+          )}
         </>
       ) : null}
     </section>
@@ -228,6 +557,36 @@ function sourceLabel(source: string): string {
   if (source === "codex") return "Codex";
   if (source === "opencode") return "OpenCode";
   return source;
+}
+
+/** Why a source's history is incomplete; phrased for the coverage banner. */
+function coverageDetail(coverage: UsageSourceCoverage): string {
+  switch (coverage.reason) {
+    case "lateBaseline":
+      return coverage.coveredFrom
+        ? `history is only covered since ${formatSinceDate(coverage.coveredFrom)}`
+        : "history starts partway through this range";
+    case "monitoringDisabled":
+      return "collection is off; history while off is missing";
+    case "pendingRebaseline":
+      return "history while collection was off is missing";
+    case "noBaseline":
+      return "no history collected yet";
+    case "sourceAbsent":
+    case "schemaUnsupported":
+    case "readFailure":
+      return coverage.lastObservedAt
+        ? `may be missing events after ${formatSinceDate(coverage.lastObservedAt)}`
+        : "recent events may be missing";
+    case "scanCeiling":
+      return "collection has a recoverable backlog";
+    case "collectionPaused":
+      return coverage.lastObservedAt
+        ? `collection is paused — events after ${formatSinceDate(coverage.lastObservedAt)} may be missing`
+        : "collection is paused — recent events may be missing";
+    default:
+      return "history coverage is incomplete";
+  }
 }
 
 function formatSinceDate(iso: string): string {

@@ -38,6 +38,7 @@ const IPC_SURFACE = new Set([
   "opendesign::refresh_opendesign_usage",
   "open_main_window",
   "runtime::get_codex_accounts",
+  "runtime::get_operational_settings",
   "runtime::get_runtime_snapshot",
   "runtime::request_refresh",
   "runtime::request_refresh_on_reconnect",

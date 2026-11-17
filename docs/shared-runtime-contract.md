@@ -38,14 +38,19 @@ stay in TS.
 
 ## IPC contract
 
-Commands (both windows call them; custom commands are not ACL-gated):
+Commands (the dashboard calls all four; the floating bar calls only the three
+shared commands below; every custom command is ACL-gated per
+calling window by the app permission manifest in
+`src-tauri/permissions/ipc-windows.toml` plus the capabilities in
+`src-tauri/capabilities/*.json`, and the resolved grants are exercised at
+runtime by `src-tauri/src/ipc_window_authorization.rs`):
 
-- `get_runtime_snapshot` → full `RuntimeSnapshot`
-- `request_refresh` → starts or coalesces a cycle
+- `get_runtime_snapshot` → full `RuntimeSnapshot` (both windows)
+- `request_refresh` → starts or coalesces a cycle (both windows)
 - `request_refresh_on_reconnect` → the webview `online` hook; a trigger
-  only, with per-kind burst dedupe (see Resilience below)
-- `set_refresh_interval` (minutes) → updates the runtime scheduler; the
-  persisted TS settings value is pushed on attach and on every change
+  only, with per-kind burst dedupe (see Resilience below; both windows)
+- `set_refresh_interval` (minutes) → updates the runtime scheduler from the
+  dashboard; its settings queue pushes the value on attach and every change
 
 Events:
 

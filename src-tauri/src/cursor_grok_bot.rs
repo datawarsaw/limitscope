@@ -65,6 +65,7 @@
 //! wrong figure. On-demand spend metadata (the separate current-period
 //! endpoint) is deliberately out of scope for v1.
 
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -241,50 +242,10 @@ fn cursor_state_db_path() -> Result<PathBuf, ProviderError> {
     Err(cursor_not_installed())
 }
 
-/// Removes the snapshot directory whatever happens to the read.
-struct SnapshotDirGuard {
-    path: PathBuf,
-}
-
-impl Drop for SnapshotDirGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-/// Copies the Cursor state database (plus its `-wal` sidecar when present)
-/// into a fresh temporary directory. The source files are only ever opened
-/// for reading by the copy call itself — never locked, never written, never
-/// checkpointed. The `-shm` sidecar is deliberately not copied: it is a
-/// transient shared-memory index, and the snapshot rebuilds its own from the
-/// copied WAL.
-fn snapshot_state_db(source: &Path) -> Result<SnapshotDirGuard, ProviderError> {
-    let dir = std::env::temp_dir().join(format!(
-        "limitscope-cursor-snapshot-{}",
-        uuid::Uuid::new_v4()
-    ));
-    fs::create_dir_all(&dir).map_err(|error| state_unreadable(format!("could not prepare a snapshot directory: {error}")))?;
-    let guard = SnapshotDirGuard { path: dir };
-    let mut wal_name = source.as_os_str().to_os_string();
-    wal_name.push("-wal");
-    let wal = PathBuf::from(&wal_name);
-
-    fs::copy(source, guard.path.join("state.vscdb"))
-        .map_err(|error| state_unreadable(format!("could not copy the database: {error}")))?;
-    if wal.exists() {
-        fs::copy(&wal, guard.path.join("state.vscdb-wal"))
-            .map_err(|error| state_unreadable(format!("could not copy the database WAL: {error}")))?;
-    }
-    Ok(guard)
-}
-
-/// Opens the snapshot (the WAL, if copied, is replayed here) and reads the
-/// token entry. The value is stored as TEXT or BLOB depending on the writer;
-/// both decode.
-fn read_token_from_snapshot(snapshot_dir: &Path) -> Result<String, ProviderError> {
+/// Snapshot only in memory: no credential-bearing temporary database remains.
+fn read_token_from_snapshot(source: &Path) -> Result<String, ProviderError> {
     use rusqlite::OptionalExtension;
-    let connection = rusqlite::Connection::open(snapshot_dir.join("state.vscdb"))
-        .map_err(|error| state_unreadable(format!("could not open the snapshot: {error}")))?;
+    let connection = crate::sqlite_snapshot::snapshot(source).map_err(state_unreadable)?;
     let value: Option<rusqlite::types::Value> = connection
         .query_row(
             "SELECT value FROM ItemTable WHERE key = ?1",
@@ -302,10 +263,9 @@ fn read_token_from_snapshot(snapshot_dir: &Path) -> Result<String, ProviderError
 }
 
 /// One passive read of the Cursor access token: snapshot, query, and let the
-/// guard clean the snapshot up. The source database is never mutated.
+/// connection release its memory. No credential database copy reaches disk.
 fn read_token_from_state_db(source: &Path) -> Result<String, ProviderError> {
-    let guard = snapshot_state_db(source)?;
-    read_token_from_snapshot(&guard.path)
+    read_token_from_snapshot(source)
 }
 
 /// The `exp` claim of the token's JWT payload (epoch seconds). Only the claim
@@ -851,6 +811,7 @@ fn retain_observation(
 /// retention. Never fails the caller's quota path — the runtime consumes
 /// this `Result` independently of the xAI billing result.
 pub async fn observe_grok_bot_usage() -> Result<GrokBotUsage, ProviderError> {
+    let mut binding = None;
     let result = async {
         // The client version gates the request before any credential is
         // read: without a derivable installed version the observation fails
@@ -862,12 +823,17 @@ pub async fn observe_grok_bot_usage() -> Result<GrokBotUsage, ProviderError> {
             ));
         };
         let token = load_cursor_token()?;
+        binding = Some(crate::credential_identity::fingerprint("grok-bot", &token.0));
         fetch_observation_from(http_client()?, SAND_USAGE_URL, &token, &client_version)
             .await
             .map(|(usage, _)| usage)
     }
     .await;
+    static BINDING: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    let mut previous = BINDING.get_or_init(|| Mutex::new(None)).lock().unwrap();
     let mut cache = last_observation().lock().unwrap();
+    if binding.is_none() || *previous != binding { *cache = None; }
+    *previous = binding;
     retain_observation(&mut cache, result, Utc::now())
 }
 

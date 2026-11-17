@@ -113,7 +113,10 @@ fn unrelated_spec(kind: ProviderKind, percent: f64) -> ProviderSpec {
                         reset_text: None,
                         reset_at: None,
                     }],
-                    account: None,
+                    account: if matches!(kind.id(), "zai" | "opencode-go" | "grok") {
+                Some(AccountAttributionDto { label: "fixture".into(), note: None,
+                    identity: Some(crate::credential_identity::fingerprint(kind.id(), "fixture-credential")) })
+            } else { None },
                     plan_type: None,
                     error: None,
                     error_category: None,

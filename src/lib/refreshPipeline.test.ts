@@ -28,6 +28,7 @@ function goodUsage(
     status: "ok",
     health: "live",
     checkedAt,
+    ...(id === "zai" ? { account: { label: "fixture", identity: "credential-v1:" + "a".repeat(64) } } : {}),
     limits: [{ label: "5-hour", usedPercent, resetAt }],
   };
 }
@@ -55,6 +56,7 @@ function stored(
 ): QuotaObservation {
   return {
     providerId,
+    ...(providerId === "zai" ? { account: "credential-v1:" + "a".repeat(64) } : {}),
     windowLabel,
     usedPercent,
     observedAt,

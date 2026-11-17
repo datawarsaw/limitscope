@@ -459,6 +459,32 @@ describe("Usage view presentation semantics", () => {
     expect(onScopeProvider).toHaveBeenCalledWith(null);
   });
 
+  it("does not present the previous provider's analytics when the new provider's query fails", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    loader.mockImplementation(async (query: UsageAnalyticsQuery) => {
+      if (query.providerId === "grok") throw new Error("grok history unavailable");
+      return makeAnalytics();
+    });
+    const { rerender } = renderView({ scopeProviderId: "zai" });
+    await screen.findByText("Peak observed");
+    rerender(
+      <UsageView
+        usages={usages}
+        scopeProviderId="grok"
+        onScopeProvider={vi.fn()}
+        historyRevision={1}
+        loader={loader}
+      />,
+    );
+    await screen.findByText(/Usage history could not be loaded\. grok history unavailable/);
+    expect(loader).toHaveBeenLastCalledWith({ range: "24h", providerId: "grok" });
+    // The zai projection is gone: no summary, no trend, no heatmap under grok.
+    expect(screen.queryByText("Peak observed")).toBeNull();
+    expect(screen.queryByText("Usage trend")).toBeNull();
+    expect(screen.queryByText("Updating…")).toBeNull();
+    vi.mocked(console.error).mockRestore();
+  });
+
   it("filters by window from the runtime's own quota windows", async () => {
     const user = userEvent.setup();
     renderView();
@@ -526,6 +552,20 @@ describe("Usage view presentation semantics", () => {
     await screen.findByText("Usage trend");
     expect(document.querySelectorAll("svg.usage-chart")).toHaveLength(6);
     expect(screen.getByText(/2 more windows/)).toBeTruthy();
+  });
+
+  it("renders large per-window charts when scoped to one provider", async () => {
+    loader.mockImplementation(async () =>
+      makeAnalytics({
+        trends: [makeSeries({ windowLabel: "5-hour window" }), makeSeries()],
+      }),
+    );
+    renderView({ scopeProviderId: "openai-codex" });
+    await screen.findByText("Usage trend");
+    // The provider scope earns the large charts; the small multiples grid
+    // (and its bounded-remainder note) is the all-providers presentation.
+    expect(document.querySelectorAll("figure.large-trend-chart")).toHaveLength(2);
+    expect(document.querySelectorAll("figure.usage-trend-card")).toHaveLength(0);
   });
 
   it("shows the error state with retry when the analytics query fails", async () => {

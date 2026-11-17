@@ -4,7 +4,6 @@ import {
   importLegacyHistory,
   loadRuntimeHistory,
   readLegacyHistory,
-  removeLegacyHistory,
 } from "../lib/historyClient";
 import {
   clearUsageHistoryStore,
@@ -92,30 +91,23 @@ export function useQuotaPredictions(
     void pullHistory();
   }, [historyRevision, pullHistory]);
 
-  // One-time legacy migration, main window only. After a successful import
-  // the legacy key is removed, so the migration can never run again (and a
-  // cleared history can never be resurrected from it); a failed or skipped
-  // import leaves the key in place for the next launch. The promise is kept
-  // so a user clear can deterministically wait out an in-flight import.
+  // Retain the migration source for recovery; Rust persists replay suppression.
+  // A clear waits for any in-flight migration before removing the legacy key.
   const migrationRef = useRef<Promise<void> | null>(null);
   useEffect(() => {
     if (!isMainWindowView()) return;
-    let cancelled = false;
     const migration = (async () => {
       const legacy = readLegacyHistory();
       if (!legacy.present) return;
       try {
-        await importLegacyHistory(legacy.observations);
+        const imported = await importLegacyHistory(legacy.observations);
+        if (!imported.persisted) throw new Error("Legacy quota history was not persisted");
       } catch (error) {
         console.error("Failed to import the legacy quota history", error);
         return;
       }
-      if (!cancelled) removeLegacyHistory();
     })();
     migrationRef.current = migration;
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   const predictions = useMemo(() => {

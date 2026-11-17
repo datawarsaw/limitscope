@@ -58,12 +58,24 @@ describe("settings persistence", () => {
 
   it("round-trips a saved theme", () => {
     const map = stubStorage();
-    saveSettings({ ...DEFAULT_SETTINGS, theme: "glass" });
+    expect(saveSettings({ ...DEFAULT_SETTINGS, theme: "glass" })).toBe(true);
     expect(loadSettings().theme).toBe("glass");
 
     map.clear();
     saveSettings({ ...DEFAULT_SETTINGS, theme: "oled" });
     expect(loadSettings().theme).toBe("oled");
+  });
+
+  it("reports an unavailable WebView cache instead of claiming a save", () => {
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error("QuotaExceededError");
+      },
+      removeItem: () => {},
+      clear: () => {},
+    });
+    expect(saveSettings({ ...DEFAULT_SETTINGS, theme: "glass" })).toBe(false);
   });
 
   it("keeps an unknown theme value from reaching the UI", () => {

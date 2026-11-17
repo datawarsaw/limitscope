@@ -31,10 +31,8 @@
 //!   `chatgpt-v2:<64 lowercase hex>` identity on every stored row;
 //!   out-of-range percentages clamp, and an unparseable `resetAt` degrades
 //!   to absent;
-//! - self-healing: a corrupt or foreign-version blob degrades to empty (or
-//!   the salvageable per-entry subset) and the sanitized state is written
-//!   back, so corruption never survives to the next session and never
-//!   crashes startup;
+//! - recovery: malformed supported data is preserved in a recovery file
+//!   before normalization. Unknown schemas stay untouched and write-blocked;
 //! - non-Codex account identities keep the provider-generated, display-safe
 //!   token contract (`key:3456`, `xai:<id>`). Codex history keeps only the
 //!   v2-form `chatgpt-v2:<64 lowercase hex>` identity on load and record;
@@ -135,6 +133,7 @@ pub struct RecordResult {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportResult {
+    pub persisted: bool,
     pub accepted: usize,
     pub rejected: usize,
 }
@@ -146,14 +145,18 @@ struct StoreState {
     /// Monotonic counter, bumped on every state change. Broadcast in the
     /// runtime snapshot so consumers re-pull only when history changed.
     revision: u64,
+    legacy_cleared: bool,
+    legacy_imported: bool,
 }
 
 /// The quota history store: bounded state behind a small mutex, persisted to
-/// one JSON file. Locking model: mutate state under the lock, release, then
-/// write the file — filesystem I/O never holds the lock, and provider fetch
-/// tasks never wait on it.
+/// one JSON file. An operation mutex orders mutation and durable replacement.
+/// The data mutex is released during I/O, so readers of the revision stay cheap.
 pub struct QuotaHistoryStore {
     state: Mutex<StoreState>,
+    operation: Mutex<()>,
+    writable: std::sync::atomic::AtomicBool,
+    last_write_ok: std::sync::atomic::AtomicBool,
     path: PathBuf,
     now_ms: Box<dyn Fn() -> i64 + Send + Sync>,
 }
@@ -168,6 +171,9 @@ impl QuotaHistoryStore {
     pub fn open_with_clock(path: PathBuf, now_ms: Box<dyn Fn() -> i64 + Send + Sync>) -> Self {
         let store = Self {
             state: Mutex::new(StoreState::default()),
+            operation: Mutex::new(()),
+            writable: std::sync::atomic::AtomicBool::new(true),
+            last_write_ok: std::sync::atomic::AtomicBool::new(true),
             path,
             now_ms,
         };
@@ -186,19 +192,52 @@ impl QuotaHistoryStore {
     /// (or empty), and the sanitized state is written back so degradation
     /// does not survive to the next session. Never crashes startup.
     fn load_from_disk(&self) {
-        let raw = match fs::read_to_string(&self.path) {
+        let bytes = match fs::read(&self.path) {
             Ok(raw) => raw,
             // Absent (first run, or cleared) and unreadable both start from
             // empty; the next write re-seeds the file either way.
-            Err(_) => return,
+            Err(error) => {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                return;
+            },
         };
+        let raw = match String::from_utf8(bytes) {
+            Ok(raw) => raw,
+            Err(error) => {
+                let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+                if crate::durable_file::replace(&backup, &error.into_bytes()).is_err() {
+                    self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                self.persist(&[]);
+                return;
+            }
+        };
+        let unsupported = serde_json::from_str::<Value>(&raw).ok().is_some_and(|value| {
+            !matches!(value.get("version").and_then(Value::as_u64), Some(1 | 2))
+        });
+        if unsupported {
+            self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
         let parsed = parse_blob(&raw);
+        if !parsed.healthy {
+            let backup = self.path.with_extension(format!("recovery-{}.json", uuid::Uuid::new_v4()));
+            if crate::durable_file::replace(&backup, raw.as_bytes()).is_err() {
+                self.writable.store(false, std::sync::atomic::Ordering::SeqCst);
+                return;
+            }
+        }
         let now_ms = self.now();
         let retained = apply_retention(parsed.observations, now_ms);
         let degraded = !parsed.healthy || retained.len() != parsed.total;
         {
             let mut state = self.state.lock().unwrap();
             state.observations = retained.clone();
+            state.legacy_cleared = parsed.legacy_cleared;
+            state.legacy_imported = parsed.legacy_imported;
         }
         if degraded {
             // Self-heal: persist the sanitized state so corruption,
@@ -216,6 +255,7 @@ impl QuotaHistoryStore {
     /// it. The revision is bumped only when the merged history actually
     /// changed, so an idle re-snapshot costs no re-pull on the TS side.
     pub fn record(&self, candidates: Vec<QuotaObservation>) -> RecordResult {
+        let _operation = self.operation.lock().unwrap();
         let now_ms = self.now();
         let cutoff = now_ms - QUOTA_HISTORY_RETENTION_MS;
         let mut valid = Vec::new();
@@ -227,7 +267,7 @@ impl QuotaHistoryStore {
             }
         }
 
-        let (merged, changed) = {
+        let (merged, _changed) = {
             let mut state = self.state.lock().unwrap();
             let mut all = state.observations.clone();
             all.extend(valid.iter().cloned());
@@ -241,7 +281,7 @@ impl QuotaHistoryStore {
         };
         // Write happens outside the lock; failure keeps the in-memory state
         // (predictions keep working) and the next changed pass re-persists.
-        let persisted = if changed { self.persist(&merged) } else { true };
+        let persisted = self.persist(&merged);
         RecordResult {
             accepted: valid.len(),
             rejected,
@@ -269,6 +309,7 @@ impl QuotaHistoryStore {
         window_label: Option<&str>,
         range_str: &str,
     ) -> Vec<QuotaObservation> {
+        let _operation = self.operation.lock().unwrap();
         let now_ms = self.now();
         let (retained, changed) = {
             let mut state = self.state.lock().unwrap();
@@ -336,18 +377,19 @@ impl QuotaHistoryStore {
 
     // ---- mutations ----
 
-    /// Discards the entire history: in-memory state immediately, persisted
-    /// file best-effort (an empty envelope replaces it, so a stale file
-    /// cannot resurrect cleared history on the next start). Never throws.
-    pub fn clear(&self) {
+    /// Durably replaces history with an empty envelope before clearing memory.
+    /// Failure preserves the previous file and is returned to the caller.
+    pub fn clear(&self) -> Result<(), String> {
+        let _operation = self.operation.lock().unwrap();
+        if !self.persist_with_markers(&[], true, true) { return Err("Could not durably clear quota history".into()); }
         {
             let mut state = self.state.lock().unwrap();
             state.observations.clear();
+            state.legacy_cleared = true;
+            state.legacy_imported = true;
             state.revision += 1;
         }
-        if !self.persist(&[]) {
-            let _ = fs::remove_file(&self.path);
-        }
+        Ok(())
     }
 
     /// One-time import of the legacy localStorage blob. Every entry is
@@ -359,6 +401,7 @@ impl QuotaHistoryStore {
     /// identity form, so it cannot establish account ownership. Import never
     /// blocks startup on malformed data.
     pub fn import_legacy(&self, raw: &Value) -> ImportResult {
+        let _operation = self.operation.lock().unwrap();
         let entries: Vec<&Value> = match raw {
             Value::Array(entries) => entries.iter().collect(),
             Value::Object(object) => object
@@ -386,22 +429,24 @@ impl QuotaHistoryStore {
         }
 
         let now_ms = self.now();
-        let (merged, changed) = {
+        let (merged, _changed) = {
             let mut state = self.state.lock().unwrap();
             let mut all = state.observations.clone();
-            all.extend(valid.iter().cloned());
+            if !state.legacy_cleared && !state.legacy_imported {
+                all.extend(valid.iter().cloned());
+            }
             let merged = apply_retention(all, now_ms);
             let changed = merged != state.observations;
             if changed {
                 state.observations = merged.clone();
                 state.revision += 1;
             }
+            state.legacy_imported = true;
             (merged, changed)
         };
-        if changed {
-            self.persist(&merged);
-        }
+        let persisted = self.persist(&merged);
         ImportResult {
+            persisted,
             accepted: valid.len(),
             rejected,
         }
@@ -413,20 +458,26 @@ impl QuotaHistoryStore {
     /// write to a temp file in the same directory, then rename over the
     /// target (Windows `MoveFileEx` semantics replace the existing file).
     fn persist(&self, observations: &[QuotaObservation]) -> bool {
+        let state = self.state.lock().unwrap();
+        let markers = (state.legacy_cleared, state.legacy_imported);
+        drop(state);
+        self.persist_with_markers(observations, markers.0, markers.1)
+    }
+
+    fn persist_with_markers(&self, observations: &[QuotaObservation], legacy_cleared: bool, legacy_imported: bool) -> bool {
         let envelope = HistoryEnvelope {
             version: BLOB_VERSION,
             observations: observations.to_vec(),
+            legacy_cleared,
+            legacy_imported,
         };
         let Ok(json) = serde_json::to_string(&envelope) else {
             return false;
         };
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        fs::write(&temp_path, json)
-            .and_then(|()| fs::rename(&temp_path, &self.path))
-            .is_ok()
+        let persisted = self.writable.load(std::sync::atomic::Ordering::SeqCst)
+            && crate::durable_file::replace(&self.path, json.as_bytes()).is_ok();
+        self.last_write_ok.store(persisted, std::sync::atomic::Ordering::SeqCst);
+        persisted
     }
 }
 
@@ -437,6 +488,10 @@ impl QuotaHistoryStore {
 struct HistoryEnvelope {
     version: u32,
     observations: Vec<QuotaObservation>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_cleared: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy_imported: bool,
 }
 
 // ---------- validation (exact TS `normalizeObservation` parity) ----------
@@ -777,6 +832,8 @@ fn parse_blob(raw: &str) -> ParsedBlob {
         observations,
         total: entries.len(),
         healthy,
+        legacy_cleared: blob.get("legacy_cleared").and_then(Value::as_bool).unwrap_or(false),
+        legacy_imported: blob.get("legacy_imported").and_then(Value::as_bool).unwrap_or(false),
     }
 }
 
@@ -784,6 +841,8 @@ struct ParsedBlob {
     observations: Vec<QuotaObservation>,
     total: usize,
     healthy: bool,
+    legacy_cleared: bool,
+    legacy_imported: bool,
 }
 
 impl ParsedBlob {
@@ -792,6 +851,8 @@ impl ParsedBlob {
             observations: Vec::new(),
             total,
             healthy: false,
+            legacy_cleared: false,
+            legacy_imported: false,
         }
     }
 }
@@ -826,10 +887,14 @@ fn valid_time(value: &str) -> Option<String> {
 pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObservation> {
     let mut observations = Vec::new();
     for usage in usages {
-        if usage.id == crate::runtime::ProviderKind::OpenDesign.id() {
+        if matches!(usage.id.as_str(), "opendesign" | "qwen-token-plan") {
             continue;
         }
         if usage.health != crate::runtime::ProviderHealth::Live {
+            continue;
+        }
+        if matches!(usage.id.as_str(), "zai" | "opencode-go" | "grok")
+            && usage.account.as_ref().and_then(|account| account.identity.as_deref()).filter(|identity| valid_account_identity(identity)).is_none() {
             continue;
         }
         if usage.data_freshness == Some("stale") {
@@ -1163,28 +1228,28 @@ pub fn get_history_range(
 }
 
 #[tauri::command]
-pub fn clear_history(handle: tauri::State<RuntimeHandle>) {
+pub fn clear_history(handle: tauri::State<RuntimeHandle>) -> Result<(), String> {
     // Lane B: clearing the history also drops held suspicious-drop
     // candidates — no gated window may outlive the history it was gated
     // against. The next cycle classifies from scratch.
     handle.clear_pending_confirmations();
     if let Some(store) = handle.history_store() {
-        store.clear();
-    }
+        store.clear()?;
+    } else { return Err("Quota history persistence is unavailable".into()); }
+    Ok(())
 }
 
 #[tauri::command]
 pub fn import_legacy_history(
     handle: tauri::State<RuntimeHandle>,
     observations: Value,
-) -> ImportResult {
-    match handle.history_store() {
-        Some(store) => store.import_legacy(&observations),
-        None => ImportResult {
-            accepted: 0,
-            rejected: 0,
-        },
+) -> Result<ImportResult, String> {
+    let store = handle.history_store().ok_or("Quota history persistence is unavailable")?;
+    let result = store.import_legacy(&observations);
+    if !result.persisted {
+        return Err("Could not durably import quota history; keep the migration source".into());
     }
+    Ok(result)
 }
 
 // ---------- tests ----------
@@ -1280,6 +1345,97 @@ mod tests {
 
     fn at(minute_offset: i64) -> String {
         canonical_timestamp(NOW_MS - minute_offset * 60_000)
+    }
+
+    #[test]
+    fn identical_retry_after_failed_write_is_durable_and_failed_clear_preserves_source() {
+        let (store, dir) = temp_store("retry-durable");
+        let row = observation("zai", "Monthly", 10.0, CHECKED_AT);
+        let backup = dir.path().join("backup.json");
+        assert!(store.record(vec![row.clone()]).persisted);
+        fs::rename(&store.path, &backup).unwrap();
+        fs::create_dir(&store.path).unwrap();
+        let mut changed = row; changed.used_percent = 20.0;
+        assert!(!store.record(vec![changed.clone()]).persisted);
+        assert!(store.clear().is_err());
+        assert!(backup.is_file());
+        fs::remove_dir(&store.path).unwrap();
+        fs::rename(backup, &store.path).unwrap();
+        assert!(store.record(vec![changed]).persisted);
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        assert_eq!(reopened.history()[0].used_percent, 20.0);
+    }
+
+    #[test]
+    fn integration_history_clear_suppresses_legacy_replay_after_restart() {
+        let (store, _dir) = temp_store("integration-clear-marker");
+        let legacy = serde_json::json!([{ "providerId": "zai", "windowLabel": "5-hour", "usedPercent": 30.0, "observedAt": CHECKED_AT }]);
+        assert!(store.import_legacy(&legacy).persisted);
+        store.clear().unwrap();
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        assert!(reopened.import_legacy(&legacy).persisted);
+        assert!(reopened.history().is_empty());
+        // 0.8.24's schema ignores unknown JSON fields and can still read rows.
+        #[derive(Deserialize)]
+        struct PreviousEnvelope { version: u32, observations: Vec<QuotaObservation> }
+        let rollback: PreviousEnvelope = serde_json::from_slice(&fs::read(&store.path).unwrap()).unwrap();
+        assert_eq!(rollback.version, 2);
+        assert!(rollback.observations.is_empty());
+    }
+
+    #[test]
+    fn integration_credential_identities_partition_history_across_restart() {
+        let (store, _dir) = temp_store("integration-credential-history");
+        for provider in ["zai", "opencode-go", "grok"] {
+            for key in ["synthetic-first-1234", "synthetic-second-1234"] {
+                let mut row = observation(provider, "weekly", 10.0, CHECKED_AT);
+                row.account = Some(crate::credential_identity::fingerprint(provider, key));
+                assert!(store.record(vec![row]).persisted);
+            }
+        }
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        let rows = reopened.history();
+        assert_eq!(rows.len(), 6);
+        for provider in ["zai", "opencode-go", "grok"] {
+            for key in ["synthetic-first-1234", "synthetic-second-1234"] {
+                let identity = crate::credential_identity::fingerprint(provider, key);
+                assert_eq!(rows.iter().filter(|row| row.provider_id == provider && row.account.as_deref() == Some(&identity)).count(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn integration_history_non_utf8_is_preserved_and_future_schema_is_write_blocked() {
+        let dir = tempdir::temp_dir("integration-corrupt");
+        let path = dir.path().join(HISTORY_FILE_NAME);
+        let corrupt = [0xff, 0x00, 0xfe];
+        fs::write(&path, corrupt).unwrap();
+        let store = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
+        assert!(fs::read_dir(dir.path()).unwrap().filter_map(Result::ok)
+            .any(|entry| entry.path() != path && fs::read(entry.path()).ok().as_deref() == Some(&corrupt)));
+        assert!(store.record(vec![observation("zai", "weekly", 5.0, CHECKED_AT)]).persisted);
+        let future = br#"{"version":999,"observations":[]}"#;
+        fs::write(&path, future).unwrap();
+        let blocked = QuotaHistoryStore::open_with_clock(path.clone(), fixed_clock());
+        assert!(!blocked.record(vec![observation("zai", "weekly", 5.0, CHECKED_AT)]).persisted);
+        assert!(blocked.clear().is_err());
+        assert_eq!(fs::read(path).unwrap(), future);
+    }
+
+    #[test]
+    fn concurrent_mutations_finish_with_disk_equal_to_memory_and_clear_cannot_resurrect() {
+        let (store, _dir) = temp_store("concurrent-ordered");
+        let store = std::sync::Arc::new(store);
+        std::thread::scope(|scope| {
+            for i in 0..12 {
+                let store = store.clone();
+                scope.spawn(move || { assert!(store.record(vec![observation("zai", &format!("window-{i}"), 10.0, CHECKED_AT)]).persisted); });
+            }
+        });
+        let reopened = QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock());
+        assert_eq!(reopened.history(), store.history());
+        store.clear().unwrap();
+        assert!(QuotaHistoryStore::open_with_clock(store.path.clone(), fixed_clock()).history().is_empty());
     }
 
     // 1. valid observation recording
@@ -1626,7 +1782,7 @@ mod tests {
         let (store, dir) = temp_store("clear");
         store.record(vec![observation("zai", "5-hour", 10.0, CHECKED_AT)]);
         assert!(!store.history().is_empty());
-        store.clear();
+        store.clear().unwrap();
         assert!(store.history().is_empty());
         // The persisted file cannot resurrect the cleared history: an empty
         // envelope replaced it (or the file is gone).
@@ -1800,6 +1956,7 @@ mod tests {
         assert_eq!(
             result,
             ImportResult {
+                persisted: true,
                 accepted: 2,
                 rejected: 3
             }
@@ -1835,6 +1992,7 @@ mod tests {
         assert_eq!(
             result,
             ImportResult {
+                persisted: true,
                 accepted: 1,
                 rejected: 2
             }
@@ -2317,6 +2475,20 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_provider_identity_never_enters_new_history() {
+        for provider in ["zai", "opencode-go", "grok", "qwen-token-plan"] {
+            let mut dto = ok_usage(provider, "fixture", 42.0);
+            dto.account = None;
+            assert!(observations_from_usages(&[dto.clone()]).is_empty());
+            dto.account = Some(AccountAttributionDto {
+                label: "fixture".into(), note: None,
+                identity: Some(crate::credential_identity::fingerprint(provider, "fixture")),
+            });
+            assert_eq!(observations_from_usages(&[dto]).len(), if provider == "qwen-token-plan" { 0 } else { 1 });
+        }
+    }
+
+    #[test]
     fn eligibility_carries_the_account_identity() {
         let mut usage = ok_usage("opencode-go", "OpenCode Go", 42.0);
         usage.account = Some(AccountAttributionDto {
@@ -2333,11 +2505,8 @@ mod tests {
             note: None,
             identity: Some("   ".to_string()),
         });
-        assert_eq!(
-            observations_from_usages(&[blank])[0].account,
-            None,
-            "a blank identity token stays unattributed"
-        );
+        assert!(observations_from_usages(&[blank]).is_empty(),
+            "a blank identity cannot authorize history attribution");
     }
 
     // 17. credentials/tokens are never part of the serialized schema
@@ -2438,7 +2607,7 @@ mod tests {
         // Re-recording the same snapshot changes nothing.
         store.record(vec![observation("zai", "5-hour", 10.0, CHECKED_AT)]);
         assert_eq!(store.revision(), after_record);
-        store.clear();
+        store.clear().unwrap();
         assert_eq!(store.revision(), after_record + 1);
     }
 
@@ -2680,7 +2849,7 @@ mod tests {
         store.record(vec![h2, d3]);
         assert_eq!(store.history_range(None, None, None, "7d").len(), 2);
 
-        store.clear();
+        store.clear().unwrap();
         assert!(store.history_range(None, None, None, "7d").is_empty());
         assert!(store.history().is_empty());
 
@@ -2865,7 +3034,10 @@ mod tests {
                 reset_text: None,
                 reset_at: None,
             }],
-            account: None,
+            account: if matches!(id, "zai" | "opencode-go" | "grok") {
+                Some(AccountAttributionDto { label: "fixture".into(), note: None,
+                    identity: Some(crate::credential_identity::fingerprint(id, "fixture-credential")) })
+            } else { None },
             plan_type: None,
             error: None,
             error_category: None,

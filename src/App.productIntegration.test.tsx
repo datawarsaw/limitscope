@@ -168,6 +168,7 @@ describe("local data × usage (scenarios 6-11)", () => {
     renderApp([codexUsage()]);
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Clear usage history" }));
     await user.click(await screen.findByRole("button", { name: "Clear usage history" }));
     expect(mocks.historyCleared).toBe(true);
@@ -175,8 +176,8 @@ describe("local data × usage (scenarios 6-11)", () => {
 
     // The Usage destination (an independent data plane) is unaffected by a
     // quota-history clear.
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 
   it("8. settings survive a history clear", async () => {
@@ -186,6 +187,7 @@ describe("local data × usage (scenarios 6-11)", () => {
     const before = localStorage.getItem("rate-limits.settings.v1");
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Clear usage history" }));
     await user.click(await screen.findByRole("button", { name: "Clear usage history" }));
     await screen.findByText("Usage history cleared.");
@@ -199,10 +201,12 @@ describe("local data × usage (scenarios 6-11)", () => {
     renderApp([codexUsage()]);
     await choosePerspective(user, "Remaining");
 
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
 
+    await user.click(screen.getByRole("button", { name: "General" }));
     const radio = screen.getByRole("radio", { name: "Used" }) as HTMLInputElement;
     expect(radio.checked).toBe(true);
     expect(
@@ -216,14 +220,15 @@ describe("local data × usage (scenarios 6-11)", () => {
     renderApp([codexUsage()]);
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
 
     expect(mocks.historyCleared).toBe(false);
     // The Usage destination still renders.
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 
   it("11. reset preferences preserves execution runs", async () => {
@@ -252,6 +257,7 @@ describe("local data × usage (scenarios 6-11)", () => {
     renderApp([codexUsage()]);
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");
@@ -272,7 +278,8 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
 
     await openSettings(user);
-      await user.click(screen.getByRole("button", { name: "Clear execution runs" }));
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
+    await user.click(screen.getByRole("button", { name: "Clear execution runs" }));
     expect(screen.getByText("Clear execution runs?")).toBeTruthy();
     await user.click(await screen.findByRole("button", { name: "Clear execution runs" }));
     await screen.findByText("Execution runs cleared.");
@@ -289,6 +296,7 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     expect(screen.getByText(/Running ·/)).toBeTruthy();
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Discard active run and clear" }));
     // The confirmation names the in-progress consequence.
     expect(
@@ -301,7 +309,7 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     expect(screen.getByText(/Running ·/)).toBeTruthy();
     expect(persistedRuns().activeRun).not.toBeNull();
 
-      await user.click(screen.getByRole("button", { name: "Discard active run and clear" }));
+    await user.click(screen.getByRole("button", { name: "Discard active run and clear" }));
       await user.click(
         await screen.findByRole("button", { name: "Discard active run and clear" }),
       );
@@ -318,13 +326,14 @@ describe("local data × execution runs (scenarios 12-14)", () => {
     await user.click(screen.getByRole("button", { name: "Finish run" }));
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Clear execution runs" }));
     await user.click(await screen.findByRole("button", { name: "Clear execution runs" }));
     await screen.findByText("Execution runs cleared.");
 
     expect(mocks.historyCleared).toBe(false);
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
   });
 });
 
@@ -332,8 +341,8 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
   it("15+16. a run started on Usage stays active across the Settings round-trip", async () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
-    // Usage is the landing destination.
-    expect(screen.getByLabelText("Usage overview")).toBeTruthy();
+    // Status is the landing destination (provider status + history chart).
+    expect(screen.getByRole("region", { name: "Quota history" })).toBeTruthy();
     await user.click(screen.getByRole("button", { name: "Execution run" }));
     await user.click(screen.getByRole("button", { name: "Start run" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
@@ -343,7 +352,7 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
       screen.getByRole("button", { name: /Execution run in progress, running for/ }),
     ).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     expect(screen.getByText(/Running ·/)).toBeTruthy();
     expect(persistedRuns().activeRun).not.toBeNull();
   });
@@ -380,7 +389,7 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     view.rerender(<App />);
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     await user.click(screen.getByRole("button", { name: "Finish run" }));
 
     const summary = within(screen.getByLabelText("Execution summary"));
@@ -400,8 +409,10 @@ describe("execution runs × navigation × usage (scenarios 15-18)", () => {
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
 
     await user.click(screen.getByRole("button", { name: "Settings" }));
-    await user.click(screen.getByRole("button", { name: "Usage" }));
+    await user.click(screen.getByRole("button", { name: "Insights" }));
     // The open panel (and its recent-run history) survives the round trip.
+    expect(screen.getByText("Recent runs (1)")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Status" }));
     expect(screen.getByText("Recent runs (1)")).toBeTruthy();
   });
 });
@@ -492,6 +503,7 @@ describe("ProviderUsage DTO coexistence (scenarios 21-23)", () => {
 
     // Settings renders the attributed, plan-typed provider's preferences row.
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Providers & Wallets" }));
     const providers = screen.getByRole("group", { name: "Providers" });
     expect(
       within(providers).getByRole("switch", {
@@ -499,8 +511,8 @@ describe("ProviderUsage DTO coexistence (scenarios 21-23)", () => {
       }),
     ).toBeTruthy();
 
-    await user.click(screen.getByRole("button", { name: "Usage" }));
-    expect(await screen.findByLabelText("Usage overview")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Insights" }));
+    expect(await screen.findByRole("main", { name: "Insights" })).toBeTruthy();
     // The reset-credit payload travels with the usage object untouched.
     expect(mocks.usages[0]?.resetCredits?.bankedCredits).toBe(3);
     expect(mocks.usages[0]?.planType).toBe("team");
@@ -520,6 +532,7 @@ describe("ProviderUsage DTO coexistence (scenarios 21-23)", () => {
     const user = userEvent.setup();
     renderApp([codexUsage()]);
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Providers & Wallets" }));
     // The provider row shows the friendly name; the masked label (fingerprint
     // scheme + tail) is display-safe…
     expect(
@@ -566,6 +579,7 @@ describe("settings schema robustness (scenarios 24-25)", () => {
     renderApp([codexUsage()]);
 
     await openSettings(user);
+    await user.click(screen.getByRole("button", { name: "Data & Privacy" }));
     await user.click(screen.getByRole("button", { name: "Reset preferences" }));
     await user.click(await screen.findByRole("button", { name: "Reset preferences" }));
     await screen.findByText("Preferences reset.");

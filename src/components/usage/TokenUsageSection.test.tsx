@@ -445,6 +445,40 @@ describe("token usage section", () => {
     expect(await screen.findByText(/ZCode: collecting · last observed/i)).toBeTruthy();
   });
 
+  it("restores the v0.9 KPI strip and model ranking with expand", async () => {
+    const user = userEvent.setup();
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => withData())}
+      />,
+    );
+    // The KPIs carry the honesty qualifiers and reflect the table's scope.
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    expect(within(kpis).getByText("Reported tokens")).toBeTruthy();
+    expect(within(kpis).getByText("124.1K")).toBeTruthy();
+    expect(
+      within(kpis).getByText("observed as reported — not your total usage"),
+    ).toBeTruthy();
+    expect(within(kpis).getAllByText("2")).toHaveLength(2);
+    expect(
+      within(kpis).getByText("recorded completions — not every API request"),
+    ).toBeTruthy();
+    expect(within(kpis).getByText("distinct models across providers")).toBeTruthy();
+    // Ranking: heaviest model first; expanding it discloses the breakdown
+    // and the recorded-event note.
+    const models = screen.getByLabelText("Models");
+    expect(within(models).getAllByText("76.6K").length).toBeGreaterThan(0);
+    await user.click(
+      within(models).getByRole("button", { name: /GLM-5\.3-Flash/ }),
+    );
+    expect(within(models).getByText("Reasoning")).toBeTruthy();
+    expect(
+      within(models).getByText(/1 recorded event · Z\.ai \(ZCode\)/),
+    ).toBeTruthy();
+  });
+
   it("reports each source's diagnostics independently", async () => {
     const data = intelligence({
       ...withData(),
@@ -472,7 +506,171 @@ describe("token usage section", () => {
         loader={vi.fn(async () => data)}
       />,
     );
-    const sources = await screen.findByText(/ZCode: collecting · last observed/);
-    expect(sources.textContent).toContain("Codex: source not found");
+    // The restored v0.9 diagnostics panel lists each source on its own row.
+    const sources = await screen.findByLabelText("Collection sources");
+    expect(within(sources).getByText(/ZCode: collecting · last observed/)).toBeTruthy();
+    expect(within(sources).getByText(/Codex: source not found/)).toBeTruthy();
+  });
+
+  // 0.8.24 protections carried over from the former Usage overview: a failed
+  // local write and a scan-ceiling backlog are disclosed, never hidden.
+  it("alerts when locally collected usage could not be saved", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({ ...withData(), lastWriteSucceeded: false }))}
+      />,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Local usage could not be saved");
+    // The collected totals stay visible beside the alert.
+    expect(screen.getByRole("group", { name: "Token usage summary" })).toBeTruthy();
+  });
+
+  it("alerts when local usage persistence is unavailable even with no rows", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () =>
+          intelligence({ persistenceAvailable: false }),
+        )}
+      />,
+    );
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("Local usage could not be saved");
+  });
+
+  it("discloses a scan-ceiling backlog in the coverage banner", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({
+          ...withData(),
+          sourceCoverage: [
+            { source: "opencode", coverage: "incomplete" as const, reason: "scanCeiling" as const },
+          ],
+        }))}
+      />,
+    );
+    const note = await screen.findByRole("note", { name: "History coverage" });
+    expect(note.textContent).toContain(
+      "OpenCode — collection has a recoverable backlog",
+    );
+  });
+
+  it("does not raise a persistence alert for a healthy store", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        loader={vi.fn(async () => ({
+          ...withData(),
+          persistenceAvailable: true,
+          lastWriteSucceeded: true,
+        }))}
+      />,
+    );
+    await screen.findByRole("group", { name: "Token usage summary" });
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("token usage daily chart provider scope", () => {
+  function group(provider: string, totalTokens: number) {
+    return {
+      provider,
+      events: 1,
+      inputTokens: totalTokens,
+      cacheReadTokens: 0,
+      cacheWriteTokens: 0,
+      outputTokens: 0,
+      reasoningTokens: 0,
+      totalTokens,
+      models: [
+        {
+          model: `${provider}-model`,
+          events: 1,
+          inputTokens: totalTokens,
+          cacheReadTokens: 0,
+          cacheWriteTokens: 0,
+          outputTokens: 0,
+          reasoningTokens: 0,
+          totalTokens,
+        },
+      ],
+    };
+  }
+
+  // zai = 100 tokens, codex = 900 tokens. The backend's daily projection is
+  // global — it carries no provider attribution — so its one day is 1000.
+  function mixed(): UsageIntelligence {
+    return intelligence({
+      eventsInRange: 2,
+      groups: [group("zai", 100), group("openai-codex", 900)],
+      daily: [
+        {
+          date: "2026-10-06",
+          observed: true,
+          events: 2,
+          totalTokens: 1000,
+          beforeCollection: false,
+        },
+      ],
+    });
+  }
+
+  function dailyCellLabels(): string[] {
+    const grid = screen.queryByRole("list", { name: "Daily reported token activity" });
+    if (!grid) return [];
+    return within(grid)
+      .queryAllByRole("listitem")
+      .map((cell) => cell.getAttribute("aria-label") ?? "");
+  }
+
+  it("never charts global daily totals under a single-provider scope", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        scopeProviderId="zai"
+        loader={vi.fn(async () => mixed())}
+      />,
+    );
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    // Table and KPIs are scoped to zai: 100 reported tokens.
+    expect(within(kpis).getByText("100")).toBeTruthy();
+    const table = screen.getByRole("table");
+    expect(within(table).queryByText("codex-model")).toBeNull();
+
+    // The displayed chart data must not carry the global (zai + codex) day.
+    const labels = dailyCellLabels();
+    expect(labels.some((label) => label.includes("1000 reported tokens"))).toBe(false);
+    // Nor any day total that disagrees with the scoped KPIs.
+    expect(labels.filter((label) => /reported tokens across/.test(label))).toEqual([]);
+
+    // The scope gap is stated, not hidden.
+    const daily = screen.getByRole("region", { name: "Daily activity" });
+    expect(
+      within(daily).getByText(/not broken down by provider/i),
+    ).toBeTruthy();
+  });
+
+  it("keeps the daily chart in all-providers scope, matching the KPIs", async () => {
+    render(
+      <TokenUsageSection
+        enabled={true}
+        revision={0}
+        scopeProviderId={null}
+        loader={vi.fn(async () => mixed())}
+      />,
+    );
+    const kpis = await screen.findByRole("group", { name: "Token usage summary" });
+    expect(within(kpis).getByText("1000")).toBeTruthy();
+    const labels = dailyCellLabels();
+    expect(labels).toHaveLength(1);
+    expect(labels[0]).toContain("1000 reported tokens across 2 recorded events");
   });
 });

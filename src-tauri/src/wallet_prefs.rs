@@ -42,6 +42,7 @@ struct PersistedWalletPrefsEnvelope {
 /// runtime start (before the scheduler's first cycle) and rewritten on every
 /// applied change from the settings lane.
 pub struct WalletPrefsStore {
+    writable: bool,
     path: PathBuf,
     monitored: Mutex<HashMap<String, bool>>,
 }
@@ -49,6 +50,10 @@ pub struct WalletPrefsStore {
 impl WalletPrefsStore {
     pub fn open(path: PathBuf) -> Self {
         let store = Self {
+            writable: crate::durable_file::prepare_json(&path, &[SCHEMA_VERSION as u64], |value| {
+                let normalized = serde_json::to_value(parse_envelope(&value.to_string())).ok();
+                value.get("monitored") == normalized.as_ref()
+            }),
             path,
             monitored: Mutex::new(HashMap::new()),
         };
@@ -67,32 +72,18 @@ impl WalletPrefsStore {
     /// error, so a restart falls back to defaults rather than to a stale
     /// file silently contradicting the UI.
     pub fn set_monitored(&self, monitored: &HashMap<String, bool>) -> Result<(), std::io::Error> {
-        {
-            let mut state = self.monitored.lock().unwrap();
-            if *state == *monitored {
-                return Ok(());
-            }
-            *state = monitored.clone();
-        }
-        self.persist()
-    }
-
-    fn persist(&self) -> Result<(), std::io::Error> {
+        if !self.writable { return Err(std::io::Error::other("Unsupported or unavailable wallet store")); }
+        let mut state = self.monitored.lock().unwrap();
         let envelope = PersistedWalletPrefsEnvelope {
             version: SCHEMA_VERSION,
-            monitored: self
-                .monitored()
-                .into_iter()
-                .map(|(id, flag)| (id, serde_json::Value::Bool(flag)))
-                .collect(),
+            monitored: monitored.iter().map(|(id, flag)| (id.clone(), serde_json::Value::Bool(*flag))).collect(),
         };
-        let json = serde_json::to_string_pretty(&envelope)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
-        let temp_path = self.path.with_extension("json.tmp");
-        if let Some(parent) = self.path.parent() {
-            let _ = fs::create_dir_all(parent);
+        let json = serde_json::to_vec(&envelope)?;
+        if fs::read(&self.path).ok().as_deref() != Some(json.as_slice()) {
+            crate::durable_file::replace(&self.path, &json)?;
         }
-        fs::write(&temp_path, json.as_bytes()).and_then(|()| fs::rename(&temp_path, &self.path))
+        *state = monitored.clone();
+        Ok(())
     }
 
     fn load_from_disk(&self) {
@@ -145,6 +136,37 @@ mod tests {
     fn remove_store(path: &std::path::Path) {
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(path.with_extension("json.tmp"));
+    }
+
+    #[test]
+    fn applying_defaults_after_semantic_corruption_really_repairs_disk() {
+        let path = store_path("defaults-after-corruption");
+        fs::write(&path, r#"{"version":1,"monitored":"broken"}"#).unwrap();
+        let store = WalletPrefsStore::open(path.clone());
+        store.set_monitored(&store.monitored()).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(value["monitored"].is_object());
+        // Remove only this fixture's preserved recovery copies.
+        for entry in fs::read_dir(path.parent().unwrap()).unwrap().filter_map(Result::ok) {
+            if entry.file_name().to_string_lossy().starts_with(&format!("{}.recovery-", path.file_stem().unwrap().to_string_lossy())) {
+                fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        remove_store(&path);
+    }
+
+    #[test]
+    fn failed_write_does_not_change_memory_and_identical_retry_succeeds() {
+        let path = store_path("failed-retry");
+        let store = WalletPrefsStore::open(path.clone());
+        let flags = HashMap::from([("openrouter".to_string(), false)]);
+        fs::create_dir(&path).unwrap();
+        assert!(store.set_monitored(&flags).is_err());
+        assert!(store.monitored().is_empty());
+        fs::remove_dir(&path).unwrap();
+        store.set_monitored(&flags).unwrap();
+        assert_eq!(WalletPrefsStore::open(path.clone()).monitored(), flags);
+        remove_store(&path);
     }
 
     #[test]

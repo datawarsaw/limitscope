@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import {
+  codexFenceScope,
   loadUsageAnalytics,
   type CodexScope,
   type UsageAnalyticsLoader,
@@ -17,15 +18,20 @@ import { shortProviderId, shortProviderName, usableQuotaWindows } from "../../li
 import type { QuotaPerspective } from "../../lib/quotaPresentation";
 import { UsageSummaryStrip } from "./UsageSummaryStrip";
 import { UsageTrendChart } from "./UsageTrendChart";
+import { LargeTrendChart } from "../charts/LargeTrendChart";
 import { UsageHeatmap } from "./UsageHeatmap";
 import { TokenUsageSection } from "./TokenUsageSection";
 import type { ProviderUsage } from "../../types";
-import { isCodexProviderId } from "../../lib/providerIds";
 
 /**
- * The v0.7 Usage view: one coherent analytics surface over the backend
- * `get_usage_analytics` projection — filters, the five-metric summary strip,
- * small-multiple trends, and the daily-peak heatmap.
+ * The Insights view (v0.9; the v0.7 Usage surface): one coherent analytics
+ * surface over the backend `get_usage_analytics` projection — filters, the
+ * compact metric strip, large per-window trend charts, and the daily-peak
+ * heatmap.
+ *
+ * A provider scope renders one large, readable chart per window; the "All
+ * providers" scope keeps the bounded small-multiples grid so unrelated quota
+ * windows are never merged into one aggregate figure.
  *
  * Scope of honesty, enforced everywhere below: the backend response is the
  * only source of numbers; missing observations are "not observed", never 0;
@@ -88,17 +94,10 @@ export function UsageView({
   );
 
   // The Codex identity scope the analytics are read under. The runtime's
-  // per-slot observation is authoritative; without it the visible account
-  // identities are used, which still changes when a session changes.
-  const identityScope: CodexScope =
-    codexIdentityStates ??
-    usages
-      .filter((usage) => isCodexProviderId(usage.id))
-      .map((usage) => ({
-        providerId: usage.id,
-        generation: 0,
-        identity: usage.account?.identity ?? null,
-      }));
+  // per-slot observation is authoritative; a slot it has not observed yet
+  // still fences to the visible account identity (generation 0) — never to
+  // "no slot expected", which would accept a prior session's projection.
+  const identityScope: CodexScope = codexFenceScope(usages, codexIdentityStates);
   const analytics = useUsageAnalytics(query, true, historyRevision, loader, identityScope);
 
   // Window filter options come from the runtime's own quota windows — the
@@ -228,17 +227,32 @@ export function UsageView({
           <section className="usage-panel" aria-label="Usage trend">
             <h3 className="panel-heading">Usage trend</h3>
             {trends && trends.visible.length > 0 ? (
-              <div className="usage-trend-grid">
-                {trends.visible.map((series) => (
-                  <UsageTrendChart
-                    key={`${series.providerId}|${series.account ?? ""}|${series.windowLabel}`}
-                    series={series}
-                    analytics={data}
-                    compactLabels={layout === "narrow"}
-                    perspective={perspective}
-                  />
-                ))}
-              </div>
+              scopeProviderId !== null ? (
+                // A provider scope earns the large charts: one per window,
+                // readable at a glance.
+                <div className="usage-trend-large">
+                  {trends.visible.map((series) => (
+                    <LargeTrendChart
+                      key={`${series.providerId}|${series.account ?? ""}|${series.windowLabel}`}
+                      series={series}
+                      analytics={data}
+                      perspective={perspective}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <div className="usage-trend-grid">
+                  {trends.visible.map((series) => (
+                    <UsageTrendChart
+                      key={`${series.providerId}|${series.account ?? ""}|${series.windowLabel}`}
+                      series={series}
+                      analytics={data}
+                      compactLabels={layout === "narrow"}
+                      perspective={perspective}
+                    />
+                  ))}
+                </div>
+              )
             ) : (
               <p className="usage-trend-empty">
                 No observations for this selection in the {data.range} range.

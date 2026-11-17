@@ -1106,7 +1106,7 @@ fn build_zai_attribution(account: Option<&zai::ZaiAccount>) -> Option<AccountAtt
             "Attributed to the Z.ai credential that answered; stored candidates are tried in order."
                 .to_string(),
         ),
-        identity: Some(format!("key:{hint}")),
+        identity: account?.identity.clone(),
     })
 }
 
@@ -1123,7 +1123,7 @@ fn build_opencode_attribution(key_hint: Option<&str>) -> Option<AccountAttributi
             "Only the account whose OpenCode Go key is stored locally is shown; other OpenCode accounts are not included."
                 .to_string(),
         ),
-        identity: Some(format!("key:{hint}")),
+        identity: None,
     })
 }
 
@@ -1152,6 +1152,9 @@ pub(crate) fn normalize_opencode_go(
             dto.account = build_opencode_attribution(
                 usage.account.as_ref().map(|account| account.key_hint.as_str()),
             );
+            if let Some(account) = &mut dto.account {
+                account.identity = usage.account.as_ref().and_then(|account| account.identity.clone());
+            }
             Ok(dto)
         }
         Err(error) => Err(failure_from_provider_error(error)),
@@ -1240,7 +1243,7 @@ fn build_grok_attribution(account: Option<&grok::GrokAccount>) -> Option<Account
             "Only the active xAI account's stored credential is shown; other xAI accounts are not included."
                 .to_string(),
         ),
-        identity: Some(format!("xai:{id}")),
+        identity: account.identity.clone(),
     })
 }
 
@@ -1301,7 +1304,7 @@ fn normalize_qwen_token_plan(
                     "International console, Singapore (ap-southeast-1). Monthly quota only."
                         .to_string(),
                 ),
-                identity: Some("qwen-token-plan:international:ap-southeast-1".to_string()),
+                identity: None,
             });
             Ok(dto)
         }
@@ -2178,6 +2181,7 @@ pub enum RuntimeEvent {
 }
 
 pub struct RuntimeCore {
+    grok_identity: Option<Arc<dyn Fn() -> Option<String> + Send + Sync>>,
     inner: Mutex<RuntimeInner>,
     /// Serializes Codex identity observations, account/pause changes, and
     /// validated result commits. Lock order is always lifecycle -> inner.
@@ -2213,6 +2217,10 @@ pub struct RuntimeCore {
 }
 
 impl RuntimeCore {
+    pub fn with_grok_identity(mut self, resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>) -> Self {
+        self.grok_identity = Some(resolver); self
+    }
+
     /// Reads the local login twice while the lifecycle lock is held. This
     /// detects a file replacement observed between the reads. It cannot make
     /// an external writer atomic: a replacement after the second read is a
@@ -2636,6 +2644,7 @@ impl RuntimeCore {
         now: Box<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     ) -> Self {
         Self {
+            grok_identity: None,
             inner: Mutex::new(RuntimeInner {
                 usages: Vec::new(),
                 last_good: HashMap::new(),
@@ -2927,23 +2936,9 @@ impl RuntimeCore {
         }
         results.sort_by_key(|(index, _)| *index);
 
-        // Token-log collection is a blocking, read-only work item. Complete it
-        // before taking the synchronous lifecycle/state guard so `run_cycle`
-        // remains `Send`; none of its output participates in the Codex commit.
-        if let Some(usage_intelligence) = &self.usage_intelligence {
-            if usage_intelligence.enabled() {
-                let store = usage_intelligence.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    store
-                        .collecting
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    crate::usage_intelligence::run_collection_pass(&store);
-                    store
-                        .collecting
-                        .store(false, std::sync::atomic::Ordering::Relaxed);
-                })
-                .await;
-            }
+        // Local token scans never delay quota publication or notifications.
+        if let Some(store) = &self.usage_intelligence {
+            crate::usage_intelligence::spawn_collection(store.clone());
         }
 
         // All Codex observations are validated and all result mutations are
@@ -3986,7 +3981,10 @@ impl RuntimeCore {
                     // bare unknown entry stands.
                     set_health(&mut dto, ProviderHealth::Unknown);
                     let inner = self.inner.lock().unwrap();
-                    if let Some(last_good) = inner.last_good.get(kind.id()) {
+                    if let Some(last_good) = inner.last_good.get(kind.id()).filter(|last_good| {
+                        let identity = dto.account.as_ref().and_then(|a| a.identity.as_ref());
+                        self.grok_identity.is_none() || (identity.is_some() && identity == last_good.account.as_ref().and_then(|a| a.identity.as_ref()))
+                    }) {
                         let mut retained = last_good.clone();
                         set_health(&mut retained, ProviderHealth::Unknown);
                         // A Grok Bot observation from this same cycle is
@@ -4080,7 +4078,8 @@ impl RuntimeCore {
                 .and_then(|account| account.identity.as_deref());
             let same_account = match (failure.identity.as_deref(), retained_identity) {
                 (Some(attempted), Some(retained)) => attempted == retained,
-                _ => !is_codex_provider_id(kind.id()),
+                (None, Some(retained)) if retained.starts_with("credential-v1:") => false,
+                _ => !is_codex_provider_id(kind.id()) && kind != ProviderKind::QwenTokenPlan,
             };
             if same_account {
                 // checkedAt stays at the original fetch time, so the card
@@ -4118,9 +4117,13 @@ impl RuntimeCore {
     }
 
     fn grok_cached_result(&self) -> Option<ProviderUsageDto> {
+        let binding = self.grok_identity.as_ref().map(|resolve| resolve());
         let inner = self.inner.lock().unwrap();
         let attempt = inner.grok_last_attempt_at?;
         let cached = inner.grok_last_result.clone()?;
+        if let Some(binding) = binding {
+            if binding.is_none() || cached.account.as_ref().and_then(|account| account.identity.as_ref()) != binding.as_ref() { return None; }
+        }
         let age_ms = (self.now() - attempt).num_milliseconds();
         (age_ms < GROK_MIN_POLL_INTERVAL_MS).then_some(cached)
     }
@@ -4494,10 +4497,24 @@ fn newest_by_window(stored: &[QuotaObservation]) -> HashMap<WindowKey, &QuotaObs
     by_window
 }
 
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OperationalSettings {
+    pub revision: u64,
+    pub quota_notifications: bool,
+    pub monitored: HashMap<String, bool>,
+}
+
+#[tauri::command]
+pub fn get_operational_settings(handle: tauri::State<RuntimeHandle>) -> OperationalSettings {
+    handle.operational_settings()
+}
+
 // ---------- app handle wiring ----------
 
 #[derive(Clone)]
 pub struct RuntimeHandle {
+    settings_revision: Arc<Mutex<u64>>,
     core: Arc<RuntimeCore>,
     app: AppHandle,
     interval_tx: watch::Sender<u64>,
@@ -4587,8 +4604,31 @@ impl RuntimeHandle {
     /// [`RuntimeCore::set_wallet_monitoring`]). The wallet DTOs are
     /// unchanged by this, so no snapshot event is needed: the windows sync
     /// the preference through their own settings lane.
-    pub fn set_wallet_monitoring(&self, monitored: HashMap<String, bool>) {
-        self.core.set_wallet_monitoring(&monitored);
+    pub fn set_wallet_monitoring(&self, monitored: HashMap<String, bool>) -> Result<OperationalSettings, String> {
+        let mut revision = self.settings_revision.lock().unwrap();
+        let store = self.core.wallet_prefs.as_ref().ok_or("Wallet persistence unavailable")?;
+        let mut merged = store.monitored();
+        if monitored.is_empty() { merged.clear(); }
+        for (id, value) in monitored {
+            if self.core.wallet_specs.iter().any(|spec| spec.id == id) { merged.insert(id, value); }
+        }
+        store.set_monitored(&merged).map_err(|_| "Could not persist wallet preferences")?;
+        self.core.set_wallet_monitoring(&merged);
+        *revision += 1;
+        let settings = self.operational_settings_at(*revision);
+        let _ = self.app.emit("operational-settings-changed", &settings);
+        Ok(settings)
+    }
+
+    fn operational_settings_at(&self, revision: u64) -> OperationalSettings {
+        OperationalSettings {
+            revision,
+            quota_notifications: self.notifications.as_ref().map(|lane| lane.diagnostic_counts().0).unwrap_or(false),
+            monitored: self.core.wallet_specs.iter().map(|spec| (spec.id.to_string(), self.core.wallet_monitored(spec))).collect(),
+        }
+    }
+    pub fn operational_settings(&self) -> OperationalSettings {
+        self.operational_settings_at(*self.settings_revision.lock().unwrap())
     }
 
     /// The effective OpenAI/Codex account configuration.
@@ -4599,7 +4639,10 @@ impl RuntimeHandle {
     /// Applies a new OpenAI/Codex account configuration. The provider set
     /// is rebuilt and the configuration is persisted, so a restart keeps
     /// the same accounts.
-    pub fn set_codex_accounts(&self, accounts: Vec<CodexAccountConfig>) -> bool {
+    pub fn set_codex_accounts(&self, accounts: Vec<CodexAccountConfig>) -> Result<bool, String> {
+        let _settings = self.settings_revision.lock().unwrap();
+        self.core.codex_accounts_store.as_ref().ok_or("Account persistence unavailable")?
+            .set_accounts(&accounts).map_err(|_| "Could not persist account preferences")?;
         let changed = self.core.set_codex_accounts(&accounts);
         if changed {
             // Publish the identity-projected state before the caller queues
@@ -4609,7 +4652,7 @@ impl RuntimeHandle {
                 .app
                 .emit(SNAPSHOT_EVENT, &self.core.snapshot());
         }
-        changed
+        Ok(changed)
     }
 
     pub fn snapshot(&self) -> RuntimeSnapshot {
@@ -4632,14 +4675,15 @@ impl RuntimeHandle {
     /// there, so the scheduler's startup cycle respects it before any
     /// webview attaches) and runs exactly one immediate collection pass
     /// when enabling, so the first baseline does not wait for a cycle.
-    pub fn set_usage_intelligence_enabled(&self, enabled: bool) {
+    pub fn set_usage_intelligence_enabled(&self, enabled: bool) -> Result<(), String> {
         if let Some(store) = &self.usage_intelligence {
-            store.set_enabled(enabled);
+            store.set_enabled(enabled)?;
             if enabled {
                 let store = store.clone();
                 crate::usage_intelligence::spawn_collection(store);
             }
-        }
+        } else { return Err("Usage Intelligence persistence unavailable".into()); }
+        Ok(())
     }
 
     /// The persisted last-good cache shared with the runtime's hydration
@@ -4669,11 +4713,15 @@ impl RuntimeHandle {
     /// the refresh interval, the persisted TS setting is pushed on attach
     /// and on every change; the lane persists it too, so the scheduler's
     /// immediate startup cycle (which can precede any attach) respects it.
-    pub fn set_notifications_enabled(&self, enabled: bool) {
-        if let Some(lane) = &self.notifications {
-            lane.set_enabled(enabled);
-        }
+    pub fn set_notifications_enabled(&self, enabled: bool) -> Result<OperationalSettings, String> {
+        let mut revision = self.settings_revision.lock().unwrap();
+        self.notifications.as_ref().ok_or("Notification persistence unavailable")?.try_set_enabled(enabled)?;
+        *revision += 1;
+        let settings = self.operational_settings_at(*revision);
+        let _ = self.app.emit("operational-settings-changed", &settings);
+        Ok(settings)
     }
+
 }
 
 // ---------- wake/resume detection (scheduler) ----------
@@ -4805,9 +4853,12 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
     // degrades to a runtime without the plane — never a probe, never a
     // blocked startup.
     let usage_intelligence = app.path().app_data_dir().ok().map(|dir| {
+        let emitter = app.clone();
         Arc::new(UsageIntelligenceStore::open(
             dir.join(crate::usage_intelligence::USAGE_INTELLIGENCE_FILE_NAME),
-        ))
+        ).with_completion(Box::new(move |revision| {
+            let _ = emitter.emit("usage-intelligence-changed", revision);
+        })))
     });
     // Per-wallet monitor preferences (v0.8.17): one bounded JSON file,
     // loaded before the scheduler's first cycle so a wallet the user turned
@@ -4829,8 +4880,10 @@ pub fn start(app: AppHandle) -> RuntimeHandle {
         ))
     });
     let handle = RuntimeHandle {
+        settings_revision: Arc::new(Mutex::new(0)),
         core: Arc::new(
             RuntimeCore::new(production_specs(), DEFAULT_INTERVAL_MINUTES)
+                .with_grok_identity(Arc::new(grok::current_identity))
                 .with_codex_accounts(codex_accounts.clone())
                 .with_wallets(production_wallets())
                 .with_wallet_preferences(wallet_prefs.clone())
@@ -4953,8 +5006,8 @@ pub fn set_refresh_interval(handle: tauri::State<RuntimeHandle>, minutes: u64) {
 /// TS setting to the runtime's lane on attach and on every change — the
 /// lane stays the single notification owner.
 #[tauri::command]
-pub fn set_quota_notifications_enabled(handle: tauri::State<RuntimeHandle>, enabled: bool) {
-    handle.set_notifications_enabled(enabled);
+pub fn set_quota_notifications_enabled(handle: tauri::State<RuntimeHandle>, enabled: bool) -> Result<OperationalSettings, String> {
+    handle.set_notifications_enabled(enabled)
 }
 
 /// The per-wallet monitor toggles (settings drawer). Forwards the persisted
@@ -4965,16 +5018,38 @@ pub fn set_quota_notifications_enabled(handle: tauri::State<RuntimeHandle>, enab
 pub fn set_wallet_monitoring(
     handle: tauri::State<RuntimeHandle>,
     monitored: HashMap<String, bool>,
-) {
-    handle.set_wallet_monitoring(monitored);
+) -> Result<OperationalSettings, String> {
+    handle.set_wallet_monitoring(monitored)
 }
 
 /// The configured OpenAI/Codex accounts (settings drawer). The Rust side
 /// owns the effective configuration, so the drawer reads it from here
 /// instead of assuming its own copy is the one in force.
 #[tauri::command]
-pub fn get_codex_accounts(handle: tauri::State<RuntimeHandle>) -> Vec<CodexAccountConfig> {
-    handle.codex_accounts()
+pub fn get_codex_accounts(
+    handle: tauri::State<RuntimeHandle>,
+) -> Result<Vec<CodexAccountConfig>, String> {
+    if let Some(version) = handle
+        .core
+        .codex_accounts_store
+        .as_ref()
+        .and_then(|store| store.unsupported_version())
+    {
+        return Err(format!(
+            "Unsupported account settings schema version {version}; existing file preserved"
+        ));
+    }
+    if handle
+        .core
+        .codex_accounts_store
+        .as_ref()
+        .is_some_and(|store| !store.is_writable())
+    {
+        return Err(
+            "Account settings file is unsupported or unavailable; existing file preserved".into(),
+        );
+    }
+    Ok(handle.codex_accounts())
 }
 
 /// Applies the OpenAI/Codex account configuration (settings drawer).
@@ -4987,15 +5062,15 @@ pub fn get_codex_accounts(handle: tauri::State<RuntimeHandle>) -> Vec<CodexAccou
 pub fn set_codex_accounts(
     handle: tauri::State<RuntimeHandle>,
     accounts: Vec<CodexAccountConfig>,
-) -> bool {
-    let changed = handle.set_codex_accounts(accounts);
+) -> Result<bool, String> {
+    let changed = handle.set_codex_accounts(accounts)?;
     if changed {
         // A newly configured account has no reading yet, and a resumed one
         // has a frozen reading: one cycle refreshes both without waiting for
         // the next scheduled interval.
         handle.request_refresh();
     }
-    changed
+    Ok(changed)
 }
 
 // ---------- tests ----------
@@ -5202,7 +5277,10 @@ mod tests {
                 reset_text: None,
                 reset_at: None,
             }],
-            account: None,
+            account: if matches!(id, "zai" | "opencode-go" | "grok") {
+                Some(AccountAttributionDto { label: "fixture".into(), note: None,
+                    identity: Some("fixture-account".into()) })
+            } else { None },
             plan_type: None,
             error: None,
             error_category: None,
@@ -6639,7 +6717,7 @@ mod tests {
         // "key:<hint>"; a drift between them would silently disable the
         // account guard.
         let attribution = build_opencode_attribution(Some("avmF")).unwrap();
-        assert_eq!(attribution.identity.as_deref(), Some("key:avmF"));
+        assert_eq!(attribution.identity, None, "a display suffix is not an identity");
     }
 
     // ---- identity hardening (R1): the same guard across every provider ----
@@ -6663,16 +6741,14 @@ mod tests {
 
     fn zai_usage(percent: f64, hint: &str) -> ProviderUsageDto {
         let mut usage = ok_usage("zai", "Z.ai", percent);
-        usage.account = build_zai_attribution(Some(&zai::ZaiAccount {
-            key_hint: hint.to_string(),
+        usage.account = build_zai_attribution(Some(&zai::ZaiAccount { identity: Some(format!("key:{hint}")), key_hint: hint.to_string(),
         }));
         usage
     }
 
     fn grok_usage(percent: f64, id: &str) -> ProviderUsageDto {
         let mut usage = ok_usage("grok", "Grok (xAI)", percent);
-        usage.account = build_grok_attribution(Some(&grok::GrokAccount {
-            id: id.to_string(),
+        usage.account = build_grok_attribution(Some(&grok::GrokAccount { identity: Some(format!("xai:{id}")), id: id.to_string(),
             source: "opencodex".to_string(),
         }));
         usage
@@ -6798,6 +6874,23 @@ mod tests {
         assert!(entry.account.is_none(), "no cross-credential attribution survives");
     }
 
+    #[tokio::test]
+    async fn unknown_failed_credential_cannot_reuse_fingerprinted_last_good() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Zai, calls, |nth| {
+            if nth == 1 {
+                let mut dto = zai_usage(14.0, "1234");
+                dto.account.as_mut().unwrap().identity = Some(crate::credential_identity::fingerprint("zai", "fixture-a"));
+                Ok(dto)
+            } else { Err(zai_failure(None)) }
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        assert!(!core.snapshot().providers[0].limits.is_empty());
+        core.run_cycle().await;
+        assert!(core.snapshot().providers[0].limits.is_empty());
+    }
+
     // 6. Grok same-account retention. The clock advances past the 15-minute
     //    cadence window between the cycles, so the second cycle actually
     //    re-fetches (inside the window the cached first result is served and
@@ -6863,8 +6956,7 @@ mod tests {
             Some("chatgpt:56789abc")
         );
         assert_eq!(
-            build_zai_attribution(Some(&zai::ZaiAccount {
-                key_hint: "5678".to_string(),
+            build_zai_attribution(Some(&zai::ZaiAccount { identity: Some("key:5678".into()), key_hint: "5678".to_string(),
             }))
             .unwrap()
             .identity
@@ -7165,8 +7257,7 @@ mod tests {
             fetch: Arc::new(|| {
                 Box::pin(async {
                     let mut dto = ok_usage("grok", "Grok (xAI)", 21.0);
-                    dto.account = build_grok_attribution(Some(&grok::GrokAccount {
-                        id: "acct12345".to_string(),
+                    dto.account = build_grok_attribution(Some(&grok::GrokAccount { identity: None, id: "acct12345".to_string(),
                         source: "grok-cli".to_string(),
                     }));
                     Ok(dto) as Result<_, ProviderFailure>
@@ -7178,11 +7269,11 @@ mod tests {
         let providers = &core.snapshot().providers;
         let opencode_account = providers[0].account.as_ref().unwrap();
         assert_eq!(opencode_account.label, "key ••3456");
-        assert_eq!(opencode_account.identity.as_deref(), Some("key:3456"));
+        assert_eq!(opencode_account.identity, None);
         assert_eq!(build_opencode_attribution(Some("ab")), None, "short hints stay unattributed");
         let grok_account = providers[1].account.as_ref().unwrap();
         assert_eq!(grok_account.label, "acct12345 · grok-cli");
-        assert_eq!(grok_account.identity.as_deref(), Some("xai:acct12345"));
+        assert_eq!(grok_account.identity, None);
     }
 
     // A chain emits one cycle-started and one snapshot per completed cycle
@@ -8224,6 +8315,7 @@ mod tests {
         let spec = counting_spec(ProviderKind::OpenCodeGo, calls.clone(), |nth| {
             let mut dto = ok_usage("opencode-go", "OpenCode Go", 20.0 + nth as f64);
             dto.account = build_opencode_attribution(if nth <= 2 { Some("3456") } else { Some("9999") });
+            if let Some(account) = &mut dto.account { account.identity = Some(if nth <= 2 { "key:3456" } else { "key:9999" }.into()); }
             if nth == 3 {
                 dto.account = None; // failed fetch below; success at 4
                 return Err(failure("network", None));
@@ -8503,7 +8595,10 @@ mod tests {
                 reset_at: reset_at.map(str::to_string),
                 reset_text: None,
             }],
-            account: None,
+            account: if matches!(id, "zai" | "opencode-go" | "grok") {
+                Some(AccountAttributionDto { label: "fixture".into(), note: None,
+                    identity: Some("fixture-account".into()) })
+            } else { None },
             plan_type: None,
             error: None,
             error_category: None,
@@ -8547,7 +8642,7 @@ mod tests {
             used_percent,
             observed_at: observed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
             reset_at: None,
-            account: None,
+            account: matches!(provider_id, "zai" | "opencode-go" | "grok").then(|| "fixture-account".into()),
         }
     }
 
