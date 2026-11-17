@@ -4,6 +4,8 @@ import { formatCountdown } from "../lib/format";
 import { claudeTimesNote } from "../lib/v03Integration";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
+import { isCodexProviderId } from "../lib/providerIds";
+import { formatResetCredits } from "../lib/resetCredits";
 import {
   floatingQuotaPresentation,
   quotaColorLevel,
@@ -143,6 +145,10 @@ export function FloatingProviderPopover({
     FLOATING_QUOTA_PERSPECTIVE,
   );
   const reset = primaryResetLine(item, now);
+  const resetCredits = formatResetCredits(
+    { id: item.providerId, resetCredits: item.resetCredits },
+    now.getTime(),
+  );
 
   return (
     <div
@@ -237,6 +243,19 @@ export function FloatingProviderPopover({
               />
             ))}
           </div>
+        ) : null}
+
+        {isCodexProviderId(item.providerId) ? (
+          <section className="fq-credit-bank" aria-label="Codex reset credits">
+            <strong>Reset Bank</strong>
+            {resetCredits ? (
+              <>
+                <p>{resetCredits.bankLine}</p>
+                <p>{resetCredits.applicabilityLine}</p>
+                <p>Expiry not reported</p>
+              </>
+            ) : <p>Reset credits unavailable</p>}
+          </section>
         ) : null}
 
         {/* Grok Bot lives below a hairline, separate from the Grok Weekly

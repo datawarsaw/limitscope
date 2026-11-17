@@ -652,11 +652,21 @@ html[data-window="floating"] body {
 /* Grok Bot's manual read: its own hairline section below the quota windows.
    Same hierarchy as the secondary inventory — muted label, value line, thin
    meter — plus the one explicit Refresh action and the observation stamp. */
-.fq-grokbot {
+.fq-grokbot,
+.fq-credit-bank {
   margin-top: 9px;
   padding-top: 9px;
   border-top: 1px solid var(--divider);
 }
+
+.fq-credit-bank {
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.fq-credit-bank strong { font-weight: 600; }
+.fq-credit-bank p { margin: 3px 0 0; }
 
 .fq-popover .opendesign-control {
   margin-top: 9px;
