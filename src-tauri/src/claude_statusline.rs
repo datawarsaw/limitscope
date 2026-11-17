@@ -45,6 +45,7 @@ pub(crate) const INGEST_FLAG: &str = "--claude-statusline-ingest";
 /// directory itself.
 pub(crate) const APP_IDENTIFIER: &str = "com.ratelimits.desktop";
 pub(crate) const STORE_FILE_NAME: &str = "claude-statusline-v1.json";
+const RECEIPT_FILE_NAME: &str = "claude-statusline-receipt-v1.json";
 /// Provenance label stored with the snapshot.
 pub(crate) const SOURCE: &str = "claude-code-statusline";
 
@@ -134,6 +135,7 @@ pub(crate) enum IngestError {
 pub(crate) struct Observed {
     pub five_hour: Option<(f64, i64)>,
     pub seven_day: Option<(f64, i64)>,
+    pub cli_document: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,6 +204,11 @@ pub(crate) fn parse_payload(bytes: &[u8], now_s: i64) -> Result<Observed, Ingest
             WindowKind::SevenDay,
             now_s,
         ),
+        // Recognize documented CLI metadata without retaining its contents.
+        cli_document: root.get("session_id").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty())
+            && root.get("model").and_then(Value::as_object).is_some_and(|m| {
+                ["id", "display_name"].iter().any(|key| m.get(*key).and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty()))
+            }),
     })
 }
 
@@ -317,13 +324,39 @@ fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Err(last.unwrap_or_else(|| std::io::Error::other("replace failed")))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Receipt { timestamp: i64 }
+
+fn receipt_raw(dir: &Path) -> Option<i64> {
+    let file = fs::File::open(dir.join(RECEIPT_FILE_NAME)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(129).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 128 { return None; }
+    let receipt: Receipt = serde_json::from_slice(&bytes).ok()?;
+    (receipt.timestamp > 0).then_some(receipt.timestamp)
+}
+
+pub(crate) fn read_receipt(dir: &Path, now_s: i64) -> Option<i64> {
+    receipt_raw(dir).filter(|stamp| *stamp <= now_s)
+}
+
+fn record_receipt(dir: &Path, now_s: i64) -> std::io::Result<()> {
+    if now_s <= 0 || receipt_raw(dir).is_some_and(|old| now_s.saturating_sub(old) < 60) {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec(&Receipt { timestamp: now_s })?;
+    replace_file(&dir.join(RECEIPT_FILE_NAME), &bytes)
+}
+
 /// Applies one stdin document to the store in `dir`.
 pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
     let observed = match parse_payload(input, now_s) {
         Ok(observed) => observed,
         Err(error) => return IngestOutcome::Rejected(error),
     };
-    if observed.five_hour.is_none() && observed.seven_day.is_none() {
+    let no_limits = observed.five_hour.is_none() && observed.seven_day.is_none();
+    if no_limits && !observed.cli_document {
         return IngestOutcome::NoRateLimits;
     }
     // A persistent lock file is never removed: removing it can split waiters
@@ -339,6 +372,9 @@ pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
     if lock.lock().is_err() {
         return IngestOutcome::WriteFailed;
     }
+    // A sidecar failure must not suppress an otherwise valid quota update.
+    let _ = record_receipt(dir, now_s);
+    if no_limits { return IngestOutcome::NoRateLimits; }
     let path = store_path(dir);
     let stored = match read_store(dir, now_s) {
         StoreRead::Valid(snapshot) => snapshot,
@@ -627,7 +663,7 @@ mod tests {
         // No temporary files linger.
         let mut names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         names.sort();
-        assert_eq!(names, [STORE_FILE_NAME, "claude-statusline-v1.lock"]);
+        assert_eq!(names, [RECEIPT_FILE_NAME, STORE_FILE_NAME, "claude-statusline-v1.lock"]);
         assert_eq!(fs::metadata(dir.join("claude-statusline-v1.lock")).unwrap().len(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -643,6 +679,7 @@ mod tests {
         // Identical replays, including after 15 minutes, never advance freshness.
         assert_eq!(ingest(&dir, &doc, NOW + 1000), IngestOutcome::Unchanged);
         assert_eq!(fs::read(store_path(&dir)).unwrap(), first);
+        assert_eq!(read_receipt(&dir, NOW + 1000), Some(NOW + 1000));
         match read_store(&dir, NOW + 1000) {
             StoreRead::Valid(s) => {
                 let w = s.five_hour.unwrap();
@@ -650,6 +687,35 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn receipt_accepts_cli_metadata_throttles_and_recovers() {
+        let dir = temp_dir("receipt");
+        let cli = br#"{"session_id":"synthetic","model":{"id":"synthetic"}}"#;
+        assert_eq!(read_receipt(&dir, NOW), None);
+        assert_eq!(ingest(&dir, br#"{"arbitrary":true}"#, NOW), IngestOutcome::NoRateLimits);
+        assert_eq!(read_receipt(&dir, NOW), None);
+        assert_eq!(ingest(&dir, cli, NOW), IngestOutcome::NoRateLimits);
+        assert_eq!(read_receipt(&dir, NOW), Some(NOW));
+        assert_eq!(read_store(&dir, NOW), StoreRead::Missing);
+        ingest(&dir, cli, NOW + 59);
+        assert_eq!(read_receipt(&dir, NOW + 59), Some(NOW));
+        ingest(&dir, cli, NOW + 60);
+        assert_eq!(read_receipt(&dir, NOW + 60), Some(NOW + 60));
+        ingest(&dir, cli, NOW - 100);
+        assert_eq!(read_receipt(&dir, NOW - 100), None);
+        assert_eq!(read_receipt(&dir, NOW + 60), Some(NOW + 60));
+        fs::write(dir.join(RECEIPT_FILE_NAME), b"{bad").unwrap();
+        assert_eq!(read_receipt(&dir, NOW + 120), None);
+        ingest(&dir, cli, NOW + 120);
+        assert_eq!(read_receipt(&dir, NOW + 120), Some(NOW + 120));
+        assert_eq!(fs::read_to_string(dir.join(RECEIPT_FILE_NAME)).unwrap(), format!("{{\"timestamp\":{}}}", NOW + 120));
+        let invalid_window = br#"{"session_id":"synthetic","model":{"id":"synthetic"},"rate_limits":{"five_hour":{"used_percentage":"bad"}}}"#;
+        assert_eq!(ingest(&dir, invalid_window, NOW + 180), IngestOutcome::NoRateLimits);
+        assert_eq!(read_receipt(&dir, NOW + 180), Some(NOW + 180));
+        assert_eq!(read_store(&dir, NOW + 180), StoreRead::Missing);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -709,6 +775,11 @@ mod tests {
         assert_eq!(ingest(&dir, &first, NOW + 1100), IngestOutcome::Unchanged);
         assert_eq!(ingest(&dir, &next, NOW + 1100), IngestOutcome::Unchanged);
         assert_eq!(read_store(&dir, NOW + 1100), StoreRead::Valid(saved));
+        let weekly = payload(Some((11.0, NOW + 4000)), Some((21.0, NOW + 90_000)));
+        assert_eq!(ingest(&dir, &weekly, NOW + 1200), IngestOutcome::Written);
+        let StoreRead::Valid(advanced) = read_store(&dir, NOW + 1200) else { panic!() };
+        assert_eq!(advanced.five_hour.unwrap().observed_at, NOW + 1000);
+        assert_eq!(advanced.seven_day.unwrap().observed_at, NOW + 1200);
         // A later reset before the old one expires is not sufficient proof of a new cycle.
         assert_eq!(
             ingest(&dir, &payload(Some((99.0, NOW + 8000)), None), NOW + 1100),
@@ -789,6 +860,7 @@ mod tests {
         for child in &mut children { assert!(child.wait().unwrap().success()); }
         let StoreRead::Valid(snapshot) = read_store(&dir, NOW) else { panic!("invalid store") };
         assert_eq!(snapshot.five_hour.unwrap().used_percent, 60.0);
+        assert_eq!(read_receipt(&dir, NOW), Some(NOW));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -856,6 +928,7 @@ mod tests {
         }
         fs::write(&path, good(&window("5", NOW + 100, NOW))).unwrap();
         assert!(matches!(read_store(&dir, NOW), StoreRead::Valid(_)));
+        assert_eq!(read_receipt(&dir, NOW), None, "an old v1 store does not imply a hook receipt");
         fs::remove_dir_all(dir).unwrap();
     }
 

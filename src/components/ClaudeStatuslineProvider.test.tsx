@@ -27,6 +27,7 @@ const live: ProviderUsage = {
   checkedAt: "2026-11-17T11:58:00.000Z",
   sourceUpdatedAt: "2026-11-17T11:58:00.000Z",
   dataFreshness: "fresh",
+  claudeStatuslineTimes: { receiptAt: "2026-11-17T11:59:00Z", fiveHourChangedAt: "2026-11-17T11:58:00Z", sevenDayChangedAt: "2026-11-17T08:00:00Z" },
   limits: [
     { label: "5-hour", usedPercent: 23.5, resetAt: "2026-11-17T15:00:00.000Z" },
     { label: "7-day", usedPercent: 41.2, resetAt: "2026-11-20T00:00:00.000Z" },
@@ -75,17 +76,19 @@ describe("Claude Code provider presentation", () => {
 
   it("states provenance and the passive limitation, never a live-poll claim", () => {
     const note = providerSourceNote(live, now);
-    expect(note).toContain("Updated 2m ago from Claude Code");
-    expect(note).toContain("requires Claude Code activity");
+    expect(note).toContain("Last statusLine event: 1m ago");
+    expect(note).toContain("5h usage changed: 2m ago");
+    expect(note).toContain("7d usage changed: 4h ago");
+    expect(note).toContain("does not confirm a quota refresh");
     expect(providerStatusPresentation(live).label).toBe("Recent");
-    expect(providerSourceNote(noData, now)).toBe("Waiting for Claude Code status line data");
+    expect(providerSourceNote(noData, now)).toContain("Last statusLine event: Unknown");
     expect(providerStatusPresentation(noData).label).toBe("Unavailable");
   });
 
   it("shows idle data as stale, not live", () => {
     const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
     expect(providerStatusPresentation(stale).label).toBe("Last known");
-    expect(providerSourceNote({ ...stale, sourceUpdatedAt: "2026-11-17T11:42:00Z" }, now)).toContain("Updated 18m ago");
+    expect(providerSourceNote({ ...stale, sourceUpdatedAt: "2026-11-17T11:42:00Z" }, now)).toContain("7d usage changed: 4h ago");
     expect(floatingQuotaItems([stale])[0].statusLabel).toBe("Last known");
   });
 
@@ -98,7 +101,7 @@ describe("Claude Code provider presentation", () => {
       { ...stale, limits: [] },
     ]) {
       expect(providerStatusPresentation(usage).label).toBe("Last known");
-      expect(providerSourceNote(usage, now)).toBe("Source update time unknown");
+      expect(providerSourceNote(usage, now)).toContain("Last statusLine event: 1m ago");
     }
   });
 
@@ -107,17 +110,17 @@ describe("Claude Code provider presentation", () => {
     const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale", sourceUpdatedAt: "2026-11-17T11:42:00Z" };
     await render(<PrimaryQuotaPanel usage={stale} now={now} predictionFor={() => undefined} perspective="used" />);
     expect(container.textContent).toContain("Last known");
-    expect(container.textContent).toContain("Updated 18m ago");
+    expect(container.textContent).toContain("7d usage changed: 4h ago");
     expect(container.textContent).toContain("41% used");
     await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.textContent).toContain("Last known");
-    expect(container.textContent).toContain("Updated 18m ago");
-    expect(container.textContent).toContain("requires Claude Code activity");
+    expect(container.textContent).toContain("7d usage changed: 4h ago");
+    expect(container.textContent).toContain("does not confirm a quota refresh");
     const note = providerSourceNote(stale, now, { includeAccount: false });
     await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={note} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.textContent).toContain("Last known");
-    expect(container.textContent?.match(/Updated 18m ago from Claude Code/g)).toHaveLength(1);
-    expect(container.textContent).toContain("requires Claude Code activity");
+    expect(container.textContent?.match(/Last statusLine event/g)).toHaveLength(1);
+    expect(container.textContent).toContain("does not confirm a quota refresh");
   });
 
   it("a missing provider reports no quota windows and never a 0% reading", async () => {

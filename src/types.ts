@@ -199,6 +199,11 @@ export type ProviderHealth =
 export type ProviderUsage = {
   id: string;
   name: string;
+  claudeStatuslineTimes?: {
+    receiptAt?: string;
+    fiveHourChangedAt?: string;
+    sevenDayChangedAt?: string;
+  };
   /**
    * Provider-specific banked reset-credit observation (v0.7, Codex only).
    * Present only on a fresh, account-bound observation from the Codex usage

@@ -925,6 +925,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: None,
             reset_credits: None,
@@ -956,6 +957,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: None,
             reset_credits: None,
@@ -1010,7 +1012,13 @@ mod tests {
         };
         assert!(harness.cycle(&[reading(79.0)]).is_empty());
         assert_eq!(harness.cycle(&[reading(81.0)]).len(), 1);
-        assert!(harness.cycle(&[reading(81.0)]).is_empty());
+        let mut replay = reading(81.0);
+        replay.claude_statusline_times = Some(crate::runtime::ClaudeStatuslineTimes {
+            receipt_at: Some("2026-09-29T12:01:00Z".into()),
+            five_hour_changed_at: None,
+            seven_day_changed_at: None,
+        });
+        assert!(harness.cycle(&[replay]).is_empty());
         assert!(harness.reopen().cycle(&[reading(81.0)]).is_empty());
     }
 

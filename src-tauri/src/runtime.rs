@@ -345,11 +345,24 @@ pub struct AccountAttributionDto {
     pub identity: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeStatuslineTimes {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_changed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seven_day_changed_at: Option<String>,
+}
+
 /// One provider's entry in the snapshot — the exact `ProviderUsage` wire
 /// shape from `src/types.ts` (camelCase, optional fields omitted when None).
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderUsageDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_statusline_times: Option<ClaudeStatuslineTimes>,
     pub id: String,
     pub name: String,
     /// Legacy vocabulary `"ok" | "stale" | "error" | "unknown"`, derived
@@ -932,6 +945,7 @@ fn base_usage(
         error: None,
         error_category: None,
         error_http_status: None,
+        claude_statusline_times: None,
         source_updated_at: None,
         data_freshness: None,
         reset_credits: None,
@@ -1596,6 +1610,18 @@ fn normalize_claude_statusline(
     dto
 }
 
+fn claude_with_receipt(mut dto: ProviderUsageDto, receipt: Option<i64>) -> ProviderUsageDto {
+    let changed = |label: &str| dto.limits.iter().find(|limit| limit.label == label)
+        .and_then(|limit| limit.observed_at.clone());
+    dto.claude_statusline_times = Some(ClaudeStatuslineTimes {
+        receipt_at: receipt.and_then(|s| DateTime::from_timestamp(s, 0))
+            .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        five_hour_changed_at: changed("5-hour"),
+        seven_day_changed_at: changed("7-day"),
+    });
+    dto
+}
+
 /// The production provider set — the exact registry the TS `registry.ts`
 /// pinned (same ids, same order, no simulated providers) for the default
 /// single-account configuration. Order is wire order: the frontend renders
@@ -1736,10 +1762,13 @@ fn other_production_specs() -> Vec<ProviderSpec> {
             fetch: Arc::new(|| {
                 Box::pin(async {
                     let now = Utc::now();
-                    Ok(normalize_claude_statusline(
+                    let dto = normalize_claude_statusline(
                         crate::claude_statusline::read_default_store(now),
                         now,
-                    ))
+                    );
+                    let receipt = crate::claude_statusline::data_dir()
+                        .and_then(|dir| crate::claude_statusline::read_receipt(&dir, now.timestamp()));
+                    Ok(claude_with_receipt(dto, receipt))
                 })
             }),
         },
@@ -5462,6 +5491,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: None,
             reset_credits: None,
@@ -5721,6 +5751,26 @@ mod tests {
             now,
         );
         assert_eq!(mixed.health, ProviderHealth::Stale);
+    }
+
+    #[test]
+    fn claude_receipt_is_independent_of_window_freshness() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let stale = normalize_claude_statusline(
+            claude_store(Some((10.0, s + 3600, s - 30)), Some((20.0, s + 86400, s - 4000))), now,
+        );
+        let with_receipt = claude_with_receipt(stale.clone(), Some(s));
+        assert_eq!(with_receipt.health, stale.health);
+        assert_eq!(with_receipt.source_updated_at, stale.source_updated_at);
+        assert_eq!(with_receipt.limits, stale.limits);
+        assert!(crate::history::observations_from_usages(&[with_receipt.clone()]).is_empty());
+        let wire = serde_json::to_value(&with_receipt).unwrap();
+        assert_eq!(wire["claudeStatuslineTimes"]["receiptAt"], now.to_rfc3339_opts(SecondsFormat::Millis, true));
+        assert_ne!(wire["claudeStatuslineTimes"]["fiveHourChangedAt"], wire["claudeStatuslineTimes"]["sevenDayChangedAt"]);
+        let missing = claude_with_receipt(normalize_claude_statusline(crate::claude_statusline::StoreRead::Missing, now), Some(s));
+        assert!(missing.limits.is_empty());
+        assert_eq!(missing.health, ProviderHealth::Unavailable);
     }
 
     #[test]
@@ -8958,6 +9008,7 @@ mod tests {
             error: None,
             error_category: None,
             error_http_status: None,
+            claude_statusline_times: None,
             source_updated_at: None,
             data_freshness: None,
             reset_credits: None,

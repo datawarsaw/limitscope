@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { CSSProperties, FocusEvent } from "react";
-import { formatAge, formatCountdown } from "../lib/format";
+import { formatCountdown } from "../lib/format";
+import { claudeTimesNote } from "../lib/v03Integration";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
 import {
@@ -253,8 +254,8 @@ export function FloatingProviderPopover({
             {item.error}
           </p>
         ) : null}
-        {!note && item.claudeSourceUpdatedAt ? (
-          <p className="fq-popover-note">Updated {formatAge(item.claudeSourceUpdatedAt, now)} from Claude Code · new quota data requires Claude Code activity</p>
+        {!note && item.providerId === "claude-code" ? (
+          <p className="fq-popover-note">{claudeTimesNote(item.claudeStatuslineTimes, now)}</p>
         ) : null}
         {note ? <p className="fq-popover-note">{note}</p> : null}
 
