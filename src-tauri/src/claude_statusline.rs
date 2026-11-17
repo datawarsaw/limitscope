@@ -337,6 +337,19 @@ pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
     if observed.five_hour.is_none() && observed.seven_day.is_none() {
         return IngestOutcome::NoRateLimits;
     }
+    // A persistent lock file is never removed: removing it can split waiters
+    // across different inodes. The OS releases the lock even after a crash.
+    if fs::create_dir_all(dir).is_err() {
+        return IngestOutcome::WriteFailed;
+    }
+    let lock = match fs::OpenOptions::new().read(true).write(true).create(true)
+        .open(dir.join("claude-statusline-v1.lock")) {
+        Ok(lock) => lock,
+        Err(_) => return IngestOutcome::WriteFailed,
+    };
+    if lock.lock().is_err() {
+        return IngestOutcome::WriteFailed;
+    }
     let path = store_path(dir);
     let stored = match read_store(dir, now_s) {
         StoreRead::Valid(snapshot) => snapshot,
@@ -625,8 +638,10 @@ mod tests {
             other => panic!("{other:?}"),
         }
         // No temporary files linger.
-        let names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names.len(), 1, "{names:?}");
+        let mut names: Vec<_> = fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, [STORE_FILE_NAME, "claude-statusline-v1.lock"]);
+        assert_eq!(fs::metadata(dir.join("claude-statusline-v1.lock")).unwrap().len(), 0);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -696,6 +711,54 @@ mod tests {
         let StoreRead::Valid(s) = read_store(&dir, later) else { panic!() };
         assert_eq!(s.five_hour, None, "an expired window is dropped, never shown as 0");
         assert_eq!(s.seven_day.unwrap().used_percent, 11.0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // Launched in separate test processes so this exercises the OS lock,
+    // not just synchronization inside one process.
+    #[test]
+    fn concurrent_ingest_child() {
+        let Some(dir) = std::env::var_os("LIMITSCOPE_TEST_INGEST_DIR") else { return };
+        let dir = PathBuf::from(dir);
+        let value: f64 = std::env::var("LIMITSCOPE_TEST_INGEST_VALUE").unwrap().parse().unwrap();
+        fs::write(dir.join(format!("ready-{value}")), b"ready").unwrap();
+        assert!(matches!(ingest(&dir, &payload(Some((value, NOW + 4000)), None), NOW),
+            IngestOutcome::Written | IngestOutcome::Unchanged));
+    }
+
+    #[test]
+    fn concurrent_processes_serialize_read_merge_write() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+        let dir = temp_dir("process-lock");
+        assert_eq!(ingest(&dir, &payload(Some((50.0, NOW + 4000)), None), NOW), IngestOutcome::Written);
+        let lock = fs::OpenOptions::new().read(true).write(true)
+            .open(dir.join("claude-statusline-v1.lock")).unwrap();
+        lock.lock().unwrap();
+        let mut children: Vec<_> = [60, 55].into_iter().map(|value| {
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "claude_statusline::tests::concurrent_ingest_child", "--nocapture"])
+                .env("LIMITSCOPE_TEST_INGEST_DIR", &dir)
+                .env("LIMITSCOPE_TEST_INGEST_VALUE", value.to_string())
+                .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap()
+        }).collect();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !(dir.join("ready-60").exists() && dir.join("ready-55").exists()) {
+            assert!(Instant::now() < deadline, "children did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        for child in &mut children {
+            assert!(child.try_wait().unwrap().is_none(), "ingest must wait for the lock");
+        }
+        assert_eq!(read_store(&dir, NOW), StoreRead::Valid(Snapshot {
+            version: SCHEMA_VERSION, source: SOURCE.to_string(),
+            five_hour: Some(WindowReading { used_percent: 50.0, resets_at: NOW + 4000, observed_at: NOW }),
+            seven_day: None,
+        }));
+        drop(lock);
+        for child in &mut children { assert!(child.wait().unwrap().success()); }
+        let StoreRead::Valid(snapshot) = read_store(&dir, NOW) else { panic!("invalid store") };
+        assert_eq!(snapshot.five_hour.unwrap().used_percent, 60.0);
         fs::remove_dir_all(dir).unwrap();
     }
 

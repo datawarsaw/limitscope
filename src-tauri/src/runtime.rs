@@ -2221,6 +2221,8 @@ struct CodexJobScope {
 enum CodexJobPayload {
     /// The configured slot had no usable local identity when the job began.
     Unavailable,
+    /// Configuration collision; no credential was read.
+    Collision,
     /// A valid cooldown prevented any credential or network read. The skip is
     /// projected only after the generation is revalidated at commit time;
     /// projecting it in the worker would mutate diagnostics before commit.
@@ -2447,7 +2449,9 @@ impl RuntimeCore {
     ) -> Option<CodexIdentityObservation> {
         let kind = codex_kind_for(&account.account_id)?;
         let previous = lifecycle.providers.get(kind.id()).cloned();
-        let identity = self.resolve_stable_codex_identity(account);
+        let collides = account.account_id == SECONDARY_ACCOUNT_ID
+            && codex_accounts::secondary_collides_with_primary(&self.inner.lock().unwrap().codex_accounts);
+        let identity = if collides { None } else { self.resolve_stable_codex_identity(account) };
         let observation = lifecycle.observe(kind.id(), identity).clone();
         if previous
             .as_ref()
@@ -3235,7 +3239,7 @@ impl RuntimeCore {
         prepared: PreparedCodexResult,
     ) -> Option<ProviderUsageDto> {
         let observed_identity = match &prepared.payload {
-            CodexJobPayload::Unavailable => None,
+            CodexJobPayload::Unavailable | CodexJobPayload::Collision => None,
             CodexJobPayload::Cooldown(cooldown) => cooldown.failure.identity.as_deref(),
             CodexJobPayload::Observed(Ok(dto)) => dto
                 .account
@@ -3250,7 +3254,10 @@ impl RuntimeCore {
         lifecycle
             .published
             .insert(kind.id(), current.identity_generation);
+        let collides = kind == ProviderKind::CodexSecondary
+            && codex_accounts::secondary_collides_with_primary(&self.inner.lock().unwrap().codex_accounts);
         if current != prepared.scope
+            || matches!(prepared.payload, CodexJobPayload::Collision) != collides
             || observed_identity != prepared.scope.identity.as_deref()
         {
             return None;
@@ -3261,6 +3268,13 @@ impl RuntimeCore {
         match prepared.payload {
             CodexJobPayload::Unavailable => {
                 Some(base_usage(kind, ProviderHealth::Unavailable, Vec::new()))
+            }
+            CodexJobPayload::Collision => {
+                let failure = normalize_codex(kind, Err(ProviderError::new(
+                    "codex_home_collision",
+                    "This account's Codex home is the same as the primary account's. Choose a different Codex home.",
+                )), self.now().timestamp_millis()).unwrap_err();
+                Some(self.apply_failure(kind, failure))
             }
             CodexJobPayload::Cooldown(cooldown) => {
                 let active = self.active_codex_cooldown(kind.id(), &prepared.scope)?;
@@ -3298,8 +3312,11 @@ impl RuntimeCore {
         }
         let is_codex = self.codex_identity_resolver.is_some()
             && is_codex_provider_id(spec.kind.id());
+        let mut collision = false;
         let codex_scope = if is_codex {
             let mut lifecycle = self.codex_lifecycle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            collision = spec.kind == ProviderKind::CodexSecondary
+                && codex_accounts::secondary_collides_with_primary(&self.inner.lock().unwrap().codex_accounts);
             match self.current_codex_job_scope_locked(&mut lifecycle, spec.kind.id()) {
                 Some(scope) => Some(scope),
                 None => return ProviderJobResult::Discarded,
@@ -3307,6 +3324,12 @@ impl RuntimeCore {
         } else {
             None
         };
+        if collision {
+            return ProviderJobResult::Codex(PreparedCodexResult {
+                scope: codex_scope.expect("Codex collision has a scope"),
+                payload: CodexJobPayload::Collision,
+            });
+        }
         if codex_scope
             .as_ref()
             .is_some_and(|scope| scope.identity.is_none())
@@ -4289,6 +4312,7 @@ impl RuntimeCore {
             .map(|spec| (spec.id, (spec.current_credential_binding)()))
             .collect();
         let account_configs = self.inner.lock().unwrap().codex_accounts.clone();
+        let secondary_collision = codex_accounts::secondary_collides_with_primary(&account_configs);
         let mut codex_bindings: HashMap<&'static str, Option<String>> = HashMap::new();
         let mut codex_identity_states: Vec<CodexIdentityStateDto> = Vec::new();
         let mut identity_generation_changed = false;
@@ -4360,7 +4384,15 @@ impl RuntimeCore {
                 .usages
                 .iter()
                 .map(|usage| {
-                    let projected = if self.codex_identity_resolver.is_some()
+                    let projected = if secondary_collision
+                        && usage.id == SECONDARY_ACCOUNT_ID
+                        && usage.error_category.as_deref() == Some("codex_home_collision")
+                    {
+                        let mut redacted = base_usage(ProviderKind::CodexSecondary, ProviderHealth::Unavailable, Vec::new());
+                        redacted.error = usage.error.clone();
+                        redacted.error_category = Some("codex_home_collision".to_string());
+                        redacted
+                    } else if self.codex_identity_resolver.is_some()
                         && is_codex_provider_id(&usage.id)
                     {
                         let binding = codex_bindings
