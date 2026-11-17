@@ -322,6 +322,9 @@ fn set_health(dto: &mut ProviderUsageDto, health: ProviderHealth) {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageLimitDto {
+    /// Internal per-window source time; not part of the wire contract.
+    #[serde(skip)]
+    pub observed_at: Option<String>,
     pub label: String,
     pub used_percent: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -897,6 +900,7 @@ fn limits_from(
     limits
         .iter()
         .map(|(label, used, reset)| UsageLimitDto {
+            observed_at: None,
             label: label.clone(),
             used_percent: clamp_percent(*used),
             reset_at: reset
@@ -1489,6 +1493,7 @@ fn opendesign_windows_dto(
     let limits = windows
         .into_iter()
         .map(|window| UsageLimitDto {
+            observed_at: None,
             label: match window.label {
                 crate::opendesign::OpenDesignWindowLabel::FiveHour => "5-hour".to_string(),
                 crate::opendesign::OpenDesignWindowLabel::SevenDay => "7-day".to_string(),
@@ -1558,6 +1563,8 @@ fn normalize_claude_statusline(
         };
         oldest_observed = oldest_observed.min(window.observed_at);
         limits.push(UsageLimitDto {
+            observed_at: DateTime::from_timestamp(window.observed_at, 0)
+                .map(|stamp| stamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
             label: label.to_string(),
             used_percent: clamp_percent(window.used_percent),
             reset_at: Some(reset_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -5441,6 +5448,7 @@ mod tests {
             health: ProviderHealth::Live,
             checked_at: fixed_now().to_rfc3339_opts(SecondsFormat::Millis, true),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "Weekly".to_string(),
                 used_percent: percent,
                 reset_text: None,
@@ -5736,6 +5744,23 @@ mod tests {
             now + chrono::Duration::seconds(60),
         );
         assert_eq!(again.source_updated_at, dto.source_updated_at);
+    }
+
+    #[test]
+    fn claude_history_keeps_each_window_source_time() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let dto = normalize_claude_statusline(
+            claude_store(Some((11.0, s + 3600, s - 10)), Some((20.0, s + 86_400, s - 90))), now,
+        );
+        assert_eq!(dto.health, ProviderHealth::Live);
+        let observations = crate::history::observations_from_usages(&[dto.clone()]);
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].observed_at, dto.limits[0].observed_at.clone().unwrap());
+        assert_eq!(observations[1].observed_at, dto.limits[1].observed_at.clone().unwrap());
+        assert_ne!(observations[0].observed_at, observations[1].observed_at);
+        let wire = serde_json::to_value(dto).unwrap();
+        assert!(wire["limits"][0].get("observedAt").is_none());
     }
 
     #[test]
@@ -8102,6 +8127,7 @@ mod tests {
     ) -> ProviderUsageDto {
         let mut usage = ok_usage(id, name, 10.0);
         usage.limits = vec![UsageLimitDto {
+            observed_at: None,
             label: label.to_string(),
             used_percent: 10.0,
             reset_text: None,
@@ -8195,6 +8221,7 @@ mod tests {
         );
         let mut zai = usage_with_reset("zai", "Z.ai", "Weekly", Some(&reset_at_ms(30 * 60_000)));
         zai.limits.push(UsageLimitDto {
+            observed_at: None,
             label: "5 hours".to_string(),
             used_percent: 20.0,
             reset_text: None,
@@ -8917,6 +8944,7 @@ mod tests {
             health: ProviderHealth::Live,
             checked_at: fixed_now().to_rfc3339_opts(SecondsFormat::Millis, true),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: label.to_string(),
                 used_percent: percent,
                 reset_at: reset_at.map(str::to_string),
@@ -8947,6 +8975,7 @@ mod tests {
             limits: windows
                 .iter()
                 .map(|(label, percent)| UsageLimitDto {
+                    observed_at: None,
                     label: label.to_string(),
                     used_percent: *percent,
                     reset_at: None,

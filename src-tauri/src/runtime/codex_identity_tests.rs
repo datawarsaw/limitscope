@@ -108,6 +108,7 @@ fn unrelated_spec(kind: ProviderKind, percent: f64) -> ProviderSpec {
                     health: ProviderHealth::Live,
                     checked_at: Utc::now().to_rfc3339(),
                     limits: vec![UsageLimitDto {
+                        observed_at: None,
                         label: "5-hour".to_string(),
                         used_percent: percent,
                         reset_text: None,

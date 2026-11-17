@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { CSSProperties, FocusEvent } from "react";
-import { formatCountdown } from "../lib/format";
+import { formatAge, formatCountdown } from "../lib/format";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
 import {
@@ -182,7 +182,7 @@ export function FloatingProviderPopover({
             <span className="fq-account-alias">{item.accountAlias}</span>
           ) : null}
           {/* The healthy "Live" chip is clutter; degraded statuses still badge. */}
-          {item.statusClass !== "ok" ? (
+          {item.statusClass !== "ok" || item.providerId === "claude-code" ? (
             <span className={"fq-status status-" + item.statusClass}>
               {item.statusLabel}
             </span>
@@ -252,6 +252,9 @@ export function FloatingProviderPopover({
           <p className="fq-popover-error" role="alert">
             {item.error}
           </p>
+        ) : null}
+        {item.claudeSourceUpdatedAt ? (
+          <p className="fq-popover-note">Updated {formatAge(item.claudeSourceUpdatedAt, now)} from Claude Code · new quota data requires Claude Code activity</p>
         ) : null}
         {note ? <p className="fq-popover-note">{note}</p> : null}
 

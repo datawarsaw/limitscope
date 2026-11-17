@@ -5,6 +5,8 @@ import type { ProviderUsage } from "../types";
 
 export type ProviderStatusPresentation = {
   label:
+    | "Recent"
+    | "Last known"
     | "Live"
     | "Cached"
     | "Stale"
@@ -111,6 +113,11 @@ export function providerStatusPresentation(
   if (usage.health === "error") return { label: "Refresh failed", className: "error" };
   if (usage.health === "cooldown") return { label: "Cooldown", className: "error" };
   if (usage.health === "unavailable") return { label: "Unavailable", className: "error" };
+  if (usage.id === "claude-code") {
+    return usage.health === "live" && usage.dataFreshness === "fresh" && validTime(usage.sourceUpdatedAt)
+      ? { label: "Recent", className: "ok" }
+      : { label: "Last known", className: "stale" };
+  }
   if (usage.dataFreshness === "stale") return { label: "Stale", className: "stale" };
   if (usage.dataFreshness || validTime(usage.sourceUpdatedAt)) {
     return usage.dataFreshness === "fresh" && validTime(usage.sourceUpdatedAt)
@@ -154,7 +161,7 @@ function sourceNoteText(
     if (status.label === "Unavailable") return "Waiting for Claude Code status line data";
     const received = validTime(usage.sourceUpdatedAt);
     if (received && usage.limits.length > 0 && usage.health !== "error") {
-      return `Received from Claude Code ${formatAge(received, now)} · updates only while Claude Code is running`;
+      return `Updated ${formatAge(received, now)} from Claude Code · new quota data requires Claude Code activity`;
     }
   }
   if (status.label === "Unavailable") return "Provider data unavailable";

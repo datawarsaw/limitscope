@@ -63,7 +63,8 @@ export function ClaudeStatuslineSetup() {
       <p>
         Passive source. LimitScope receives your Claude subscription 5-hour and
         7-day usage only when Claude Code runs its status line hook, so values
-        update while Claude Code is in use and are marked stale when it is idle.
+        can update after Claude Code responses and become last known when no new
+        quota information arrives.
         It needs a claude.ai Pro, Max or Ultra plan and one Claude Code
         response. No network request, login or model call is made by LimitScope.
       </p>

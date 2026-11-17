@@ -63,9 +63,6 @@ const SEVEN_DAY_HORIZON_S: i64 = 8 * 86_400;
 const SAME_WINDOW_TOLERANCE_S: i64 = 300;
 /// Tolerated clock skew for stored observation times.
 const CLOCK_SKEW_S: i64 = 300;
-/// An unchanged reading is not rewritten more often than this; Claude Code
-/// fires the hook on every update, and the file holds no history.
-const REWRITE_THROTTLE_S: i64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WindowKind {
@@ -89,7 +86,7 @@ pub(crate) struct WindowReading {
     pub used_percent: f64,
     /// Unix epoch seconds, as Claude Code reports it.
     pub resets_at: i64,
-    /// Unix epoch seconds, LimitScope's own clock at receipt.
+    /// Unix epoch seconds at receipt of the last defensibly new information.
     pub observed_at: i64,
 }
 
@@ -142,7 +139,7 @@ pub(crate) struct Observed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IngestOutcome {
     Written,
-    /// The stored snapshot already holds this reading (recent enough).
+    /// The stored snapshot already holds this reading.
     Unchanged,
     /// A valid document with no usable allow-listed window: nothing stored,
     /// and nothing already stored is touched or cleared.
@@ -267,8 +264,8 @@ pub(crate) fn read_store(dir: &Path, now_s: i64) -> StoreRead {
 /// Several Claude Code sessions can run at once and each runs the hook, so
 /// the rule must tolerate interleaving and replays: within one window the
 /// used percentage never decreases, so the larger value wins; a reading for
-/// a LATER window replaces an earlier one; a reading for an EARLIER window
-/// (a stale session) is ignored. An expired stored window is discarded.
+/// a different reset while the old window remains open is ambiguous and
+/// ignored. An expired stored window is discarded before a new one is accepted.
 fn merge_window(
     old: Option<WindowReading>,
     new: Option<(f64, i64)>,
@@ -287,28 +284,20 @@ fn merge_window(
         return Some(fresh);
     };
     if (old.resets_at - resets_at).abs() <= SAME_WINDOW_TOLERANCE_S {
-        Some(WindowReading {
-            used_percent: old.used_percent.max(percent),
-            resets_at: old.resets_at.max(resets_at),
-            observed_at: now_s,
-        })
-    } else if resets_at > old.resets_at {
-        Some(fresh)
-    } else {
-        Some(old)
-    }
-}
-
-fn same_reading(a: &Option<WindowReading>, b: &Option<WindowReading>, now_s: i64) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => {
-            a.used_percent == b.used_percent
-                && a.resets_at == b.resets_at
-                && (b.observed_at - a.observed_at).abs() < REWRITE_THROTTLE_S
-                && (now_s - a.observed_at) < REWRITE_THROTTLE_S
+        // Rounding and lagging sessions do not establish a new observation.
+        // Keep the old reset identity to avoid re-arming threshold alerts.
+        if percent > old.used_percent {
+            Some(WindowReading {
+                used_percent: percent,
+                observed_at: now_s,
+                ..old
+            })
+        } else {
+            Some(old)
         }
-        _ => false,
+    } else {
+        // A later-looking reset before the old window ends is ambiguous.
+        Some(old)
     }
 }
 
@@ -375,9 +364,7 @@ pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
         five_hour: merge_window(stored.five_hour, observed.five_hour, now_s),
         seven_day: merge_window(stored.seven_day, observed.seven_day, now_s),
     };
-    if same_reading(&stored.five_hour, &next.five_hour, now_s)
-        && same_reading(&stored.seven_day, &next.seven_day, now_s)
-    {
+    if stored == next {
         return IngestOutcome::Unchanged;
     }
     let Ok(bytes) = serde_json::to_vec(&next) else {
@@ -646,19 +633,20 @@ mod tests {
     }
 
     #[test]
-    fn ingest_is_idempotent_and_throttles_unchanged_rewrites() {
+    fn ingest_replay_never_refreshes_even_after_idle() {
         let dir = temp_dir("idem");
         let doc = payload(Some((20.0, NOW + 4000)), None);
         assert_eq!(ingest(&dir, &doc, NOW), IngestOutcome::Written);
         let first = fs::read(store_path(&dir)).unwrap();
         assert_eq!(ingest(&dir, &doc, NOW + 1), IngestOutcome::Unchanged);
         assert_eq!(fs::read(store_path(&dir)).unwrap(), first);
-        // Past the throttle, freshness advances; values do not change.
-        assert_eq!(ingest(&dir, &doc, NOW + 60), IngestOutcome::Written);
-        match read_store(&dir, NOW + 60) {
+        // Identical replays, including after 15 minutes, never advance freshness.
+        assert_eq!(ingest(&dir, &doc, NOW + 1000), IngestOutcome::Unchanged);
+        assert_eq!(fs::read(store_path(&dir)).unwrap(), first);
+        match read_store(&dir, NOW + 1000) {
             StoreRead::Valid(s) => {
                 let w = s.five_hour.unwrap();
-                assert_eq!((w.used_percent, w.resets_at, w.observed_at), (20.0, NOW + 4000, NOW + 60));
+                assert_eq!((w.used_percent, w.resets_at, w.observed_at), (20.0, NOW + 4000, NOW));
             }
             other => panic!("{other:?}"),
         }
@@ -689,7 +677,8 @@ mod tests {
         ingest(&dir, &payload(Some((55.0, NOW + 4001)), None), NOW + 30);
         let StoreRead::Valid(s) = read_store(&dir, NOW + 30) else { panic!() };
         assert_eq!(s.five_hour.unwrap().used_percent, 60.0);
-        assert_eq!(s.five_hour.unwrap().resets_at, NOW + 4001);
+        assert_eq!(s.five_hour.unwrap().resets_at, NOW + 4000);
+        assert_eq!(s.five_hour.unwrap().observed_at, NOW);
         // A stale session reporting an EARLIER window is ignored.
         ingest(&dir, &payload(Some((99.0, NOW + 100)), None), NOW + 40);
         let StoreRead::Valid(s) = read_store(&dir, NOW + 40) else { panic!() };
@@ -699,6 +688,47 @@ mod tests {
         ingest(&dir, &payload(Some((2.0, later + 17_000)), None), later);
         let StoreRead::Valid(s) = read_store(&dir, later) else { panic!() };
         assert_eq!(s.five_hour.unwrap().used_percent, 2.0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn independently_advances_windows_and_survives_restart_and_rounding() {
+        let dir = temp_dir("provenance");
+        let first = payload(Some((10.0, NOW + 4000)), Some((20.0, NOW + 90_000)));
+        assert_eq!(ingest(&dir, &first, NOW), IngestOutcome::Written);
+        // A second session advances only 5h; its rounded weekly replay is not new.
+        let next = payload(Some((11.0, NOW + 4001)), Some((20.0, NOW + 90_100)));
+        assert_eq!(ingest(&dir, &next, NOW + 1000), IngestOutcome::Written);
+        let StoreRead::Valid(saved) = read_store(&dir, NOW + 1000) else {
+            panic!()
+        };
+        assert_eq!(saved.five_hour.unwrap().observed_at, NOW + 1000);
+        assert_eq!(saved.seven_day.unwrap().observed_at, NOW);
+        assert_eq!(saved.seven_day.unwrap().resets_at, NOW + 90_000);
+        // Re-reading the persisted v1 snapshot and replaying either session is idempotent.
+        assert_eq!(ingest(&dir, &first, NOW + 1100), IngestOutcome::Unchanged);
+        assert_eq!(ingest(&dir, &next, NOW + 1100), IngestOutcome::Unchanged);
+        assert_eq!(read_store(&dir, NOW + 1100), StoreRead::Valid(saved));
+        // A later reset before the old one expires is not sufficient proof of a new cycle.
+        assert_eq!(
+            ingest(&dir, &payload(Some((99.0, NOW + 8000)), None), NOW + 1100),
+            IngestOutcome::Unchanged
+        );
+        // After each reset a low new-window value is real, including the weekly window.
+        let later = NOW + 90_001;
+        assert_eq!(
+            ingest(
+                &dir,
+                &payload(Some((2.0, later + 4000)), Some((1.0, later + 90_000))),
+                later
+            ),
+            IngestOutcome::Written
+        );
+        let StoreRead::Valid(saved) = read_store(&dir, later) else {
+            panic!()
+        };
+        assert_eq!(saved.five_hour.unwrap().used_percent, 2.0);
+        assert_eq!(saved.seven_day.unwrap().used_percent, 1.0);
         fs::remove_dir_all(dir).unwrap();
     }
 

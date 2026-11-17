@@ -162,6 +162,7 @@ mod tests {
             status: ProviderHealth::Live.legacy_status(),
             checked_at: "2026-09-29T11:55:00.000Z".to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "5-hour limit".to_string(),
                 used_percent: percent,
                 reset_text: None,

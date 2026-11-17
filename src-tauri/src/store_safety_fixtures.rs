@@ -93,6 +93,7 @@ fn zai_usage(percent: f64) -> ProviderUsageDto {
         status: ProviderHealth::Live.legacy_status(),
         checked_at: OBSERVED_AT.to_string(),
         limits: vec![UsageLimitDto {
+            observed_at: None,
             label: "5-hour limit".to_string(),
             used_percent: percent,
             reset_text: None,
