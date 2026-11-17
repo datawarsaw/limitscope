@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  DEFAULT_PROVIDER_ORDER,
   canHideProvider,
+  effectiveProviderOrder,
   fullDisplayOrder,
   moveProviderOrder,
   orderVisibleProviders,
@@ -10,6 +12,19 @@ import {
 } from "./providerPreferences";
 
 const REGISTRY = ["openai-codex", "zai", "opencode-go", "antigravity", "grok"];
+
+// The production registry, in the order the runtime registers it.
+const PRODUCTION_REGISTRY = [
+  "openai-codex",
+  "openai-codex:secondary",
+  "antigravity",
+  "zai",
+  "opencode-go",
+  "grok",
+  "qwen-token-plan",
+  "minimax-token-plan",
+  "opendesign",
+];
 
 describe("sanitizeProviderPreferences", () => {
   it("defaults missing preferences to empty order and hidden", () => {
@@ -32,9 +47,16 @@ describe("sanitizeProviderPreferences", () => {
 });
 
 describe("resolveProviderPreferences", () => {
-  it("defaults to canonical registry order with nothing hidden", () => {
+  it("defaults to the curated default order with nothing hidden", () => {
     expect(resolveProviderPreferences(REGISTRY, undefined)).toEqual({
-      visibleOrderedIds: [...REGISTRY],
+      visibleOrderedIds: ["openai-codex", "antigravity", "zai", "opencode-go", "grok"],
+      hiddenIds: [],
+    });
+  });
+
+  it("leads with the default order for the production registry", () => {
+    expect(resolveProviderPreferences(PRODUCTION_REGISTRY, undefined)).toEqual({
+      visibleOrderedIds: [...PRODUCTION_REGISTRY],
       hiddenIds: [],
     });
   });
@@ -58,7 +80,11 @@ describe("resolveProviderPreferences", () => {
       order: [],
       hidden: ["zai", "grok"],
     });
-    expect(resolved.visibleOrderedIds).toEqual(["openai-codex", "opencode-go", "antigravity"]);
+    expect(resolved.visibleOrderedIds).toEqual([
+      "openai-codex",
+      "antigravity",
+      "opencode-go",
+    ]);
     expect(resolved.hiddenIds).toEqual(["zai", "grok"]);
   });
 
@@ -180,6 +206,105 @@ describe("canHideProvider / toggleProviderHidden", () => {
 
   it("refuses unknown provider ids", () => {
     expect(toggleProviderHidden(REGISTRY, undefined, "nope", true).applied).toBe(false);
+  });
+});
+
+describe("the default provider order", () => {
+  it("is the confirmed nine-provider order with both Codex accounts first", () => {
+    expect(DEFAULT_PROVIDER_ORDER).toEqual([
+      "openai-codex",
+      "openai-codex:secondary",
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "grok",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+    ]);
+  });
+
+  it("applies to a configuration that has no order of its own", () => {
+    expect(effectiveProviderOrder(PRODUCTION_REGISTRY, undefined)).toEqual([
+      ...PRODUCTION_REGISTRY,
+    ]);
+    expect(effectiveProviderOrder(PRODUCTION_REGISTRY, { order: [], hidden: [] })).toEqual([
+      ...PRODUCTION_REGISTRY,
+    ]);
+  });
+
+  it("never hides a provider: visibility stays a separate preference", () => {
+    const resolved = resolveProviderPreferences(PRODUCTION_REGISTRY, {
+      order: [],
+      hidden: ["zai", "grok"],
+    });
+    expect(resolved.visibleOrderedIds).toEqual([
+      "openai-codex",
+      "openai-codex:secondary",
+      "antigravity",
+      "opencode-go",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+    ]);
+    expect(resolved.hiddenIds).toEqual(["zai", "grok"]);
+  });
+
+  it("preserves a persisted custom order instead of the default", () => {
+    const custom = {
+      order: ["grok", "openai-codex", "zai", "opencode-go", "antigravity"],
+      hidden: [],
+    };
+    expect(effectiveProviderOrder(REGISTRY, custom)).toEqual([
+      "grok",
+      "openai-codex",
+      "zai",
+      "opencode-go",
+      "antigravity",
+    ]);
+    expect(resolveProviderPreferences(REGISTRY, custom).visibleOrderedIds).toEqual([
+      "grok",
+      "openai-codex",
+      "zai",
+      "opencode-go",
+      "antigravity",
+    ]);
+  });
+
+  it("appends a provider the default does not name, in registry order", () => {
+    const registry = [...PRODUCTION_REGISTRY, "future-provider"];
+    expect(effectiveProviderOrder(registry, undefined)).toEqual([
+      ...PRODUCTION_REGISTRY,
+      "future-provider",
+    ]);
+  });
+
+  it("ignores a default entry that is not registered", () => {
+    // The second Codex account is absent while it is not configured.
+    expect(effectiveProviderOrder(REGISTRY, undefined)).toEqual([
+      "openai-codex",
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "grok",
+    ]);
+  });
+
+  it("shows the default order in the settings list", () => {
+    expect(fullDisplayOrder(PRODUCTION_REGISTRY, undefined)).toEqual([
+      ...PRODUCTION_REGISTRY,
+    ]);
+    expect(fullDisplayOrder(PRODUCTION_REGISTRY, { order: [], hidden: ["zai"] })).toEqual([
+      "openai-codex",
+      "openai-codex:secondary",
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "grok",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+    ]);
   });
 });
 

@@ -38,15 +38,37 @@ export type CodexAccountPreferences = {
 };
 
 /**
- * Registry defaults for the two Codex accounts. Both start monitored with no
- * alias, so existing users keep today's single-account behavior, and the
- * secondary account appears in the UI without collecting anything until it
- * has a home.
+ * The initial editable values of the second Codex account.
+ *
+ * The account is offered with a name and a Codex home of its own, so the
+ * user only has to create that folder and log that account in with the
+ * Codex CLI. These are INITIAL values, not a stored configuration: they
+ * apply only while the second account has never been configured, and any
+ * value the user saved always wins.
+ *
+ * The primary account is deliberately not part of this: it keeps its own
+ * default Codex home and its own identity.
+ */
+export const SECONDARY_CODEX_ACCOUNT_DEFAULTS = {
+  alias: "CoWork",
+  codexHome: "C:\\codex-home-second",
+} as const;
+
+/**
+ * Registry defaults for the two Codex accounts. Both start monitored. The
+ * primary account keeps the single-login behavior it has always had, and
+ * the secondary account starts on its own initial name and its own initial
+ * Codex home, so it is readable on its own from the first run.
  */
 export const DEFAULT_CODEX_ACCOUNT_PREFERENCES: CodexAccountPreferences = {
   accounts: [
     { accountId: CODEX_PROVIDER_ID, alias: "", codexHome: "", monitored: true },
-    { accountId: CODEX_SECONDARY_PROVIDER_ID, alias: "", codexHome: "", monitored: true },
+    {
+      accountId: CODEX_SECONDARY_PROVIDER_ID,
+      alias: SECONDARY_CODEX_ACCOUNT_DEFAULTS.alias,
+      codexHome: SECONDARY_CODEX_ACCOUNT_DEFAULTS.codexHome,
+      monitored: true,
+    },
   ],
 };
 
@@ -93,11 +115,33 @@ export function sanitizeCodexAccountPreferences(value: unknown): CodexAccountPre
     firstByAccountId.set(accountId, entry as Partial<CodexAccountSettings>);
   }
 
-  return {
-    accounts: CODEX_ACCOUNT_IDS.map((accountId) =>
-      sanitizeAccount(accountId, firstByAccountId.get(accountId) ?? {}),
-    ),
-  };
+  const accounts = CODEX_ACCOUNT_IDS.map((accountId) =>
+    sanitizeAccount(accountId, firstByAccountId.get(accountId) ?? {}),
+  );
+  applySecondaryAccountDefaults(accounts);
+  return { accounts };
+}
+
+/**
+ * The initial editable values of the second account apply only while that
+ * account has never been configured.
+ *
+ * "Never configured" is the account's own Codex home being empty: that is
+ * exactly the state in which the account cannot be read at all. A saved
+ * home is a real configuration and is never touched, and a saved name is
+ * never replaced — only the values that are still unset receive the initial
+ * ones. The primary account is never touched here.
+ */
+function applySecondaryAccountDefaults(accounts: CodexAccountSettings[]): void {
+  const secondary = accounts.find(
+    (account) => account.accountId === CODEX_SECONDARY_PROVIDER_ID,
+  );
+  if (!secondary) return;
+  if (secondary.codexHome.trim().length > 0) return;
+  secondary.codexHome = SECONDARY_CODEX_ACCOUNT_DEFAULTS.codexHome;
+  if (secondary.alias.trim().length === 0) {
+    secondary.alias = SECONDARY_CODEX_ACCOUNT_DEFAULTS.alias;
+  }
 }
 
 /**

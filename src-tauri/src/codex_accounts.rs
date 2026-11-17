@@ -22,8 +22,9 @@
 //!
 //! The store persists one bounded JSON file in the app-data directory,
 //! written temp-then-rename like the sibling stores. A corrupt or
-//! foreign-version file degrades to the defaults: one primary account, no
-//! second account, both monitored — exactly the pre-multi-account behavior.
+//! foreign-version file degrades to the defaults: both accounts monitored,
+//! the primary on its own default Codex home, and the second account on its
+//! own initial Codex home with its initial name.
 
 use std::fs;
 use std::io;
@@ -48,6 +49,19 @@ pub const SECONDARY_ACCOUNT_ID: &str = "openai-codex:secondary";
 
 /// The known account ids, in registry order.
 pub const KNOWN_ACCOUNT_IDS: [&str; 2] = [PRIMARY_ACCOUNT_ID, SECONDARY_ACCOUNT_ID];
+
+/// The initial editable name of the second Codex account.
+///
+/// An initial value, not a stored configuration: it applies only while the
+/// second account has never been configured, and a saved name always wins.
+pub const SECONDARY_DEFAULT_ALIAS: &str = "CoWork";
+
+/// The initial Codex home of the second Codex account: its own directory,
+/// holding its own `auth.json`, separate from the primary account's login.
+///
+/// The account owner creates that folder and logs that account in with the
+/// Codex CLI inside it. LimitScope only ever reads the resulting file.
+pub const SECONDARY_DEFAULT_CODEX_HOME: &str = "C:\\codex-home-second";
 
 /// One configured Codex account.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +93,14 @@ fn default_monitored() -> bool {
 impl CodexAccountConfig {
     /// The default entry for one known account id.
     pub fn default_for(account_id: &str) -> Self {
+        if account_id == SECONDARY_ACCOUNT_ID {
+            return Self {
+                account_id: account_id.to_string(),
+                alias: SECONDARY_DEFAULT_ALIAS.to_string(),
+                codex_home: SECONDARY_DEFAULT_CODEX_HOME.to_string(),
+                monitored: true,
+            };
+        }
         Self {
             account_id: account_id.to_string(),
             alias: String::new(),
@@ -92,9 +114,10 @@ impl CodexAccountConfig {
     /// The primary account always can: with no explicit home it falls back
     /// to the ambient `CODEX_HOME` and then to `~/.codex`, which is the
     /// single-login behavior this app has always had. The second account
-    /// has no default of its own — reading it from the primary account's
-    /// home would silently duplicate one identity, so it counts as
-    /// configured only when it names its own Codex home.
+    /// never falls back to the primary account's home — that would
+    /// silently duplicate one identity — so it counts as configured only
+    /// when it names its own Codex home, which is its initial home until
+    /// the user changes it.
     pub fn is_configured(&self) -> bool {
         if self.account_id == PRIMARY_ACCOUNT_ID {
             return true;
@@ -140,7 +163,32 @@ pub fn normalize_accounts(accounts: &[CodexAccountConfig]) -> Vec<CodexAccountCo
         account.codex_home = account.codex_home.trim().to_string();
         out.push(account);
     }
+    apply_secondary_initial_defaults(&mut out);
     out
+}
+
+/// The initial editable values of the second account apply only while that
+/// account has never been configured.
+///
+/// "Never configured" is the account's own Codex home being empty: that is
+/// exactly the state in which the account cannot be read at all. A saved
+/// home is a real configuration and is never touched, and a saved name is
+/// never replaced — only the values that are still unset receive the
+/// initial ones. The primary account is never touched here.
+fn apply_secondary_initial_defaults(accounts: &mut [CodexAccountConfig]) {
+    let Some(secondary) = accounts
+        .iter_mut()
+        .find(|account| account.account_id == SECONDARY_ACCOUNT_ID)
+    else {
+        return;
+    };
+    if !secondary.codex_home.trim().is_empty() {
+        return;
+    }
+    secondary.codex_home = SECONDARY_DEFAULT_CODEX_HOME.to_string();
+    if secondary.alias.trim().is_empty() {
+        secondary.alias = SECONDARY_DEFAULT_ALIAS.to_string();
+    }
 }
 
 /// Rejects a configuration in which both Codex accounts resolve to the same
@@ -788,7 +836,31 @@ mod tests {
         let accounts = store.accounts();
         assert_eq!(accounts.len(), 2);
         assert_eq!(accounts[0].alias, "Personal");
-        assert_eq!(accounts[1].alias, "");
+        assert_eq!(accounts[1].alias, "CoWork");
+        assert_eq!(accounts[1].codex_home, "C:\\codex-home-second");
+        remove_store(&path);
+    }
+
+    #[test]
+    fn a_persisted_unconfigured_second_account_gets_the_initial_values() {
+        let path = store_path("unconfigured-secondary");
+        let raw = r#"{
+          "version": 1,
+          "accounts": [
+            { "accountId": "openai-codex", "alias": "Personal", "codexHome": "", "monitored": true },
+            { "accountId": "openai-codex:secondary", "alias": "", "codexHome": "", "monitored": true }
+          ]
+        }"#;
+        fs::write(&path, raw).expect("write fixture");
+        let store = CodexAccountStore::open(path.clone());
+        let accounts = store.accounts();
+        assert_eq!(accounts[1].alias, "CoWork");
+        assert_eq!(accounts[1].codex_home, "C:\\codex-home-second");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read fixture"),
+            raw,
+            "reading the store never rewrites the persisted file"
+        );
         remove_store(&path);
     }
 
@@ -821,13 +893,71 @@ mod tests {
         let accounts = default_accounts();
         assert!(accounts[0].is_configured(), "the primary account always resolves");
         assert!(
-            !accounts[1].is_configured(),
-            "the second account needs its own Codex home"
+            accounts[1].is_configured(),
+            "the second account starts on its own initial Codex home"
+        );
+        assert_eq!(accounts[1].codex_home_option(), Some(SECONDARY_DEFAULT_CODEX_HOME));
+        assert_ne!(
+            accounts[1].codex_home_option(),
+            accounts[0].codex_home_option(),
+            "the second account never resolves to the primary account's home"
         );
         let mut secondary = accounts[1].clone();
-        secondary.codex_home = "C:\\\\codex-home-second".to_string();
+        secondary.codex_home = "C:\\fixture\\other".to_string();
         assert!(secondary.is_configured());
-        assert_eq!(secondary.codex_home_option(), Some("C:\\\\codex-home-second"));
+        assert_eq!(secondary.codex_home_option(), Some("C:\\fixture\\other"));
+        assert_eq!(accounts[0].codex_home_option(), None);
+    }
+
+    #[test]
+    fn the_second_account_carries_its_initial_name_and_home() {
+        let accounts = default_accounts();
+        assert_eq!(accounts[0].account_id, PRIMARY_ACCOUNT_ID);
+        assert_eq!(accounts[0].alias, "");
+        assert_eq!(accounts[0].codex_home, "");
+        assert_eq!(accounts[1].account_id, SECONDARY_ACCOUNT_ID);
+        assert_eq!(accounts[1].alias, "CoWork");
+        assert_eq!(accounts[1].codex_home, "C:\\codex-home-second");
+        assert!(accounts[1].monitored);
+    }
+
+    #[test]
+    fn an_unconfigured_second_account_receives_the_initial_values() {
+        let mut accounts = default_accounts();
+        accounts[1].alias = String::new();
+        accounts[1].codex_home = String::new();
+        let normalized = normalize_accounts(&accounts);
+        assert_eq!(normalized[1].alias, "CoWork");
+        assert_eq!(normalized[1].codex_home, "C:\\codex-home-second");
+    }
+
+    #[test]
+    fn a_configured_second_account_keeps_every_saved_value() {
+        let mut accounts = default_accounts();
+        accounts[1].alias = "Work".to_string();
+        accounts[1].codex_home = "C:\\fixture\\work".to_string();
+        accounts[1].monitored = false;
+        let normalized = normalize_accounts(&accounts);
+        assert_eq!(normalized[1].alias, "Work");
+        assert_eq!(normalized[1].codex_home, "C:\\fixture\\work");
+        assert!(!normalized[1].monitored);
+    }
+
+    #[test]
+    fn a_saved_name_survives_while_the_home_is_still_unset() {
+        let mut accounts = default_accounts();
+        accounts[1].alias = "Work".to_string();
+        accounts[1].codex_home = String::new();
+        let normalized = normalize_accounts(&accounts);
+        assert_eq!(normalized[1].alias, "Work", "a saved name is never replaced");
+        assert_eq!(normalized[1].codex_home, "C:\\codex-home-second");
+    }
+
+    #[test]
+    fn the_initial_values_never_reach_the_primary_account() {
+        let accounts = default_accounts();
+        assert_eq!(accounts[0].alias, "");
+        assert_eq!(accounts[0].codex_home, "");
         assert_eq!(accounts[0].codex_home_option(), None);
     }
 
@@ -842,7 +972,7 @@ mod tests {
         assert_eq!(normalized[1].account_id, SECONDARY_ACCOUNT_ID);
         // The alias travelled with its account, not with its position.
         assert_eq!(normalized[0].alias, "Second");
-        assert_eq!(normalized[1].alias, "");
+        assert_eq!(normalized[1].alias, "CoWork");
     }
 
     #[test]

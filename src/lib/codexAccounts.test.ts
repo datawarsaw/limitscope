@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_CODEX_ACCOUNT_PREFERENCES,
+  SECONDARY_CODEX_ACCOUNT_DEFAULTS,
   codexAccountSettings,
   isCodexAccountConfigured,
   sanitizeCodexAccountPreferences,
@@ -12,11 +13,23 @@ const PRIMARY = "openai-codex";
 const SECONDARY = "openai-codex:secondary";
 
 describe("codex account preferences", () => {
-  it("defaults to two monitored accounts with no alias or home", () => {
+  it("defaults to two monitored accounts, the second one on its initial values", () => {
     expect(DEFAULT_CODEX_ACCOUNT_PREFERENCES.accounts).toEqual([
       { accountId: PRIMARY, alias: "", codexHome: "", monitored: true },
-      { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
+      {
+        accountId: SECONDARY,
+        alias: "CoWork",
+        codexHome: "C:\\codex-home-second",
+        monitored: true,
+      },
     ]);
+  });
+
+  it("offers the second account its initial name and home", () => {
+    expect(SECONDARY_CODEX_ACCOUNT_DEFAULTS).toEqual({
+      alias: "CoWork",
+      codexHome: "C:\\codex-home-second",
+    });
   });
 
   it("falls back to the defaults for undefined and garbage input", () => {
@@ -77,7 +90,12 @@ describe("codex account preferences", () => {
     });
     expect(result.accounts).toEqual([
       { accountId: PRIMARY, alias: "Work", codexHome: "/a", monitored: false },
-      { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
+      {
+        accountId: SECONDARY,
+        alias: "CoWork",
+        codexHome: "C:\\codex-home-second",
+        monitored: true,
+      },
     ]);
   });
 
@@ -98,7 +116,7 @@ describe("codex account preferences", () => {
     expect(result.accounts[1]).toEqual({
       accountId: SECONDARY,
       alias: "S",
-      codexHome: "",
+      codexHome: "C:\\codex-home-second",
       monitored: true,
     });
   });
@@ -127,8 +145,8 @@ describe("codex account preferences", () => {
     // The input is never mutated, so React state stays honest.
     expect(before[1]).toEqual({
       accountId: SECONDARY,
-      alias: "",
-      codexHome: "",
+      alias: "CoWork",
+      codexHome: "C:\\codex-home-second",
       monitored: true,
     });
   });
@@ -169,5 +187,62 @@ describe("codex account preferences", () => {
     expect(isCodexAccountConfigured(bare)).toBe(false);
     expect(isCodexAccountConfigured({ ...bare, codexHome: "   " })).toBe(false);
     expect(isCodexAccountConfigured({ ...bare, codexHome: "C:\\codex\\b" })).toBe(true);
+  });
+
+  it("gives an unconfigured second account its initial values", () => {
+    const result = sanitizeCodexAccountPreferences({
+      accounts: [
+        { accountId: PRIMARY, alias: "Main", codexHome: "C:\\codex\\main", monitored: true },
+        { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
+      ],
+    });
+    expect(result.accounts[1]).toEqual({
+      accountId: SECONDARY,
+      alias: "CoWork",
+      codexHome: "C:\\codex-home-second",
+      monitored: true,
+    });
+  });
+
+  it("never replaces the saved values of a configured second account", () => {
+    const stored = {
+      accountId: SECONDARY,
+      alias: "Work",
+      codexHome: "C:\\codex\\b",
+      monitored: false,
+    };
+    const result = sanitizeCodexAccountPreferences({
+      accounts: [
+        { accountId: PRIMARY, alias: "Main", codexHome: "C:\\codex\\main", monitored: true },
+        stored,
+      ],
+    });
+    expect(result.accounts[1]).toEqual(stored);
+  });
+
+  it("keeps a saved name while the home is still unset", () => {
+    const result = sanitizeCodexAccountPreferences({
+      accounts: [{ accountId: SECONDARY, alias: "Work", codexHome: "", monitored: true }],
+    });
+    expect(result.accounts[1].alias).toBe("Work");
+    expect(result.accounts[1].codexHome).toBe("C:\\codex-home-second");
+  });
+
+  it("never touches the primary account's home or identity", () => {
+    const result = sanitizeCodexAccountPreferences({
+      accounts: [{ accountId: PRIMARY, alias: "Main", codexHome: "C:\\codex\\main", monitored: false }],
+    });
+    expect(result.accounts[0]).toEqual({
+      accountId: PRIMARY,
+      alias: "Main",
+      codexHome: "C:\\codex\\main",
+      monitored: false,
+    });
+    expect(DEFAULT_CODEX_ACCOUNT_PREFERENCES.accounts[0]).toEqual({
+      accountId: PRIMARY,
+      alias: "",
+      codexHome: "",
+      monitored: true,
+    });
   });
 });
