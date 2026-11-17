@@ -192,6 +192,8 @@ fn usage(auth: &CodexAuth, count: u32) -> CodexUsage {
         Utc::now(),
         auth.account_id.as_deref(),
         auth.identity.clone(),
+        #[cfg(windows)]
+        None,
     )
     .unwrap()
 }
@@ -452,11 +454,13 @@ async fn actual_http_reader_limits_body_rejects_errors_redirects_and_schema_drif
     responses.push(chunked);
     for response in responses {
         let (url, server) = server(response, false);
-        assert!(
-            read_credit_details(credit_details_request(client, &auth, &url))
-                .await
-                .is_none()
-        );
+        assert!(read_credit_details(
+            credit_details_request(client, &auth, &url),
+            #[cfg(windows)]
+            None
+        )
+        .await
+        .is_none());
         server.join().unwrap();
     }
     for body in [valid_details(), b"{\"credits\":null}".to_vec()] {
@@ -464,9 +468,13 @@ async fn actual_http_reader_limits_body_rejects_errors_redirects_and_schema_drif
             format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
         response.extend(&body);
         let (url, server) = server(response, false);
-        let read = read_credit_details(credit_details_request(client, &auth, &url))
-            .await
-            .unwrap();
+        let read = read_credit_details(
+            credit_details_request(client, &auth, &url),
+            #[cfg(windows)]
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(read, body);
         server.join().unwrap();
     }
@@ -484,7 +492,13 @@ async fn http_body_timeout_keeps_usage_and_counts_successful() {
     enrich_credit_expiry(
         &mut usage,
         &auth,
-        || read_credit_details(credit_details_request(http_client().unwrap(), &auth, &url)),
+        || {
+            read_credit_details(
+                credit_details_request(http_client().unwrap(), &auth, &url),
+                #[cfg(windows)]
+                None,
+            )
+        },
         || auth.identity.clone(),
     )
     .await;
