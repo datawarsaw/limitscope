@@ -94,24 +94,53 @@ mechanism — no new harness:
 powershell -NoProfile -File scripts/provider-quota-diagnostic.ps1
 ```
 
-One invocation reports all five production providers in canonical registry
-order (`openai-codex`, `zai`, `opencode-go`, `antigravity`, `grok`) through
-the real production fetch paths, redacted by construction and secret-scanned
-(schema and boundaries: `docs/provider-diagnostic-v0.6.md`). The filled table
-is part of the release's own evidence: the dated PASS / FAIL / UNVERIFIED rows
-must remain part of the release evidence / closeout record used for that
-delivery. That record is repository-independent — keep the evidence wherever
-the delivery keeps its release record (for example the delivery report or the
-published GitHub Release notes); no specific ledger file in this repository is
-mandatory. Template:
+The invocation reports every slot in `production_specs()` in registry order,
+including each configured Codex account separately. The current registry contains
+primary and secondary Codex, Claude Code, Z.ai, OpenCode Go, Antigravity, Grok,
+Qwen Token Plan, MiniMax Token Plan and OpenDesign. The registry, not this list,
+is authoritative. Preserve every row in the delivery evidence.
 
-| Provider | Checked at | Result | Evidence | Note |
-| --- | --- | --- | --- | --- |
-| OpenAI / Codex (`openai-codex`) | | | | |
-| Z.ai (`zai`) | | | | |
-| OpenCode Go (`opencode-go`) | | | | |
-| Google Antigravity (`antigravity`) | | | | |
-| Grok (xAI) (`grok`) | | | | |
+For future releases only, the operator may declare inactive provider families in
+an explicit local JSON file outside the repository and run:
+
+```powershell
+powershell -NoProfile -File scripts/provider-quota-diagnostic.ps1 -ScopeFile <local-file>
+```
+
+Example shape (replace the date with the current UTC date and state only the
+operator's current decision; do not store private paths, account details or secrets):
+
+```json
+{
+  "schemaVersion": 1,
+  "providers": [
+    {"id":"openai-codex", "state":"INACTIVE", "date":"2026-11-17", "reason":"Not active for this release"},
+    {"id":"zai", "state":"ACTIVE", "date":"2026-11-17", "reason":"Required for this release"}
+  ]
+}
+```
+
+Each entry requires an exact registered family ID, `ACTIVE` or `INACTIVE`, the
+current UTC date and a nonblank, single-line reason (at most 200 characters).
+Duplicate or unknown IDs, unknown fields, invalid schema, stale dates, or an
+unreadable declaration abort the diagnostic before any probe. An omitted family
+is REQUIRED. The `openai-codex` family covers both Codex account slots; do not
+specify `openai-codex:secondary` separately. Other family IDs match registry IDs.
+The operator must recertify every declaration on the release day and verify it
+against actual intended activation; neither credentials, caches nor hidden UI
+cards establish activation. Re-run after any change in activation or release day.
+No file means every slot is REQUIRED and the full diagnostic runs as before.
+
+The scope is separate from the result: `REQUIRED` or `EXCLUDED_INACTIVE`.
+An excluded slot is never fetched and remains `UNVERIFIED`; retain its dated
+operator declaration in the evidence. The reason stays in the local declaration
+and is never printed by the diagnostic; retain the declaration securely and record
+only a safe reason summary in release evidence. A required slot is probed and
+its `PASS`, `FAIL`, or `UNVERIFIED` result remains subject to the rules below.
+The printed result is provisional until the overall secret scan passes. A scan or
+probe failure invalidates the gate. Record one row per registry slot with scope,
+checked time (or declaration date for an excluded slot), result and safe evidence.
+Any required non-PASS remains for the operator's Human Acceptance decision.
 
 ### Result semantics
 
@@ -151,9 +180,8 @@ judgment.
 
 ### Recording rules
 
-- One row per production provider, in the canonical registry order above; no
-  provider is added, merged, or dropped.
-- "Checked at" is the diagnostic row's own `checkedAt` stamp (RFC-3339 UTC).
+- One row per production registry slot, in registry order; no slot is merged or dropped.
+- "Checked at" is the diagnostic row's own `checkedAt` stamp (RFC-3339 UTC); for excluded slots record the declaration date instead.
 - "Evidence" names the command plus a short result reference (health, and the
   normalized reason code when not PASS).
 - Record only the safe summary. The diagnostic output carries masked account

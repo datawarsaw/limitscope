@@ -1,9 +1,11 @@
+# Optional explicit per-release declaration. Without it all registry slots are REQUIRED.
+param([string]$ScopeFile)
+
 # Provider quota diagnostic — unified, redacted, read-only (every production provider).
 #
 # One invocation runs the sanctioned Rust probe (the ignored
 # `five_provider_diagnostic_report` test in src-tauri) and prints one
-# redacted, normalized row per production provider — Codex, Z.ai,
-# OpenCode Go, Antigravity, Grok, and Qwen Token Plan:
+# redacted, normalized row per production registry slot:
 #
 #   health (canonical: live/stale/unknown/cooldown/error/unavailable)
 #   checkedAt, freshness / source stamp where meaningful
@@ -36,6 +38,15 @@ Write-Host "== LimitScope provider quota diagnostic (redacted, read-only) =="
 Write-Host "Running the production-provider probe via cargo test (ignored live probe)..."
 Write-Host ""
 
+# Do not let an inherited variable silently alter the release scope.
+$previousScope = [Environment]::GetEnvironmentVariable("LIMITSCOPE_RELEASE_SCOPE_FILE", "Process")
+if ($PSBoundParameters.ContainsKey("ScopeFile")) {
+    if ([string]::IsNullOrWhiteSpace($ScopeFile)) { throw "ScopeFile must name a readable declaration" }
+    $resolvedScope = (Resolve-Path -LiteralPath $ScopeFile).ProviderPath
+    [Environment]::SetEnvironmentVariable("LIMITSCOPE_RELEASE_SCOPE_FILE", $resolvedScope, "Process")
+} else {
+    [Environment]::SetEnvironmentVariable("LIMITSCOPE_RELEASE_SCOPE_FILE", $null, "Process")
+}
 Push-Location (Join-Path $repoRoot "src-tauri")
 try {
     # Build progress and warnings go to a temp stderr log so they can never
@@ -43,7 +54,7 @@ try {
     # ("Continue" here: PowerShell 5.1 turns native stderr lines — cargo's
     # progress output — into error records that would otherwise abort.)
     $ErrorActionPreference = "Continue"
-    & cargo test --locked --bin rate-limits five_provider_diagnostic_report -- --ignored --nocapture --test-threads=1 2> $errLog | Tee-Object -FilePath $outLog
+    & cargo test --locked --bin rate-limits five_provider_diagnostic_report -- --ignored --nocapture --test-threads=1 2> $errLog | Set-Content -Path $outLog
     $cargoExit = $LASTEXITCODE
     $ErrorActionPreference = "Stop"
     if ($cargoExit -ne 0) {
@@ -53,6 +64,7 @@ try {
     }
 } finally {
     Pop-Location
+    [Environment]::SetEnvironmentVariable("LIMITSCOPE_RELEASE_SCOPE_FILE", $previousScope, "Process")
 }
 Write-Host ""
 
@@ -80,5 +92,6 @@ if ($hits.Count -gt 0) {
     exit 1
 }
 
+Get-Content $outLog | ForEach-Object { Write-Host $_ }
 Write-Host "secret scan: PASS (no credential-shaped material in the diagnostic output)"
 Write-Host "redacted output saved to $outLog"
