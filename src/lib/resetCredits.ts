@@ -61,7 +61,7 @@ export type ResetCreditLines = {
  * unavailable (absent, stale, invalid, or a non-Codex provider).
  */
 export function formatResetCredits(
-  usage: ProviderUsage,
+  usage: Pick<ProviderUsage, "id" | "resetCredits">,
   nowMs: number = Date.now(),
 ): ResetCreditLines | null {
   if (baseProviderId(usage.id) !== CODEX_PROVIDER_ID) return null;

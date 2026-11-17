@@ -98,6 +98,8 @@ export type FloatingQuotaItem = {
    * remain the Grok segment's quota. Only the Grok detail card reads it.
    */
   grokBot?: GrokBotUsage;
+  /** The observation belonging to this provider/account only. */
+  resetCredits?: ProviderUsage["resetCredits"];
   /** Snapshot is stale even when an error marker is also showing. */
   stale: boolean;
   statusLabel: ProviderStatusPresentation["label"];
@@ -643,6 +645,7 @@ export function floatingQuotaItems(
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),
       ...(usage.accountAlias ? { accountAlias: usage.accountAlias } : {}),
       ...(grokBot ? { grokBot } : {}),
+      ...(usage.resetCredits ? { resetCredits: usage.resetCredits } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,
       ...(usage.id === "claude-code" ? { claudeStatuslineTimes: usage.claudeStatuslineTimes } : {}),
