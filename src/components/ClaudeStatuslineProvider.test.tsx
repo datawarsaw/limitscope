@@ -89,6 +89,19 @@ describe("Claude Code provider presentation", () => {
     expect(floatingQuotaItems([stale])[0].statusLabel).toBe("Last known");
   });
 
+  it("preserves unknown health and does not claim a check time for missing source data", () => {
+    expect(providerStatusPresentation({ ...live, health: "unknown" })).toEqual({ label: "Unknown", className: "unknown" });
+    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
+    for (const usage of [
+      { ...stale, sourceUpdatedAt: undefined },
+      { ...stale, sourceUpdatedAt: "invalid" },
+      { ...stale, limits: [] },
+    ]) {
+      expect(providerStatusPresentation(usage).label).toBe("Last known");
+      expect(providerSourceNote(usage, now)).toBe("Source update time unknown");
+    }
+  });
+
   it("shows last known age and retained values on both surfaces", async () => {
     invoke.mockResolvedValue(setupInfo);
     const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale", sourceUpdatedAt: "2026-11-17T11:42:00Z" };
@@ -99,6 +112,11 @@ describe("Claude Code provider presentation", () => {
     await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.textContent).toContain("Last known");
     expect(container.textContent).toContain("Updated 18m ago");
+    expect(container.textContent).toContain("requires Claude Code activity");
+    const note = providerSourceNote(stale, now, { includeAccount: false });
+    await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={note} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
+    expect(container.textContent).toContain("Last known");
+    expect(container.textContent?.match(/Updated 18m ago from Claude Code/g)).toHaveLength(1);
     expect(container.textContent).toContain("requires Claude Code activity");
   });
 

@@ -253,7 +253,7 @@ export function FloatingProviderPopover({
             {item.error}
           </p>
         ) : null}
-        {item.claudeSourceUpdatedAt ? (
+        {!note && item.claudeSourceUpdatedAt ? (
           <p className="fq-popover-note">Updated {formatAge(item.claudeSourceUpdatedAt, now)} from Claude Code · new quota data requires Claude Code activity</p>
         ) : null}
         {note ? <p className="fq-popover-note">{note}</p> : null}
