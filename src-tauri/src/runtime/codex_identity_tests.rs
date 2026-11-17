@@ -746,10 +746,12 @@ async fn a_single_codex_account_leaves_unrelated_providers_untouched() {
     core.codex_identity_resolver = Some(Arc::new(codex::current_codex_identity));
     let core = Arc::new(core);
     core.set_codex_accounts(&accounts);
-    core.set_codex_specs(specs);
+    // set_codex_specs preserves non-Codex registrations already in the core.
+    core.set_codex_specs(specs.into_iter().filter(|spec| is_codex_provider_id(spec.kind.id())).collect());
     core.run_cycle().await;
 
     let snapshot = core.snapshot();
+    assert_eq!(snapshot.providers.iter().filter(|usage| usage.id == "zai").count(), 1);
     assert_eq!(provider_entry(&snapshot, "openai-codex").limits[0].used_percent, 38.0);
     assert_eq!(provider_entry(&snapshot, "zai").limits[0].used_percent, 12.0);
     assert!(
