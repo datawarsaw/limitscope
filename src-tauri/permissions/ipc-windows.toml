@@ -89,6 +89,11 @@ description = "Trigger the explicit Grok Bot / OpenDesign accessibility reads."
 commands.allow = ["refresh_grok_bot_usage", "refresh_opendesign_usage"]
 
 [[permission]]
+identifier = "allow-claude-statusline-setup-read"
+description = "Read the opt-in Claude Code statusLine command for display. Writes nothing."
+commands.allow = ["get_claude_statusline_setup"]
+
+[[permission]]
 identifier = "allow-open-main-window"
 description = "Show and focus the main dashboard window."
 commands.allow = ["open_main_window"]

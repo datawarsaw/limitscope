@@ -17,6 +17,7 @@ const REGISTRY = ["openai-codex", "zai", "opencode-go", "antigravity", "grok"];
 const PRODUCTION_REGISTRY = [
   "openai-codex",
   "openai-codex:secondary",
+  "claude-code",
   "antigravity",
   "zai",
   "opencode-go",
@@ -210,10 +211,11 @@ describe("canHideProvider / toggleProviderHidden", () => {
 });
 
 describe("the default provider order", () => {
-  it("is the confirmed nine-provider order with both Codex accounts first", () => {
+  it("is the confirmed ten-provider order with both Codex accounts first", () => {
     expect(DEFAULT_PROVIDER_ORDER).toEqual([
       "openai-codex",
       "openai-codex:secondary",
+      "claude-code",
       "antigravity",
       "zai",
       "opencode-go",
@@ -241,6 +243,7 @@ describe("the default provider order", () => {
     expect(resolved.visibleOrderedIds).toEqual([
       "openai-codex",
       "openai-codex:secondary",
+      "claude-code",
       "antigravity",
       "opencode-go",
       "qwen-token-plan",
@@ -297,6 +300,7 @@ describe("the default provider order", () => {
     expect(fullDisplayOrder(PRODUCTION_REGISTRY, { order: [], hidden: ["zai"] })).toEqual([
       "openai-codex",
       "openai-codex:secondary",
+      "claude-code",
       "antigravity",
       "zai",
       "opencode-go",
@@ -308,3 +312,138 @@ describe("the default provider order", () => {
   });
 });
 
+describe("Claude Code in the default provider order", () => {
+  it("sits third: after Codex and Codex CoWork, before Antigravity", () => {
+    const order = [...DEFAULT_PROVIDER_ORDER];
+    expect(order.slice(0, 4)).toEqual([
+      "openai-codex",
+      "openai-codex:secondary",
+      "claude-code",
+      "antigravity",
+    ]);
+    expect(order.slice(3)).toEqual([
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "grok",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+    ]);
+  });
+
+  it("keeps the relative order of the other nine providers unchanged", () => {
+    const withoutClaude = DEFAULT_PROVIDER_ORDER.filter((id) => id !== "claude-code");
+    expect(withoutClaude).toEqual([
+      "openai-codex",
+      "openai-codex:secondary",
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "grok",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+    ]);
+  });
+
+  it("appends Claude to a legacy saved order without rewriting it, and shows it", () => {
+    // A preference file written before Claude existed: nine ids, one hidden.
+    const legacy = {
+      order: [
+        "grok",
+        "openai-codex",
+        "openai-codex:secondary",
+        "zai",
+        "opencode-go",
+        "antigravity",
+        "qwen-token-plan",
+        "minimax-token-plan",
+        "opendesign",
+      ],
+      hidden: ["zai"],
+    };
+    const snapshot = JSON.stringify(legacy);
+    const resolved = resolveProviderPreferences(PRODUCTION_REGISTRY, legacy);
+    expect(resolved.visibleOrderedIds).toEqual([
+      "grok",
+      "openai-codex",
+      "openai-codex:secondary",
+      "opencode-go",
+      "antigravity",
+      "qwen-token-plan",
+      "minimax-token-plan",
+      "opendesign",
+      "claude-code",
+    ]);
+    expect(resolved.hiddenIds).toEqual(["zai"]);
+    expect(JSON.stringify(legacy)).toBe(snapshot);
+    expect(effectiveProviderOrder(PRODUCTION_REGISTRY, legacy).slice(0, 9)).toEqual(legacy.order);
+  });
+
+  it("a hidden Claude keeps its place and stays hidden, never removed from the order", () => {
+    const resolved = resolveProviderPreferences(PRODUCTION_REGISTRY, {
+      order: [],
+      hidden: ["claude-code"],
+    });
+    expect(resolved.visibleOrderedIds).not.toContain("claude-code");
+    expect(resolved.hiddenIds).toEqual(["claude-code"]);
+    expect(fullDisplayOrder(PRODUCTION_REGISTRY, { order: [], hidden: ["claude-code"] })[2]).toBe(
+      "claude-code",
+    );
+  });
+});
+
+
+describe("partial persisted order and visibility", () => {
+  it("a partial saved order leads, then the rest follow in registry order, without rewriting it", () => {
+    const saved = { order: ["opendesign", "grok"], hidden: [] as string[] };
+    const snapshot = JSON.stringify(saved);
+    expect(effectiveProviderOrder(PRODUCTION_REGISTRY, saved)).toEqual([
+      "opendesign",
+      "grok",
+      "openai-codex",
+      "openai-codex:secondary",
+      "claude-code",
+      "antigravity",
+      "zai",
+      "opencode-go",
+      "qwen-token-plan",
+      "minimax-token-plan",
+    ]);
+    expect(JSON.stringify(saved)).toBe(snapshot);
+  });
+
+  it("a saved order naming unknown ids ignores them and keeps the known ones", () => {
+    const resolved = resolveProviderPreferences(PRODUCTION_REGISTRY, {
+      order: ["gone-provider", "zai", "zai"],
+      hidden: ["also-gone"],
+    });
+    expect(resolved.visibleOrderedIds.slice(0, 2)).toEqual(["zai", "openai-codex"]);
+    expect(resolved.visibleOrderedIds).toHaveLength(PRODUCTION_REGISTRY.length);
+    expect(resolved.hiddenIds).toEqual([]);
+  });
+
+  it("visibility alone never rewrites or loses the default order; order alone hides nothing", () => {
+    const hiddenOnly = resolveProviderPreferences(PRODUCTION_REGISTRY, {
+      order: [],
+      hidden: ["antigravity", "claude-code"],
+    });
+    expect(hiddenOnly.hiddenIds).toEqual(["claude-code", "antigravity"]);
+    expect(hiddenOnly.visibleOrderedIds[0]).toBe("openai-codex");
+    const orderOnly = resolveProviderPreferences(PRODUCTION_REGISTRY, {
+      order: ["grok"],
+      hidden: [],
+    });
+    expect(orderOnly.hiddenIds).toEqual([]);
+    expect(orderOnly.visibleOrderedIds[0]).toBe("grok");
+  });
+
+  it("a malformed partial store degrades to the default order with nothing hidden", () => {
+    for (const saved of [{ order: "grok" }, { hidden: 3 }, { order: [1, null, ""] }, "x", null]) {
+      const resolved = resolveProviderPreferences(PRODUCTION_REGISTRY, saved);
+      expect(resolved.visibleOrderedIds).toEqual([...DEFAULT_PROVIDER_ORDER]);
+      expect(resolved.hiddenIds).toEqual([]);
+    }
+  });
+});

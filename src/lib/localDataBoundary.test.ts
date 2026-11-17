@@ -36,6 +36,9 @@ const IPC_SURFACE = new Set([
   // triggered only by an explicit user action in the OpenDesign detail card.
   // It reads no browser storage and makes no network request.
   "opendesign::refresh_opendesign_usage",
+  // Claude Code opt-in setup: returns this executable's statusLine command
+  // for display only. It reads no Claude Code file and writes nothing.
+  "claude_statusline::get_claude_statusline_setup",
   "open_main_window",
   "runtime::get_codex_accounts",
   "runtime::get_operational_settings",

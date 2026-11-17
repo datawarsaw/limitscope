@@ -14,6 +14,7 @@
 import {
   CODEX_PROVIDER_ID,
   CODEX_SECONDARY_PROVIDER_ID,
+  CLAUDE_CODE_PROVIDER_ID,
 } from "./providerIds";
 
 export type ProviderPreferences = {
@@ -28,7 +29,8 @@ export type ProviderPreferences = {
  *
  * This is the order an operator confirmed for a new configuration: the two
  * Codex accounts first — the second account right after the primary — then
- * Antigravity, Z.ai, OpenCode, Grok, Qwen, MiniMax and OpenDesign.
+ * Claude Code, Antigravity, Z.ai, OpenCode, Grok, Qwen, MiniMax and
+ * OpenDesign.
  *
  * It is a DEFAULT, not a stored configuration. A persisted custom order
  * always wins and is never rewritten; this list only decides the order of a
@@ -39,6 +41,7 @@ export type ProviderPreferences = {
 export const DEFAULT_PROVIDER_ORDER: readonly string[] = [
   CODEX_PROVIDER_ID,
   CODEX_SECONDARY_PROVIDER_ID,
+  CLAUDE_CODE_PROVIDER_ID,
   "antigravity",
   "zai",
   "opencode-go",

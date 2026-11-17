@@ -91,7 +91,10 @@ async fn publish(core: &Arc<RuntimeCore>) -> RuntimeSnapshot {
 
 #[tokio::test]
 async fn production_normalization_preserves_primary_single_account_behavior() {
-    let specs = codex_specs_with_fetch(&codex_accounts::default_accounts(), |home| async move {
+    // Single-account scenario: the second account's initial home is cleared.
+    let mut single = codex_accounts::default_accounts();
+    single[1].codex_home = String::new();
+    let specs = codex_specs_with_fetch(&single, |home| async move {
         assert_eq!(home, None, "the primary keeps its default source");
         Ok(usage(0, 0.0))
     });
@@ -375,4 +378,31 @@ async fn production_normalization_isolates_last_good_cooldown_history_pause_and_
         assert_eq!(resumed.providers[affected].health, ProviderHealth::Live);
         assert_eq!(resumed.providers[affected].monitoring_paused, Some(false));
     }
+}
+
+#[tokio::test]
+async fn a_second_account_sharing_the_primary_home_never_reads_that_login() {
+    let dir = std::env::temp_dir().join(format!("limitscope-collision-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut accounts = codex_accounts::default_accounts();
+    accounts[0].codex_home = dir.to_string_lossy().into_owned();
+    accounts[1].codex_home = dir.join(".").to_string_lossy().into_owned();
+    let fetched = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let specs = codex_specs_with_fetch(&accounts, {
+        let fetched = fetched.clone();
+        move |home| {
+            let fetched = fetched.clone();
+            async move {
+                fetched.lock().unwrap().push(home);
+                Ok(usage(0, 0.0))
+            }
+        }
+    });
+    assert_eq!(specs.len(), 2);
+    let primary = (specs[0].fetch)().await.unwrap();
+    assert_eq!(primary.health, ProviderHealth::Live);
+    let secondary = (specs[1].fetch)().await.expect_err("the shared login is never read");
+    assert_eq!(secondary.code, "codex_home_collision");
+    assert_eq!(fetched.lock().unwrap().len(), 1, "only the primary account read the login");
+    std::fs::remove_dir_all(dir).unwrap();
 }

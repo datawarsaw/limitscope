@@ -99,14 +99,17 @@ describe("codex account preferences", () => {
     ]);
   });
 
-  it("replaces wrongly typed fields with per-account defaults", () => {
+  it("replaces wrongly typed fields of a saved entry with neutral values, like the Rust store", () => {
     const result = sanitizeCodexAccountPreferences({
       accounts: [
         { accountId: PRIMARY, alias: 42, codexHome: null, monitored: "yes" },
         { accountId: SECONDARY, alias: { x: 1 }, codexHome: 7, monitored: 0 },
       ],
     });
-    expect(result.accounts).toEqual(DEFAULT_CODEX_ACCOUNT_PREFERENCES.accounts);
+    expect(result.accounts).toEqual([
+      { accountId: PRIMARY, alias: "", codexHome: "", monitored: true },
+      { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
+    ]);
   });
 
   it("skips non-object entries without throwing", () => {
@@ -116,7 +119,7 @@ describe("codex account preferences", () => {
     expect(result.accounts[1]).toEqual({
       accountId: SECONDARY,
       alias: "S",
-      codexHome: "C:\\codex-home-second",
+      codexHome: "",
       monitored: true,
     });
   });
@@ -189,12 +192,9 @@ describe("codex account preferences", () => {
     expect(isCodexAccountConfigured({ ...bare, codexHome: "C:\\codex\\b" })).toBe(true);
   });
 
-  it("gives an unconfigured second account its initial values", () => {
+  it("gives an ABSENT second account its initial values", () => {
     const result = sanitizeCodexAccountPreferences({
-      accounts: [
-        { accountId: PRIMARY, alias: "Main", codexHome: "C:\\codex\\main", monitored: true },
-        { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
-      ],
+      accounts: [{ accountId: PRIMARY, alias: "Main", codexHome: "C:\\codex\\main", monitored: true }],
     });
     expect(result.accounts[1]).toEqual({
       accountId: SECONDARY,
@@ -202,6 +202,21 @@ describe("codex account preferences", () => {
       codexHome: "C:\\codex-home-second",
       monitored: true,
     });
+  });
+
+  it("never repopulates a cleared second account home", () => {
+    const result = sanitizeCodexAccountPreferences({
+      accounts: [
+        { accountId: SECONDARY, alias: "", codexHome: "", monitored: true },
+      ],
+    });
+    expect(result.accounts[1]).toEqual({
+      accountId: SECONDARY,
+      alias: "",
+      codexHome: "",
+      monitored: true,
+    });
+    expect(isCodexAccountConfigured(result.accounts[1])).toBe(false);
   });
 
   it("never replaces the saved values of a configured second account", () => {
@@ -220,12 +235,38 @@ describe("codex account preferences", () => {
     expect(result.accounts[1]).toEqual(stored);
   });
 
-  it("keeps a saved name while the home is still unset", () => {
+  it("keeps a saved name and a deactivated flag while the home is cleared", () => {
     const result = sanitizeCodexAccountPreferences({
-      accounts: [{ accountId: SECONDARY, alias: "Work", codexHome: "", monitored: true }],
+      accounts: [{ accountId: SECONDARY, alias: "Work", codexHome: "", monitored: false }],
     });
-    expect(result.accounts[1].alias).toBe("Work");
-    expect(result.accounts[1].codexHome).toBe("C:\\codex-home-second");
+    expect(result.accounts[1]).toEqual({
+      accountId: SECONDARY,
+      alias: "Work",
+      codexHome: "",
+      monitored: false,
+    });
+  });
+
+  it("matches the Rust store for a partially saved second account", () => {
+    // Rust parse_account: a lacking field is "" / "" / true, never CoWork.
+    const homeOnly = sanitizeCodexAccountPreferences({
+      accounts: [{ accountId: SECONDARY, codexHome: "C:/fixture/work" }],
+    });
+    expect(homeOnly.accounts[1]).toEqual({
+      accountId: SECONDARY,
+      alias: "",
+      codexHome: "C:/fixture/work",
+      monitored: true,
+    });
+    const aliasOnly = sanitizeCodexAccountPreferences({
+      accounts: [{ accountId: SECONDARY, alias: "Work" }],
+    });
+    expect(aliasOnly.accounts[1]).toEqual({
+      accountId: SECONDARY,
+      alias: "Work",
+      codexHome: "",
+      monitored: true,
+    });
   });
 
   it("never touches the primary account's home or identity", () => {

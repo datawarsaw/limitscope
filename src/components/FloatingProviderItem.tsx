@@ -20,6 +20,8 @@ export function ProviderMark({ id }: { id: string }) {
   // never the account.
   const provider = baseProviderId(id);
   if (provider === "opendesign") return <span className="fq-mark-fallback">OD</span>;
+  // A monogram, not Anthropic's mark: no brand asset is bundled.
+  if (provider === "claude-code") return <span className="fq-mark-fallback">CC</span>;
   if (provider === "minimax-token-plan") {
     // The MiniMax mark reduced to a two-letter monogram: the brand's own
     // wordmark is not licensed into the app, and the single-letter fallback

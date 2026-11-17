@@ -308,7 +308,7 @@ impl ProviderLastGoodStore {
 
         for spec in specs {
             let kind = spec.kind;
-            if kind.is_manual_only() {
+            if kind.is_manual_only() || kind.keeps_own_durable_store() {
                 continue;
             }
             let Some(persisted) = state.get(kind.id()) else {
@@ -502,7 +502,7 @@ impl ProviderLastGoodStore {
     /// - Must have non-empty valid limits
     /// - Errors, cooldown skips, and unavailable states are never recorded
     pub fn record_success(&self, kind: ProviderKind, dto: &ProviderUsageDto) {
-        if kind.is_manual_only() {
+        if kind.is_manual_only() || kind.keeps_own_durable_store() {
             return;
         }
         if !provider_identity_is_current(

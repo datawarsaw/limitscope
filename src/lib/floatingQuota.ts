@@ -471,6 +471,7 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   "qwen-token-plan": ["Monthly"],
   "minimax-token-plan": ["Weekly"],
   opendesign: ["7-day"],
+  "claude-code": ["7-day"],
 };
 
 const MINUTE_SECONDS = 60;

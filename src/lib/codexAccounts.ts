@@ -43,8 +43,8 @@ export type CodexAccountPreferences = {
  * The account is offered with a name and a Codex home of its own, so the
  * user only has to create that folder and log that account in with the
  * Codex CLI. These are INITIAL values, not a stored configuration: they
- * apply only while the second account has never been configured, and any
- * value the user saved always wins.
+ * apply only while the second account has no saved entry, and any
+ * value the user saved — including a cleared home — always wins.
  *
  * The primary account is deliberately not part of this: it keeps its own
  * default Codex home and its own identity.
@@ -79,16 +79,20 @@ function defaultAccount(accountId: string): CodexAccountSettings {
   return { ...(found ?? { accountId, alias: "", codexHome: "", monitored: true }) };
 }
 
+/**
+ * One persisted entry. A PRESENT entry is the user's own configuration: a
+ * field it lacks is neutral (empty name, empty home, monitoring on) — the
+ * exact rule of the Rust store — and never receives the initial values.
+ */
 function sanitizeAccount(
   accountId: string,
   entry: Partial<CodexAccountSettings>,
 ): CodexAccountSettings {
-  const fallback = defaultAccount(accountId);
   return {
     accountId,
-    alias: typeof entry.alias === "string" ? entry.alias : fallback.alias,
-    codexHome: typeof entry.codexHome === "string" ? entry.codexHome : fallback.codexHome,
-    monitored: typeof entry.monitored === "boolean" ? entry.monitored : fallback.monitored,
+    alias: typeof entry.alias === "string" ? entry.alias : "",
+    codexHome: typeof entry.codexHome === "string" ? entry.codexHome : "",
+    monitored: typeof entry.monitored === "boolean" ? entry.monitored : true,
   };
 }
 
@@ -115,33 +119,13 @@ export function sanitizeCodexAccountPreferences(value: unknown): CodexAccountPre
     firstByAccountId.set(accountId, entry as Partial<CodexAccountSettings>);
   }
 
-  const accounts = CODEX_ACCOUNT_IDS.map((accountId) =>
-    sanitizeAccount(accountId, firstByAccountId.get(accountId) ?? {}),
-  );
-  applySecondaryAccountDefaults(accounts);
+  // Only an ABSENT account starts from its initial values. A saved entry —
+  // including one whose home the user cleared — is never repopulated.
+  const accounts = CODEX_ACCOUNT_IDS.map((accountId) => {
+    const entry = firstByAccountId.get(accountId);
+    return entry ? sanitizeAccount(accountId, entry) : defaultAccount(accountId);
+  });
   return { accounts };
-}
-
-/**
- * The initial editable values of the second account apply only while that
- * account has never been configured.
- *
- * "Never configured" is the account's own Codex home being empty: that is
- * exactly the state in which the account cannot be read at all. A saved
- * home is a real configuration and is never touched, and a saved name is
- * never replaced — only the values that are still unset receive the initial
- * ones. The primary account is never touched here.
- */
-function applySecondaryAccountDefaults(accounts: CodexAccountSettings[]): void {
-  const secondary = accounts.find(
-    (account) => account.accountId === CODEX_SECONDARY_PROVIDER_ID,
-  );
-  if (!secondary) return;
-  if (secondary.codexHome.trim().length > 0) return;
-  secondary.codexHome = SECONDARY_CODEX_ACCOUNT_DEFAULTS.codexHome;
-  if (secondary.alias.trim().length === 0) {
-    secondary.alias = SECONDARY_CODEX_ACCOUNT_DEFAULTS.alias;
-  }
 }
 
 /**

@@ -22,6 +22,7 @@ import { CRITICAL_PERCENT, NEAR_LIMIT_PERCENT } from "./thresholds";
  * for the narrow rail only, with a generic fallback for unknown providers. */
 const SHORT_NAMES: Readonly<Record<string, string>> = {
   "openai-codex": "Codex",
+  "claude-code": "Claude",
   zai: "Z.ai",
   "opencode-go": "OpenCode",
   antigravity: "Antigravity",

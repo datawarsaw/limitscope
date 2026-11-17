@@ -163,32 +163,21 @@ pub fn normalize_accounts(accounts: &[CodexAccountConfig]) -> Vec<CodexAccountCo
         account.codex_home = account.codex_home.trim().to_string();
         out.push(account);
     }
-    apply_secondary_initial_defaults(&mut out);
     out
 }
 
-/// The initial editable values of the second account apply only while that
-/// account has never been configured.
-///
-/// "Never configured" is the account's own Codex home being empty: that is
-/// exactly the state in which the account cannot be read at all. A saved
-/// home is a real configuration and is never touched, and a saved name is
-/// never replaced — only the values that are still unset receive the
-/// initial ones. The primary account is never touched here.
-fn apply_secondary_initial_defaults(accounts: &mut [CodexAccountConfig]) {
-    let Some(secondary) = accounts
-        .iter_mut()
-        .find(|account| account.account_id == SECONDARY_ACCOUNT_ID)
-    else {
-        return;
+/// Whether the second account's initial values would collide with the
+/// primary account's credential home in THIS process environment (ambient
+/// `CODEX_HOME`, `~/.codex`, working directory). Used by the runtime so a
+/// configuration that was never validated by the write path (initial
+/// defaults, an older persisted file, or an ambient `CODEX_HOME` set after
+/// the save) can never read one login under two account names.
+pub fn secondary_collides_with_primary(accounts: &[CodexAccountConfig]) -> bool {
+    let ambient = std::env::var("CODEX_HOME").ok();
+    let (Some(user_home), Ok(current_dir)) = (std::env::home_dir(), std::env::current_dir()) else {
+        return false;
     };
-    if !secondary.codex_home.trim().is_empty() {
-        return;
-    }
-    secondary.codex_home = SECONDARY_DEFAULT_CODEX_HOME.to_string();
-    if secondary.alias.trim().is_empty() {
-        secondary.alias = SECONDARY_DEFAULT_ALIAS.to_string();
-    }
+    validate_codex_home_collisions_in(accounts, ambient.as_deref(), &user_home, &current_dir).is_err()
 }
 
 /// Rejects a configuration in which both Codex accounts resolve to the same
@@ -842,25 +831,54 @@ mod tests {
     }
 
     #[test]
-    fn a_persisted_unconfigured_second_account_gets_the_initial_values() {
-        let path = store_path("unconfigured-secondary");
+    fn a_persisted_cleared_second_account_stays_cleared_and_is_never_rewritten() {
+        let path = store_path("cleared-secondary");
         let raw = r#"{
           "version": 1,
           "accounts": [
             { "accountId": "openai-codex", "alias": "Personal", "codexHome": "", "monitored": true },
-            { "accountId": "openai-codex:secondary", "alias": "", "codexHome": "", "monitored": true }
+            { "accountId": "openai-codex:secondary", "alias": "Work", "codexHome": "", "monitored": false }
           ]
         }"#;
         fs::write(&path, raw).expect("write fixture");
         let store = CodexAccountStore::open(path.clone());
         let accounts = store.accounts();
-        assert_eq!(accounts[1].alias, "CoWork");
-        assert_eq!(accounts[1].codex_home, "C:\\codex-home-second");
-        assert_eq!(
-            fs::read_to_string(&path).expect("read fixture"),
-            raw,
-            "reading the store never rewrites the persisted file"
-        );
+        assert_eq!(accounts[1].alias, "Work", "the saved name is preserved");
+        assert_eq!(accounts[1].codex_home, "", "a cleared home is never repopulated");
+        assert!(!accounts[1].monitored);
+        assert!(!accounts[1].is_configured());
+        assert_eq!(fs::read_to_string(&path).expect("read fixture"), raw);
+        remove_store(&path);
+    }
+
+    #[test]
+    fn a_partially_saved_second_account_takes_neutral_values_never_the_initial_ones() {
+        // Same rule as the WebView sanitizer: a PRESENT entry is the user's
+        // configuration; a field it lacks is empty (monitoring on), not the
+        // initial CoWork values.
+        let path = store_path("partial-secondary");
+        fs::write(
+            &path,
+            r#"{ "version": 1, "accounts": [
+              { "accountId": "openai-codex:secondary", "codexHome": "C:/fixture/work" }
+            ] }"#,
+        )
+        .expect("write fixture");
+        let accounts = CodexAccountStore::open(path.clone()).accounts();
+        assert_eq!(accounts[1].alias, "");
+        assert_eq!(accounts[1].codex_home, "C:/fixture/work");
+        assert!(accounts[1].monitored);
+        fs::write(
+            &path,
+            r#"{ "version": 1, "accounts": [
+              { "accountId": "openai-codex:secondary", "alias": "Work" }
+            ] }"#,
+        )
+        .expect("write fixture");
+        let accounts = CodexAccountStore::open(path.clone()).accounts();
+        assert_eq!(accounts[1].alias, "Work");
+        assert_eq!(accounts[1].codex_home, "");
+        assert!(!accounts[1].is_configured());
         remove_store(&path);
     }
 
@@ -922,13 +940,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unconfigured_second_account_receives_the_initial_values() {
+    fn an_absent_second_account_receives_the_initial_values_but_a_cleared_one_does_not() {
+        let normalized = normalize_accounts(&[default_accounts()[0].clone()]);
+        assert_eq!(normalized[1].alias, "CoWork");
+        assert_eq!(normalized[1].codex_home, "C:\\codex-home-second");
         let mut accounts = default_accounts();
         accounts[1].alias = String::new();
         accounts[1].codex_home = String::new();
         let normalized = normalize_accounts(&accounts);
-        assert_eq!(normalized[1].alias, "CoWork");
-        assert_eq!(normalized[1].codex_home, "C:\\codex-home-second");
+        assert_eq!(normalized[1].alias, "");
+        assert_eq!(normalized[1].codex_home, "");
+        assert!(!normalized[1].is_configured());
     }
 
     #[test]
@@ -944,13 +966,52 @@ mod tests {
     }
 
     #[test]
-    fn a_saved_name_survives_while_the_home_is_still_unset() {
+    fn clearing_the_home_keeps_the_saved_name_and_persists_cleared() {
+        let root = temp_dir("clear-home-context");
+        let path = store_path("clear-home");
+        let store = CodexAccountStore::open(path.clone());
         let mut accounts = default_accounts();
         accounts[1].alias = "Work".to_string();
+        accounts[1].codex_home = "C:/fixture/work".to_string();
+        apply(&store, &accounts, &root).unwrap();
         accounts[1].codex_home = String::new();
-        let normalized = normalize_accounts(&accounts);
-        assert_eq!(normalized[1].alias, "Work", "a saved name is never replaced");
-        assert_eq!(normalized[1].codex_home, "C:\\codex-home-second");
+        apply(&store, &accounts, &root).unwrap();
+        for reopened in [store.accounts(), CodexAccountStore::open(path.clone()).accounts()] {
+            assert_eq!(reopened[1].alias, "Work");
+            assert_eq!(reopened[1].codex_home, "");
+            assert!(!reopened[1].is_configured());
+        }
+        // Deactivating keeps every saved value too.
+        accounts[1].codex_home = "C:/fixture/work".to_string();
+        accounts[1].monitored = false;
+        apply(&store, &accounts, &root).unwrap();
+        let reopened = CodexAccountStore::open(path.clone()).accounts();
+        assert_eq!(reopened[1], accounts[1]);
+        remove_store(&path);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn the_runtime_guard_detects_the_initial_home_matching_the_primary_home() {
+        let root = temp_dir("runtime-guard-context");
+        let shared = root.join("shared");
+        fs::create_dir_all(&shared).unwrap();
+        let mut accounts = default_accounts();
+        accounts[0].codex_home = shared.to_string_lossy().into_owned();
+        accounts[1].codex_home = shared.join(".").to_string_lossy().into_owned();
+        assert!(validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root).is_err());
+        // The unsaved initial home is checked against the ambient home too.
+        accounts[0].codex_home = String::new();
+        accounts[1].codex_home = shared.to_string_lossy().into_owned();
+        assert!(validate_codex_home_collisions_in(
+            &accounts,
+            Some(shared.to_string_lossy().as_ref()),
+            &root.join("user"),
+            &root
+        )
+        .is_err());
+        assert!(validate_codex_home_collisions_in(&accounts, None, &root.join("user"), &root).is_ok());
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -972,7 +1033,7 @@ mod tests {
         assert_eq!(normalized[1].account_id, SECONDARY_ACCOUNT_ID);
         // The alias travelled with its account, not with its position.
         assert_eq!(normalized[0].alias, "Second");
-        assert_eq!(normalized[1].alias, "CoWork");
+        assert_eq!(normalized[1].alias, "CoWork", "the absent second account gets its initial name");
     }
 
     #[test]

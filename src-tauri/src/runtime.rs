@@ -662,6 +662,9 @@ pub enum ProviderKind {
     QwenTokenPlan,
     MiniMaxTokenPlan,
     OpenDesign,
+    /// Claude Code subscription limits, received passively from the
+    /// documented `statusLine` hook (see `claude_statusline.rs`).
+    ClaudeCode,
 }
 
 impl ProviderKind {
@@ -676,6 +679,7 @@ impl ProviderKind {
             ProviderKind::QwenTokenPlan => "qwen-token-plan",
             ProviderKind::MiniMaxTokenPlan => "minimax-token-plan",
             ProviderKind::OpenDesign => "opendesign",
+            ProviderKind::ClaudeCode => "claude-code",
         }
     }
 
@@ -690,6 +694,7 @@ impl ProviderKind {
             ProviderKind::QwenTokenPlan => "Qwen Token Plan",
             ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan",
             ProviderKind::OpenDesign => "OpenDesign",
+            ProviderKind::ClaudeCode => "Claude Code",
         }
     }
 
@@ -704,6 +709,7 @@ impl ProviderKind {
             "qwen-token-plan" => Some(ProviderKind::QwenTokenPlan),
             "minimax-token-plan" => Some(ProviderKind::MiniMaxTokenPlan),
             "opendesign" => Some(ProviderKind::OpenDesign),
+            "claude-code" => Some(ProviderKind::ClaudeCode),
             _ => None,
         }
     }
@@ -719,7 +725,17 @@ impl ProviderKind {
             ProviderKind::QwenTokenPlan => "Qwen Token Plan usage could not be fetched.",
             ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan usage could not be fetched.",
             ProviderKind::OpenDesign => "OpenDesign usage could not be read.",
+            ProviderKind::ClaudeCode => "Claude Code usage could not be read.",
         }
+    }
+
+    /// Claude Code's snapshot is already a durable, validated, bounded
+    /// store of its own (`claude-statusline-v1.json`), re-validated and
+    /// expiry-checked on every read. A second persisted copy in the
+    /// last-good cache could only resurface values past their reset, so
+    /// this provider never enters that cache.
+    pub(crate) fn keeps_own_durable_store(self) -> bool {
+        matches!(self, ProviderKind::ClaudeCode)
     }
 
     /// OpenDesign is fed only by an explicit UIA scan. It must never enter
@@ -1494,6 +1510,85 @@ fn opendesign_windows_dto(
     dto
 }
 
+/// A statusLine observation is live for 15 minutes after LimitScope received
+/// it. Claude Code only runs the hook on its own events, so an idle or
+/// closed Claude Code stops refreshing the reading; past this age the value
+/// is shown as stale (and never recorded as a live observation) until the
+/// window resets.
+const CLAUDE_STATUSLINE_LIVE_S: i64 = 15 * 60;
+
+/// Projects the stored statusLine snapshot onto the common provider
+/// contract. Missing, unreadable, expired and idle data are each reported
+/// as such — an absent or reset window is NEVER inferred to be 0% used.
+fn normalize_claude_statusline(
+    read: crate::claude_statusline::StoreRead,
+    now: DateTime<Utc>,
+) -> ProviderUsageDto {
+    use crate::claude_statusline::StoreRead;
+    let now_s = now.timestamp();
+    let now_iso = now.to_rfc3339_opts(SecondsFormat::Millis, true);
+    let snapshot = match read {
+        StoreRead::Missing => {
+            return ProviderUsageDto {
+                checked_at: now_iso,
+                error: Some("No Claude Code status line data has been received yet.".to_string()),
+                error_category: Some("statusline_no_data".to_string()),
+                ..base_usage(ProviderKind::ClaudeCode, ProviderHealth::Unavailable, Vec::new())
+            };
+        }
+        StoreRead::Invalid => {
+            return ProviderUsageDto {
+                checked_at: now_iso,
+                error: Some("The saved Claude Code status line data could not be read.".to_string()),
+                error_category: Some("statusline_store_invalid".to_string()),
+                ..base_usage(ProviderKind::ClaudeCode, ProviderHealth::Error, Vec::new())
+            };
+        }
+        StoreRead::Valid(snapshot) => snapshot,
+    };
+    let mut limits = Vec::new();
+    let mut oldest_observed = i64::MAX;
+    for (label, window) in [("5-hour", snapshot.five_hour), ("7-day", snapshot.seven_day)] {
+        // A window past its reset carries no current information.
+        let Some(window) = window.filter(|window| window.resets_at > now_s) else {
+            continue;
+        };
+        let Some(reset_at) = DateTime::from_timestamp(window.resets_at, 0) else {
+            continue;
+        };
+        oldest_observed = oldest_observed.min(window.observed_at);
+        limits.push(UsageLimitDto {
+            label: label.to_string(),
+            used_percent: clamp_percent(window.used_percent),
+            reset_at: Some(reset_at.to_rfc3339_opts(SecondsFormat::Millis, true)),
+            reset_text: None,
+        });
+    }
+    if limits.is_empty() {
+        return ProviderUsageDto {
+            checked_at: now_iso,
+            error: Some(
+                "The last Claude Code limits have reset; waiting for the next Claude Code response."
+                    .to_string(),
+            ),
+            error_category: Some("statusline_windows_expired".to_string()),
+            ..base_usage(ProviderKind::ClaudeCode, ProviderHealth::Unavailable, Vec::new())
+        };
+    }
+    // The entry is as old as its oldest displayed window.
+    let observed_iso = DateTime::from_timestamp(oldest_observed, 0)
+        .map(|stamp| stamp.to_rfc3339_opts(SecondsFormat::Millis, true))
+        .unwrap_or_else(|| now_iso.clone());
+    let age_s = now_s - oldest_observed;
+    let live = (-300..=CLAUDE_STATUSLINE_LIVE_S).contains(&age_s);
+    let health = if live { ProviderHealth::Live } else { ProviderHealth::Stale };
+    let mut dto = base_usage(ProviderKind::ClaudeCode, health, limits);
+    dto.checked_at = observed_iso.clone();
+    dto.source_updated_at = Some(observed_iso);
+    dto.data_freshness = Some(if live { "fresh" } else { "stale" });
+    dto
+}
+
 /// The production provider set — the exact registry the TS `registry.ts`
 /// pinned (same ids, same order, no simulated providers) for the default
 /// single-account configuration. Order is wire order: the frontend renders
@@ -1535,8 +1630,32 @@ where
     Fut: Future<Output = Result<CodexUsage, ProviderError>> + Send + 'static,
 {
     let mut specs = Vec::new();
+    // The second account must never read the primary account's login under
+    // its own name. The write path rejects such a configuration; this guards
+    // the ones it never saw (initial values, an ambient CODEX_HOME).
+    let collides = codex_accounts::secondary_collides_with_primary(accounts);
     for account in accounts {
         if !account.is_configured() {
+            continue;
+        }
+        if collides && account.account_id == codex_accounts::SECONDARY_ACCOUNT_ID {
+            if let Some(kind) = codex_kind_for(&account.account_id) {
+                specs.push(ProviderSpec {
+                    kind,
+                    fetch: Arc::new(move || {
+                        Box::pin(async move {
+                            normalize_codex(
+                                kind,
+                                Err(ProviderError::new(
+                                    "codex_home_collision",
+                                    "This account's Codex home is the same as the primary account's. Choose a different Codex home.",
+                                )),
+                                Utc::now().timestamp_millis(),
+                            )
+                        })
+                    }),
+                });
+            }
             continue;
         }
         let Some(kind) = codex_kind_for(&account.account_id) else {
@@ -1602,6 +1721,21 @@ fn other_production_specs() -> Vec<ProviderSpec> {
     // gate inside the normalizer — the gate evaluates bounds against the
     // moment the provider actually answered.
     vec![
+        ProviderSpec {
+            kind: ProviderKind::ClaudeCode,
+            // Offline by construction: reads only the local snapshot the
+            // documented statusLine hook delivered. No network, no model
+            // call, no credential, and nothing is started or polled.
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    let now = Utc::now();
+                    Ok(normalize_claude_statusline(
+                        crate::claude_statusline::read_default_store(now),
+                        now,
+                    ))
+                })
+            }),
+        },
         ProviderSpec {
             kind: ProviderKind::Zai,
             fetch: Arc::new(|| {
@@ -3973,6 +4107,9 @@ impl RuntimeCore {
                     store.record_success(kind, &dto);
                 }
             }
+            // The statusLine snapshot is its own durable source of truth;
+            // nothing is retained or persisted a second time.
+            ProviderKind::ClaudeCode => {}
             ProviderKind::Grok => {
                 if dto.limits.is_empty() {
                     // Zero-window success: usage is unknown upstream, never
@@ -5477,6 +5614,160 @@ mod tests {
         assert_eq!(dto.error, None);
     }
 
+    // ---- Claude Code statusLine provider ----
+
+    fn claude_store(
+        five: Option<(f64, i64, i64)>,
+        seven: Option<(f64, i64, i64)>,
+    ) -> crate::claude_statusline::StoreRead {
+        use crate::claude_statusline::{Snapshot, StoreRead, WindowReading, SOURCE};
+        let window = |(used_percent, resets_at, observed_at): (f64, i64, i64)| WindowReading {
+            used_percent,
+            resets_at,
+            observed_at,
+        };
+        StoreRead::Valid(Snapshot {
+            version: 1,
+            source: SOURCE.to_string(),
+            five_hour: five.map(window),
+            seven_day: seven.map(window),
+        })
+    }
+
+    #[test]
+    fn claude_code_projection_is_live_with_provenance_and_exact_values() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let dto = normalize_claude_statusline(
+            claude_store(Some((23.5, s + 3600, s - 60)), Some((41.2, s + 86_400, s - 60))),
+            now,
+        );
+        assert_eq!(dto.id, "claude-code");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.status, "ok");
+        assert_eq!(dto.data_freshness, Some("fresh"));
+        assert_eq!(dto.source_updated_at.as_deref(), Some(dto.checked_at.as_str()));
+        assert_eq!(
+            dto.limits.iter().map(|l| (l.label.as_str(), l.used_percent)).collect::<Vec<_>>(),
+            [("5-hour", 23.5), ("7-day", 41.2)]
+        );
+        assert!(dto.limits.iter().all(|l| l.reset_at.is_some() && l.reset_text.is_none()));
+        assert_eq!(dto.plan_type, None, "the hook does not state a plan, so none is claimed");
+        assert_eq!(dto.error, None);
+    }
+
+    #[test]
+    fn claude_code_idle_data_goes_stale_and_is_never_recorded() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let live_edge = normalize_claude_statusline(
+            claude_store(Some((50.0, s + 3600, s - CLAUDE_STATUSLINE_LIVE_S)), None),
+            now,
+        );
+        assert_eq!(live_edge.health, ProviderHealth::Live);
+        let stale = normalize_claude_statusline(
+            claude_store(Some((50.0, s + 3600, s - CLAUDE_STATUSLINE_LIVE_S - 1)), None),
+            now,
+        );
+        assert_eq!(stale.health, ProviderHealth::Stale);
+        assert_eq!(stale.data_freshness, Some("stale"));
+        assert_eq!(stale.limits[0].used_percent, 50.0, "the value is kept, labelled stale");
+        // History and notifications share this gate: a stale reading never
+        // becomes an observation.
+        assert!(crate::history::observations_from_usages(&[stale]).is_empty());
+        // One idle window makes the whole entry stale (oldest wins).
+        let mixed = normalize_claude_statusline(
+            claude_store(Some((1.0, s + 3600, s - 10)), Some((2.0, s + 86_400, s - 3600))),
+            now,
+        );
+        assert_eq!(mixed.health, ProviderHealth::Stale);
+    }
+
+    #[test]
+    fn claude_code_live_readings_enter_history_with_their_source_time() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let dto = normalize_claude_statusline(
+            claude_store(Some((10.0, s + 3600, s - 30)), Some((20.0, s + 86_400, s - 30))),
+            now,
+        );
+        let observations = crate::history::observations_from_usages(&[dto.clone()]);
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().all(|o| o.provider_id == "claude-code"
+            && Some(o.observed_at.as_str()) == dto.source_updated_at.as_deref()
+            && o.reset_at.is_some()
+            && o.account.is_none()));
+        // The same snapshot read again on a later cycle keeps the same
+        // source timestamp, so history's same-timestamp dedupe applies.
+        let again = normalize_claude_statusline(
+            claude_store(Some((10.0, s + 3600, s - 30)), Some((20.0, s + 86_400, s - 30))),
+            now + chrono::Duration::seconds(60),
+        );
+        assert_eq!(again.source_updated_at, dto.source_updated_at);
+    }
+
+    #[test]
+    fn claude_code_missing_invalid_and_expired_data_is_never_zero() {
+        let now = fixed_now();
+        let s = now.timestamp();
+        let missing = normalize_claude_statusline(crate::claude_statusline::StoreRead::Missing, now);
+        assert_eq!(missing.health, ProviderHealth::Unavailable);
+        assert_eq!(missing.error_category.as_deref(), Some("statusline_no_data"));
+        assert!(missing.limits.is_empty());
+        let invalid = normalize_claude_statusline(crate::claude_statusline::StoreRead::Invalid, now);
+        assert_eq!(invalid.health, ProviderHealth::Error);
+        assert_eq!(invalid.error_category.as_deref(), Some("statusline_store_invalid"));
+        assert!(invalid.limits.is_empty());
+        // Both windows have reset: unavailable, not "0% used".
+        let expired = normalize_claude_statusline(
+            claude_store(Some((99.0, s, s - 100)), Some((98.0, s - 5, s - 100))),
+            now,
+        );
+        assert_eq!(expired.health, ProviderHealth::Unavailable);
+        assert_eq!(expired.error_category.as_deref(), Some("statusline_windows_expired"));
+        assert!(expired.limits.is_empty());
+        // One reset window disappears; the other stays, honestly labelled.
+        let partial = normalize_claude_statusline(
+            claude_store(Some((99.0, s - 1, s - 100)), Some((40.0, s + 600, s - 100))),
+            now,
+        );
+        assert_eq!(partial.limits.len(), 1);
+        assert_eq!(partial.limits[0].label, "7-day");
+        for dto in [&missing, &invalid, &expired] {
+            assert!(crate::history::observations_from_usages(std::slice::from_ref(dto)).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_code_production_closure_is_offline_and_registered_after_the_codex_accounts() {
+        let specs = production_specs();
+        let ids: Vec<&str> = specs.iter().map(|spec| spec.kind.id()).collect();
+        assert_eq!(&ids[..3], ["openai-codex", "openai-codex:secondary", "claude-code"]);
+        let spec = specs
+            .into_iter()
+            .find(|spec| spec.kind == ProviderKind::ClaudeCode)
+            .unwrap();
+        // The closure only reads the local snapshot; whatever the test
+        // machine holds, it answers with a well-formed Claude entry.
+        let dto = (spec.fetch)().await.expect("a local read never fails the cycle");
+        assert_eq!(dto.id, "claude-code");
+        assert_eq!(ProviderKind::from_id("claude-code"), Some(ProviderKind::ClaudeCode));
+        assert!(ProviderKind::ClaudeCode.keeps_own_durable_store());
+        assert!(!ProviderKind::ClaudeCode.is_manual_only());
+    }
+
+    #[test]
+    fn claude_code_is_never_written_to_the_last_good_cache() {
+        let (core, _clock) = manual_clock_core(vec![]);
+        let s = fixed_now().timestamp();
+        let dto = core.apply_success(
+            ProviderKind::ClaudeCode,
+            normalize_claude_statusline(claude_store(Some((10.0, s + 3600, s)), None), fixed_now()),
+        );
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert!(core.inner.lock().unwrap().last_good.get("claude-code").is_none());
+    }
+
     #[test]
     fn opendesign_observations_are_excluded_before_history_and_notifications() {
         let stamp = fixed_now().to_rfc3339();
@@ -6174,6 +6465,8 @@ mod tests {
             kinds,
             vec![
                 ProviderKind::Codex,
+                ProviderKind::CodexSecondary,
+                ProviderKind::ClaudeCode,
                 ProviderKind::Zai,
                 ProviderKind::OpenCodeGo,
                 ProviderKind::Antigravity,
@@ -6186,12 +6479,14 @@ mod tests {
         let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
+            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
         );
         assert!(ids.contains(&"grok"), "Grok must remain production");
         // No simulated providers: the production runtime never carries the
-        // mock adapters (Claude stays a dev/test-only mock outside Rust).
-        assert!(!serde_json::to_string(&ids).unwrap().contains("claude"));
+        // mock adapters. The only Claude entry is the passive statusLine
+        // provider, never a mock or a private-endpoint adapter.
+        assert!(!serde_json::to_string(&ids).unwrap().contains("mock"));
+        assert_eq!(ids.iter().filter(|id| id.contains("claude")).collect::<Vec<_>>(), [&"claude-code"]);
     }
 
     // 1. one cycle fetches all registered providers once
@@ -8486,7 +8781,7 @@ mod tests {
         let ids: Vec<&str> = production_specs().iter().map(|s| s.kind.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
+            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
         );
     }
 
@@ -12309,6 +12604,9 @@ mod tests {
     #[test]
     fn a_configured_second_account_joins_the_registry_and_an_unconfigured_one_does_not() {
         let mut accounts = codex_accounts::default_accounts();
+        // The second account starts on its initial Codex home; clearing it
+        // is the unconfigured state.
+        accounts[1].codex_home = String::new();
         let specs = production_specs_for_accounts(&accounts);
         assert_eq!(
             specs
@@ -12334,7 +12632,7 @@ mod tests {
                 .iter()
                 .filter(|spec| !is_codex_provider_id(spec.kind.id()))
                 .count(),
-            7,
+            8,
             "the other providers keep their exact set"
         );
     }

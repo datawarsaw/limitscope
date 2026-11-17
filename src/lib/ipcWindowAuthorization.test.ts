@@ -76,6 +76,7 @@ const MAIN_COMMANDS = new Set([
   "export_usage_history",
   "refresh_grok_bot_usage",
   "refresh_opendesign_usage",
+  "get_claude_statusline_setup",
 ]);
 
 /**

@@ -468,3 +468,48 @@ describe("stable-feed isolation (RC-mode R8)", () => {
     expect(issues.some((issue) => issue.includes("not valid JSON"))).toBe(true);
   });
 });
+
+describe("S8 Claude registration boundary", () => {
+  const canonical = ["codex", "opencode_go", "zai", "antigravity", "grok"]
+    .flatMap((provider) => [`mod ${provider};`, `${provider}::get_${provider}_usage,`])
+    .join("\n");
+
+  it("permits the documented passive statusLine module", () => {
+    const main = canonical + "\nmod claude_statusline;\nclaude_statusline::get_claude_statusline_setup,\nclaude_statusline::run_cli_if_requested(&args)";
+    expect(extractProviderStatus(main).claudeRegistered).toBe(false);
+  });
+
+  it("still forbids the historical private OAuth adapter, however it is spelled", () => {
+    for (const forbidden of [
+      "mod claude;",
+      "claude::get_claude_usage,",
+      "mod claude_oauth;",
+      "mod claude_usage;",
+      "claude_usage::get_claude_usage,",
+      "mod claude_statusline;\nmod claude_oauth;",
+    ]) {
+      expect(extractProviderStatus(canonical + "\n" + forbidden).claudeRegistered, forbidden).toBe(true);
+    }
+  });
+});
+
+describe("claude_statusline trust boundary", () => {
+  it("contains no credential, network, private endpoint or settings write in code", async () => {
+    const { readFileSync } = await import("node:fs");
+    const source = readFileSync(new URL("../src-tauri/src/claude_statusline.rs", import.meta.url), "utf8");
+    // Drop the test module and comments: only shipped code is audited.
+    const shipped = source
+      .split("#[cfg(test)]")[0]
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("//"))
+      .join("\n");
+    for (const forbidden of [
+      /reqwest|hyper|ureq|http:\/\/|https:\/\//i,
+      /oauth|api\.anthropic|\.credentials|access_token|bearer|authorization/i,
+      /\.claude|settings\.json|USERPROFILE|home_dir/i,
+      /Command::new|std::process::Command/,
+    ]) {
+      expect(shipped, String(forbidden)).not.toMatch(forbidden);
+    }
+  });
+});
