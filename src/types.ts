@@ -18,6 +18,8 @@ export type CodexResetCredits = {
    * Absent means unknown — never zero.
    */
   currentlyApplicable?: number;
+  /** Proven nearest expiry from complete same-request details; shares checkedAt. */
+  nextCreditExpiresAt?: string;
   /**
    * RFC-3339 UTC time of the observation. Current only within
    * RESET_CREDITS_TTL_MS (see src/lib/resetCredits.ts).

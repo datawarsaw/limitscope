@@ -4,6 +4,7 @@ import {
   CODEX_PROVIDER_ID,
   RESET_CREDITS_TTL_MS,
   formatResetCredits,
+  formatCreditExpiry,
   isResetCreditsFresh,
 } from "./resetCredits";
 
@@ -139,5 +140,38 @@ describe("formatResetCredits", () => {
     const text = (lines?.bankLine ?? "") + " " + (lines?.applicabilityLine ?? "");
     expect(text).not.toMatch(/resets? (left|available)/i);
     expect(text).not.toMatch(/replenishments? available/i);
+  });
+});
+
+describe("formatCreditExpiry", () => {
+  const fresh = { bankedCredits: 2, currentlyApplicable: 0, checkedAt: FRESH_AT,
+    source: "codex-wham-usage" as const, nextCreditExpiresAt: "2026-10-04T12:30:00Z" };
+
+  it("formats the verified future date and time in the app's system locale", () => {
+    const expected = new Intl.DateTimeFormat(undefined, {
+      year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    }).format(new Date(fresh.nextCreditExpiresAt));
+    expect(formatCreditExpiry(fresh, NOW)).toBe(`Next credit expiry ${expected}`);
+    expect(fresh.bankedCredits).toBe(2);
+    expect(fresh.currentlyApplicable).toBe(0);
+  });
+
+  it("withholds missing, null, malformed, elapsed or zero-bank deadlines", () => {
+    expect(formatCreditExpiry(undefined, NOW)).toBe("Expiry not reported");
+    for (const nextCreditExpiresAt of [undefined, null, "bad", "2026-10-04", "2026-10-04T12:00:00",
+      "2026-02-30T00:00:00Z", "2026-09-30T12:00:00Z", "2026-09-30T11:59:59Z", 123]) {
+      expect(formatCreditExpiry({ ...fresh, nextCreditExpiresAt: nextCreditExpiresAt as string }, NOW)).toBe("Expiry not reported");
+    }
+    expect(formatCreditExpiry({ ...fresh, bankedCredits: 0 }, NOW)).toBe("Expiry not reported");
+    expect(formatCreditExpiry({ ...fresh, bankedCredits: -1 }, NOW)).toBe("Expiry not reported");
+  });
+
+  it("shares the existing 15-minute TTL without restamping an old expiry", () => {
+    const observed = Date.parse(FRESH_AT);
+    expect(formatCreditExpiry(fresh, observed + RESET_CREDITS_TTL_MS)).toMatch(/^Next credit expiry /);
+    expect(formatCreditExpiry(fresh, observed + RESET_CREDITS_TTL_MS + 1)).toBe("Expiry not reported");
+    expect(formatCreditExpiry({ ...fresh, checkedAt: "bad" }, NOW)).toBe("Expiry not reported");
+    expect(formatCreditExpiry({ ...fresh, checkedAt: new Date(NOW + 300_001).toISOString() }, NOW)).toBe("Expiry not reported");
+    expect(formatCreditExpiry({ ...fresh, nextCreditExpiresAt: undefined, checkedAt: new Date(NOW).toISOString() }, NOW)).toBe("Expiry not reported");
   });
 });

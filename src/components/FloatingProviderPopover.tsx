@@ -5,7 +5,7 @@ import { claudeTimesNote } from "../lib/v03Integration";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
 import { isCodexProviderId } from "../lib/providerIds";
-import { formatResetCredits } from "../lib/resetCredits";
+import { formatCreditExpiry, formatResetCredits } from "../lib/resetCredits";
 import {
   floatingQuotaPresentation,
   quotaColorLevel,
@@ -252,7 +252,7 @@ export function FloatingProviderPopover({
               <>
                 <p>{resetCredits.bankLine}</p>
                 <p>{resetCredits.applicabilityLine}</p>
-                <p>Expiry not reported</p>
+                <p>{formatCreditExpiry(item.resetCredits, now.getTime())}</p>
               </>
             ) : <p>Reset credits unavailable</p>}
           </section>
