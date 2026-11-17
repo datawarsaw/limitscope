@@ -246,7 +246,7 @@ export function FloatingProviderPopover({
         ) : null}
 
         {isCodexProviderId(item.providerId) ? (
-          <section className="fq-reset-bank" aria-label="Codex reset credits">
+          <section className="fq-credit-bank" aria-label="Codex reset credits">
             <strong>Reset Bank</strong>
             {resetCredits ? (
               <>
