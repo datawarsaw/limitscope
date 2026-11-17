@@ -11,12 +11,45 @@
  * the display name.
  */
 
+import {
+  CODEX_PROVIDER_ID,
+  CODEX_SECONDARY_PROVIDER_ID,
+  CLAUDE_CODE_PROVIDER_ID,
+} from "./providerIds";
+
 export type ProviderPreferences = {
   /** Preferred display order of known provider ids. */
   order: string[];
   /** Ids the user chose to hide from prominent UI surfaces. */
   hidden: string[];
 };
+
+/**
+ * The default display order for a configuration that has no custom order.
+ *
+ * This is the order an operator confirmed for a new configuration: the two
+ * Codex accounts first — the second account right after the primary — then
+ * Claude Code, Antigravity, Z.ai, OpenCode, Grok, Qwen, MiniMax and
+ * OpenDesign.
+ *
+ * It is a DEFAULT, not a stored configuration. A persisted custom order
+ * always wins and is never rewritten; this list only decides the order of a
+ * configuration that has no order of its own. It also hides nothing:
+ * visibility stays a separate preference, and a provider the user hid stays
+ * hidden whatever the order is.
+ */
+export const DEFAULT_PROVIDER_ORDER: readonly string[] = [
+  CODEX_PROVIDER_ID,
+  CODEX_SECONDARY_PROVIDER_ID,
+  CLAUDE_CODE_PROVIDER_ID,
+  "antigravity",
+  "zai",
+  "opencode-go",
+  "grok",
+  "qwen-token-plan",
+  "minimax-token-plan",
+  "opendesign",
+];
 
 export const DEFAULT_PROVIDER_PREFERENCES: ProviderPreferences = {
   order: [],
@@ -45,6 +78,39 @@ function cleanIdList(value: unknown): string[] {
     out.push(entry);
   }
   return out;
+}
+
+/**
+ * The order the presentation layer uses for one configuration.
+ *
+ * A persisted custom order wins and is preserved exactly. Without one the
+ * curated default order leads, and every registry id the default does not
+ * name follows in registry order — so a provider registered by a later
+ * version still appears, deterministically, instead of disappearing.
+ * Ids that no longer exist are ignored, as before.
+ */
+export function effectiveProviderOrder(
+  registryIds: readonly string[],
+  saved: unknown,
+): string[] {
+  const prefs = sanitizeProviderPreferences(saved);
+  const registry = registryIds.filter(isProviderId);
+  const inRegistry = new Set(registry);
+  const source = prefs.order.length > 0 ? prefs.order : DEFAULT_PROVIDER_ORDER;
+
+  const ordered: string[] = [];
+  const seen = new Set<string>();
+  for (const id of source) {
+    if (!inRegistry.has(id) || seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(id);
+  }
+  for (const id of registry) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(id);
+  }
+  return ordered;
 }
 
 /**
@@ -85,18 +151,7 @@ export function resolveProviderPreferences(
     prefs.hidden.filter((id) => inRegistry.has(id)),
   );
 
-  const ordered: string[] = [];
-  const seen = new Set<string>();
-  for (const id of prefs.order) {
-    if (!inRegistry.has(id) || seen.has(id)) continue;
-    seen.add(id);
-    ordered.push(id);
-  }
-  for (const id of registry) {
-    if (seen.has(id)) continue;
-    seen.add(id);
-    ordered.push(id);
-  }
+  const ordered = effectiveProviderOrder(registryIds, prefs);
 
   // At-least-one-visible rule (v0.6 settings remediation): toggle
   // refusal keeps the interactive path from creating an empty UI, so
@@ -152,7 +207,9 @@ export function fullDisplayOrder(
     registryIds,
     prefs,
   );
-  const orderIndex = new Map(prefs.order.map((id, index) => [id, index]));
+  const orderIndex = new Map(
+    effectiveProviderOrder(registryIds, prefs).map((id, index) => [id, index]),
+  );
   const all = [...visibleOrderedIds, ...hiddenIds];
   const rankOf = (id: string): number =>
     orderIndex.has(id) ? orderIndex.get(id)! : Number.MAX_SAFE_INTEGER;

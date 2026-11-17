@@ -52,7 +52,7 @@ human-readable lines.
 | S5 | updater endpoint is exactly the production feed; identifier `com.ratelimits.desktop`; embedded trust-root key id `025FF36DE3FF44EB` |
 | S6 | no dev URL outside `build.devUrl`; CSP uses the production IPC custom protocol |
 | S7 | the five canonical providers (codex, opencode-go, zai, antigravity, grok) are registered |
-| S8 | no experimental Claude registration (unless `--allow-experimental-claude`) |
+| S8 | no experimental Claude registration (unless `--allow-experimental-claude`); the passive `claude_statusline` module is permitted, any other `claude*` module (the private OAuth adapter) is not |
 | R1 | companion release exists, not draft/prerelease (stable mode) — **with `--rc`: must instead be a published (non-draft) prerelease** |
 | R2 | exactly installer + `.sig` + `latest.json` assets |
 | R3/R4 | feed version and artifact URL match the release and tag |

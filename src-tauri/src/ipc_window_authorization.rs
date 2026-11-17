@@ -47,6 +47,7 @@ const COMMANDS: &[(&str, bool, bool)] = &[
     ("get_grok_usage", false, false),
     ("refresh_grok_bot_usage", true, true),
     ("refresh_opendesign_usage", true, true),
+    ("get_claude_statusline_setup", true, false),
     ("open_main_window", false, true),
     ("attach_floating_drag_lifecycle", false, true),
     ("detach_floating_drag_lifecycle", false, true),
@@ -361,11 +362,11 @@ fn every_registered_command_is_granted_only_where_the_capabilities_say() {
         "the manifest must grant exactly the commands the table marks as granted"
     );
 
-    assert_eq!(COMMANDS.len(), 35, "the application registers 35 commands");
+    assert_eq!(COMMANDS.len(), 36, "the application registers 36 commands");
     assert_eq!(
         COMMANDS.iter().filter(|(_, main, _)| *main).count(),
-        24,
-        "the dashboard is granted 24 application commands"
+        25,
+        "the dashboard is granted 25 application commands"
     );
     assert_eq!(
         COMMANDS.iter().filter(|(_, _, floating)| *floating).count(),
@@ -377,8 +378,8 @@ fn every_registered_command_is_granted_only_where_the_capabilities_say() {
             .iter()
             .filter(|(_, main, floating)| *main || *floating)
             .count(),
-        30,
-        "30 of the 35 registered commands are granted to at least one window"
+        31,
+        "31 of the 36 registered commands are granted to at least one window"
     );
 
     let app = build_app(echo_invoke_handler());
@@ -410,10 +411,10 @@ fn every_registered_command_is_granted_only_where_the_capabilities_say() {
         COMMANDS.len() * 2,
         "every dispatch produced one verdict"
     );
-    assert_eq!(allowed, 39, "24 dashboard grants + 15 floating grants");
+    assert_eq!(allowed, 40, "25 dashboard grants + 15 floating grants");
     assert_eq!(
-        window_scope, 21,
-        "the 15 dashboard-only and 6 floating-only commands are refused on the other window"
+        window_scope, 22,
+        "the 16 dashboard-only and 6 floating-only commands are refused on the other window"
     );
     assert_eq!(
         unresolved, 10,

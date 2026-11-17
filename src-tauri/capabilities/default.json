@@ -25,6 +25,7 @@
     "allow-diagnostics-export",
     "allow-usage-export",
     "allow-manual-provider-refresh",
+    "allow-claude-statusline-setup-read",
     "autostart:default",
     "notification:default",
     "updater:default",

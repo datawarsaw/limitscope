@@ -11,6 +11,8 @@
 
 export const CODEX_PROVIDER_ID = "openai-codex";
 export const CODEX_SECONDARY_PROVIDER_ID = "openai-codex:secondary";
+/** Claude Code subscription limits, received passively from its statusLine hook. */
+export const CLAUDE_CODE_PROVIDER_ID = "claude-code";
 
 /**
  * The provider part of an id: everything before the FIRST colon. Splitting

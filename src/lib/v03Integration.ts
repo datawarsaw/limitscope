@@ -148,6 +148,15 @@ function sourceNoteText(
   now: Date,
 ): string {
   if (status.label === "Mock") return "Deterministic sample data";
+  if (usage.id === "claude-code") {
+    // Passive source: the reading only advances while Claude Code runs its
+    // status line hook, so say how old it is and why it may not move.
+    if (status.label === "Unavailable") return "Waiting for Claude Code status line data";
+    const received = validTime(usage.sourceUpdatedAt);
+    if (received && usage.limits.length > 0 && usage.health !== "error") {
+      return `Received from Claude Code ${formatAge(received, now)} · updates only while Claude Code is running`;
+    }
+  }
   if (status.label === "Unavailable") return "Provider data unavailable";
   if (status.label === "Cooldown") {
     if (usage.limits.length === 0) return "Waiting for the server's retry window";

@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod antigravity;
+mod claude_statusline;
 mod codex;
 mod codex_accounts;
 mod cursor_grok_bot;
@@ -152,7 +153,14 @@ fn launched_from_autostart(argv: &[String]) -> bool {
 }
 
 fn main() {
-    let start_hidden = launched_from_autostart(&std::env::args().collect::<Vec<_>>());
+    // `LimitScope.exe --claude-statusline-ingest` is the opt-in Claude Code
+    // statusLine command: it must run and exit before any window, plugin or
+    // single-instance machinery exists, and it never prints anything.
+    let args = std::env::args().collect::<Vec<_>>();
+    if let Some(code) = claude_statusline::run_cli_if_requested(&args) {
+        std::process::exit(code);
+    }
+    let start_hidden = launched_from_autostart(&args);
 
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -163,6 +171,7 @@ fn main() {
             grok::get_grok_usage,
             grok_bot::refresh_grok_bot_usage,
             opendesign::refresh_opendesign_usage,
+            claude_statusline::get_claude_statusline_setup,
             open_main_window,
             floating_drag::attach_floating_drag_lifecycle,
             floating_drag::detach_floating_drag_lifecycle,

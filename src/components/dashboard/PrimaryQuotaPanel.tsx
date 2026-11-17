@@ -17,6 +17,7 @@ import {
 } from "../../lib/quotaPresentation";
 import type { ProviderUsage } from "../../types";
 import { OpenDesignRefreshControl } from "../OpenDesignRefreshControl";
+import { ClaudeStatuslineSetup } from "../ClaudeStatuslineSetup";
 
 /**
  * Zone A — the visual anchor: the selected provider, its primary quota
@@ -67,6 +68,7 @@ export function PrimaryQuotaPanel({
       </header>
       {usage.id === "opendesign" && usage.planType ? <p className="opendesign-plan">{`OpenDesign ${usage.planType}`}</p> : null}
       {usage.id === "opendesign" ? <OpenDesignRefreshControl /> : null}
+      {usage.id === "claude-code" ? <ClaudeStatuslineSetup /> : null}
 
       {primary === undefined || presentation.displayPercent === null ? (
         // An errored provider's own source note already says "No saved

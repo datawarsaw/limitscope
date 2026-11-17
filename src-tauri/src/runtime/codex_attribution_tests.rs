@@ -91,7 +91,10 @@ async fn publish(core: &Arc<RuntimeCore>) -> RuntimeSnapshot {
 
 #[tokio::test]
 async fn production_normalization_preserves_primary_single_account_behavior() {
-    let specs = codex_specs_with_fetch(&codex_accounts::default_accounts(), |home| async move {
+    // Single-account scenario: the second account's initial home is cleared.
+    let mut single = codex_accounts::default_accounts();
+    single[1].codex_home = String::new();
+    let specs = codex_specs_with_fetch(&single, |home| async move {
         assert_eq!(home, None, "the primary keeps its default source");
         Ok(usage(0, 0.0))
     });
@@ -375,4 +378,67 @@ async fn production_normalization_isolates_last_good_cooldown_history_pause_and_
         assert_eq!(resumed.providers[affected].health, ProviderHealth::Live);
         assert_eq!(resumed.providers[affected].monitoring_paused, Some(false));
     }
+}
+
+#[tokio::test]
+async fn a_second_account_sharing_the_primary_home_never_reads_that_login() {
+    let dir = std::env::temp_dir().join(format!("limitscope-collision-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut accounts = codex_accounts::default_accounts();
+    accounts[0].codex_home = dir.to_string_lossy().into_owned();
+    accounts[1].codex_home = dir.join(".").to_string_lossy().into_owned();
+    let fetched = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let specs = codex_specs_with_fetch(&accounts, {
+        let fetched = fetched.clone();
+        move |home| {
+            let fetched = fetched.clone();
+            async move {
+                fetched.lock().unwrap().push(home);
+                Ok(usage(0, 0.0))
+            }
+        }
+    });
+    assert_eq!(specs.len(), 2);
+    let primary = (specs[0].fetch)().await.unwrap();
+    assert_eq!(primary.health, ProviderHealth::Live);
+    let secondary = (specs[1].fetch)().await.expect_err("the shared login is never read");
+    assert_eq!(secondary.code, "codex_home_collision");
+    assert_eq!(fetched.lock().unwrap().len(), 1, "only the primary account read the login");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn collision_runtime_cycle_redacts_secondary_and_keeps_primary() {
+    let mut configs = accounts();
+    configs[0].codex_home = "synthetic-same-home".into();
+    configs[1].codex_home = configs[0].codex_home.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let specs = codex_specs_with_fetch(&configs, {
+        let calls = calls.clone();
+        move |_| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok(usage(0, 0.0)) }
+        }
+    });
+    let mut core = RuntimeCore::new(specs, 5);
+    core.codex_identity_resolver = Some(Arc::new(|_| Some(identity(0))));
+    {
+        let mut inner = core.inner.lock().unwrap();
+        inner.codex_accounts = configs.clone();
+        inner.codex_monitored = monitored_map(&configs);
+    }
+    let core = Arc::new(core);
+    let snapshot = publish(&core).await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_own_reading(&snapshot.providers[0], 0, 0.0);
+    let secondary = &snapshot.providers[1];
+    assert_eq!(secondary.error_category.as_deref(), Some("codex_home_collision"));
+    assert!(secondary.error.as_deref().unwrap().contains("same as the primary"));
+    assert!(secondary.account.is_none());
+    assert!(snapshot.codex_identity_states.iter()
+        .filter(|state| state.provider_id == SECONDARY_ACCOUNT_ID)
+        .all(|state| state.identity.is_none()));
+    assert_eq!(snapshot.codex_identity_states.iter()
+        .find(|state| state.provider_id == PRIMARY_ACCOUNT_ID).unwrap().identity.as_deref(),
+        Some(identity(0).as_str()));
 }

@@ -319,10 +319,12 @@ mod tests {
     #[test]
     fn the_probe_covers_the_production_registry() {
         let specs = production_specs();
-        assert_eq!(specs.len(), 8);
+        assert_eq!(specs.len(), 10);
         let ids: Vec<_> = specs.iter().map(|s| s.kind.id()).collect();
         for id in [
             "openai-codex",
+            "openai-codex:secondary",
+            "claude-code",
             "zai",
             "opencode-go",
             "antigravity",

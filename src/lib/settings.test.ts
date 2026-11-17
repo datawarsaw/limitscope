@@ -17,16 +17,16 @@ import {
 
 /**
  * The canonical OpenAI/Codex account defaults. The primary account reads
- * the default Codex home; the second account has no home of its own, so it
- * contributes no provider until the user points it at one.
+ * the default Codex home; the second account starts on its own initial
+ * Codex home with its initial name, and keeps whatever the user saved.
  */
 const DEFAULT_CODEX_ACCOUNTS = {
   accounts: [
     { accountId: "openai-codex", alias: "", codexHome: "", monitored: true },
     {
       accountId: "openai-codex:secondary",
-      alias: "",
-      codexHome: "",
+      alias: "CoWork",
+      codexHome: "C:\\codex-home-second",
       monitored: true,
     },
   ],

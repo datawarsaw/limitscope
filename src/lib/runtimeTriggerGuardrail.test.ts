@@ -71,6 +71,9 @@ const ALLOWED_COMMANDS = new Set([
   // invoked only from the OpenDesign card's Refresh button. It fetches
   // nothing, reads no browser storage, and is never scheduled.
   "refresh_opendesign_usage",
+  // Read-only display of the opt-in Claude Code statusLine command. It does
+  // not fetch, schedule or refresh anything.
+  "get_claude_statusline_setup",
   // Native drag lifecycle (Human-Accepted Slice A): attach/detach/restore
   // the Rust-owned window drag observer. Not a fetch and not a refresh.
   "attach_floating_drag_lifecycle",

@@ -3425,3 +3425,23 @@ body {
   text-anchor: end;
   font-variant-numeric: tabular-nums;
 }
+
+/* Claude Code passive statusLine provider: opt-in setup note. */
+.claude-setup {
+  margin: 0.6rem 0;
+  font-size: 0.85em;
+  line-height: 1.45;
+  color: var(--text-muted, inherit);
+}
+.claude-setup details > summary {
+  cursor: pointer;
+}
+.claude-setup pre {
+  margin: 0.4rem 0;
+  padding: 0.5rem;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.12);
+}

@@ -145,6 +145,8 @@ async fn same_workspace_switch_isolated_across_snapshot_failure_pause_and_cooldo
     std::fs::write(&auth_file, fixture_auth("user-a", workspace)).unwrap();
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = dir.to_string_lossy().into_owned();
+    // Single-account scenario: the second account's initial home is cleared.
+    accounts[1].codex_home = String::new();
     let fail = Arc::new(AtomicBool::new(false));
     let calls = Arc::new(AtomicUsize::new(0));
     let specs = codex_specs_with_fetch(&accounts, {
@@ -250,6 +252,8 @@ async fn missing_login_keeps_the_slot_unavailable_without_values() {
     std::fs::create_dir(&dir).unwrap();
     let mut accounts = codex_accounts::default_accounts();
     accounts[0].codex_home = dir.to_string_lossy().into_owned();
+    // Single-account scenario: the second account's initial home is cleared.
+    accounts[1].codex_home = String::new();
     let specs = codex_specs_with_fetch(&accounts, |_| async { panic!("missing identity must not fetch") });
     let mut core = RuntimeCore::with_injections(specs.clone(), 5, Box::new(|| 0), Box::new(Utc::now));
     core.codex_identity_resolver = Some(Arc::new(codex::current_codex_identity));
@@ -742,10 +746,12 @@ async fn a_single_codex_account_leaves_unrelated_providers_untouched() {
     core.codex_identity_resolver = Some(Arc::new(codex::current_codex_identity));
     let core = Arc::new(core);
     core.set_codex_accounts(&accounts);
-    core.set_codex_specs(specs);
+    // set_codex_specs preserves non-Codex registrations already in the core.
+    core.set_codex_specs(specs.into_iter().filter(|spec| is_codex_provider_id(spec.kind.id())).collect());
     core.run_cycle().await;
 
     let snapshot = core.snapshot();
+    assert_eq!(snapshot.providers.iter().filter(|usage| usage.id == "zai").count(), 1);
     assert_eq!(provider_entry(&snapshot, "openai-codex").limits[0].used_percent, 38.0);
     assert_eq!(provider_entry(&snapshot, "zai").limits[0].used_percent, 12.0);
     assert!(

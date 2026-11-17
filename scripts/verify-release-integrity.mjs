@@ -365,7 +365,16 @@ export function extractProviderStatus(mainRs) {
     if (!new RegExp(`^mod\\s+${provider}\\s*;`, "m").test(text)) missingMods.push(provider);
     if (!text.includes(`${provider}::get_${provider}_usage`)) missingHandlers.push(provider);
   }
-  const claudeRegistered = /\bmod\s+claude\b/.test(text) || /\bclaude::/.test(text);
+  // Only the documented passive statusLine module is permitted: it holds no
+  // credential, makes no request and never touches ~/.claude. Any other
+  // claude* module or path (the historical private OAuth usage adapter:
+  // claude, claude_oauth, claude_usage, ...) stays forbidden.
+  const ALLOWED_CLAUDE_MODULE = "claude_statusline";
+  const claudeNames = [
+    ...text.matchAll(/\bmod\s+(claude\w*)\b/g),
+    ...text.matchAll(/\b(claude\w*)::/g),
+  ].map((match) => match[1]);
+  const claudeRegistered = claudeNames.some((name) => name !== ALLOWED_CLAUDE_MODULE);
   return { missingMods, missingHandlers, claudeRegistered };
 }
 

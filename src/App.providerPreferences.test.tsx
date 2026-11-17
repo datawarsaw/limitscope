@@ -109,14 +109,14 @@ describe('provider presentation preferences', () => {
     cleanup();
   });
 
-  it('lists providers in canonical registry order with visibility switches', () => {
+  it('lists providers in the default order with visibility switches', () => {
     render(<App />);
     openSettings();
     expect(providerSwitchLabels()).toEqual([
       'Show OpenAI / Codex in the floating bar',
+      'Show Google Antigravity in the floating bar',
       'Show Z.ai in the floating bar',
       'Show OpenCode Go in the floating bar',
-      'Show Google Antigravity in the floating bar',
       'Show Grok (xAI) in the floating bar',
       'Show MiniMax Token Plan in the floating bar',
     ]);
@@ -166,6 +166,7 @@ describe('provider presentation preferences', () => {
     openSettings();
     fireEvent.click(screen.getByRole('button', { name: 'Move OpenCode up' }));
     fireEvent.click(screen.getByRole('button', { name: 'Move OpenCode up' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Move OpenCode up' }));
     expect(providerSwitchLabels()[0]).toBe('Show OpenCode Go in the floating bar');
     expect(storedPrefs().order.slice(0, 2)).toEqual(['opencode-go', 'openai-codex']);
   });
@@ -189,7 +190,8 @@ describe('provider presentation preferences', () => {
     moveDown.focus();
     expect(document.activeElement).toBe(moveDown);
     await user.keyboard('{Enter}');
-    expect(providerSwitchLabels()[1]).toBe('Show OpenCode Go in the floating bar');
-    expect(providerSwitchLabels()[2]).toBe('Show Z.ai in the floating bar');
+    expect(providerSwitchLabels()[1]).toBe('Show Google Antigravity in the floating bar');
+    expect(providerSwitchLabels()[2]).toBe('Show OpenCode Go in the floating bar');
+    expect(providerSwitchLabels()[3]).toBe('Show Z.ai in the floating bar');
   });
 });
