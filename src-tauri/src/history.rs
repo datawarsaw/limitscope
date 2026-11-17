@@ -929,7 +929,11 @@ pub fn observations_from_usages(usages: &[ProviderUsageDto]) -> Vec<QuotaObserva
                 provider_id: usage.id.clone(),
                 window_label: window_label.to_string(),
                 used_percent: limit.used_percent,
-                observed_at: observed_at.clone(),
+                observed_at: if usage.id == "claude-code" {
+                    // Fail closed if per-window provenance was lost.
+                    let Some(time) = limit.observed_at.as_deref().and_then(valid_time) else { continue };
+                    time
+                } else { observed_at.clone() },
                 reset_at,
                 account: account.clone(),
             });
@@ -2419,12 +2423,14 @@ mod tests {
         let mut usage = ok_usage("zai", "Z.ai", 63.0);
         usage.limits = vec![
             UsageLimitDto {
+                observed_at: None,
                 label: "  ".to_string(),
                 used_percent: 10.0,
                 reset_at: None,
                 reset_text: None,
             },
             UsageLimitDto {
+                observed_at: None,
                 label: "5-hour".to_string(),
                 used_percent: f64::NAN,
                 reset_text: None,
@@ -2433,12 +2439,14 @@ mod tests {
             // An unparseable resetAt degrades to absent — the window is
             // still recorded (engine tolerance parity).
             UsageLimitDto {
+                observed_at: None,
                 label: "weekly".to_string(),
                 used_percent: 20.0,
                 reset_at: Some("garbage".to_string()),
                 reset_text: None,
             },
             UsageLimitDto {
+                observed_at: None,
                 label: "weekly".to_string(),
                 used_percent: 25.0,
                 reset_text: None,
@@ -3029,6 +3037,7 @@ mod tests {
             health: crate::runtime::ProviderHealth::Live,
             checked_at: CHECKED_AT.to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "5-hour".to_string(),
                 used_percent: percent,
                 reset_text: None,

@@ -103,6 +103,7 @@ export type FloatingQuotaItem = {
   statusLabel: ProviderStatusPresentation["label"];
   statusClass: ProviderStatusPresentation["className"];
   error?: string;
+  claudeSourceUpdatedAt?: string;
 };
 
 export type FloatingClickAction = {
@@ -644,6 +645,7 @@ export function floatingQuotaItems(
       ...(grokBot ? { grokBot } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,
+      ...(usage.id === "claude-code" && usage.sourceUpdatedAt ? { claudeSourceUpdatedAt: usage.sourceUpdatedAt } : {}),
       statusClass: status.className,
       ...(usage.error ? { error: usage.error } : {}),
     });

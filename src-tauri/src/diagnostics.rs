@@ -649,6 +649,7 @@ mod tests {
             status: ProviderHealth::Live.legacy_status(),
             checked_at: "2026-09-29T11:55:00.000Z".to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "5h".to_string(),
                 used_percent: 42.5,
                 reset_text: None,
@@ -1100,6 +1101,7 @@ mod tests {
     fn corrupt_or_unknown_optional_fields_fail_safely() {
         let mut source = source_with_error("safe");
         source.usage.limits.push(UsageLimitDto {
+            observed_at: None,
             label: "".into(),
             used_percent: f64::NAN,
             reset_text: None,

@@ -910,6 +910,7 @@ mod tests {
             health: crate::runtime::ProviderHealth::Live,
             checked_at: NOW.to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "Weekly credits".to_string(),
                 used_percent: percent,
                 reset_text: None,
@@ -944,6 +945,7 @@ mod tests {
             health: crate::runtime::ProviderHealth::Live,
             checked_at: NOW.to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "Weekly credits".to_string(),
                 used_percent: percent,
                 reset_text: None,
@@ -994,6 +996,22 @@ mod tests {
     fn with_freshness(mut usage: ProviderUsageDto, freshness: &'static str) -> ProviderUsageDto {
         usage.data_freshness = Some(freshness);
         usage
+    }
+
+    #[test]
+    fn claude_replay_and_restart_do_not_repeat_threshold_notification() {
+        let harness = enabled_harness("claude-replay");
+        let reading = |percent| {
+            let mut dto = named_usage("claude-code", "Claude Code", percent);
+            dto.source_updated_at = Some(NOW.to_string());
+            dto.data_freshness = Some("fresh");
+            dto.limits[0].observed_at = Some(NOW.to_string());
+            dto
+        };
+        assert!(harness.cycle(&[reading(79.0)]).is_empty());
+        assert_eq!(harness.cycle(&[reading(81.0)]).len(), 1);
+        assert!(harness.cycle(&[reading(81.0)]).is_empty());
+        assert!(harness.reopen().cycle(&[reading(81.0)]).is_empty());
     }
 
     // 1. 79 -> 81 triggers exactly one near-limit notification

@@ -354,6 +354,7 @@ impl ProviderLastGoodStore {
                     }
                 }
                 valid_limits.push(UsageLimitDto {
+                    observed_at: None,
                     label: limit.label.clone(),
                     used_percent: limit.used_percent.clamp(0.0, 100.0),
                     reset_at: limit.reset_at.clone(),
@@ -969,6 +970,7 @@ mod tests {
             status: ProviderHealth::Live.legacy_status(),
             checked_at: "2026-09-29T11:55:00.000Z".to_string(),
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "5-hour limit".to_string(),
                 used_percent: percent,
                 reset_text: None,
@@ -2017,6 +2019,7 @@ mod tests {
         let plausible = sample_usage(ProviderKind::Zai, 30.0, Some("2026-10-06T12:00:00Z"));
         let plausible_usage = ProviderUsageDto {
             limits: vec![UsageLimitDto {
+                observed_at: None,
                 label: "Weekly".to_string(),
                 used_percent: plausible.limits[0].used_percent,
                 reset_at: plausible.limits[0].reset_at.clone(),

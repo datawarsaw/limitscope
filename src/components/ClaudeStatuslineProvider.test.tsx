@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PrimaryQuotaPanel } from "./dashboard/PrimaryQuotaPanel";
+import { FloatingProviderPopover } from "./FloatingProviderPopover";
 import {
   chainedCommand,
   chainedSnippet,
@@ -74,15 +75,49 @@ describe("Claude Code provider presentation", () => {
 
   it("states provenance and the passive limitation, never a live-poll claim", () => {
     const note = providerSourceNote(live, now);
-    expect(note).toContain("Received from Claude Code");
-    expect(note).toContain("updates only while Claude Code is running");
+    expect(note).toContain("Updated 2m ago from Claude Code");
+    expect(note).toContain("requires Claude Code activity");
+    expect(providerStatusPresentation(live).label).toBe("Recent");
     expect(providerSourceNote(noData, now)).toBe("Waiting for Claude Code status line data");
     expect(providerStatusPresentation(noData).label).toBe("Unavailable");
   });
 
   it("shows idle data as stale, not live", () => {
     const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
-    expect(providerStatusPresentation(stale).label).toBe("Stale");
+    expect(providerStatusPresentation(stale).label).toBe("Last known");
+    expect(providerSourceNote({ ...stale, sourceUpdatedAt: "2026-11-17T11:42:00Z" }, now)).toContain("Updated 18m ago");
+    expect(floatingQuotaItems([stale])[0].statusLabel).toBe("Last known");
+  });
+
+  it("preserves unknown health and does not claim a check time for missing source data", () => {
+    expect(providerStatusPresentation({ ...live, health: "unknown" })).toEqual({ label: "Unknown", className: "unknown" });
+    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
+    for (const usage of [
+      { ...stale, sourceUpdatedAt: undefined },
+      { ...stale, sourceUpdatedAt: "invalid" },
+      { ...stale, limits: [] },
+    ]) {
+      expect(providerStatusPresentation(usage).label).toBe("Last known");
+      expect(providerSourceNote(usage, now)).toBe("Source update time unknown");
+    }
+  });
+
+  it("shows last known age and retained values on both surfaces", async () => {
+    invoke.mockResolvedValue(setupInfo);
+    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale", sourceUpdatedAt: "2026-11-17T11:42:00Z" };
+    await render(<PrimaryQuotaPanel usage={stale} now={now} predictionFor={() => undefined} perspective="used" />);
+    expect(container.textContent).toContain("Last known");
+    expect(container.textContent).toContain("Updated 18m ago");
+    expect(container.textContent).toContain("41% used");
+    await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
+    expect(container.textContent).toContain("Last known");
+    expect(container.textContent).toContain("Updated 18m ago");
+    expect(container.textContent).toContain("requires Claude Code activity");
+    const note = providerSourceNote(stale, now, { includeAccount: false });
+    await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={note} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
+    expect(container.textContent).toContain("Last known");
+    expect(container.textContent?.match(/Updated 18m ago from Claude Code/g)).toHaveLength(1);
+    expect(container.textContent).toContain("requires Claude Code activity");
   });
 
   it("a missing provider reports no quota windows and never a 0% reading", async () => {
