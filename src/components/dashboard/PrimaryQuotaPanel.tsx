@@ -17,6 +17,7 @@ import {
 } from "../../lib/quotaPresentation";
 import type { ProviderUsage } from "../../types";
 import { OpenDesignRefreshControl } from "../OpenDesignRefreshControl";
+import { ClaudeRefreshControl } from "../ClaudeRefreshControl";
 import { ClaudeStatuslineSetup } from "../ClaudeStatuslineSetup";
 
 /**
@@ -68,6 +69,7 @@ export function PrimaryQuotaPanel({
       </header>
       {usage.id === "opendesign" && usage.planType ? <p className="opendesign-plan">{`OpenDesign ${usage.planType}`}</p> : null}
       {usage.id === "opendesign" ? <OpenDesignRefreshControl /> : null}
+      {usage.id === "claude-code" ? <ClaudeRefreshControl /> : null}
       {usage.id === "claude-code" ? <ClaudeStatuslineSetup /> : null}
 
       {primary === undefined || presentation.displayPercent === null ? (

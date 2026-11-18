@@ -26,6 +26,7 @@
     "allow-usage-export",
     "allow-manual-provider-refresh",
     "allow-claude-statusline-setup-read",
+    "allow-claude-cli-ping",
     "autostart:default",
     "notification:default",
     "updater:default",

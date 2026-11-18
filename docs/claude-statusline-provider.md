@@ -28,3 +28,33 @@ OAuth usage endpoint; this provider does not use it.
 * At registration the runtime refuses to read the primary account's login
   under the second account's name (explicit or ambient `CODEX_HOME`): the
   second account reports `codex_home_collision` instead.
+
+## On-demand refresh: one explicit request
+
+The provider stays passive. One explicit dashboard action, "Ping Claude (uses
+1 request)", starts the already installed Claude CLI in a visible console
+window with one fixed prompt ("Reply exactly OK.") and the restricted
+argument set (--restricted, --strict-mcp-config). Claude Code then runs its
+own statusLine hook, and the existing ingest path stores whatever windows
+Claude reports.
+
+* The click is the only thing that sends a request. There is no timer, no
+  polling, no retry and no background service.
+* The button reports the ATTEMPT, never a measurement: "Claude launched;
+  quota pending". The provider runtime keeps owning the derived documents
+  and refreshes them on its own schedule.
+* The executable is resolved from a bounded list of known install locations
+  and the PATH, and it is started with a direct CreateProcessW call: no
+  shell, no command-string interpolation, no caller-supplied argument. Only
+  claude.exe is accepted.
+* The child gets a console of its own and a scratch working directory (the
+  system temp directory), so the one-shot session cannot reach the user's
+  projects, and the restricted arguments keep it away from tools and MCP
+  servers.
+* Known limitation: a headless claude -p run does NOT trigger the
+  statusLine hook in Claude Code 2.1.318. Verified locally on 2026-11-18:
+  one authorized prompt returned OK, and the receipt and the stored windows
+  did not move. That is why the action starts an interactive session.
+* Known limitation: the interactive session stays open and may ask once
+  whether the scratch folder can be trusted, because the session runs in the
+  system temp directory rather than in a project.

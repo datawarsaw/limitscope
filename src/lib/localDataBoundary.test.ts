@@ -39,6 +39,8 @@ const IPC_SURFACE = new Set([
   // Claude Code opt-in setup: returns this executable's statusLine command
   // for display only. It reads no Claude Code file and writes nothing.
   "claude_statusline::get_claude_statusline_setup",
+  // Claude Code on-demand ping: starts the installed Claude CLI once, with one fixed prompt, for an explicit user action. It reads no file, clears nothing and never runs on a timer.
+  "claude_cli::refresh_claude_usage",
   "open_main_window",
   "runtime::get_codex_accounts",
   "runtime::get_operational_settings",

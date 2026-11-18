@@ -3445,3 +3445,27 @@ body {
   border-radius: 6px;
   background: rgba(127, 127, 127, 0.12);
 }
+
+/* Claude Code on-demand ping: one explicit request, nothing automatic. */
+.claude-refresh-button {
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 11px;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.claude-refresh-button:hover:not([aria-disabled="true"]) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text);
+}
+.claude-refresh-button:focus-visible {
+  outline: 2px solid var(--teal);
+  outline-offset: 1px;
+}
+.claude-refresh-button[aria-disabled="true"] {
+  cursor: default;
+  opacity: 0.6;
+}
