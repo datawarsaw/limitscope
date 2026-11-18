@@ -51,7 +51,12 @@ describe("Claude Code on-demand ping", () => {
   });
 
   it("reports every non-success attempt honestly", async () => {
-    for (const status of ["notFound", "spawnFailed", "alreadyRunning"] as const) {
+    for (const status of [
+      "notFound",
+      "spawnFailed",
+      "scratchUnavailable",
+      "alreadyRunning",
+    ] as const) {
       invoke.mockResolvedValue({ status });
       await render(<ClaudeRefreshControl />);
       await act(async () => button().click());
@@ -61,7 +66,16 @@ describe("Claude Code on-demand ping", () => {
     }
     expect(claudeRefreshMessage("notFound")).toContain("Claude CLI not found");
     expect(claudeRefreshMessage("spawnFailed")).toContain("could not be started");
-    expect(claudeRefreshMessage("alreadyRunning")).toContain("already starting");
+    expect(claudeRefreshMessage("scratchUnavailable")).toContain(
+      "working directory",
+    );
+    // The refusal of a second paid request says so, and claims no quota.
+    expect(claudeRefreshMessage("alreadyRunning")).toContain(
+      "already running",
+    );
+    expect(claudeRefreshMessage("alreadyRunning")).toContain(
+      "no second request was sent",
+    );
   });
 
   it("keeps a second click from starting a second Claude session", async () => {

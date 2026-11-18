@@ -33,10 +33,11 @@ OAuth usage endpoint; this provider does not use it.
 
 The provider stays passive. One explicit dashboard action, "Ping Claude (uses
 1 request)", starts the already installed Claude CLI in a visible console
-window with one fixed prompt ("Reply exactly OK.") and the restricted
-argument set (--restricted, --strict-mcp-config). Claude Code then runs its
-own statusLine hook, and the existing ingest path stores whatever windows
-Claude reports.
+window with one fixed prompt ("Reply exactly OK."). The session keeps the
+user's settings (--setting-sources user), so the statusLine hook runs, and
+it keeps no tool (--tools ""), no command (--disable-slash-commands) and no
+MCP server (--strict-mcp-config). Claude Code then runs its own statusLine
+hook, and the existing ingest path stores whatever windows Claude reports.
 
 * The click is the only thing that sends a request. There is no timer, no
   polling, no retry and no background service.
@@ -47,14 +48,18 @@ Claude reports.
   and the PATH, and it is started with a direct CreateProcessW call: no
   shell, no command-string interpolation, no caller-supplied argument. Only
   claude.exe is accepted.
-* The child gets a console of its own and a scratch working directory (the
-  system temp directory), so the one-shot session cannot reach the user's
-  projects, and the restricted arguments keep it away from tools and MCP
-  servers.
+* The child gets a console of its own and a fresh empty scratch working
+  directory below the app's per-user data directory, so the one-shot
+  session cannot reach the user's projects. The scratch directory is
+  removed without recursion once the session ends; a directory Claude Code
+  wrote into is left in place.
+* While the session runs, the backend holds the attempt lock: a second
+  click is refused ("A Claude session is already running") instead of
+  starting a second paid request.
 * Known limitation: a headless claude -p run does NOT trigger the
   statusLine hook in Claude Code 2.1.318. Verified locally on 2026-11-18:
   one authorized prompt returned OK, and the receipt and the stored windows
   did not move. That is why the action starts an interactive session.
 * Known limitation: the interactive session stays open and may ask once
-  whether the scratch folder can be trusted, because the session runs in the
-  system temp directory rather than in a project.
+  whether the scratch folder can be trusted, because the session runs in a
+  fresh directory rather than in a project.

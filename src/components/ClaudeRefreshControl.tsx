@@ -6,6 +6,7 @@ export type ClaudeRefreshStatus =
   | "launched"
   | "notFound"
   | "spawnFailed"
+  | "scratchUnavailable"
   | "alreadyRunning";
 
 export interface ClaudeRefreshResult {
@@ -24,8 +25,10 @@ export function claudeRefreshMessage(status: ClaudeRefreshStatus): string {
       return "Claude CLI not found. Install Claude Code (claude.exe) or add it to PATH.";
     case "spawnFailed":
       return "Claude CLI could not be started.";
+    case "scratchUnavailable":
+      return "The isolated working directory for Claude could not be created, so nothing was started.";
     case "alreadyRunning":
-      return "A Claude ping is already starting.";
+      return "A Claude session is already running, so no second request was sent. Try again once it is closed.";
   }
 }
 
@@ -67,7 +70,10 @@ export function ClaudeRefreshControl() {
         On demand only. Ping Claude starts your installed Claude Code in a new
         window and sends one tiny request, so Claude Code runs its status
         line hook and reports the 5-hour and 7-day usage. Nothing runs in the
-        background: the button is the only thing that sends a request.
+        background: the button is the only thing that sends a request. While
+        that session is open, another ping is refused. If Claude Code asks
+        whether it may trust the scratch folder, accept it once to let the
+        request through.
       </p>
       <button
         type="button"
