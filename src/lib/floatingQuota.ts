@@ -98,6 +98,15 @@ export type FloatingQuotaItem = {
    * remain the Grok segment's quota. Only the Grok detail card reads it.
    */
   grokBot?: GrokBotUsage;
+  /** The Mistral monthly budgets the runtime collected for this provider,
+   * when the provider carries them.
+   *
+   * The same observation the main dashboard shows for the same pools: the
+   * Vibe budget and the API budget, each with its own percentage, reset and
+   * amount, plus the verified plan name. The Mistral detail card reads it;
+   * the segment's percentage still comes from the Vibe primary window.
+   */
+  mistralBudgets?: ProviderUsage["mistralBudgets"];
   /** The observation belonging to this provider/account only. */
   resetCredits?: ProviderUsage["resetCredits"];
   /** Snapshot is stale even when an error marker is also showing. */
@@ -473,6 +482,9 @@ const FLOATING_PRIMARY_LABELS: Readonly<Record<string, readonly string[]>> = {
   zai: ["Weekly"],
   "qwen-token-plan": ["Monthly"],
   "minimax-token-plan": ["Weekly"],
+  // Mistral's Vibe budget is its primary window: it is the allowance the
+  // user acts on, and the API budget stays its independent sibling.
+  mistral: ["Vibe Budget"],
   opendesign: ["7-day"],
   "claude-code": ["7-day"],
 };
@@ -645,6 +657,7 @@ export function floatingQuotaItems(
       ...(usage.account?.label ? { accountLabel: usage.account.label } : {}),
       ...(usage.accountAlias ? { accountAlias: usage.accountAlias } : {}),
       ...(grokBot ? { grokBot } : {}),
+      ...(usage.mistralBudgets ? { mistralBudgets: usage.mistralBudgets } : {}),
       ...(usage.resetCredits ? { resetCredits: usage.resetCredits } : {}),
       stale: isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,

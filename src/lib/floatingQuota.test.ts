@@ -593,6 +593,95 @@ describe("floating primary quota selection", () => {
     });
   });
 
+  it("designates the Mistral Vibe budget as the primary window over the API budget", () => {
+    // The Vibe allowance is the budget the user acts on; the API budget
+    // stays its independent sibling, even when it is the more depleted one.
+    const items = floatingQuotaItems([
+      usage(
+        "mistral",
+        [
+          limit("Vibe Budget", 0.27, "2026-12-01T00:00:00.000Z"),
+          limit("API Budget", 14.12, "2026-12-01T00:00:00.000Z"),
+        ],
+        { name: "Mistral" },
+      ),
+    ]);
+
+    expect(items[0]).toMatchObject({
+      percent: 0,
+      usedPercent: 0.27,
+      windowLabel: "Vibe Budget",
+    });
+    expect(items[0].windows.map((row) => row.label)).toEqual([
+      "Vibe Budget",
+      "API Budget",
+    ]);
+    expect(items[0].primaryReset).toEqual({
+      label: "Vibe Budget",
+      resetAt: "2026-12-01T00:00:00.000Z",
+    });
+  });
+
+  it("carries the Mistral budget observation onto the floating item", () => {
+    const mistralBudgets = {
+      planName: "EDU",
+      rows: [
+        {
+          key: "vibe",
+          label: "Vibe Budget",
+          available: true,
+          currency: "EUR",
+          totalCents: 12750,
+          usedCents: 34,
+          remainingCents: 12716,
+          usedPercent: 0.27,
+          resetAt: "2026-12-01T00:00:00.000Z",
+          amountDerived: true,
+        },
+      ],
+    };
+    const items = floatingQuotaItems([
+      usage("mistral", [limit("Vibe Budget", 0.27, "2026-12-01T00:00:00.000Z")], {
+        name: "Mistral",
+        mistralBudgets,
+      }),
+    ]);
+    expect(items[0].mistralBudgets).toEqual(mistralBudgets);
+
+    // A runtime that sent no observation leaves the item without one: the
+    // card then falls back to the generic window list.
+    const plain = floatingQuotaItems([
+      usage("mistral", [limit("Vibe Budget", 0.27, "2026-12-01T00:00:00.000Z")], {
+        name: "Mistral",
+      }),
+    ]);
+    expect(plain[0].mistralBudgets).toBeUndefined();
+  });
+
+  it("leaves every other provider's primary window untouched", () => {
+    const cases: [string, string][] = [
+      ["openai-codex", "Weekly"],
+      ["antigravity", "Gemini Weekly"],
+      ["grok", "Weekly credits"],
+      ["opencode-go", "30-day"],
+      ["zai", "Weekly"],
+      ["qwen-token-plan", "Monthly"],
+      ["minimax-token-plan", "Weekly"],
+      ["opendesign", "7-day"],
+      ["claude-code", "7-day"],
+    ];
+    for (const [id, expected] of cases) {
+      const items = floatingQuotaItems([
+        usage(
+          id,
+          [limit(expected, 10, RESET_AT), limit("Other window", 99, RESET_AT)],
+          { name: id },
+        ),
+      ]);
+      expect(items[0].windowLabel, id).toBe(expected);
+    }
+  });
+
   it("keeps Antigravity's families separate: Gemini Weekly over a depleted Claude Weekly", () => {
     // The task's example shape: the Claude family is nearly exhausted while
     // the Gemini weekly pool still has 70% left. The collapsed segment speaks

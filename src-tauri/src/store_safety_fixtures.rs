@@ -115,6 +115,7 @@ fn zai_usage(percent: f64) -> ProviderUsageDto {
         zcode_reset_cards: None,
         zcode_plans: None,
         grok_bot: None,
+        mistral_budgets: None,
         fallback_failure: None,
         account_alias: None,
         monitoring_paused: None,

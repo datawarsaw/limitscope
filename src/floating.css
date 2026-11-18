@@ -668,6 +668,61 @@ html[data-window="floating"] body {
 .fq-credit-bank strong { font-weight: 600; }
 .fq-credit-bank p { margin: 3px 0 0; }
 
+/* Mistral's two monthly budgets: the same hairline section hierarchy as the
+   secondary inventory, with each row stating its own remaining percentage,
+   its own money (used, total and remaining, always in the row's own
+   currency) and its own reset. A row the source did not report states only
+   that it is unavailable — it never borrows a number from its sibling. */
+.fq-mistral {
+  margin-top: 9px;
+  padding-top: 9px;
+  border-top: 1px solid var(--divider);
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.fq-mistral-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.fq-mistral-head strong { font-weight: 600; color: var(--text); }
+
+.fq-mistral-row {
+  display: grid;
+  grid-template-columns: minmax(56px, max-content) 1fr;
+  column-gap: 8px;
+  row-gap: 2px;
+  margin-top: 7px;
+}
+
+.fq-mistral-label { color: var(--text); }
+.fq-mistral-state { text-align: right; }
+.fq-mistral-amounts,
+.fq-mistral-reason,
+.fq-mistral-reset {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.fq-mistral-amounts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.fq-mistral-row.is-unavailable .fq-mistral-state { color: var(--text-dim); }
+/* The row is a two-column grid, so a meter that stays in one cell is
+   squeezed into the label column and reads as a narrow bar. Both budget
+   meters span the full row width. */
+.fq-mistral-row .fq-meter {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
+
 .fq-popover .opendesign-control {
   margin-top: 9px;
   padding-top: 9px;

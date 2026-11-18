@@ -24,6 +24,7 @@ mod store_safety_fixtures;
 mod last_good;
 mod local_data;
 mod minimax_token_plan;
+mod mistral;
 mod notifications;
 mod opencode_go;
 mod opendesign;

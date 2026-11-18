@@ -152,6 +152,63 @@ export type GrokBotUsage = {
 export type DataFreshness = "fresh" | "stale";
 
 /**
+ * One Mistral monthly budget row (Mistral entry only).
+ * Mirrors the Rust MistralBudgetRowDto DTO (src-tauri/src/mistral.rs).
+ *
+ * The Vibe row and the API row are independent: one can be measured while
+ * the other is unknown, and they are never merged, summed or converted into
+ * each other. Amounts travel as integer cents in the row's own currency,
+ * so a consumer can never read one currency's cents as another's.
+ */
+export type MistralBudgetRow = {
+  /** Stable row key: the Vibe row or the API row. */
+  key: string;
+  /** Display label: "Vibe Budget" or "API Budget". */
+  label: string;
+  /**
+   * Whether this row carries a measured budget. A row that is not available
+   * states no percentage and no amount: it is unknown, never zero and never
+   * full.
+   */
+  available: boolean;
+  /** ISO currency code exactly as the source reported it (e.g. EUR). */
+  currency?: string;
+  /** The budget total, in cents. */
+  totalCents?: number;
+  /** The consumed amount, in cents. */
+  usedCents?: number;
+  /** The remaining amount, in cents. */
+  remainingCents?: number;
+  /** The source's own used percentage (0-100). */
+  usedPercent?: number;
+  /** The source's own reset instant, preserved verbatim. */
+  resetAt?: string;
+  /**
+   * True when the used amount was derived from the percentage and the
+   * budget total instead of being reported by the source.
+   */
+  amountDerived?: boolean;
+  /**
+   * Why this row is unknown, in a fixed vocabulary: missing, currency,
+   * initial_budget, usage_percentage or reset_at.
+   */
+  unavailableReason?: string;
+};
+
+/**
+ * The Mistral budget observation (Mistral entry only): both monthly
+ * budgets plus the verified plan name.
+ *
+ * The plan name is present only when the subscription endpoint verified it
+ * (e.g. EDU); an unverified plan is absent, never guessed.
+ */
+export type MistralBudgets = {
+  planName?: string;
+  /** Both rows, always both, in display order (Vibe first). */
+  rows: MistralBudgetRow[];
+};
+
+/**
  * Attribution of the shown quota windows to one specific account of a
  * provider. Present only when the provider can prove which account the
  * windows belong to (a stable, display-safe identity — never a secret).
@@ -229,6 +286,10 @@ export type ProviderUsage = {
    * passive supplemental pool, independent of the xAI billing windows on
    * the same entry. See {@link GrokBotUsage}. */
   grokBot?: GrokBotUsage;
+  /** Mistral monthly budget observation (Mistral entry only) — the Vibe and
+ * API budgets, each with its own percentage, reset and EUR amount, plus the
+ * verified plan name. See {@link MistralBudgets}. */
+  mistralBudgets?: MistralBudgets;
   /** True for deterministic demo providers; they never enter history/prediction. */
   simulated?: boolean;
   /** Legacy status vocabulary, derived in Rust from {@link ProviderUsage.health}

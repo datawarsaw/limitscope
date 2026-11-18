@@ -48,6 +48,7 @@ export const DEFAULT_PROVIDER_ORDER: readonly string[] = [
   "grok",
   "qwen-token-plan",
   "minimax-token-plan",
+  "mistral",
   "opendesign",
 ];
 

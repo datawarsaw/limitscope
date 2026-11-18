@@ -24,6 +24,7 @@ const PRODUCTION_REGISTRY = [
   "grok",
   "qwen-token-plan",
   "minimax-token-plan",
+  "mistral",
   "opendesign",
 ];
 
@@ -211,7 +212,7 @@ describe("canHideProvider / toggleProviderHidden", () => {
 });
 
 describe("the default provider order", () => {
-  it("is the confirmed ten-provider order with both Codex accounts first", () => {
+  it("is the confirmed eleven-provider order with both Codex accounts first", () => {
     expect(DEFAULT_PROVIDER_ORDER).toEqual([
       "openai-codex",
       "openai-codex:secondary",
@@ -222,6 +223,7 @@ describe("the default provider order", () => {
       "grok",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
       "opendesign",
     ]);
   });
@@ -248,6 +250,7 @@ describe("the default provider order", () => {
       "opencode-go",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
       "opendesign",
     ]);
     expect(resolved.hiddenIds).toEqual(["zai", "grok"]);
@@ -307,6 +310,7 @@ describe("the default provider order", () => {
       "grok",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
       "opendesign",
     ]);
   });
@@ -328,11 +332,12 @@ describe("Claude Code in the default provider order", () => {
       "grok",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
       "opendesign",
     ]);
   });
 
-  it("keeps the relative order of the other nine providers unchanged", () => {
+  it("keeps the relative order of the other ten providers unchanged", () => {
     const withoutClaude = DEFAULT_PROVIDER_ORDER.filter((id) => id !== "claude-code");
     expect(withoutClaude).toEqual([
       "openai-codex",
@@ -343,6 +348,7 @@ describe("Claude Code in the default provider order", () => {
       "grok",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
       "opendesign",
     ]);
   });
@@ -375,6 +381,7 @@ describe("Claude Code in the default provider order", () => {
       "minimax-token-plan",
       "opendesign",
       "claude-code",
+      "mistral",
     ]);
     expect(resolved.hiddenIds).toEqual(["zai"]);
     expect(JSON.stringify(legacy)).toBe(snapshot);
@@ -410,6 +417,7 @@ describe("partial persisted order and visibility", () => {
       "opencode-go",
       "qwen-token-plan",
       "minimax-token-plan",
+      "mistral",
     ]);
     expect(JSON.stringify(saved)).toBe(snapshot);
   });
