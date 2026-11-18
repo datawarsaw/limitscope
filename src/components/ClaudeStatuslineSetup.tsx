@@ -66,7 +66,8 @@ export function ClaudeStatuslineSetup() {
         can update after Claude Code responses and become last known when no new
         quota information arrives.
         It needs a claude.ai Pro, Max or Ultra plan and one Claude Code
-        response. No network request, login or model call is made by LimitScope.
+        response. LimitScope itself makes no network request, login or model
+        call; the ping above starts Claude Code, which sends one request.
       </p>
       <details>
         <summary>Set up Claude Code monitoring (opt-in)</summary>

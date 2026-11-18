@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod antigravity;
+mod claude_cli;
 mod claude_statusline;
 mod codex;
 mod codex_accounts;
@@ -173,6 +174,7 @@ fn main() {
             grok_bot::refresh_grok_bot_usage,
             opendesign::refresh_opendesign_usage,
             claude_statusline::get_claude_statusline_setup,
+            claude_cli::refresh_claude_usage,
             open_main_window,
             floating_drag::attach_floating_drag_lifecycle,
             floating_drag::detach_floating_drag_lifecycle,

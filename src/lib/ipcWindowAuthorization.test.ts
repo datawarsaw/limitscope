@@ -77,6 +77,7 @@ const MAIN_COMMANDS = new Set([
   "refresh_grok_bot_usage",
   "refresh_opendesign_usage",
   "get_claude_statusline_setup",
+  "refresh_claude_usage",
 ]);
 
 /**
@@ -107,6 +108,7 @@ const FLOATING_DENIED_SAMPLE = [
   "export_diagnostics",
   "pick_usage_export_directory",
   "export_usage_history",
+  "refresh_claude_usage",
   ...LEGACY_PROVIDER_FETCHES,
 ];
 

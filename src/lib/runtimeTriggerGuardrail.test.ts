@@ -74,6 +74,8 @@ const ALLOWED_COMMANDS = new Set([
   // Read-only display of the opt-in Claude Code statusLine command. It does
   // not fetch, schedule or refresh anything.
   "get_claude_statusline_setup",
+  // Claude Code on-demand ping: one explicit user action that starts the installed Claude CLI once, so Claude Code runs its own status line hook. Not a provider fetch, not a shared-runtime refresh, and never scheduled.
+  "refresh_claude_usage",
   // Native drag lifecycle (Human-Accepted Slice A): attach/detach/restore
   // the Rust-owned window drag observer. Not a fetch and not a refresh.
   "attach_floating_drag_lifecycle",

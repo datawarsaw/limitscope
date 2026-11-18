@@ -94,6 +94,11 @@ description = "Read the opt-in Claude Code statusLine command for display. Write
 commands.allow = ["get_claude_statusline_setup"]
 
 [[permission]]
+identifier = "allow-claude-cli-ping"
+description = "Start the installed Claude CLI once, with one fixed prompt, for an explicit on-demand quota refresh. It starts a process, creates one empty scratch directory and reads no file."
+commands.allow = ["refresh_claude_usage"]
+
+[[permission]]
 identifier = "allow-open-main-window"
 description = "Show and focus the main dashboard window."
 commands.allow = ["open_main_window"]
