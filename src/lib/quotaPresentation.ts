@@ -200,3 +200,18 @@ export function predictionQuotaPresentation(
         : `Projected remaining at reset: ${presentation.displayPercent}%`,
   };
 }
+
+/**
+ * Presentation-only window prefix for reset countdown lines (e.g.
+ * "Weekly reset in ..."). Genuine 7-day labels normalize to "Weekly" while
+ * raw metadata ("7-day" in window lists, selectors, history, and metrics),
+ * provider-prefixed labels ("Gemini Weekly", "Claude Weekly", "Argon Weekly"),
+ * and other durations ("1-day", "5-hour", "30-day", "17-day") stay intact.
+ */
+export function resetCountdownLabel(rawLabel: string): string {
+  const trimmed = rawLabel.trim();
+  if (/^7(?:\s*-\s*|\s+)days?$/i.test(trimmed) || /^7d$/i.test(trimmed)) {
+    return "Weekly";
+  }
+  return trimmed;
+}

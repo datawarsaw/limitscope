@@ -74,6 +74,35 @@ describe("Claude Code provider presentation", () => {
     ]);
   });
 
+  it("renders Weekly reset in for Claude Code 7-day countdown while retaining 7-day window metadata", async () => {
+    const [item] = floatingQuotaItems([live]);
+    expect(item.windowLabel).toBe("7-day");
+    expect(item.primaryReset?.label).toBe("7-day");
+
+    await render(
+      <FloatingProviderPopover
+        item={item}
+        pinned={false}
+        now={now}
+        note={null}
+        align={0}
+        exiting={false}
+        onMouseEnter={() => {}}
+        onMouseLeave={() => {}}
+        onFocus={() => {}}
+        onBlur={() => {}}
+      />,
+    );
+
+    expect(container.querySelector(".fq-primary-reset")?.textContent).toBe(
+      "Weekly reset in 2d 12h",
+    );
+    const windowLabels = Array.from(
+      container.querySelectorAll(".fq-window-label"),
+    ).map((el) => el.textContent);
+    expect(windowLabels).toEqual(["5-hour", "7-day"]);
+  });
+
   it("states provenance and the passive limitation, never a live-poll claim", () => {
     const note = providerSourceNote(live, now);
     expect(note).toContain("Last statusLine event: 1m ago");

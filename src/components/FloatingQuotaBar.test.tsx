@@ -1206,4 +1206,29 @@ describe("FloatingQuotaBar with two OpenAI/Codex accounts", () => {
       "—",
     );
   });
+
+  it("maps genuine 7-day countdown prefix to Weekly without altering other durations or named weekly labels", async () => {
+    const cases: Array<[string, string]> = [
+      ["7-day", "Weekly reset in 8h 24m"],
+      ["1-day", "1-day reset in 8h 24m"],
+      ["5-hour", "5-hour reset in 8h 24m"],
+      ["30-day", "30-day reset in 8h 24m"],
+      ["Gemini Weekly", "Gemini Weekly reset in 8h 24m"],
+      ["Claude Weekly", "Claude Weekly reset in 8h 24m"],
+      ["Argon Weekly", "Argon Weekly reset in 8h 24m"],
+    ];
+    for (const [label, expected] of cases) {
+      const provider = item({
+        providerId: "claude-code",
+        name: "Claude Code",
+        windowLabel: label,
+        windows: [{ label, usedPercent: 22, resetAt: RESET_AT }],
+        primaryReset: { label, resetAt: RESET_AT },
+      });
+      await renderBar({ items: [provider], detailId: "claude-code", pinned: true });
+      const dialog = container.querySelector('[role="dialog"]')!;
+      expect(dialog.querySelector(".fq-primary-reset")!.textContent).toBe(expected);
+      expect(dialog.querySelector(".fq-window-label")!.textContent).toBe(label);
+    }
+  });
 });
