@@ -3,7 +3,10 @@ import type { CSSProperties, FocusEvent } from "react";
 import { formatCountdown } from "../lib/format";
 import { claudeTimesNote } from "../lib/v03Integration";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
-import { FLOATING_QUOTA_PERSPECTIVE } from "../lib/floatingQuota";
+import {
+  FLOATING_QUOTA_PERSPECTIVE,
+  floatingDetailRowLabel,
+} from "../lib/floatingQuota";
 import { isCodexProviderId } from "../lib/providerIds";
 import { formatCreditExpiry, formatResetCredits } from "../lib/resetCredits";
 import {
@@ -240,7 +243,7 @@ export function FloatingProviderPopover({
               <WindowRow
                 key={window.label}
                 item={item}
-                label={window.label}
+                label={floatingDetailRowLabel(item.providerId, window.label)}
                 usedPercent={window.usedPercent}
                 resetAt={window.resetAt}
                 resetText={window.resetText}

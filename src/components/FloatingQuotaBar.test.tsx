@@ -1228,7 +1228,11 @@ describe("FloatingQuotaBar with two OpenAI/Codex accounts", () => {
       await renderBar({ items: [provider], detailId: "claude-code", pinned: true });
       const dialog = container.querySelector('[role="dialog"]')!;
       expect(dialog.querySelector(".fq-primary-reset")!.textContent).toBe(expected);
-      expect(dialog.querySelector(".fq-window-label")!.textContent).toBe(label);
+      // The Claude Code detail row agrees with its countdown line: a genuine
+      // 7-day window reads "Weekly"; every other label stays as reported.
+      expect(dialog.querySelector(".fq-window-label")!.textContent).toBe(
+        label === "7-day" ? "Weekly" : label,
+      );
     }
   });
 });

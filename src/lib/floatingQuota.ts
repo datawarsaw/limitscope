@@ -5,7 +5,10 @@ import type {
   ProviderUsage,
 } from "../types";
 import { grokBotFor } from "./grokBot";
-import { baseProviderId } from "./providerIds";
+import {
+  baseProviderId,
+  CLAUDE_CODE_PROVIDER_ID,
+} from "./providerIds";
 import { isUsableQuotaWindow } from "./quotaStrip";
 import { isWalletMonitored, type WalletPreferences } from "./walletPreferences";
 import {
@@ -14,6 +17,7 @@ import {
 } from "./v03Integration";
 import {
   quotaPresentation,
+  resetCountdownLabel,
   type QuotaPerspective,
 } from "./quotaPresentation";
 
@@ -667,6 +671,24 @@ export function floatingQuotaItems(
     });
   }
   return items;
+}
+
+/**
+ * Presentation-only label for one floating detail row.
+ *
+ * Claude Code's subscription allowance is a weekly pool that its statusLine
+ * reports under the raw "7-day" label; the detail row reads "Weekly", the
+ * same wording the countdown line above it already uses. Every other
+ * provider keeps its own label (OpenDesign still reads "7-day"), and the
+ * raw label stays in the stored window metadata: primary-window selection,
+ * history, metrics and the server reset timestamps are untouched.
+ */
+export function floatingDetailRowLabel(
+  providerId: string,
+  rawLabel: string,
+): string {
+  if (baseProviderId(providerId) !== CLAUDE_CODE_PROVIDER_ID) return rawLabel;
+  return resetCountdownLabel(rawLabel);
 }
 
 // ---------- API wallets ----------
