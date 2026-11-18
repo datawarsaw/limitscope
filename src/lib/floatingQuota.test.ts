@@ -14,6 +14,7 @@ import {
   dockWalletDotRect,
   floatingBarWidth,
   floatingClickAction,
+  floatingDetailRowLabel,
   floatingItemLabel,
   floatingPrimaryWindow,
   floatingQuotaItems,
@@ -1415,5 +1416,29 @@ describe("two OpenAI/Codex accounts", () => {
     ]);
     expect(items[0].state).toBe("error");
     expect(items[0].percent).toBe(69);
+  });
+});
+
+describe("floating detail row label", () => {
+  it("names Claude Code's genuine 7-day window Weekly", () => {
+    expect(floatingDetailRowLabel("claude-code", "7-day")).toBe("Weekly");
+    expect(floatingDetailRowLabel("claude-code", "5-hour")).toBe("5-hour");
+  });
+
+  it("leaves every other provider's label untouched", () => {
+    for (const id of [
+      "opendesign",
+      "grok",
+      "openai-codex",
+      "antigravity",
+      "zai",
+      "opencode-go",
+    ]) {
+      expect(floatingDetailRowLabel(id, "7-day"), id).toBe("7-day");
+    }
+    expect(floatingDetailRowLabel("openai-codex", "Weekly")).toBe("Weekly");
+    expect(floatingDetailRowLabel("antigravity", "Gemini Weekly")).toBe(
+      "Gemini Weekly",
+    );
   });
 });

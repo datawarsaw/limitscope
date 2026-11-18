@@ -97,10 +97,12 @@ describe("Claude Code provider presentation", () => {
     expect(container.querySelector(".fq-primary-reset")?.textContent).toBe(
       "Weekly reset in 2d 12h",
     );
+    // The detail row names the same window Weekly; the raw "7-day" label
+    // stays in the stored metadata asserted above.
     const windowLabels = Array.from(
       container.querySelectorAll(".fq-window-label"),
     ).map((el) => el.textContent);
-    expect(windowLabels).toEqual(["5-hour", "7-day"]);
+    expect(windowLabels).toEqual(["5-hour", "Weekly"]);
   });
 
   it("states provenance and the passive limitation, never a live-poll claim", () => {
