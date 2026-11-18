@@ -932,6 +932,7 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            mistral_budgets: None,
             account_alias: None,
             monitoring_paused: None,
             fallback_failure: None,
@@ -964,6 +965,7 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            mistral_budgets: None,
             account_alias: None,
             monitoring_paused: None,
             fallback_failure: None,
@@ -1224,7 +1226,7 @@ mod tests {
             .collect();
         assert_eq!(
             ids,
-            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
+            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "mistral", "opendesign"]
         );
         let serialized = serde_json::to_string(&ids).unwrap();
         assert!(!serialized.contains("mock"), "no mock adapters in the notification path");

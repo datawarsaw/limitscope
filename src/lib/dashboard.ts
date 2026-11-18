@@ -29,6 +29,7 @@ const SHORT_NAMES: Readonly<Record<string, string>> = {
   grok: "Grok",
   "qwen-token-plan": "Qwen",
   "minimax-token-plan": "MiniMax",
+  mistral: "Mistral",
   opendesign: "OpenDesign",
 };
 

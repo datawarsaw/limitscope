@@ -99,6 +99,7 @@ use crate::opencode_go::{self, OpenCodeGoUsage};
 use crate::provider_error::{ProviderError, MAX_COOLDOWN_MS};
 use crate::qwen_token_plan::{self, QwenTokenPlanUsage};
 use crate::minimax_token_plan::{self, MiniMaxUsage};
+use crate::mistral::{MistralBudgetsDto, MistralUsage};
 use crate::wallet::{self, WalletAmount, WalletBalance};
 use crate::zai::{self, ZaiUsage};
 use crate::zcode_plans::{self, ZCodePlansObservation};
@@ -429,6 +430,15 @@ pub struct ProviderUsageDto {
     /// it. Providers other than Grok never set this field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grok_bot: Option<GrokBotUsage>,
+    /// Optional Mistral budget observation (Mistral entry only). The two
+    /// monthly budgets — the Vibe allowance and the API allowance — each
+    /// with its own percentage, its own reset and its own EUR amount, plus
+    /// the verified plan name. The rows are independent: one can be
+    /// measured while the other is unknown, and they are never merged,
+    /// summed or converted into each other. Present only on the Mistral
+    /// entry when the billing read answered. Other providers never set it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mistral_budgets: Option<MistralBudgetsDto>,
     /// Internal, never serialized (`serde(skip)`): the Antigravity adapter's
     /// structured live-failure cause when a refresh degraded to cached
     /// windows. The success path records it in the diagnostics lane's
@@ -677,6 +687,12 @@ pub enum ProviderKind {
     Grok,
     QwenTokenPlan,
     MiniMaxTokenPlan,
+    /// Mistral's own monthly budgets: the Vibe (Studio) allowance and the
+    /// API allowance, read from the canonical Mistral billing API with the
+    /// account's own stored key. One provider, two independent rows: the
+    /// Vibe row is the provider's primary window, the API row is its
+    /// sibling, and they are never merged or summed.
+    Mistral,
     OpenDesign,
     /// Claude Code subscription limits, received passively from the
     /// documented `statusLine` hook (see `claude_statusline.rs`).
@@ -694,6 +710,7 @@ impl ProviderKind {
             ProviderKind::Grok => "grok",
             ProviderKind::QwenTokenPlan => "qwen-token-plan",
             ProviderKind::MiniMaxTokenPlan => "minimax-token-plan",
+            ProviderKind::Mistral => "mistral",
             ProviderKind::OpenDesign => "opendesign",
             ProviderKind::ClaudeCode => "claude-code",
         }
@@ -709,6 +726,7 @@ impl ProviderKind {
             ProviderKind::Grok => "Grok (xAI)",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan",
             ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan",
+            ProviderKind::Mistral => "Mistral",
             ProviderKind::OpenDesign => "OpenDesign",
             ProviderKind::ClaudeCode => "Claude Code",
         }
@@ -724,6 +742,7 @@ impl ProviderKind {
             "grok" => Some(ProviderKind::Grok),
             "qwen-token-plan" => Some(ProviderKind::QwenTokenPlan),
             "minimax-token-plan" => Some(ProviderKind::MiniMaxTokenPlan),
+            "mistral" => Some(ProviderKind::Mistral),
             "opendesign" => Some(ProviderKind::OpenDesign),
             "claude-code" => Some(ProviderKind::ClaudeCode),
             _ => None,
@@ -740,6 +759,7 @@ impl ProviderKind {
             ProviderKind::Grok => "Grok usage could not be fetched.",
             ProviderKind::QwenTokenPlan => "Qwen Token Plan usage could not be fetched.",
             ProviderKind::MiniMaxTokenPlan => "MiniMax Token Plan usage could not be fetched.",
+            ProviderKind::Mistral => "Mistral budget usage could not be fetched.",
             ProviderKind::OpenDesign => "OpenDesign usage could not be read.",
             ProviderKind::ClaudeCode => "Claude Code usage could not be read.",
         }
@@ -952,6 +972,7 @@ fn base_usage(
         zcode_reset_cards: None,
         zcode_plans: None,
         grok_bot: None,
+        mistral_budgets: None,
         fallback_failure: None,
         account_alias: None,
         monitoring_paused: None,
@@ -1392,6 +1413,75 @@ fn normalize_minimax_token_plan(
             Ok(dto)
         }
         Err(error) => Err(failure_from_provider_error(error)),
+    }
+}
+
+/// Mistral's two monthly budgets become two quota windows.
+///
+/// Each row is measured on its own: a row the source did not report (or
+/// reported unusably) contributes no window at all, so the sibling stays
+/// measurable and the missing one is simply absent rather than zero. The
+/// source's used percentage is the canonical value; the UI's remaining
+/// perspective is derived from it at the presentation layer, and the EUR
+/// amounts ride the observation beside the windows.
+fn normalize_mistral(
+    result: Result<MistralUsage, ProviderError>,
+    now_ms: i64,
+) -> Result<ProviderUsageDto, ProviderFailure> {
+    match result {
+        Ok(usage) => {
+            let windows: Vec<(String, f64, Option<String>)> = usage
+                .rows
+                .iter()
+                .filter(|row| row.available)
+                .map(|row| {
+                    (
+                        row.label.to_string(),
+                        row.used_percent.unwrap_or(0.0),
+                        row.reset_at.clone(),
+                    )
+                })
+                .collect();
+            let limits = limits_from(&windows, now_ms);
+            // One measured row is enough for a live reading; the other row
+            // keeps its own unknown state inside the observation.
+            let health = if limits.is_empty() {
+                ProviderHealth::Unknown
+            } else {
+                ProviderHealth::Live
+            };
+            let mut dto = base_usage(ProviderKind::Mistral, health, limits);
+            dto.plan_type = usage.plan_name.clone();
+            dto.account = Some(build_mistral_attribution(&usage.account));
+            dto.mistral_budgets = Some(MistralBudgetsDto {
+                plan_name: usage.plan_name.clone(),
+                rows: usage.rows,
+            });
+            Ok(dto)
+        }
+        Err(error) => Err(failure_from_provider_error(error)),
+    }
+}
+
+/// The account attribution for the credential that answered.
+///
+/// The masked tail names the key; the deterministic fingerprint is the
+/// account identity the runtime isolates last-good by. The attribution is
+/// present even when no tail can be masked safely: without an identity the
+/// runtime's account guard could not tell two accounts apart, and a reading
+/// would then be retained across a credential change.
+fn build_mistral_attribution(account: &crate::mistral::MistralAccount) -> AccountAttributionDto {
+    let label = match account.key_hint.as_deref() {
+        Some(hint) if !hint.trim().is_empty() => format!("key \u{2022}\u{2022}{hint}"),
+        _ => "Mistral API key".to_string(),
+    };
+    AccountAttributionDto {
+        label,
+        note: Some(
+            "Read-only Mistral billing: the Vibe and API monthly budgets of the stored key."
+                .to_string(),
+        ),
+        identity: account.identity.clone(),
     }
 }
 
@@ -1848,6 +1938,15 @@ fn other_production_specs() -> Vec<ProviderSpec> {
                         minimax_token_plan::get_minimax_usage().await,
                         now_ms,
                     )
+                })
+            }),
+        },
+        ProviderSpec {
+            kind: ProviderKind::Mistral,
+            fetch: Arc::new(|| {
+                Box::pin(async {
+                    let now_ms = Utc::now().timestamp_millis();
+                    normalize_mistral(crate::mistral::get_mistral_usage().await, now_ms)
                 })
             }),
         },
@@ -4156,7 +4255,8 @@ impl RuntimeCore {
             | ProviderKind::OpenCodeGo
             | ProviderKind::Antigravity
             | ProviderKind::QwenTokenPlan
-            | ProviderKind::MiniMaxTokenPlan => {
+            | ProviderKind::MiniMaxTokenPlan
+            | ProviderKind::Mistral => {
                 self.inner
                     .lock()
                     .unwrap()
@@ -5498,6 +5598,7 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            mistral_budgets: None,
             account_alias: None,
             monitoring_paused: None,
             fallback_failure: None,
@@ -6582,13 +6683,14 @@ mod tests {
                 ProviderKind::Grok,
                 ProviderKind::QwenTokenPlan,
                 ProviderKind::MiniMaxTokenPlan,
+                ProviderKind::Mistral,
                 ProviderKind::OpenDesign,
             ]
         );
         let ids: Vec<&str> = kinds.iter().map(|k| k.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
+            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "mistral", "opendesign"]
         );
         assert!(ids.contains(&"grok"), "Grok must remain production");
         // No simulated providers: the production runtime never carries the
@@ -7195,6 +7297,213 @@ mod tests {
             }),
             identity,
         )
+    }
+
+    // ---------- Mistral: two independent monthly budgets ----------
+
+    /// One Mistral budget row. An unavailable row states no percentage and
+    /// no amount at all — the shape the adapter produces for a row the
+    /// source did not report (or reported unusably).
+    fn mistral_row(
+        key: &'static str,
+        label: &'static str,
+        available: bool,
+    ) -> crate::mistral::MistralBudgetRowDto {
+        crate::mistral::MistralBudgetRowDto {
+            key,
+            label,
+            available,
+            currency: available.then(|| "EUR".to_string()),
+            total_cents: available.then_some(12_750),
+            used_cents: available.then_some(34),
+            remaining_cents: available.then_some(12_716),
+            used_percent: available.then_some(0.27),
+            reset_at: Some("2026-10-25T00:00:00Z".to_string()),
+            amount_derived: available.then_some(true),
+            unavailable_reason: (!available).then(|| "missing".to_string()),
+        }
+    }
+
+    fn mistral_rows() -> Vec<crate::mistral::MistralBudgetRowDto> {
+        vec![
+            mistral_row(crate::mistral::VIBE_ROW_KEY, "Vibe Budget", true),
+            mistral_row(crate::mistral::API_ROW_KEY, "API Budget", true),
+        ]
+    }
+
+    fn mistral_usage_dto(
+        rows: Vec<crate::mistral::MistralBudgetRowDto>,
+        plan: Option<&str>,
+        identity: &str,
+    ) -> ProviderUsageDto {
+        let usage = MistralUsage {
+            rows,
+            plan_name: plan.map(str::to_string),
+            account: crate::mistral::MistralAccount {
+                key_hint: Some("alue".to_string()),
+                identity: Some(identity.to_string()),
+            },
+        };
+        normalize_mistral(Ok(usage), fixed_now().timestamp_millis()).expect("mistral usage")
+    }
+
+    fn mistral_failure(identity: Option<&str>) -> ProviderFailure {
+        failure_with_identity(
+            failure_from_provider_error(ProviderError::new("auth_invalid", "rejected")),
+            identity,
+        )
+    }
+
+    fn mistral_transient_failure(identity: Option<&str>) -> ProviderFailure {
+        failure_with_identity(
+            failure_from_provider_error(ProviderError::transient("network", "network down")),
+            identity,
+        )
+    }
+
+    #[test]
+    fn mistral_publishes_the_vibe_and_api_budgets_as_two_windows() {
+        let dto = mistral_usage_dto(mistral_rows(), Some("EDU"), "credential-v1:mistral-a");
+        assert_eq!(dto.id, "mistral");
+        assert_eq!(dto.name, "Mistral");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.limits.len(), 2);
+        // Vibe is the primary window and therefore the first one.
+        assert_eq!(dto.limits[0].label, "Vibe Budget");
+        assert_eq!(dto.limits[1].label, "API Budget");
+        assert_eq!(dto.plan_type.as_deref(), Some("EDU"));
+        assert_eq!(
+            dto.account.as_ref().and_then(|account| account.identity.as_deref()),
+            Some("credential-v1:mistral-a")
+        );
+        let budgets = dto.mistral_budgets.as_ref().expect("budgets");
+        assert_eq!(budgets.plan_name.as_deref(), Some("EDU"));
+        assert_eq!(budgets.rows.len(), 2);
+        assert_eq!(budgets.rows[0].total_cents, Some(12_750));
+        assert_eq!(budgets.rows[0].used_cents, Some(34));
+        assert_eq!(budgets.rows[0].remaining_cents, Some(12_716));
+        assert_eq!(budgets.rows[0].currency.as_deref(), Some("EUR"));
+    }
+
+    #[test]
+    fn an_unknown_mistral_row_stays_unknown_while_its_sibling_is_measured() {
+        let rows = vec![
+            mistral_row(crate::mistral::VIBE_ROW_KEY, "Vibe Budget", true),
+            mistral_row(crate::mistral::API_ROW_KEY, "API Budget", false),
+        ];
+        let dto = mistral_usage_dto(rows, None, "credential-v1:mistral-a");
+        assert_eq!(dto.health, ProviderHealth::Live);
+        assert_eq!(dto.limits.len(), 1);
+        assert_eq!(dto.limits[0].label, "Vibe Budget");
+        // An unverified plan is simply absent, never guessed.
+        assert_eq!(dto.plan_type, None);
+        let budgets = dto.mistral_budgets.as_ref().expect("budgets");
+        assert!(budgets.rows[0].available);
+        assert!(!budgets.rows[1].available);
+        assert_eq!(budgets.rows[1].used_cents, None);
+        assert_eq!(budgets.rows[1].total_cents, None);
+        assert_eq!(budgets.rows[1].used_percent, None);
+    }
+
+    #[test]
+    fn two_unknown_mistral_rows_are_unknown_never_zero() {
+        let rows = vec![
+            mistral_row(crate::mistral::VIBE_ROW_KEY, "Vibe Budget", false),
+            mistral_row(crate::mistral::API_ROW_KEY, "API Budget", false),
+        ];
+        let dto = mistral_usage_dto(rows, None, "credential-v1:mistral-a");
+        assert_eq!(dto.health, ProviderHealth::Unknown);
+        assert!(dto.limits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mistral_last_good_is_retained_for_the_same_credential() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |nth| match nth {
+            1 => Ok(mistral_usage_dto(mistral_rows(), Some("EDU"), "credential-v1:mistral-a")),
+            _ => Err(mistral_failure(Some("credential-v1:mistral-a"))),
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        core.run_cycle().await;
+        let retained = &core.snapshot().providers[0];
+        assert_eq!(retained.status, "error");
+        assert_eq!(retained.limits.len(), 2);
+        assert_eq!(
+            retained
+                .account
+                .as_ref()
+                .and_then(|account| account.identity.as_deref()),
+            Some("credential-v1:mistral-a")
+        );
+        // The retained reading keeps the budget amounts, so the detail card
+        // stays complete while it is marked as failed.
+        assert!(retained.mistral_budgets.is_some());
+    }
+
+    #[tokio::test]
+    async fn mistral_last_good_is_dropped_when_the_credential_changed() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |nth| match nth {
+            1 => Ok(mistral_usage_dto(mistral_rows(), Some("EDU"), "credential-v1:mistral-a")),
+            _ => Err(mistral_failure(Some("credential-v1:mistral-b"))),
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        core.run_cycle().await;
+        let entry = &core.snapshot().providers[0];
+        assert_eq!(entry.status, "error");
+        assert!(
+            entry.limits.is_empty(),
+            "another credential's last-good must not stand in"
+        );
+        assert!(entry.mistral_budgets.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unresolved_mistral_credential_never_reuses_a_fingerprinted_last_good() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |nth| match nth {
+            1 => Ok(mistral_usage_dto(mistral_rows(), Some("EDU"), "credential-v1:mistral-a")),
+            _ => Err(mistral_failure(None)),
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        assert!(!core.snapshot().providers[0].limits.is_empty());
+        core.run_cycle().await;
+        assert!(core.snapshot().providers[0].limits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_transient_mistral_failure_keeps_the_account_bound_last_good() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |nth| match nth {
+            1 => Ok(mistral_usage_dto(mistral_rows(), Some("EDU"), "credential-v1:mistral-a")),
+            _ => Err(mistral_transient_failure(Some("credential-v1:mistral-a"))),
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        core.run_cycle().await;
+        let retained = &core.snapshot().providers[0];
+        assert_eq!(retained.health, ProviderHealth::Error);
+        assert_eq!(retained.limits.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_missing_mistral_credential_is_unavailable_not_an_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |_| {
+            Err(failure_from_provider_error(ProviderError::new(
+                "credential_missing",
+                "no key",
+            )))
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        let entry = &core.snapshot().providers[0];
+        assert_eq!(entry.health, ProviderHealth::Unavailable);
+        assert!(entry.limits.is_empty());
+        assert_eq!(entry.error_category.as_deref(), Some("credential_missing"));
     }
 
     // 1. Codex same-account failure retention
@@ -8892,7 +9201,7 @@ mod tests {
         let ids: Vec<&str> = production_specs().iter().map(|s| s.kind.id()).collect();
         assert_eq!(
             ids,
-            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "opendesign"]
+            ["openai-codex", "openai-codex:secondary", "claude-code", "zai", "opencode-go", "antigravity", "grok", "qwen-token-plan", "minimax-token-plan", "mistral", "opendesign"]
         );
     }
 
@@ -9017,6 +9326,7 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            mistral_budgets: None,
             account_alias: None,
             monitoring_paused: None,
             fallback_failure: None,
@@ -12746,7 +13056,7 @@ mod tests {
                 .iter()
                 .filter(|spec| !is_codex_provider_id(spec.kind.id()))
                 .count(),
-            8,
+            9,
             "the other providers keep their exact set"
         );
     }

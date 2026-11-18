@@ -28,6 +28,12 @@ export function ProviderMark({ id }: { id: string }) {
     // would be indistinguishable from other providers at 16px.
     return <span className="fq-mark-fallback">MM</span>;
   }
+  if (provider === "mistral") {
+    // A monogram, like the other reduced marks: the Mistral wordmark is not
+    // licensed into the app, and a bare "M" would be indistinguishable
+    // from MiniMax at 16px.
+    return <span className="fq-mark-fallback">MI</span>;
+  }
   if (provider === "openai-codex") {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">

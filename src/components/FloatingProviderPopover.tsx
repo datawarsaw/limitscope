@@ -13,6 +13,7 @@ import {
 } from "../lib/quotaPresentation";
 import { ProviderMark } from "./FloatingProviderItem";
 import { GrokBotSection } from "./GrokBotSection";
+import { MistralBudgetSection } from "./MistralBudgetSection";
 import { OpenDesignRefreshControl } from "./OpenDesignRefreshControl";
 
 /**
@@ -230,7 +231,10 @@ export function FloatingProviderPopover({
           </span>
         ) : null}
 
-        {item.windows.length > 0 ? (
+        {/* The Mistral rows carry their own money, reset and availability,
+            so the generic window list would repeat the same two pools in a
+            second, thinner shape. It stays for every other provider. */}
+        {item.windows.length > 0 && !item.mistralBudgets ? (
           <div className="fq-windows">
             {item.windows.map((window) => (
               <WindowRow
@@ -244,6 +248,10 @@ export function FloatingProviderPopover({
               />
             ))}
           </div>
+        ) : null}
+
+        {item.mistralBudgets ? (
+          <MistralBudgetSection budgets={item.mistralBudgets} />
         ) : null}
 
         {isCodexProviderId(item.providerId) ? (

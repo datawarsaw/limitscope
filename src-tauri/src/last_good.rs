@@ -72,6 +72,49 @@ pub struct PersistedProviderState {
     pub last_successful_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_updated_at: Option<String>,
+    /// The Mistral budget observation. Optional: an entry written before the
+    /// Mistral provider existed carries no budgets and hydrates as the plain
+    /// windows it always had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mistral_budgets: Option<PersistedMistralBudgets>,
+}
+
+/// One persisted Mistral budget row.
+///
+/// The two rows stay independent here too: an unavailable row persists as
+/// unavailable, never as a zero and never as a full budget. The row's
+/// identity comes from the closed key set, never from a stored label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedMistralBudgetRow {
+    pub key: String,
+    pub label: String,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub currency: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remaining_cents: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_percent: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_derived: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+/// The persisted Mistral budgets: both rows plus the verified plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedMistralBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_name: Option<String>,
+    pub rows: Vec<PersistedMistralBudgetRow>,
 }
 
 /// One persisted prepaid balance. Kept in its own list: no limits, no
@@ -396,6 +439,10 @@ impl ProviderLastGoodStore {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            // The Mistral budgets hydrate as stale observations: the row
+            // amounts and their reset belong to the moment they were read,
+            // never to the cold start.
+            mistral_budgets: restored_mistral_budgets(persisted.mistral_budgets.as_ref()),
             account_alias: None,
             monitoring_paused: None,
                 fallback_failure: None,
@@ -542,6 +589,7 @@ impl ProviderLastGoodStore {
             }).collect(),
             last_successful_at: now_iso,
             source_updated_at: dto.source_updated_at.clone(),
+            mistral_budgets: persisted_mistral_budgets(dto.mistral_budgets.as_ref()),
         };
 
         let mut lock = self.state.lock().unwrap();
@@ -786,6 +834,107 @@ fn effective_persisted_balances(state: &PersistedWalletState) -> Vec<PersistedWa
     }
 }
 
+/// The persisted form of the Mistral budget observation.
+///
+/// Only a genuine live observation is persisted: the adapter already
+/// guarantees that an available row carries a coherent set of amounts, and
+/// an unavailable row carries none.
+fn persisted_mistral_budgets(
+    budgets: Option<&crate::mistral::MistralBudgetsDto>,
+) -> Option<PersistedMistralBudgets> {
+    let budgets = budgets?;
+    let rows = budgets
+        .rows
+        .iter()
+        .map(|row| PersistedMistralBudgetRow {
+            key: row.key.to_string(),
+            label: row.label.to_string(),
+            available: row.available,
+            currency: row.currency.clone(),
+            total_cents: row.total_cents,
+            used_cents: row.used_cents,
+            remaining_cents: row.remaining_cents,
+            used_percent: row.used_percent,
+            reset_at: row.reset_at.clone(),
+            amount_derived: row.amount_derived,
+            unavailable_reason: row.unavailable_reason.clone(),
+        })
+        .collect();
+    Some(PersistedMistralBudgets {
+        plan_name: budgets.plan_name.clone(),
+        rows,
+    })
+}
+
+/// Restores the persisted Mistral budgets into the wire shape.
+///
+/// The row identity comes from the closed key set, never from a stored
+/// label, and a row whose amounts do not add up is restored as
+/// unavailable: a stale file must never present a number the source never
+/// stated.
+fn restored_mistral_budgets(
+    budgets: Option<&PersistedMistralBudgets>,
+) -> Option<crate::mistral::MistralBudgetsDto> {
+    let budgets = budgets?;
+    let mut rows = Vec::new();
+    for row in &budgets.rows {
+        let Some((key, label)) = crate::mistral::row_identity(&row.key) else {
+            continue;
+        };
+        let available = row.available && mistral_row_is_coherent(row);
+        rows.push(crate::mistral::MistralBudgetRowDto {
+            key,
+            label,
+            available,
+            currency: row.currency.clone(),
+            total_cents: row.total_cents,
+            used_cents: row.used_cents,
+            remaining_cents: row.remaining_cents,
+            used_percent: row.used_percent,
+            reset_at: row.reset_at.clone(),
+            amount_derived: row.amount_derived,
+            unavailable_reason: if available {
+                None
+            } else {
+                Some(
+                    row.unavailable_reason
+                        .clone()
+                        .unwrap_or_else(|| "missing".to_string()),
+                )
+            },
+        });
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    Some(crate::mistral::MistralBudgetsDto {
+        plan_name: budgets.plan_name.clone(),
+        rows,
+    })
+}
+
+/// Whether a persisted row's amounts still add up to its own total.
+fn mistral_row_is_coherent(row: &PersistedMistralBudgetRow) -> bool {
+    let (Some(total), Some(used), Some(remaining)) =
+        (row.total_cents, row.used_cents, row.remaining_cents)
+    else {
+        return false;
+    };
+    if total < 0 || used < 0 || remaining < 0 || used + remaining != total {
+        return false;
+    }
+    let Some(currency) = row.currency.as_deref() else {
+        return false;
+    };
+    if currency.len() != 3 || !currency.chars().all(|ch| ch.is_ascii_alphabetic()) {
+        return false;
+    }
+    match row.used_percent {
+        Some(percent) => percent.is_finite() && (0.0..=100.0).contains(&percent),
+        None => false,
+    }
+}
+
 fn is_valid_persisted_state(state: &PersistedProviderState) -> bool {
     if state.provider_id.trim().is_empty() || state.provider_name.trim().is_empty() {
         return false;
@@ -993,6 +1142,7 @@ mod tests {
             zcode_reset_cards: None,
             zcode_plans: None,
             grok_bot: None,
+            mistral_budgets: None,
             fallback_failure: None,
             account_alias: None,
             monitoring_paused: None,
@@ -1174,6 +1324,7 @@ mod tests {
                 ],
                 last_successful_at: "2026-09-29T11:00:00Z".to_string(),
                 source_updated_at: None,
+                mistral_budgets: None,
             };
 
             assert!(!is_valid_persisted_state(&state));
@@ -1239,6 +1390,112 @@ mod tests {
         assert_eq!(provider.data_freshness, Some("stale"));
         assert!(provider.error.is_none());
         assert_eq!(provider.checked_at, "2026-09-29T12:00:00.000Z");
+    }
+
+    // The Mistral budgets survive a restart as a stale observation: the
+    // amounts and the reset belong to the moment they were read, and an
+    // unavailable row stays unavailable instead of becoming a number.
+    #[test]
+    fn mistral_budgets_persist_and_hydrate_as_stale() {
+        let dir = tempdir::temp_dir("mistral-budgets");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now)));
+
+        let mut live = sample_usage(ProviderKind::Mistral, 14.12, Some("2026-10-25T00:00:00Z"));
+        live.limits = vec![UsageLimitDto {
+            observed_at: None,
+            label: "Vibe Budget".to_string(),
+            used_percent: 0.27,
+            reset_text: None,
+            reset_at: Some("2026-10-25T00:00:00Z".to_string()),
+        }];
+        live.plan_type = Some("EDU".to_string());
+        live.account = Some(AccountAttributionDto {
+            label: "key ••alue".to_string(),
+            note: None,
+            identity: Some("credential-v1:mistral-a".to_string()),
+        });
+        live.mistral_budgets = Some(crate::mistral::MistralBudgetsDto {
+            plan_name: Some("EDU".to_string()),
+            rows: vec![
+                crate::mistral::MistralBudgetRowDto {
+                    key: crate::mistral::VIBE_ROW_KEY,
+                    label: "Vibe Budget",
+                    available: true,
+                    currency: Some("EUR".to_string()),
+                    total_cents: Some(12_750),
+                    used_cents: Some(34),
+                    remaining_cents: Some(12_716),
+                    used_percent: Some(0.27),
+                    reset_at: Some("2026-10-25T00:00:00Z".to_string()),
+                    amount_derived: Some(true),
+                    unavailable_reason: None,
+                },
+                crate::mistral::MistralBudgetRowDto {
+                    key: crate::mistral::API_ROW_KEY,
+                    label: "API Budget",
+                    available: false,
+                    currency: None,
+                    total_cents: None,
+                    used_cents: None,
+                    remaining_cents: None,
+                    used_percent: None,
+                    reset_at: None,
+                    amount_derived: None,
+                    unavailable_reason: Some("missing".to_string()),
+                },
+            ],
+        });
+        store.record_success(ProviderKind::Mistral, &live);
+
+        let specs = vec![mock_spec(ProviderKind::Mistral, Ok(live.clone()))];
+        let core = RuntimeCore::with_injections(
+            specs,
+            5,
+            Box::new(|| 0),
+            Box::new(fixed_now),
+        ).with_last_good_store(Some(store));
+
+        let snapshot = core.snapshot();
+        let provider = &snapshot.providers[0];
+        assert_eq!(provider.health, ProviderHealth::Stale);
+        let budgets = provider.mistral_budgets.as_ref().expect("hydrated budgets");
+        assert_eq!(budgets.plan_name.as_deref(), Some("EDU"));
+        assert_eq!(budgets.rows.len(), 2);
+        assert!(budgets.rows[0].available);
+        assert_eq!(budgets.rows[0].total_cents, Some(12_750));
+        assert_eq!(budgets.rows[0].used_cents, Some(34));
+        assert_eq!(budgets.rows[0].remaining_cents, Some(12_716));
+        assert_eq!(budgets.rows[0].currency.as_deref(), Some("EUR"));
+        assert!(!budgets.rows[1].available);
+        assert_eq!(budgets.rows[1].unavailable_reason.as_deref(), Some("missing"));
+        assert_eq!(budgets.rows[1].total_cents, None);
+    }
+
+    // A persisted row whose amounts no longer add up is restored as unknown:
+    // a rewritten file must never present a number the source never stated.
+    #[test]
+    fn an_incoherent_persisted_mistral_row_hydrates_as_unknown() {
+        let budgets = PersistedMistralBudgets {
+            plan_name: Some("EDU".to_string()),
+            rows: vec![PersistedMistralBudgetRow {
+                key: "vibe".to_string(),
+                label: "Vibe Budget".to_string(),
+                available: true,
+                currency: Some("EUR".to_string()),
+                total_cents: Some(12_750),
+                used_cents: Some(34),
+                remaining_cents: Some(999),
+                used_percent: Some(0.27),
+                reset_at: None,
+                amount_derived: Some(true),
+                unavailable_reason: None,
+            }],
+        };
+        let restored = restored_mistral_budgets(Some(&budgets)).expect("restored");
+        assert_eq!(restored.rows.len(), 1);
+        assert!(!restored.rows[0].available);
+        assert_eq!(restored.rows[0].unavailable_reason.as_deref(), Some("missing"));
     }
 
     #[test]
@@ -1976,6 +2233,7 @@ mod tests {
                 }],
                 last_successful_at: "2026-09-29T12:00:00.000Z".to_string(),
                 source_updated_at: None,
+                mistral_budgets: None,
             }],
             wallets: Vec::new(),
         };

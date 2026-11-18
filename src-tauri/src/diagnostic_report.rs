@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn the_probe_covers_the_production_registry() {
         let specs = production_specs();
-        assert_eq!(specs.len(), 10);
+        assert_eq!(specs.len(), 11);
         let ids: Vec<_> = specs.iter().map(|s| s.kind.id()).collect();
         for id in [
             "openai-codex",
@@ -407,6 +407,7 @@ mod tests {
             "grok",
             "qwen-token-plan",
             "minimax-token-plan",
+            "mistral",
             "opendesign",
         ] {
             assert!(ids.contains(&id), "probe misses {id}");
