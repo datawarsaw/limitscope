@@ -204,6 +204,7 @@ describe("Mistral monthly budgets on the floating deck", () => {
       ["initial_budget", "Budget total not reported"],
       ["usage_percentage", "Usage not reported"],
       ["reset_at", "Reset time not readable"],
+      ["expired", "Cycle ended"],
     ];
     for (const [reason, expected] of reasons) {
       const usage: ProviderUsage = {

@@ -66,6 +66,28 @@ pub(crate) const CREDENTIAL_TARGET: &str = "ai.mistral.vibe";
 /// carry, and a mismatch fails closed.
 pub(crate) const CREDENTIAL_USER: &str = "MISTRAL_API_KEY";
 
+/// The credential is absent from the store: nothing was there to read.
+pub(crate) const CREDENTIAL_MISSING: &str = "credential_missing";
+/// The credential is there but cannot be used: the store could not be read,
+/// the entry could not be decoded, or the secret is not a usable key.
+pub(crate) const CREDENTIAL_UNREADABLE: &str = "credential_unreadable";
+/// The entry under the authorized target belongs to a different account
+/// than the one this adapter is authorized to read.
+pub(crate) const CREDENTIAL_AMBIGUOUS: &str = "credential_ambiguous";
+
+/// Every credential-source code this adapter can produce.
+///
+/// All three are local-state conditions, not refusals by the provider: the
+/// runtime classifies them through `runtime::SOURCE_ABSENT_CODES` as
+/// *unavailable*, never as an error and never as a zero. The list is
+/// published so the runtime's classification is asserted against the codes
+/// the adapter really produces, not against a hand-written copy of them.
+pub(crate) const CREDENTIAL_SOURCE_CODES: [&str; 3] = [
+    CREDENTIAL_MISSING,
+    CREDENTIAL_UNREADABLE,
+    CREDENTIAL_AMBIGUOUS,
+];
+
 /// Whole-request budget: connect, TLS, response and body read. The same
 /// budget the other live backends use.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
@@ -151,7 +173,7 @@ pub struct MistralBudgetRowDto {
     pub amount_derived: Option<bool>,
     /// Why this row is unknown, in a fixed display-safe vocabulary:
     /// `missing`, `currency`, `initial_budget`, `usage_percentage`,
-    /// `reset_at`.
+    /// `reset_at`, `expired`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
 }
@@ -254,7 +276,7 @@ pub(crate) fn resolve_credential() -> Result<MistralCredential, ProviderError> {
     let stored = read_stored_credential()?;
     let Some(stored) = stored else {
         return Err(ProviderError::new(
-            "credential_missing",
+            CREDENTIAL_MISSING,
             "No Mistral API key is stored in Windows Credential Manager under \"ai.mistral.vibe\".",
         ));
     };
@@ -264,14 +286,14 @@ pub(crate) fn resolve_credential() -> Result<MistralCredential, ProviderError> {
         // closed is the only safe answer: using it would spend a credential
         // nobody authorized for this read.
         return Err(ProviderError::new(
-            "credential_ambiguous",
+            CREDENTIAL_AMBIGUOUS,
             "The stored Mistral credential belongs to a different account than the authorized one.",
         ));
     }
     let secret_text = stored.secret.trim();
     if secret_text.is_empty() || !secret_text.chars().all(|ch| ch.is_ascii_graphic()) {
         return Err(ProviderError::new(
-            "credential_unreadable",
+            CREDENTIAL_UNREADABLE,
             "The stored Mistral credential could not be read as a usable API key.",
         ));
     }
@@ -352,7 +374,7 @@ fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
             return Ok(None);
         }
         return Err(ProviderError::new(
-            "credential_unreadable",
+            CREDENTIAL_UNREADABLE,
             "The Mistral credential could not be read from Windows Credential Manager.",
         ));
     }
@@ -383,7 +405,7 @@ fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
 #[cfg(not(windows))]
 fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
     Err(ProviderError::new(
-        "credential_unreadable",
+        CREDENTIAL_UNREADABLE,
         "Mistral budget reading requires the Windows Credential Manager.",
     ))
 }

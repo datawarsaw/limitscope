@@ -635,7 +635,16 @@ fn failure_from_antigravity_error(error: AntigravityError) -> ProviderFailure {
 /// Codes are never renamed for uniformity (see `provider_error.rs`), so the
 /// list is exhaustive over the current vocabulary and suffix-matches the
 /// provider-prefixed `*_not_installed` codes.
-const SOURCE_ABSENT_CODES: [&str; 13] = [
+///
+/// `credential_unreadable` is the sibling of `auth_unreadable`: the local
+/// credential store could not be read (the Mistral adapter's own code for a
+/// failing `CredReadW`, an entry that cannot be decoded, or a secret that is
+/// not a usable key). It is a local-state condition, exactly like a missing
+/// credential, so the provider is *unavailable* rather than an error the UI
+/// would keep retrying. A refused key (`auth_invalid`) and a permission or
+/// billing refusal (`not_entitled`, `billing_restricted`) are untouched by
+/// this entry: they keep the verdict the provider contract gives them.
+const SOURCE_ABSENT_CODES: [&str; 14] = [
     "auth_expired",
     "auth_invalid",
     "auth_unreadable",
@@ -645,6 +654,7 @@ const SOURCE_ABSENT_CODES: [&str; 13] = [
     "credential_missing",
     "credential_expired",
     "credential_ambiguous",
+    "credential_unreadable",
     "opencodex_config_unreadable",
     "cache_missing",
     "no_account",
@@ -7504,6 +7514,72 @@ mod tests {
         assert_eq!(entry.health, ProviderHealth::Unavailable);
         assert!(entry.limits.is_empty());
         assert_eq!(entry.error_category.as_deref(), Some("credential_missing"));
+    }
+
+    // An unreadable credential is the same local-state condition as a
+    // missing one: the store could not be read, so there is nothing to
+    // evaluate. It must be *unavailable*, not an error the UI keeps
+    // retrying — and it must not carry a stale reading forward, because a
+    // failure that never resolved an identity never reuses a
+    // fingerprinted last-good.
+    #[tokio::test]
+    async fn an_unreadable_mistral_credential_is_unavailable_not_an_error() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let spec = counting_spec(ProviderKind::Mistral, calls.clone(), |_| {
+            Err(failure_from_provider_error(ProviderError::new(
+                crate::mistral::CREDENTIAL_UNREADABLE,
+                "the credential store could not be read",
+            )))
+        });
+        let core = test_core(vec![spec]);
+        core.run_cycle().await;
+        let entry = &core.snapshot().providers[0];
+        assert_eq!(entry.health, ProviderHealth::Unavailable);
+        assert!(entry.limits.is_empty());
+        assert_eq!(
+            entry.error_category.as_deref(),
+            Some("credential_unreadable")
+        );
+    }
+
+    // Every credential-source code the Mistral adapter really produces is
+    // classified as unavailable. The list is the adapter's own, so a new
+    // local-state code cannot slip past the classification as an error.
+    #[test]
+    fn every_mistral_credential_source_code_is_unavailable() {
+        for code in crate::mistral::CREDENTIAL_SOURCE_CODES {
+            let failure = failure_from_provider_error(ProviderError::new(code, "no usable key"));
+            assert_eq!(
+                failure_health(&failure),
+                ProviderHealth::Unavailable,
+                "{code} is a local-state condition, so it must be unavailable"
+            );
+        }
+    }
+
+    // The fix for the unreadable credential does not soften any verdict the
+    // provider contract gives: a permission refusal and a billing refusal
+    // stay errors, a malformed body stays an error, and a refused key keeps
+    // the source-absent classification it always had.
+    #[test]
+    fn the_mistral_authorization_and_billing_verdicts_are_not_weakened() {
+        for code in [
+            "not_entitled",
+            "billing_restricted",
+            "unexpected_response",
+            "transient",
+        ] {
+            let failure = failure_from_provider_error(ProviderError::new(code, "refused"));
+            assert_eq!(
+                failure_health(&failure),
+                ProviderHealth::Error,
+                "{code} must stay an error"
+            );
+        }
+        // Unchanged by this fix: a key the provider refused is a
+        // source-absent condition, exactly as the provider contract states.
+        let refused = failure_from_provider_error(ProviderError::new("auth_invalid", "401"));
+        assert_eq!(failure_health(&refused), ProviderHealth::Unavailable);
     }
 
     // 1. Codex same-account failure retention

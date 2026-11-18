@@ -715,7 +715,13 @@ html[data-window="floating"] body {
 }
 
 .fq-mistral-row.is-unavailable .fq-mistral-state { color: var(--text-dim); }
-.fq-mistral-row .fq-meter { margin-top: 4px; }
+/* The row is a two-column grid, so a meter that stays in one cell is
+   squeezed into the label column and reads as a narrow bar. Both budget
+   meters span the full row width. */
+.fq-mistral-row .fq-meter {
+  grid-column: 1 / -1;
+  margin-top: 4px;
+}
 
 .fq-popover .opendesign-control {
   margin-top: 9px;

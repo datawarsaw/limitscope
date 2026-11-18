@@ -441,8 +441,10 @@ impl ProviderLastGoodStore {
             grok_bot: None,
             // The Mistral budgets hydrate as stale observations: the row
             // amounts and their reset belong to the moment they were read,
-            // never to the cold start.
-            mistral_budgets: restored_mistral_budgets(persisted.mistral_budgets.as_ref()),
+            // never to the cold start. A row whose cycle is over hydrates
+            // as unknown, so a past cycle's money is never presented as
+            // this month's.
+            mistral_budgets: restored_mistral_budgets(persisted.mistral_budgets.as_ref(), now),
             account_alias: None,
             monitoring_paused: None,
                 fallback_failure: None,
@@ -872,8 +874,17 @@ fn persisted_mistral_budgets(
 /// label, and a row whose amounts do not add up is restored as
 /// unavailable: a stale file must never present a number the source never
 /// stated.
+///
+/// The row's reset bound is validated per row against the same clock and
+/// the same plausibility table the runtime applies to live windows. A row
+/// whose cycle is over — or whose bound is unreadable or implausible —
+/// hydrates as unknown with no amount at all, because its money belongs to
+/// a cycle that is no longer running. The check is per row: an expired
+/// Vibe row never takes its API sibling down with it, and a valid sibling
+/// keeps its own measurement.
 fn restored_mistral_budgets(
     budgets: Option<&PersistedMistralBudgets>,
+    now: DateTime<Utc>,
 ) -> Option<crate::mistral::MistralBudgetsDto> {
     let budgets = budgets?;
     let mut rows = Vec::new();
@@ -881,27 +892,36 @@ fn restored_mistral_budgets(
         let Some((key, label)) = crate::mistral::row_identity(&row.key) else {
             continue;
         };
-        let available = row.available && mistral_row_is_coherent(row);
+        let reset_state = mistral_row_reset_state(row, label, now);
+        let available = row.available
+            && mistral_row_is_coherent(row)
+            && reset_state == MistralResetState::Current;
+        // An unknown row states no number at all: the amounts are cleared,
+        // exactly as the live adapter leaves an unusable row. A stale file
+        // must never present money the source never stated for this cycle.
+        let unavailable_reason = if available {
+            None
+        } else {
+            Some(row.unavailable_reason.clone().unwrap_or_else(|| {
+                match reset_state {
+                    MistralResetState::Current => "missing".to_string(),
+                    MistralResetState::Expired => "expired".to_string(),
+                    MistralResetState::Unusable => "reset_at".to_string(),
+                }
+            }))
+        };
         rows.push(crate::mistral::MistralBudgetRowDto {
             key,
             label,
             available,
-            currency: row.currency.clone(),
-            total_cents: row.total_cents,
-            used_cents: row.used_cents,
-            remaining_cents: row.remaining_cents,
-            used_percent: row.used_percent,
-            reset_at: row.reset_at.clone(),
-            amount_derived: row.amount_derived,
-            unavailable_reason: if available {
-                None
-            } else {
-                Some(
-                    row.unavailable_reason
-                        .clone()
-                        .unwrap_or_else(|| "missing".to_string()),
-                )
-            },
+            currency: if available { row.currency.clone() } else { None },
+            total_cents: if available { row.total_cents } else { None },
+            used_cents: if available { row.used_cents } else { None },
+            remaining_cents: if available { row.remaining_cents } else { None },
+            used_percent: if available { row.used_percent } else { None },
+            reset_at: if available { row.reset_at.clone() } else { None },
+            amount_derived: if available { row.amount_derived } else { None },
+            unavailable_reason,
         });
     }
     if rows.is_empty() {
@@ -911,6 +931,56 @@ fn restored_mistral_budgets(
         plan_name: budgets.plan_name.clone(),
         rows,
     })
+}
+
+/// The state of one persisted row's reset bound, measured against the
+/// hydration clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MistralResetState {
+    /// No bound was ever stated, or the bound still lies ahead of the clock.
+    Current,
+    /// The cycle the amounts belong to is over.
+    Expired,
+    /// The bound is unreadable, or implausible for this row's horizon.
+    Unusable,
+}
+
+/// Whether a persisted row's reset bound still describes a running cycle.
+///
+/// A row's money belongs to the cycle the source reported: once that cycle
+/// is over, the amounts are last cycle's money and may not be presented as
+/// this month's. The bound is read against the same clock and the same
+/// plausibility table the runtime applies to live windows
+/// (`reset_plausibility::plausible_reset_at`), so a stamp persisted by an
+/// older version can never re-enter the runtime as an available row.
+///
+/// A row with no bound at all stays usable: the source never stated a cycle
+/// end for it, which is exactly the case the live adapter accepts.
+fn mistral_row_reset_state(
+    row: &PersistedMistralBudgetRow,
+    label: &str,
+    now: DateTime<Utc>,
+) -> MistralResetState {
+    let Some(reset_at) = row.reset_at.as_deref() else {
+        return MistralResetState::Current;
+    };
+    let Ok(reset) = DateTime::parse_from_rfc3339(reset_at) else {
+        // An unreadable bound: the cycle the amounts came from cannot be
+        // established, so the row stays unknown.
+        return MistralResetState::Unusable;
+    };
+    let reset = reset.with_timezone(&Utc);
+    if reset <= now {
+        // The cycle is over, at the hydration clock exactly as much as a
+        // second before it.
+        return MistralResetState::Expired;
+    }
+    if !crate::reset_plausibility::plausible_reset_at(label, reset_at, now.timestamp_millis()) {
+        // A bound outside this row's plausible horizon cannot be trusted to
+        // describe a running cycle.
+        return MistralResetState::Unusable;
+    }
+    MistralResetState::Current
 }
 
 /// Whether a persisted row's amounts still add up to its own total.
@@ -1472,6 +1542,110 @@ mod tests {
         assert_eq!(budgets.rows[1].total_cents, None);
     }
 
+    // End to end: a cold start whose Vibe cycle is already over hydrates
+    // the provider (the API window still lives) and the expanded card sees
+    // the expired row as unknown. No past-cycle money reaches the card,
+    // and the sibling keeps its own measurement.
+    #[test]
+    fn a_cold_start_with_one_expired_mistral_row_publishes_no_past_cycle_money() {
+        let dir = tempdir::temp_dir("mistral-expired-row");
+        let path = dir.path().join(LAST_GOOD_FILE_NAME);
+        let store = Arc::new(ProviderLastGoodStore::open_with_clock(path, Box::new(fixed_now)));
+
+        let mut live = sample_usage(ProviderKind::Mistral, 14.12, Some("2026-10-25T00:00:00Z"));
+        live.limits = vec![
+            UsageLimitDto {
+                observed_at: None,
+                label: "Vibe Budget".to_string(),
+                used_percent: 0.27,
+                reset_text: None,
+                reset_at: Some("2026-09-01T00:00:00Z".to_string()),
+            },
+            UsageLimitDto {
+                observed_at: None,
+                label: "API Budget".to_string(),
+                used_percent: 14.12,
+                reset_text: None,
+                reset_at: Some("2026-10-25T00:00:00Z".to_string()),
+            },
+        ];
+        live.plan_type = Some("EDU".to_string());
+        live.account = Some(AccountAttributionDto {
+            label: "key mask".to_string(),
+            note: None,
+            identity: Some("credential-v1:mistral-a".to_string()),
+        });
+        live.mistral_budgets = Some(crate::mistral::MistralBudgetsDto {
+            plan_name: Some("EDU".to_string()),
+            rows: vec![
+                crate::mistral::MistralBudgetRowDto {
+                    key: crate::mistral::VIBE_ROW_KEY,
+                    label: "Vibe Budget",
+                    available: true,
+                    currency: Some("EUR".to_string()),
+                    total_cents: Some(12_750),
+                    used_cents: Some(34),
+                    remaining_cents: Some(12_716),
+                    used_percent: Some(0.27),
+                    reset_at: Some("2026-09-01T00:00:00Z".to_string()),
+                    amount_derived: Some(true),
+                    unavailable_reason: None,
+                },
+                crate::mistral::MistralBudgetRowDto {
+                    key: crate::mistral::API_ROW_KEY,
+                    label: "API Budget",
+                    available: true,
+                    currency: Some("EUR".to_string()),
+                    total_cents: Some(1_275),
+                    used_cents: Some(180),
+                    remaining_cents: Some(1_095),
+                    used_percent: Some(14.12),
+                    reset_at: Some("2026-10-25T00:00:00Z".to_string()),
+                    amount_derived: Some(true),
+                    unavailable_reason: None,
+                },
+            ],
+        });
+        store.record_success(ProviderKind::Mistral, &live);
+
+        let specs = vec![mock_spec(ProviderKind::Mistral, Ok(live.clone()))];
+        let core = RuntimeCore::with_injections(
+            specs,
+            5,
+            Box::new(|| 0),
+            Box::new(fixed_now),
+        )
+        .with_last_good_store(Some(store));
+
+        let snapshot = core.snapshot();
+        let provider = &snapshot.providers[0];
+        assert_eq!(provider.health, ProviderHealth::Stale);
+        // The expired window never enters the hydrated state; only the
+        // sibling window is live.
+        assert_eq!(provider.limits.len(), 1);
+        assert_eq!(provider.limits[0].label, "API Budget");
+
+        let budgets = provider.mistral_budgets.as_ref().expect("hydrated budgets");
+        assert_eq!(budgets.rows.len(), 2);
+        let vibe = &budgets.rows[0];
+        assert_eq!(vibe.key, crate::mistral::VIBE_ROW_KEY);
+        assert!(!vibe.available);
+        assert_eq!(vibe.unavailable_reason.as_deref(), Some("expired"));
+        assert_eq!(vibe.total_cents, None);
+        assert_eq!(vibe.used_cents, None);
+        assert_eq!(vibe.remaining_cents, None);
+        assert_eq!(vibe.used_percent, None);
+        assert_eq!(vibe.currency, None);
+
+        let api = &budgets.rows[1];
+        assert_eq!(api.key, crate::mistral::API_ROW_KEY);
+        assert!(api.available);
+        assert_eq!(api.total_cents, Some(1_275));
+        assert_eq!(api.used_cents, Some(180));
+        assert_eq!(api.remaining_cents, Some(1_095));
+        assert_eq!(api.unavailable_reason, None);
+    }
+
     // A persisted row whose amounts no longer add up is restored as unknown:
     // a rewritten file must never present a number the source never stated.
     #[test]
@@ -1492,10 +1666,154 @@ mod tests {
                 unavailable_reason: None,
             }],
         };
-        let restored = restored_mistral_budgets(Some(&budgets)).expect("restored");
+        let restored = restored_mistral_budgets(Some(&budgets), fixed_now()).expect("restored");
         assert_eq!(restored.rows.len(), 1);
         assert!(!restored.rows[0].available);
         assert_eq!(restored.rows[0].unavailable_reason.as_deref(), Some("missing"));
+        assert_eq!(restored.rows[0].total_cents, None);
+        assert_eq!(restored.rows[0].used_cents, None);
+        assert_eq!(restored.rows[0].remaining_cents, None);
+        assert_eq!(restored.rows[0].used_percent, None);
+    }
+
+    /// A persisted Mistral row in the shape the adapter writes it: an
+    /// available row with its own money and its own reset bound.
+    fn persisted_mistral_row(key: &str, reset_at: Option<&str>) -> PersistedMistralBudgetRow {
+        PersistedMistralBudgetRow {
+            key: key.to_string(),
+            label: "a stored label is never trusted".to_string(),
+            available: true,
+            currency: Some("EUR".to_string()),
+            total_cents: Some(12_750),
+            used_cents: Some(34),
+            remaining_cents: Some(12_716),
+            used_percent: Some(0.27),
+            reset_at: reset_at.map(str::to_string),
+            amount_derived: Some(true),
+            unavailable_reason: None,
+        }
+    }
+
+    // A row whose cycle is over is restored as unknown: its money belongs to
+    // a cycle that is no longer running. The check is per row, so the
+    // sibling that is still inside its cycle keeps its own measurement and
+    // never inherits the expired row's numbers.
+    #[test]
+    fn an_expired_mistral_row_hydrates_as_unknown_while_its_sibling_stays_measured() {
+        let budgets = PersistedMistralBudgets {
+            plan_name: Some("EDU".to_string()),
+            rows: vec![
+                persisted_mistral_row("vibe", Some("2026-09-01T00:00:00Z")),
+                persisted_mistral_row("api", Some("2026-10-25T00:00:00Z")),
+            ],
+        };
+        let restored = restored_mistral_budgets(Some(&budgets), fixed_now()).expect("restored");
+        assert_eq!(restored.rows.len(), 2);
+
+        let vibe = &restored.rows[0];
+        assert_eq!(vibe.key, crate::mistral::VIBE_ROW_KEY);
+        assert!(!vibe.available, "an expired row must not read as available");
+        assert_eq!(vibe.unavailable_reason.as_deref(), Some("expired"));
+        assert_eq!(vibe.total_cents, None);
+        assert_eq!(vibe.used_cents, None);
+        assert_eq!(vibe.remaining_cents, None);
+        assert_eq!(vibe.used_percent, None);
+        assert_eq!(vibe.reset_at, None);
+
+        let api = &restored.rows[1];
+        assert_eq!(api.key, crate::mistral::API_ROW_KEY);
+        assert!(api.available, "a row inside its cycle keeps its measurement");
+        assert_eq!(api.total_cents, Some(12_750));
+        assert_eq!(api.used_cents, Some(34));
+        assert_eq!(api.remaining_cents, Some(12_716));
+        assert_eq!(api.used_percent, Some(0.27));
+        assert_eq!(api.reset_at.as_deref(), Some("2026-10-25T00:00:00Z"));
+        assert_eq!(api.unavailable_reason, None);
+    }
+
+    // Both rows expired: nothing is published. Not one stale amount
+    // survives, and the two rows stay independent of each other.
+    #[test]
+    fn two_expired_mistral_rows_hydrate_without_any_amount() {
+        let budgets = PersistedMistralBudgets {
+            plan_name: Some("EDU".to_string()),
+            rows: vec![
+                persisted_mistral_row("vibe", Some("2026-09-01T00:00:00Z")),
+                persisted_mistral_row("api", Some("2026-09-02T00:00:00Z")),
+            ],
+        };
+        let restored = restored_mistral_budgets(Some(&budgets), fixed_now()).expect("restored");
+        assert_eq!(restored.rows.len(), 2);
+        for row in &restored.rows {
+            assert!(!row.available);
+            assert_eq!(row.unavailable_reason.as_deref(), Some("expired"));
+            assert_eq!(row.total_cents, None);
+            assert_eq!(row.used_cents, None);
+            assert_eq!(row.remaining_cents, None);
+            assert_eq!(row.used_percent, None);
+        }
+    }
+
+    // The boundary is the hydration clock itself: a reset that equals the
+    // clock is already over, one second ahead is still running.
+    #[test]
+    fn the_mistral_reset_boundary_is_the_hydration_clock() {
+        let now = fixed_now();
+        let at_the_clock = now.to_rfc3339();
+        let one_second_ahead = (now + chrono::Duration::seconds(1)).to_rfc3339();
+
+        let expired = PersistedMistralBudgets {
+            plan_name: None,
+            rows: vec![persisted_mistral_row("vibe", Some(&at_the_clock))],
+        };
+        let restored = restored_mistral_budgets(Some(&expired), now).expect("restored");
+        assert!(!restored.rows[0].available);
+        assert_eq!(restored.rows[0].unavailable_reason.as_deref(), Some("expired"));
+
+        let ahead = PersistedMistralBudgets {
+            plan_name: None,
+            rows: vec![persisted_mistral_row("vibe", Some(&one_second_ahead))],
+        };
+        let restored = restored_mistral_budgets(Some(&ahead), now).expect("restored");
+        assert!(restored.rows[0].available);
+        assert_eq!(restored.rows[0].total_cents, Some(12_750));
+    }
+
+    // A bound that cannot be read, or that lies outside the row's plausible
+    // horizon, can never re-enter the runtime as an available row.
+    #[test]
+    fn an_unusable_mistral_reset_hydrates_as_unknown() {
+        for reset_at in [
+            "soon",
+            "2026-13-40T99:00:00Z",
+            // 93 days out: far beyond the conservative 35-day horizon.
+            "2026-12-31T00:00:00Z",
+        ] {
+            let budgets = PersistedMistralBudgets {
+                plan_name: None,
+                rows: vec![persisted_mistral_row("vibe", Some(reset_at))],
+            };
+            let restored =
+                restored_mistral_budgets(Some(&budgets), fixed_now()).expect("restored");
+            assert!(!restored.rows[0].available, "{reset_at} must not read as available");
+            assert_eq!(restored.rows[0].unavailable_reason.as_deref(), Some("reset_at"));
+            assert_eq!(restored.rows[0].total_cents, None);
+            assert_eq!(restored.rows[0].used_percent, None);
+        }
+    }
+
+    // A row the source never gave a bound for stays usable: there is no
+    // cycle to have expired, exactly as the live adapter accepts.
+    #[test]
+    fn a_mistral_row_without_a_bound_stays_usable() {
+        let budgets = PersistedMistralBudgets {
+            plan_name: None,
+            rows: vec![persisted_mistral_row("vibe", None)],
+        };
+        let restored = restored_mistral_budgets(Some(&budgets), fixed_now()).expect("restored");
+        assert!(restored.rows[0].available);
+        assert_eq!(restored.rows[0].total_cents, Some(12_750));
+        assert_eq!(restored.rows[0].reset_at, None);
     }
 
     #[test]

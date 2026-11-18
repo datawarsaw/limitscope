@@ -83,6 +83,10 @@ export function mistralUnavailableReason(reason: string | undefined): string {
       return "Usage not reported";
     case "reset_at":
       return "Reset time not readable";
+    case "expired":
+      // The row's own cycle is over: the money it carried belongs to a
+      // cycle that is no longer running, so the row states nothing.
+      return "Cycle ended";
     default:
       return "Unavailable";
   }

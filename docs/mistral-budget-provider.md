@@ -63,6 +63,17 @@ as an exact one the source did not state. The remaining amount is
 The source's reset instant is preserved verbatim; the UI reads it in the
 viewer's own local time.
 
+### Cold start
+
+The persisted reading is re-validated at cold start, per row. A row whose
+reset bound has already passed — or that cannot be read, or that lies
+outside the runtime's reset plausibility horizon — hydrates as *unknown*
+with no amount at all: its money belongs to a cycle that is no longer
+running, so it is never presented as this month's spending. The check is
+per row, so one expired budget never takes its sibling down and never
+publishes a past cycle's EUR amounts. A row the source never gave a bound
+for stays usable, exactly as in the live reading.
+
 ## Error policy
 
 | Condition | Verdict | Health |
@@ -73,6 +84,12 @@ viewer's own local time.
 | 402 | `billing_restricted` — a billing refusal of the *reading*, never an invalid-key verdict | error |
 | 408, 429, 5xx, transport timeout | transient | error, last-good retained |
 | malformed body | `unexpected_response` | error |
+
+All three credential codes are local-state conditions: the runtime
+classifies them as *unavailable* — never an error, never a zero. A refused
+key (`auth_invalid`) keeps its source-absent classification, while a
+permission refusal (`not_entitled`) and a billing refusal
+(`billing_restricted`) stay errors.
 
 A transient or deterministic failure keeps the previous reading only when it
 belongs to the same account: the retained entry's identity is the

@@ -416,3 +416,19 @@ describe("API wallet slot guards", () => {
     expect(block).toContain(".fq-wallet.is-refreshing .fq-wallet-dot");
   });
 });
+
+describe("Mistral budget row layout guards", () => {
+  it("spans both Mistral meter bars across the full row width", () => {
+    // The row is a two-column grid: the label on the left, the state on
+    // the right. A meter that does not span both columns is squeezed into
+    // the label column and reads as a narrow bar instead of a full-width
+    // meter.
+    const row = css.match(/\.fq-mistral-row \{[^}]*\}/)?.[0] ?? "";
+    expect(row).toContain("grid-template-columns");
+
+    // One rule covers both budget rows: every meter inside a Mistral row
+    // spans the whole row.
+    const meter = css.match(/\.fq-mistral-row \.fq-meter \{[^}]*\}/)?.[0] ?? "";
+    expect(meter).toContain("grid-column: 1 / -1");
+  });
+});
