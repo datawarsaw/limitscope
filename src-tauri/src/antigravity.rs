@@ -199,14 +199,16 @@ fn schema_changed() -> AntigravityError {
 // ---------- normalization ----------
 
 /// Labels use only evidence-backed names: the `gemini` / `non-gemini` family
-/// keys are verified in the local cache, and the `non-gemini` family — the
-/// third-party models Antigravity also serves — displays as "Claude", the
-/// family's headline models. The family key itself is the internal
-/// identifier and stays `non-gemini`. Unknown future family keys are passed
-/// through (display-sanitized) rather than guessed at.
+/// keys are verified in the local cache, `gemini-argon` is the separately
+/// named Argon quota group (`Argon Weekly` for its weekly bucket), and the
+/// `non-gemini` family — the third-party models Antigravity also serves —
+/// displays as "Claude", the family's headline models. The family key itself is
+/// the internal identifier and stays `non-gemini`. Unknown future family keys
+/// are passed through (display-sanitized) rather than guessed at.
 fn family_label(family: &str) -> &str {
     match family {
         "gemini" => "Gemini",
+        "gemini-argon" => "Argon",
         "non-gemini" => "Claude",
         other => other,
     }
@@ -913,10 +915,13 @@ async fn fetch_live_windows_inner(
 // ---------- live source: response normalization ----------
 
 /// Live family classification over `groups[]`, mirroring the cache-path
-/// family semantics. The Gemini group is the `gemini` family; the
-/// third-party group — Google's own description names Claude and GPT models —
-/// is the `non-gemini` family the cache uses for the same bucket. Unknown
-/// groups fall back to their display name verbatim rather than guessed at.
+/// family semantics. An explicitly named Argon quota group (identified ONLY
+/// by its own `displayName`, never by a generic group's `description` or by
+/// bucket fields) is the `gemini-argon` family, checked before generic Gemini
+/// classification. The Gemini group is the `gemini` family; the third-party
+/// group — Google's own description names Claude and GPT models — is the
+/// `non-gemini` family the cache uses for the same bucket. Unknown groups
+/// fall back to their display name verbatim rather than guessed at.
 fn live_family_key(group: &Value) -> String {
     let group = group.as_object();
     let display = group
@@ -925,6 +930,9 @@ fn live_family_key(group: &Value) -> String {
         .unwrap_or("")
         .trim()
         .to_string();
+    if display.to_lowercase().contains("argon") {
+        return "gemini-argon".to_string();
+    }
     let description = group
         .and_then(|group| group.get("description"))
         .and_then(Value::as_str)
@@ -975,15 +983,16 @@ fn live_window_key(bucket: &Value) -> Option<String> {
 }
 
 /// Canonical emission order so live data renders like the cache data:
-/// families Gemini, then Claude (the `non-gemini` family), then anything
-/// else; within a family
+/// families Gemini, then Argon (`gemini-argon`), then Claude (the
+/// `non-gemini` family), then anything else; within a family
 /// the 5-hour window, then weekly, then others. The live response orders
 /// buckets per its own whim (observed: weekly first).
 fn live_family_rank(family_key: &str) -> usize {
     match family_key {
         "gemini" => 0,
-        "non-gemini" => 1,
-        _ => 2,
+        "gemini-argon" => 1,
+        "non-gemini" => 2,
+        _ => 3,
     }
 }
 
@@ -2292,5 +2301,264 @@ mod tests {
             );
         }
         assert!(!usage.limits.is_empty(), "expected at least one window");
+    }
+
+    // ---------- separate Argon weekly quota (synthetic tests; not live evidence) ----------
+
+    fn synthetic_gemini_group() -> Value {
+        serde_json::json!({
+            "displayName": "Gemini Models",
+            "description": "Models within this group: Gemini Flash, Gemini Pro",
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": 0.89034826,
+                    "resetTime": "2026-10-04T21:32:12Z",
+                    "window": "weekly"
+                },
+                {
+                    "bucketId": "gemini-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "remainingFraction": 0.991144,
+                    "resetTime": "2026-09-30T03:49:11Z",
+                    "window": "5h"
+                }
+            ]
+        })
+    }
+
+    fn synthetic_claude_group() -> Value {
+        serde_json::json!({
+            "displayName": "Claude and GPT models",
+            "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+            "buckets": [
+                {
+                    "bucketId": "3p-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": 0.65,
+                    "resetTime": "2026-10-06T22:52:14Z",
+                    "window": "weekly"
+                },
+                {
+                    "bucketId": "3p-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "remainingFraction": 0.9,
+                    "resetTime": "2026-09-30T03:52:14Z",
+                    "window": "5h"
+                }
+            ]
+        })
+    }
+
+    fn synthetic_argon_group(remaining_fraction: Value, reset_time: Value) -> Value {
+        serde_json::json!({
+            "displayName": "Gemini 4 Argon",
+            "description": "Models within this group: Gemini 4 Argon",
+            "buckets": [
+                {
+                    "bucketId": "gemini-argon-wtu-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": remaining_fraction,
+                    "resetTime": reset_time,
+                    "window": "weekly"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn live_argon_group_orders_canonically_across_both_group_orders() {
+        let argon_last = serde_json::json!({
+            "groups": [
+                synthetic_gemini_group(),
+                synthetic_claude_group(),
+                synthetic_argon_group(
+                    serde_json::json!(0.42),
+                    serde_json::json!("2026-10-11T21:32:12Z"),
+                )
+            ]
+        });
+        let argon_first = serde_json::json!({
+            "groups": [
+                synthetic_argon_group(
+                    serde_json::json!(0.42),
+                    serde_json::json!("2026-10-11T21:32:12Z"),
+                ),
+                synthetic_claude_group(),
+                synthetic_gemini_group()
+            ]
+        });
+
+        for body in [&argon_last, &argon_first] {
+            let limits = parse_quota_summary(body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Gemini",
+                    "Gemini Weekly",
+                    "Argon Weekly",
+                    "Claude",
+                    "Claude Weekly"
+                ]
+            );
+            // Gemini Weekly remains distinct (primary Gemini weekly window) with
+            // its own fraction and reset time.
+            assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+            assert_eq!(limits[1].reset_at.as_deref(), Some("2026-10-04T21:32:12Z"));
+            // Argon Weekly keeps its independent fraction and reset time.
+            assert_eq!(limits[2].used_percent, (1.0 - 0.42) * 100.0);
+            assert_eq!(limits[2].reset_at.as_deref(), Some("2026-10-11T21:32:12Z"));
+            // Claude windows remain independent.
+            assert_eq!(limits[3].used_percent, (1.0 - 0.9) * 100.0);
+            assert_eq!(limits[3].reset_at.as_deref(), Some("2026-09-30T03:52:14Z"));
+            assert_eq!(limits[4].used_percent, (1.0 - 0.65) * 100.0);
+            assert_eq!(limits[4].reset_at.as_deref(), Some("2026-10-06T22:52:14Z"));
+        }
+    }
+
+    #[test]
+    fn live_generic_gemini_description_or_bucket_mentioning_argon_is_not_reclassified() {
+        let body = serde_json::json!({
+            "groups": [{
+                "displayName": "Gemini Models",
+                "description": "Models within this group: Gemini Flash, Gemini Pro, Gemini 4 Argon shared pool",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "displayName": "Weekly Limit Remaining (includes Argon)",
+                        "remainingFraction": 0.72,
+                        "resetTime": "2026-10-04T21:32:12Z",
+                        "window": "weekly"
+                    },
+                    {
+                        "bucketId": "gemini-5h",
+                        "displayName": "Five Hour Limit Remaining",
+                        "remainingFraction": 0.8,
+                        "resetTime": "2026-09-30T03:49:11Z",
+                        "window": "5h"
+                    }
+                ]
+            }]
+        });
+        let limits = parse_quota_summary(&body);
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Gemini", "Gemini Weekly"]
+        );
+        assert!(limits
+            .iter()
+            .all(|limit| !limit.label.to_lowercase().contains("argon")));
+        assert_eq!(limits[0].used_percent, (1.0 - 0.8) * 100.0);
+        assert_eq!(limits[1].used_percent, (1.0 - 0.72) * 100.0);
+    }
+
+    #[test]
+    fn live_without_argon_group_keeps_original_four_windows() {
+        let limits = parse_quota_summary(&live_summary_body());
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Gemini", "Gemini Weekly", "Claude", "Claude Weekly"]
+        );
+        assert!(limits
+            .iter()
+            .all(|limit| !limit.label.to_lowercase().contains("argon")));
+    }
+
+    #[test]
+    fn live_argon_invalid_fraction_and_reset_fail_closed() {
+        // Invalid or missing remainingFraction must skip Argon rather than
+        // inventing a blank or 0% row.
+        for bad_fraction in [
+            Value::Null,
+            serde_json::json!("0.5"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({
+                "groups": [
+                    synthetic_gemini_group(),
+                    synthetic_argon_group(
+                        bad_fraction,
+                        serde_json::json!("2026-10-11T21:32:12Z"),
+                    ),
+                    synthetic_claude_group()
+                ]
+            });
+            let limits = parse_quota_summary(&body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["Gemini", "Gemini Weekly", "Claude", "Claude Weekly"]
+            );
+        }
+
+        // Invalid or missing resetTime must drop reset_at to None rather than
+        // passing malformed text or inventing a timestamp, while keeping real usage.
+        for bad_reset in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("soon-ish"),
+            serde_json::json!(12345),
+        ] {
+            let body = serde_json::json!({
+                "groups": [
+                    synthetic_gemini_group(),
+                    synthetic_argon_group(serde_json::json!(0.25), bad_reset),
+                    synthetic_claude_group()
+                ]
+            });
+            let limits = parse_quota_summary(&body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Gemini",
+                    "Gemini Weekly",
+                    "Argon Weekly",
+                    "Claude",
+                    "Claude Weekly"
+                ]
+            );
+            assert_eq!(limits[2].used_percent, 75.0);
+            assert_eq!(limits[2].reset_at, None);
+        }
+    }
+
+    #[test]
+    fn live_family_key_retains_strict_unknown_behavior() {
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "Gemini 4 Argon",
+                "description": "Anything"
+            })),
+            "gemini-argon"
+        );
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "Grok Models",
+                "description": "Argon mentioned only in description"
+            })),
+            "Grok Models"
+        );
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "   ",
+                "description": "Argon mentioned only in description"
+            })),
+            "Other"
+        );
     }
 }
