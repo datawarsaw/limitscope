@@ -88,13 +88,22 @@ const CACHE_FILE: &str = "antigravity-accounts.json";
 // process; nothing beyond normalized windows is returned to the WebView.
 
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-const QUOTA_URL: &str = "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+const QUOTA_URL: &str =
+    "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 const CLIENT_ID: &str = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "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";
-/// The UA the Antigravity IDE sends; some accounts reject other clients for
-/// quota accounting only (mirrored fallback: `antigravity/1.0`).
+/// Antigravity CLI-family UA, sent ONLY on the first quota-summary POST. The
+/// summary reports the separate Gemini 4 Argon group only to the CLI client
+/// family (the IDE UA can omit it even with HTTP 200). Format follows the
+/// pinned opencodex reference `antigravityCliUserAgent`
+/// (`antigravity/cli/<ver> (os_type=…; arch=…; aidev_client; auth_method=oauth)`,
+/// lidge-jun/opencodex@04304da, src/adapters/client-fingerprint.ts), with the
+/// locally verified official CLI version (`agy --version` = 1.5.3) and that
+/// reference's Windows platform tokens (`windows/amd64`). Some accounts
+/// reject the fingerprint for quota accounting only (mirrored 403-only
+/// fallback: `antigravity/1.0`).
 const QUOTA_USER_AGENT: &str =
-    "antigravity/ide/2.5.5 (os_type=windows; arch=x86_64; antigravity-ide; auth_method=oauth)";
+    "antigravity/cli/1.5.3 (os_type=windows; arch=amd64; aidev_client; auth_method=oauth)";
 const QUOTA_FALLBACK_USER_AGENT: &str = "antigravity/1.0";
 const LIVE_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// Reuse a cached access token until shortly before its documented expiry so
@@ -199,14 +208,18 @@ fn schema_changed() -> AntigravityError {
 // ---------- normalization ----------
 
 /// Labels use only evidence-backed names: the `gemini` / `non-gemini` family
-/// keys are verified in the local cache, and the `non-gemini` family — the
-/// third-party models Antigravity also serves — displays as "Claude", the
-/// family's headline models. The family key itself is the internal
-/// identifier and stays `non-gemini`. Unknown future family keys are passed
-/// through (display-sanitized) rather than guessed at.
+/// keys are verified in the local cache, `gemini-argon` is the separately
+/// named Argon quota group (`Argon Weekly` for its weekly bucket),
+/// `gemini-carbon` an explicitly identified Carbon bucket, and the
+/// `non-gemini` family — the third-party models Antigravity also serves —
+/// displays as "Claude", the family's headline models. The family key itself is
+/// the internal identifier and stays `non-gemini`. Unknown future family keys
+/// are passed through (display-sanitized) rather than guessed at.
 fn family_label(family: &str) -> &str {
     match family {
         "gemini" => "Gemini",
+        "gemini-argon" => "Argon",
+        "gemini-carbon" => "Carbon",
         "non-gemini" => "Claude",
         other => other,
     }
@@ -486,10 +499,7 @@ fn parse_quota(raw: &str) -> Result<ParsedQuota, AntigravityError> {
     };
     // The active account is the one the plugin last used; an out-of-range
     // index falls back to the first stored account rather than erroring.
-    let active_index = root
-        .get("activeIndex")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let active_index = root.get("activeIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
     let account = accounts.get(active_index).or_else(|| accounts.first());
     let Some(account) = account else {
         return Err(no_account());
@@ -638,10 +648,7 @@ fn extract_live_credentials(raw: &str) -> Option<LiveCredentials> {
     if accounts.is_empty() {
         return None;
     }
-    let active_index = root
-        .get("activeIndex")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    let active_index = root.get("activeIndex").and_then(Value::as_u64).unwrap_or(0) as usize;
     let account = accounts.get(active_index).or_else(|| accounts.first())?;
     let refresh_token = account
         .get("refreshToken")
@@ -760,18 +767,13 @@ async fn get_access_token(refresh_token: &str) -> Result<String, AntigravityErro
     {
         let guard = access_token_cache().lock().unwrap();
         if let Some(cached) = guard.as_ref() {
-            if cached.expires_at - Utc::now()
-                > chrono::Duration::seconds(TOKEN_REUSE_MARGIN_SECS)
-            {
+            if cached.expires_at - Utc::now() > chrono::Duration::seconds(TOKEN_REUSE_MARGIN_SECS) {
                 return Ok(cached.token.clone());
             }
         }
     }
     let client = live_http_client().map_err(|_| {
-        AntigravityError::new(
-            "network",
-            "Antigravity live quota fetch could not start.",
-        )
+        AntigravityError::new("network", "Antigravity live quota fetch could not start.")
     })?;
     let response = client
         .post(TOKEN_URL)
@@ -829,13 +831,14 @@ async fn get_access_token(refresh_token: &str) -> Result<String, AntigravityErro
 /// failure class so the caller can mirror the IDE's documented 403 retry
 /// and classify the cause for the cache fallback.
 async fn fetch_quota_summary(
+    url: &str,
     access_token: &str,
     project_id: &str,
     user_agent: &str,
 ) -> Result<Value, QuotaFetchFailure> {
     let client = live_http_client().map_err(|_| QuotaFetchFailure::Transport)?;
     let response = client
-        .post(QUOTA_URL)
+        .post(url)
         .bearer_auth(access_token)
         .header("accept", "application/json")
         .header("user-agent", user_agent)
@@ -880,29 +883,33 @@ async fn fetch_live_windows(
     })
 }
 
+/// The quota-summary request sequence: the CLI-family UA first, then exactly
+/// one retry with the plain client UA on HTTP 403 only. Any other outcome —
+/// success (with or without an Argon group), other statuses, transport or
+/// body failures — makes no further request.
+async fn fetch_quota_summary_with_fallback(
+    url: &str,
+    access_token: &str,
+    project_id: &str,
+) -> Result<Value, AntigravityError> {
+    match fetch_quota_summary(url, access_token, project_id, QUOTA_USER_AGENT).await {
+        Ok(summary) => Ok(summary),
+        Err(QuotaFetchFailure::HttpStatus(403)) => {
+            fetch_quota_summary(url, access_token, project_id, QUOTA_FALLBACK_USER_AGENT)
+                .await
+                .map_err(quota_fetch_error)
+        }
+        Err(failure) => Err(quota_fetch_error(failure)),
+    }
+}
+
 async fn fetch_live_windows_inner(
     credentials: &LiveCredentials,
 ) -> Result<Vec<AntigravityLimitWindow>, AntigravityError> {
     let access_token = get_access_token(&credentials.refresh_token).await?;
-    let summary = match fetch_quota_summary(
-        &access_token,
-        &credentials.project_id,
-        QUOTA_USER_AGENT,
-    )
-    .await
-    {
-        Ok(summary) => summary,
-        Err(QuotaFetchFailure::HttpStatus(403)) => {
-            fetch_quota_summary(
-                &access_token,
-                &credentials.project_id,
-                QUOTA_FALLBACK_USER_AGENT,
-            )
-            .await
-            .map_err(quota_fetch_error)?
-        }
-        Err(failure) => return Err(quota_fetch_error(failure)),
-    };
+    let summary =
+        fetch_quota_summary_with_fallback(QUOTA_URL, &access_token, &credentials.project_id)
+            .await?;
     let windows = parse_quota_summary(&summary);
     if windows.is_empty() {
         return Err(unusable_quota_response());
@@ -912,10 +919,66 @@ async fn fetch_live_windows_inner(
 
 // ---------- live source: response normalization ----------
 
-/// Live family classification over `groups[]`, mirroring the cache-path
-/// family semantics. The Gemini group is the `gemini` family; the
-/// third-party group — Google's own description names Claude and GPT models —
-/// is the `non-gemini` family the cache uses for the same bucket. Unknown
+/// Lowercase ASCII-alphanumeric tokens: the token boundaries every identity
+/// match below uses, so `Paragon` or `gemini-argonite` never read as Argon.
+fn identity_tokens(text: &str) -> Vec<String> {
+    text.to_ascii_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// An explicit Gemini model identity: the token `gemini`, optional numeric
+/// version tokens, then `model` — `gemini-argon-*`, `gemini-4-carbon-*`,
+/// `Gemini 4 Argon`. A field that merely mentions the model elsewhere
+/// (`Weekly Limit Remaining (includes Argon)`) is not an identity.
+fn names_gemini_model(tokens: &[String], model: &str) -> bool {
+    tokens.iter().enumerate().any(|(index, token)| {
+        token == "gemini"
+            && tokens[index + 1..]
+                .iter()
+                .find(|next| !next.bytes().all(|byte| byte.is_ascii_digit()))
+                .is_some_and(|next| next == model)
+    })
+}
+
+/// Per-bucket family from the bucket's OWN identity (`bucketId`, then
+/// `displayName`, each field matched on its own so tokens never pair across
+/// fields): explicit Argon first, explicit Carbon second, then generic
+/// Gemini, then the third-party (Claude) family. `None` when the bucket
+/// names no family, in which case its own group's classification applies.
+fn live_bucket_family(bucket: &Value) -> Option<&'static str> {
+    let bucket = bucket.as_object()?;
+    let fields: Vec<Vec<String>> = ["bucketId", "displayName"]
+        .iter()
+        .map(|key| identity_tokens(bucket.get(*key).and_then(Value::as_str).unwrap_or("")))
+        .collect();
+    let any_field = |test: &dyn Fn(&[String]) -> bool| fields.iter().any(|tokens| test(tokens));
+    if any_field(&|tokens| names_gemini_model(tokens, "argon")) {
+        Some("gemini-argon")
+    } else if any_field(&|tokens| names_gemini_model(tokens, "carbon")) {
+        Some("gemini-carbon")
+    } else if any_field(&|tokens| tokens.iter().any(|token| token == "gemini")) {
+        Some("gemini")
+    } else if any_field(&|tokens| {
+        tokens
+            .iter()
+            .any(|token| matches!(token.as_str(), "claude" | "3p" | "gpt" | "opus" | "sonnet"))
+    }) {
+        Some("non-gemini")
+    } else {
+        None
+    }
+}
+
+/// Live group-level family, the fallback for buckets that name no family of
+/// their own. Mirrors the cache-path family semantics. A group whose own
+/// `displayName` carries the whole token `argon` (or `carbon`) is that
+/// family — never on a generic group's `description` mention, never on a
+/// substring such as `Paragon`. The Gemini group is the `gemini` family; the
+/// third-party group — Google's own description names Claude and GPT models
+/// — is the `non-gemini` family the cache uses for the same bucket. Unknown
 /// groups fall back to their display name verbatim rather than guessed at.
 fn live_family_key(group: &Value) -> String {
     let group = group.as_object();
@@ -925,6 +988,13 @@ fn live_family_key(group: &Value) -> String {
         .unwrap_or("")
         .trim()
         .to_string();
+    let display_tokens = identity_tokens(&display);
+    if display_tokens.iter().any(|token| token == "argon") {
+        return "gemini-argon".to_string();
+    }
+    if display_tokens.iter().any(|token| token == "carbon") {
+        return "gemini-carbon".to_string();
+    }
     let description = group
         .and_then(|group| group.get("description"))
         .and_then(Value::as_str)
@@ -975,15 +1045,17 @@ fn live_window_key(bucket: &Value) -> Option<String> {
 }
 
 /// Canonical emission order so live data renders like the cache data:
-/// families Gemini, then Claude (the `non-gemini` family), then anything
-/// else; within a family
-/// the 5-hour window, then weekly, then others. The live response orders
-/// buckets per its own whim (observed: weekly first).
+/// families Gemini, then Argon (`gemini-argon`), then Carbon
+/// (`gemini-carbon`), then Claude (the `non-gemini` family), then anything
+/// else; within a family the 5-hour window, then weekly, then others. The
+/// live response orders buckets per its own whim (observed: weekly first).
 fn live_family_rank(family_key: &str) -> usize {
     match family_key {
         "gemini" => 0,
-        "non-gemini" => 1,
-        _ => 2,
+        "gemini-argon" => 1,
+        "gemini-carbon" => 2,
+        "non-gemini" => 3,
+        _ => 4,
     }
 }
 
@@ -999,7 +1071,13 @@ fn live_window_rank(window_key: &str) -> usize {
 /// bucket carrying `remainingFraction` (0–1 remaining) and `resetTime`
 /// (ISO-8601). Same conversion contract as the cache path —
 /// `(1 - fraction) * 100`, clamped; unusable fractions skip the bucket;
-/// unparsable resets drop the reset line, never the window. Labels dedupe
+/// unparsable resets drop the reset line, never the window. Each bucket's
+/// family comes from its own identity first (`live_bucket_family`), its
+/// group's only when the bucket is ambiguous. Carbon may share the Gemini
+/// pool on some accounts, so a Carbon window needs distinct evidence: an
+/// explicitly identified `gemini-carbon` bucket that is the ONLY usable one
+/// for its label (ambiguous buckets of a Carbon-named group, and duplicate
+/// Carbon buckets, are dropped — never shown as Gemini). Other labels dedupe
 /// first-wins per canonical rank.
 fn parse_quota_summary(body: &Value) -> Vec<AntigravityLimitWindow> {
     let Some(groups) = body.get("groups").and_then(Value::as_array) else {
@@ -1007,11 +1085,16 @@ fn parse_quota_summary(body: &Value) -> Vec<AntigravityLimitWindow> {
     };
     let mut windows: Vec<(String, String, AntigravityLimitWindow)> = Vec::new();
     for group in groups {
-        let family_key = live_family_key(group);
+        let group_family = live_family_key(group);
         let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
             continue;
         };
         for bucket in buckets {
+            let family_key = match live_bucket_family(bucket) {
+                Some(family) => family.to_string(),
+                None if group_family == "gemini-carbon" => continue,
+                None => group_family.clone(),
+            };
             let Some(window_key) = live_window_key(bucket) else {
                 continue;
             };
@@ -1029,6 +1112,16 @@ fn parse_quota_summary(body: &Value) -> Vec<AntigravityLimitWindow> {
             ));
         }
     }
+    // Carbon needs a unique explicit bucket per label; ambiguity drops it.
+    let mut carbon_counts = std::collections::HashMap::new();
+    for (family, _, window) in &windows {
+        if family == "gemini-carbon" {
+            *carbon_counts.entry(window.label.clone()).or_insert(0usize) += 1;
+        }
+    }
+    windows.retain(|(family, _, window)| {
+        family != "gemini-carbon" || carbon_counts.get(&window.label) == Some(&1)
+    });
     // Canonical order, then first-wins dedupe per label.
     windows.sort_by(|(family_a, window_a, _), (family_b, window_b, _)| {
         (live_family_rank(family_a), live_window_rank(window_a))
@@ -1167,22 +1260,10 @@ mod tests {
     #[test]
     fn reset_timestamps_are_preserved_exactly() {
         let limits = parse_quota(&realistic_cache()).unwrap().limits;
-        assert_eq!(
-            limits[0].reset_at.as_deref(),
-            Some("2026-09-18T03:10:11Z")
-        );
-        assert_eq!(
-            limits[1].reset_at.as_deref(),
-            Some("2026-09-23T21:48:16Z")
-        );
-        assert_eq!(
-            limits[2].reset_at.as_deref(),
-            Some("2026-09-18T07:04:09Z")
-        );
-        assert_eq!(
-            limits[3].reset_at.as_deref(),
-            Some("2026-09-20T11:48:41Z")
-        );
+        assert_eq!(limits[0].reset_at.as_deref(), Some("2026-09-18T03:10:11Z"));
+        assert_eq!(limits[1].reset_at.as_deref(), Some("2026-09-23T21:48:16Z"));
+        assert_eq!(limits[2].reset_at.as_deref(), Some("2026-09-18T07:04:09Z"));
+        assert_eq!(limits[3].reset_at.as_deref(), Some("2026-09-20T11:48:41Z"));
     }
 
     #[test]
@@ -1256,16 +1337,14 @@ mod tests {
 
     #[test]
     fn missing_quota_reports_quota_missing() {
-        let no_quota = serde_json::json!({ "accounts": [{ "email": "user@example.com" }] })
-            .to_string();
+        let no_quota =
+            serde_json::json!({ "accounts": [{ "email": "user@example.com" }] }).to_string();
         assert_eq!(parse_quota(&no_quota).unwrap_err().code, "quota_missing");
 
-        let null_quota =
-            serde_json::json!({ "accounts": [{ "cachedQuota": null }] }).to_string();
+        let null_quota = serde_json::json!({ "accounts": [{ "cachedQuota": null }] }).to_string();
         assert_eq!(parse_quota(&null_quota).unwrap_err().code, "quota_missing");
 
-        let not_object =
-            serde_json::json!({ "accounts": [{ "cachedQuota": "0.5" }] }).to_string();
+        let not_object = serde_json::json!({ "accounts": [{ "cachedQuota": "0.5" }] }).to_string();
         assert_eq!(parse_quota(&not_object).unwrap_err().code, "quota_missing");
     }
 
@@ -1443,11 +1522,26 @@ mod tests {
             fallback_failure: None,
         };
         let wire = serde_json::to_string(&usage).unwrap();
-        assert!(wire.contains("usedPercent"), "wire format must be camelCase: {wire}");
-        assert!(wire.contains("resetAt"), "wire format must be camelCase: {wire}");
-        assert!(wire.contains("sourceUpdatedAt"), "wire format must be camelCase: {wire}");
-        assert!(wire.contains("dataFreshness"), "wire format must be camelCase: {wire}");
-        assert!(wire.contains(r#""dataFreshness":"stale""#), "verdict must be lowercase: {wire}");
+        assert!(
+            wire.contains("usedPercent"),
+            "wire format must be camelCase: {wire}"
+        );
+        assert!(
+            wire.contains("resetAt"),
+            "wire format must be camelCase: {wire}"
+        );
+        assert!(
+            wire.contains("sourceUpdatedAt"),
+            "wire format must be camelCase: {wire}"
+        );
+        assert!(
+            wire.contains("dataFreshness"),
+            "wire format must be camelCase: {wire}"
+        );
+        assert!(
+            wire.contains(r#""dataFreshness":"stale""#),
+            "verdict must be lowercase: {wire}"
+        );
         assert!(!wire.contains("used_percent"));
         assert!(!wire.contains("source_updated_at"));
         // Credentials and account identity must never travel toward the WebView.
@@ -1483,9 +1577,9 @@ mod tests {
 
     #[test]
     fn string_cached_quota_updated_at_is_preserved_verbatim() {
-        let parsed = parse_quota(&cache_with_stamp(
-            serde_json::json!("2026-09-20T11:48:41+02:00"),
-        ))
+        let parsed = parse_quota(&cache_with_stamp(serde_json::json!(
+            "2026-09-20T11:48:41+02:00"
+        )))
         .unwrap();
         let (exact, at) = parsed.source_updated_at.expect("stamp should parse");
         assert_eq!(exact, "2026-09-20T11:48:41+02:00");
@@ -1524,10 +1618,7 @@ mod tests {
             );
             // Indeterminate freshness must read as stale, never fresh.
             assert_eq!(
-                data_freshness(
-                    parsed.source_updated_at.map(|(_, at)| at),
-                    Utc::now()
-                ),
+                data_freshness(parsed.source_updated_at.map(|(_, at)| at), Utc::now()),
                 DataSourceFreshness::Stale
             );
         }
@@ -1570,7 +1661,10 @@ mod tests {
         );
         assert_eq!(
             data_freshness(
-                Some(now - chrono::Duration::hours(STALE_AFTER_HOURS) - chrono::Duration::milliseconds(1)),
+                Some(
+                    now - chrono::Duration::hours(STALE_AFTER_HOURS)
+                        - chrono::Duration::milliseconds(1)
+                ),
                 now
             ),
             DataSourceFreshness::Stale
@@ -1648,7 +1742,10 @@ mod tests {
         // 2026-09-19 must see it as stale, while all four windows stay.
         let parsed = parse_quota(&realistic_cache()).unwrap();
         let (_, at) = parsed.source_updated_at.expect("stamp should parse");
-        assert_eq!(data_freshness(Some(at), Utc::now()), DataSourceFreshness::Stale);
+        assert_eq!(
+            data_freshness(Some(at), Utc::now()),
+            DataSourceFreshness::Stale
+        );
         assert_eq!(parsed.limits.len(), 4);
     }
 
@@ -1678,7 +1775,9 @@ mod tests {
         // Passive check against the real local file when it exists; skipped
         // silently otherwise so the suite stays green on clean machines.
         let Ok(path) = cache_path() else { return };
-        let Ok(raw) = fs::read_to_string(&path) else { return };
+        let Ok(raw) = fs::read_to_string(&path) else {
+            return;
+        };
         let parsed = parse_quota(&raw).expect("real cache should parse");
         assert!(!parsed.limits.is_empty());
         let (exact, at) = parsed
@@ -1778,20 +1877,13 @@ mod tests {
     #[test]
     fn live_reset_times_are_preserved_and_future_resets_stay_future() {
         let limits = parse_quota_summary(&live_summary_body());
-        assert_eq!(
-            limits[0].reset_at.as_deref(),
-            Some("2026-09-30T03:49:11Z")
-        );
-        assert_eq!(
-            limits[1].reset_at.as_deref(),
-            Some("2026-10-04T21:32:12Z")
-        );
+        assert_eq!(limits[0].reset_at.as_deref(), Some("2026-09-30T03:49:11Z"));
+        assert_eq!(limits[1].reset_at.as_deref(), Some("2026-10-04T21:32:12Z"));
         // Every captured reset parses and sits after the capture instant
         // (2026-09-29), so the UI counts down instead of reporting
         // "Reset time passed".
         for limit in &limits {
-            let reset = DateTime::parse_from_rfc3339(limit.reset_at.as_deref().unwrap())
-                .unwrap();
+            let reset = DateTime::parse_from_rfc3339(limit.reset_at.as_deref().unwrap()).unwrap();
             assert!(reset > DateTime::parse_from_rfc3339("2026-09-29T00:00:00Z").unwrap());
         }
     }
@@ -2169,8 +2261,7 @@ mod tests {
     fn live_failure_falls_back_to_cache_and_retains_the_cause() {
         // Representative failure categories: auth-type, transport, schema.
         for code in ["auth_invalid", "network", "unexpected_response"] {
-            let usage =
-                resolve_usage(&realistic_cache(), Some(Err(live_failure(code)))).unwrap();
+            let usage = resolve_usage(&realistic_cache(), Some(Err(live_failure(code)))).unwrap();
             // Cached windows remain exactly usable as before — same labels,
             // same exact snapshot stamp, same stale verdict.
             assert_eq!(
@@ -2187,9 +2278,10 @@ mod tests {
             );
             assert_eq!(usage.data_freshness, DataSourceFreshness::Stale);
             // The fresh live-failure cause is retained, verbatim.
-            let cause = usage.fallback_failure.as_ref().unwrap_or_else(|| {
-                panic!("fallback cause must be retained for {code}")
-            });
+            let cause = usage
+                .fallback_failure
+                .as_ref()
+                .unwrap_or_else(|| panic!("fallback cause must be retained for {code}"));
             assert_eq!(cause.code, code);
             assert_eq!(cause.message, "authored display-safe cause");
         }
@@ -2204,8 +2296,7 @@ mod tests {
             "activeIndex": 0
         })
         .to_string();
-        let error =
-            resolve_usage(&raw, Some(Err(live_failure("network")))).unwrap_err();
+        let error = resolve_usage(&raw, Some(Err(live_failure("network")))).unwrap_err();
         assert_eq!(error.code, "quota_missing");
     }
 
@@ -2220,11 +2311,8 @@ mod tests {
 
     #[test]
     fn fallback_wire_is_display_safe_and_camel_case() {
-        let usage = resolve_usage(
-            &realistic_cache(),
-            Some(Err(live_failure("auth_invalid"))),
-        )
-        .unwrap();
+        let usage =
+            resolve_usage(&realistic_cache(), Some(Err(live_failure("auth_invalid")))).unwrap();
         let wire = serde_json::to_string(&usage).unwrap();
         assert!(
             wire.contains(r#""fallbackFailure":{"code":"auth_invalid""#),
@@ -2292,5 +2380,652 @@ mod tests {
             );
         }
         assert!(!usage.limits.is_empty(), "expected at least one window");
+    }
+
+    // ---------- separate Argon weekly quota (synthetic tests; not live evidence) ----------
+
+    fn synthetic_gemini_group() -> Value {
+        serde_json::json!({
+            "displayName": "Gemini Models",
+            "description": "Models within this group: Gemini Flash, Gemini Pro",
+            "buckets": [
+                {
+                    "bucketId": "gemini-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": 0.89034826,
+                    "resetTime": "2026-10-04T21:32:12Z",
+                    "window": "weekly"
+                },
+                {
+                    "bucketId": "gemini-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "remainingFraction": 0.991144,
+                    "resetTime": "2026-09-30T03:49:11Z",
+                    "window": "5h"
+                }
+            ]
+        })
+    }
+
+    fn synthetic_claude_group() -> Value {
+        serde_json::json!({
+            "displayName": "Claude and GPT models",
+            "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+            "buckets": [
+                {
+                    "bucketId": "3p-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": 0.65,
+                    "resetTime": "2026-10-06T22:52:14Z",
+                    "window": "weekly"
+                },
+                {
+                    "bucketId": "3p-5h",
+                    "displayName": "Five Hour Limit Remaining",
+                    "remainingFraction": 0.9,
+                    "resetTime": "2026-09-30T03:52:14Z",
+                    "window": "5h"
+                }
+            ]
+        })
+    }
+
+    fn synthetic_argon_group(remaining_fraction: Value, reset_time: Value) -> Value {
+        serde_json::json!({
+            "displayName": "Gemini 4 Argon",
+            "description": "Models within this group: Gemini 4 Argon",
+            "buckets": [
+                {
+                    "bucketId": "gemini-argon-wtu-weekly",
+                    "displayName": "Weekly Limit Remaining",
+                    "remainingFraction": remaining_fraction,
+                    "resetTime": reset_time,
+                    "window": "weekly"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn live_argon_group_orders_canonically_across_both_group_orders() {
+        let argon_last = serde_json::json!({
+            "groups": [
+                synthetic_gemini_group(),
+                synthetic_claude_group(),
+                synthetic_argon_group(
+                    serde_json::json!(0.42),
+                    serde_json::json!("2026-10-11T21:32:12Z"),
+                )
+            ]
+        });
+        let argon_first = serde_json::json!({
+            "groups": [
+                synthetic_argon_group(
+                    serde_json::json!(0.42),
+                    serde_json::json!("2026-10-11T21:32:12Z"),
+                ),
+                synthetic_claude_group(),
+                synthetic_gemini_group()
+            ]
+        });
+
+        for body in [&argon_last, &argon_first] {
+            let limits = parse_quota_summary(body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Gemini",
+                    "Gemini Weekly",
+                    "Argon Weekly",
+                    "Claude",
+                    "Claude Weekly"
+                ]
+            );
+            // Gemini Weekly remains distinct (primary Gemini weekly window) with
+            // its own fraction and reset time.
+            assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+            assert_eq!(limits[1].reset_at.as_deref(), Some("2026-10-04T21:32:12Z"));
+            // Argon Weekly keeps its independent fraction and reset time.
+            assert_eq!(limits[2].used_percent, (1.0 - 0.42) * 100.0);
+            assert_eq!(limits[2].reset_at.as_deref(), Some("2026-10-11T21:32:12Z"));
+            // Claude windows remain independent.
+            assert_eq!(limits[3].used_percent, (1.0 - 0.9) * 100.0);
+            assert_eq!(limits[3].reset_at.as_deref(), Some("2026-09-30T03:52:14Z"));
+            assert_eq!(limits[4].used_percent, (1.0 - 0.65) * 100.0);
+            assert_eq!(limits[4].reset_at.as_deref(), Some("2026-10-06T22:52:14Z"));
+        }
+    }
+
+    #[test]
+    fn live_generic_gemini_description_or_bucket_mentioning_argon_is_not_reclassified() {
+        let body = serde_json::json!({
+            "groups": [{
+                "displayName": "Gemini Models",
+                "description": "Models within this group: Gemini Flash, Gemini Pro, Gemini 4 Argon shared pool",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "displayName": "Weekly Limit Remaining (includes Argon)",
+                        "remainingFraction": 0.72,
+                        "resetTime": "2026-10-04T21:32:12Z",
+                        "window": "weekly"
+                    },
+                    {
+                        "bucketId": "gemini-5h",
+                        "displayName": "Five Hour Limit Remaining",
+                        "remainingFraction": 0.8,
+                        "resetTime": "2026-09-30T03:49:11Z",
+                        "window": "5h"
+                    }
+                ]
+            }]
+        });
+        let limits = parse_quota_summary(&body);
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Gemini", "Gemini Weekly"]
+        );
+        assert!(limits
+            .iter()
+            .all(|limit| !limit.label.to_lowercase().contains("argon")));
+        assert_eq!(limits[0].used_percent, (1.0 - 0.8) * 100.0);
+        assert_eq!(limits[1].used_percent, (1.0 - 0.72) * 100.0);
+    }
+
+    #[test]
+    fn live_without_argon_group_keeps_original_four_windows() {
+        let limits = parse_quota_summary(&live_summary_body());
+        assert_eq!(
+            limits
+                .iter()
+                .map(|limit| limit.label.as_str())
+                .collect::<Vec<_>>(),
+            ["Gemini", "Gemini Weekly", "Claude", "Claude Weekly"]
+        );
+        assert!(limits
+            .iter()
+            .all(|limit| !limit.label.to_lowercase().contains("argon")));
+    }
+
+    #[test]
+    fn live_argon_invalid_fraction_and_reset_fail_closed() {
+        // Invalid or missing remainingFraction must skip Argon rather than
+        // inventing a blank or 0% row.
+        for bad_fraction in [
+            Value::Null,
+            serde_json::json!("0.5"),
+            serde_json::json!(true),
+        ] {
+            let body = serde_json::json!({
+                "groups": [
+                    synthetic_gemini_group(),
+                    synthetic_argon_group(
+                        bad_fraction,
+                        serde_json::json!("2026-10-11T21:32:12Z"),
+                    ),
+                    synthetic_claude_group()
+                ]
+            });
+            let limits = parse_quota_summary(&body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["Gemini", "Gemini Weekly", "Claude", "Claude Weekly"]
+            );
+        }
+
+        // Invalid or missing resetTime must drop reset_at to None rather than
+        // passing malformed text or inventing a timestamp, while keeping real usage.
+        for bad_reset in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("soon-ish"),
+            serde_json::json!(12345),
+        ] {
+            let body = serde_json::json!({
+                "groups": [
+                    synthetic_gemini_group(),
+                    synthetic_argon_group(serde_json::json!(0.25), bad_reset),
+                    synthetic_claude_group()
+                ]
+            });
+            let limits = parse_quota_summary(&body);
+            assert_eq!(
+                limits
+                    .iter()
+                    .map(|limit| limit.label.as_str())
+                    .collect::<Vec<_>>(),
+                [
+                    "Gemini",
+                    "Gemini Weekly",
+                    "Argon Weekly",
+                    "Claude",
+                    "Claude Weekly"
+                ]
+            );
+            assert_eq!(limits[2].used_percent, 75.0);
+            assert_eq!(limits[2].reset_at, None);
+        }
+    }
+
+    #[test]
+    fn live_family_key_retains_strict_unknown_behavior() {
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "Gemini 4 Argon",
+                "description": "Anything"
+            })),
+            "gemini-argon"
+        );
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "Grok Models",
+                "description": "Argon mentioned only in description"
+            })),
+            "Grok Models"
+        );
+        assert_eq!(
+            live_family_key(&serde_json::json!({
+                "displayName": "   ",
+                "description": "Argon mentioned only in description"
+            })),
+            "Other"
+        );
+    }
+
+    // ---------- CLI-family quota UA + per-bucket Argon/Carbon (synthetic; not live evidence) ----------
+
+    /// Read one HTTP/1.1 request (headers plus Content-Length body).
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            if read == 0 {
+                break;
+            }
+            raw.extend_from_slice(&chunk[..read]);
+            let text = String::from_utf8_lossy(&raw).to_string();
+            if let Some(end) = text.find("\r\n\r\n") {
+                let length = text[..end]
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if raw.len() >= end + 4 + length {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&raw).to_string()
+    }
+
+    /// Serve `statuses` in order on a local listener (one connection each),
+    /// run the real request sequence against it, and return the result, the
+    /// captured requests, and whether any extra request arrived.
+    async fn run_summary_sequence(
+        statuses: &[u16],
+    ) -> (Result<Value, AntigravityError>, Vec<String>, bool) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let statuses = statuses.to_vec();
+        let server = thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in statuses {
+                let (mut stream, _) = listener.accept().unwrap();
+                requests.push(read_http_request(&mut stream));
+                let body = r#"{"groups":[]}"#;
+                stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+            listener.set_nonblocking(true).unwrap();
+            let extra = listener.accept().is_ok();
+            (requests, extra)
+        });
+        let result = fetch_quota_summary_with_fallback(
+            &format!("http://{addr}/v1internal:retrieveUserQuotaSummary"),
+            "unit-test-access-token",
+            "unit-test-project",
+        )
+        .await;
+        let (requests, extra) = server.join().unwrap();
+        (result, requests, extra)
+    }
+
+    fn user_agent_of(request: &str) -> String {
+        request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("user-agent")
+                    .then(|| value.trim().to_string())
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn quota_user_agent_is_the_windows_cli_family_at_the_verified_version() {
+        assert_eq!(
+            QUOTA_USER_AGENT,
+            "antigravity/cli/1.5.3 (os_type=windows; arch=amd64; aidev_client; auth_method=oauth)"
+        );
+        assert_eq!(QUOTA_FALLBACK_USER_AGENT, "antigravity/1.0");
+    }
+
+    #[tokio::test]
+    async fn quota_summary_sends_cli_user_agent_first_with_a_403_only_fallback() {
+        // Success: exactly one request, CLI UA, same auth/body/endpoint shape.
+        // (The served body has no Argon group: missing Argon never retries.)
+        let (result, requests, extra) = run_summary_sequence(&[200]).await;
+        assert!(result.is_ok());
+        assert_eq!(requests.len(), 1);
+        assert!(!extra);
+        assert_eq!(user_agent_of(&requests[0]), QUOTA_USER_AGENT);
+        let lower = requests[0].to_ascii_lowercase();
+        assert!(lower.starts_with("post /v1internal:retrieveuserquotasummary "));
+        assert!(lower.contains("authorization: bearer unit-test-access-token"));
+        assert!(requests[0].contains(r#"{"project":"unit-test-project"}"#));
+
+        // 403: exactly one retry with the plain client UA.
+        let (result, requests, extra) = run_summary_sequence(&[403, 200]).await;
+        assert!(result.is_ok());
+        assert!(!extra);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| user_agent_of(r))
+                .collect::<Vec<_>>(),
+            [QUOTA_USER_AGENT, QUOTA_FALLBACK_USER_AGENT]
+        );
+
+        // A 403 on the retry fails; no third request. A refused quota
+        // summary is `unexpected_response` — only token-refresh refusal is
+        // `auth_invalid`.
+        let (result, requests, extra) = run_summary_sequence(&[403, 403]).await;
+        let error = result.unwrap_err();
+        assert_eq!(error.code, "unexpected_response");
+        assert!(error.message.contains("HTTP 403"));
+        assert_eq!(requests.len(), 2);
+        assert!(!extra);
+
+        // Any other failure status: no fallback request at all.
+        for status in [401u16, 404, 429, 500] {
+            let (result, requests, extra) = run_summary_sequence(&[status]).await;
+            assert!(result.is_err());
+            assert_eq!(requests.len(), 1);
+            assert!(!extra, "status {status} must not retry");
+            assert_eq!(user_agent_of(&requests[0]), QUOTA_USER_AGENT);
+        }
+    }
+
+    fn bucket(id: &str, window: &str, fraction: Value, reset: Value) -> Value {
+        serde_json::json!({
+            "bucketId": id,
+            "displayName": if window == "5h" { "Five Hour Limit Remaining" } else { "Weekly Limit Remaining" },
+            "remainingFraction": fraction,
+            "resetTime": reset,
+            "window": window
+        })
+    }
+
+    fn labels(limits: &[AntigravityLimitWindow]) -> Vec<&str> {
+        limits.iter().map(|limit| limit.label.as_str()).collect()
+    }
+
+    #[test]
+    fn mixed_bucket_ids_in_one_group_split_per_bucket_in_any_order() {
+        let gemini_weekly = bucket(
+            "gemini-weekly",
+            "weekly",
+            serde_json::json!(0.89034826),
+            serde_json::json!("2026-10-04T21:32:12Z"),
+        );
+        let gemini_5h = bucket(
+            "gemini-5h",
+            "5h",
+            serde_json::json!(0.991144),
+            serde_json::json!("2026-09-30T03:49:11Z"),
+        );
+        let argon = bucket(
+            "gemini-argon-wtu-weekly",
+            "weekly",
+            serde_json::json!(0.42),
+            serde_json::json!("2026-10-11T21:32:12Z"),
+        );
+        let carbon = bucket(
+            "gemini-carbon-wtu-weekly",
+            "weekly",
+            serde_json::json!(0.17),
+            serde_json::json!("2026-10-12T08:00:00.5+02:00"),
+        );
+        let forward = serde_json::json!({ "groups": [
+            { "displayName": "Gemini Models", "buckets": [gemini_weekly.clone(), gemini_5h.clone(), argon.clone(), carbon.clone()] },
+            synthetic_claude_group()
+        ]});
+        // Argon/Carbon buckets listed first, Claude group first.
+        let reversed = serde_json::json!({ "groups": [
+            synthetic_claude_group(),
+            { "displayName": "Gemini Models", "buckets": [carbon, argon, gemini_5h, gemini_weekly] }
+        ]});
+        for body in [&forward, &reversed] {
+            let limits = parse_quota_summary(body);
+            assert_eq!(
+                labels(&limits),
+                [
+                    "Gemini",
+                    "Gemini Weekly",
+                    "Argon Weekly",
+                    "Carbon Weekly",
+                    "Claude",
+                    "Claude Weekly"
+                ]
+            );
+            // Gemini Weekly (primary) keeps its own bucket's values.
+            assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+            assert_eq!(limits[1].reset_at.as_deref(), Some("2026-10-04T21:32:12Z"));
+            // Argon and Carbon keep exact bucket-local usage and reset.
+            assert_eq!(limits[2].used_percent, (1.0 - 0.42) * 100.0);
+            assert_eq!(limits[2].reset_at.as_deref(), Some("2026-10-11T21:32:12Z"));
+            assert_eq!(limits[3].used_percent, (1.0 - 0.17) * 100.0);
+            assert_eq!(
+                limits[3].reset_at.as_deref(),
+                Some("2026-10-12T08:00:00.5+02:00")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_argon_and_carbon_buckets_win_over_their_group() {
+        // Separate groups, the Argon/Carbon groups FIRST, and an explicit
+        // Argon bucket under a generic group: Gemini Weekly never takes
+        // Argon or Carbon values.
+        let body = serde_json::json!({ "groups": [
+            { "displayName": "Gemini 4 Carbon", "buckets": [
+                bucket("gemini-4-carbon-weekly", "weekly", serde_json::json!(0.3), serde_json::json!("2026-10-13T00:00:00Z"))
+            ]},
+            { "displayName": "Quota", "buckets": [
+                bucket("gemini-argon-weekly", "weekly", serde_json::json!(0.6), serde_json::json!("2026-10-14T00:00:00Z"))
+            ]},
+            synthetic_gemini_group(),
+        ]});
+        let limits = parse_quota_summary(&body);
+        assert_eq!(
+            labels(&limits),
+            ["Gemini", "Gemini Weekly", "Argon Weekly", "Carbon Weekly"]
+        );
+        assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+        assert_eq!(limits[2].used_percent, (1.0 - 0.6) * 100.0);
+        assert_eq!(limits[2].reset_at.as_deref(), Some("2026-10-14T00:00:00Z"));
+        assert_eq!(limits[3].used_percent, (1.0 - 0.3) * 100.0);
+        assert_eq!(limits[3].reset_at.as_deref(), Some("2026-10-13T00:00:00Z"));
+    }
+
+    #[test]
+    fn absent_argon_and_carbon_keep_the_original_four_windows() {
+        let limits = parse_quota_summary(&live_summary_body());
+        assert_eq!(
+            labels(&limits),
+            ["Gemini", "Gemini Weekly", "Claude", "Claude Weekly"]
+        );
+        // Argon only (no Carbon bucket): no Carbon row is invented.
+        let body = serde_json::json!({ "groups": [
+            synthetic_gemini_group(),
+            synthetic_argon_group(serde_json::json!(0.42), serde_json::json!("2026-10-11T21:32:12Z")),
+            synthetic_claude_group()
+        ]});
+        let limits = parse_quota_summary(&body);
+        assert_eq!(
+            labels(&limits),
+            [
+                "Gemini",
+                "Gemini Weekly",
+                "Argon Weekly",
+                "Claude",
+                "Claude Weekly"
+            ]
+        );
+    }
+
+    #[test]
+    fn collisions_and_mentions_never_classify_as_argon_or_carbon() {
+        let body = serde_json::json!({ "groups": [
+            {
+                "displayName": "Gemini Models",
+                "description": "Models within this group: Gemini 4 Argon, Gemini 4 Carbon shared pool",
+                "buckets": [
+                    { "bucketId": "gemini-weekly", "displayName": "Weekly Limit Remaining (includes Argon and Carbon)",
+                      "remainingFraction": 0.72, "resetTime": "2026-10-04T21:32:12Z", "window": "weekly" },
+                    bucket("gemini-argonite-5h", "5h", serde_json::json!(0.8), serde_json::json!("2026-09-30T03:49:11Z"))
+                ]
+            },
+            { "displayName": "Paragon Models", "buckets": [
+                bucket("paragon-weekly", "weekly", serde_json::json!(0.5), serde_json::json!("2026-10-05T00:00:00Z"))
+            ]},
+            { "displayName": "Carbonate Models", "description": "Carbon", "buckets": [
+                bucket("carbonate-weekly", "weekly", serde_json::json!(0.5), serde_json::json!("2026-10-05T00:00:00Z"))
+            ]}
+        ]});
+        let limits = parse_quota_summary(&body);
+        assert_eq!(
+            labels(&limits),
+            [
+                "Gemini",
+                "Gemini Weekly",
+                "Paragon Models Weekly",
+                "Carbonate Models Weekly"
+            ]
+        );
+        assert_eq!(limits[1].used_percent, (1.0 - 0.72) * 100.0);
+        // Token-boundary identity checks.
+        let tokens = |text: &str| identity_tokens(text);
+        assert!(names_gemini_model(
+            &tokens("gemini-argon-wtu-weekly"),
+            "argon"
+        ));
+        assert!(names_gemini_model(&tokens("Gemini 4 Argon"), "argon"));
+        assert!(names_gemini_model(&tokens("gemini-carbon-x"), "carbon"));
+        assert!(!names_gemini_model(
+            &tokens("gemini-paragon-weekly"),
+            "argon"
+        ));
+        assert!(!names_gemini_model(&tokens("gemini-argonite"), "argon"));
+        assert!(!names_gemini_model(
+            &tokens("gemini weekly includes argon"),
+            "argon"
+        ));
+        assert!(!names_gemini_model(&tokens("argon-weekly"), "argon"));
+    }
+
+    #[test]
+    fn carbon_without_unique_explicit_evidence_is_dropped_not_shown_as_gemini() {
+        let carbon = |fraction: f64| {
+            bucket(
+                "gemini-carbon-weekly",
+                "weekly",
+                serde_json::json!(fraction),
+                serde_json::json!("2026-10-13T00:00:00Z"),
+            )
+        };
+        // Duplicate Carbon buckets for one label: ambiguous, dropped.
+        let body = serde_json::json!({ "groups": [
+            synthetic_gemini_group(),
+            { "displayName": "Gemini 4 Carbon", "buckets": [carbon(0.3), carbon(0.4)] }
+        ]});
+        assert_eq!(
+            labels(&parse_quota_summary(&body)),
+            ["Gemini", "Gemini Weekly"]
+        );
+        // A Carbon-named group whose bucket names no family: no Carbon row,
+        // and its values never land on Gemini Weekly even when listed first.
+        let body = serde_json::json!({ "groups": [
+            { "displayName": "Gemini 4 Carbon", "buckets": [
+                { "window": "weekly", "remainingFraction": 0.01, "resetTime": "2026-10-13T00:00:00Z" }
+            ]},
+            synthetic_gemini_group()
+        ]});
+        let limits = parse_quota_summary(&body);
+        assert_eq!(labels(&limits), ["Gemini", "Gemini Weekly"]);
+        assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+    }
+
+    #[test]
+    fn invalid_argon_and_carbon_values_fail_closed() {
+        for bad_fraction in [
+            Value::Null,
+            serde_json::json!("0.5"),
+            serde_json::json!(true),
+            serde_json::json!({}),
+        ] {
+            let body = serde_json::json!({ "groups": [
+                synthetic_gemini_group(),
+                { "displayName": "Gemini Models", "buckets": [
+                    bucket("gemini-argon-weekly", "weekly", bad_fraction.clone(), serde_json::json!("2026-10-11T21:32:12Z")),
+                    bucket("gemini-carbon-weekly", "weekly", bad_fraction.clone(), serde_json::json!("2026-10-12T21:32:12Z"))
+                ]}
+            ]});
+            let limits = parse_quota_summary(&body);
+            // Skipped, never replaced with Gemini values.
+            assert_eq!(labels(&limits), ["Gemini", "Gemini Weekly"]);
+            assert_eq!(limits[1].used_percent, (1.0 - 0.89034826) * 100.0);
+        }
+        for bad_reset in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("soon"),
+            serde_json::json!(1),
+        ] {
+            let body = serde_json::json!({ "groups": [
+                synthetic_gemini_group(),
+                { "displayName": "Gemini Models", "buckets": [
+                    bucket("gemini-carbon-weekly", "weekly", serde_json::json!(0.25), bad_reset.clone())
+                ]}
+            ]});
+            let limits = parse_quota_summary(&body);
+            assert_eq!(
+                labels(&limits),
+                ["Gemini", "Gemini Weekly", "Carbon Weekly"]
+            );
+            assert_eq!(limits[2].used_percent, 75.0);
+            assert_eq!(limits[2].reset_at, None);
+        }
     }
 }

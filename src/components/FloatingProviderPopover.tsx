@@ -9,6 +9,7 @@ import { formatCreditExpiry, formatResetCredits } from "../lib/resetCredits";
 import {
   floatingQuotaPresentation,
   quotaColorLevel,
+  resetCountdownLabel,
 } from "../lib/quotaPresentation";
 import { ProviderMark } from "./FloatingProviderItem";
 import { GrokBotSection } from "./GrokBotSection";
@@ -28,7 +29,7 @@ function primaryResetLine(
   if (primary) {
     const countdown = formatCountdown(primary.resetAt, now);
     if (countdown) {
-      return { muted: primary.label + " reset in ", strong: countdown };
+      return { muted: resetCountdownLabel(primary.label) + " reset in ", strong: countdown };
     }
     return { muted: primary.label + " · Reset time passed", strong: null };
   }

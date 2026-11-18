@@ -7,6 +7,7 @@ import {
   predictionQuotaPresentation,
   quotaColorLevel,
   quotaPresentation,
+  resetCountdownLabel,
   trayQuotaPresentation,
 } from "./quotaPresentation";
 import { formatResetLine } from "./format";
@@ -189,5 +190,30 @@ describe("quota color levels", () => {
     // Defensive outliers clamp for display only; the level still reads them.
     expect(quotaColorLevel(quotaPresentation(125, "remaining"))).toBe("critical");
     expect(quotaColorLevel(quotaPresentation(-25, "remaining"))).toBe("healthy");
+  });
+});
+
+describe("reset countdown presentation label", () => {
+  it.each(["7-day", " 7-day ", "7-Day", "7-days", "7 day", "7 days", "7d"])(
+    "maps genuine 7-day label %j to Weekly",
+    (label) => {
+      expect(resetCountdownLabel(label)).toBe("Weekly");
+    },
+  );
+
+  it.each([
+    "Weekly",
+    "Weekly credits",
+    "Gemini Weekly",
+    "Claude Weekly",
+    "Argon Weekly",
+    "1-day",
+    "5-hour",
+    "30-day",
+    "17-day",
+    "27-day",
+    "7-day credits",
+  ])("preserves non-generic or other-duration label %j", (label) => {
+    expect(resetCountdownLabel(label)).toBe(label);
   });
 });
