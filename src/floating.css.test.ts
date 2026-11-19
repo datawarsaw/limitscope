@@ -268,6 +268,20 @@ describe("floating quota bar semantic color guards", () => {
     expect(css).not.toContain('[data-provider="antigravity"]');
   });
 
+  it("gives the provider mark its published collapsed and expanded sizes", () => {
+    // The marks are monochrome silhouettes, so their size is the whole
+    // legibility budget: 16px on the collapsed segment, 14px on the
+    // expanded card. The Mistral mark's ten white pixels have to survive
+    // both, so the sizes are pinned here rather than left to drift.
+    const markBlock = css.match(/\.fq-mark svg \{[^}]*\}/)?.[0] ?? "";
+    expect(markBlock).toContain("width: 16px");
+    expect(markBlock).toContain("height: 16px");
+
+    const popoverBlock = css.match(/\.fq-popover-mark svg \{[^}]*\}/)?.[0] ?? "";
+    expect(popoverBlock).toContain("width: 14px");
+    expect(popoverBlock).toContain("height: 14px");
+  });
+
   it("keeps the collapsed bar countdown-free; secondary windows and account stay styled", () => {
     expect(css).not.toContain(".fq-reset");
     expect(css).toContain(".fq-windows");

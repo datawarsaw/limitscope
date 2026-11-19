@@ -90,26 +90,37 @@ const card = (item: ReturnType<typeof floatingQuotaItems>[number]) => (
 );
 
 /**
- * The published Mistral pixel-cat emblem, as it stands in Mistral's own
- * 2026 brand kit: Icon/Gradient/RGB/SVG/Mistral-Icon-Gradient-RGB.svg
- * (sha256 5aa0534fb52009c3ef9321544cd14d4b84ba34d4ee041abb3bdde9c3f2e765ca),
+ * The published Mistral pixel-cat emblem in Mistral's published WHITE
+ * monochrome variant, as it stands in Mistral's own 2026 brand kit:
+ * Icon/Monochrome/RGB/SVG/Icon-Mistral-White.svg
+ * (sha256 65b6edef03c108849cea04b82017882624be60e641f0fa9dff72800b4a6c83b5),
  * fetched from https://mistral.ai/cms-media/api/media/file/Mistral_Logos_2026.zip
  * and linked from https://mistral.ai/brand/ . The viewBox is the published
- * one, so the emblem keeps the brand's own clearspace.
+ * one, so the emblem keeps the brand's own clearspace, and the ten rects
+ * are the gradient variant's ten rects with the published white fill.
  */
 const PUBLISHED_VIEWBOX = "0 0 162 162";
 
 const PUBLISHED_PIXELS: [number, number, number, number, string][] = [
-  [31, 31, 20, 20, "#FFAF01"],
-  [111, 31, 20, 20, "#FFAF01"],
-  [71, 91, 20, 20, "#E61300"],
-  [31, 91, 20, 20, "#E61300"],
-  [111, 91, 20, 20, "#E61300"],
-  [31, 51, 40, 20, "#FF8204"],
-  [11, 111, 60, 20, "#C4001D"],
-  [91, 111, 60, 20, "#C4001D"],
-  [31, 71, 100, 20, "#FA500F"],
-  [91, 51, 40, 20, "#FF8204"],
+  [31, 31, 20, 20, "white"],
+  [111, 31, 20, 20, "white"],
+  [71, 91, 20, 20, "white"],
+  [31, 91, 20, 20, "white"],
+  [111, 91, 20, 20, "white"],
+  [31, 51, 40, 20, "white"],
+  [11, 111, 60, 20, "white"],
+  [91, 111, 60, 20, "white"],
+  [31, 71, 100, 20, "white"],
+  [91, 51, 40, 20, "white"],
+];
+
+/** The gradient variant's published stops, which must not reach the mark. */
+const REJECTED_GRADIENT_STOPS = [
+  "#FFAF01",
+  "#FF8204",
+  "#FA500F",
+  "#E61300",
+  "#C4001D",
 ];
 
 /** Reads the emblem back out of the DOM, pixel by pixel. */
@@ -157,17 +168,37 @@ describe("Mistral provider mark", () => {
     expect(view.container.querySelector(".fq-mark-fallback")).toBeNull();
   });
 
-  it("keeps the published gradient instead of recolouring the mark", () => {
+  it("draws the mark in one published white fill, with no gradient and no multicolour", () => {
     const view = render(<ProviderMark id="mistral" />);
     const { svg, rects } = readEmblem(view, "svg");
 
-    // The brand's preferred treatment, used exactly as published: the
-    // emblem does not inherit currentColor the way the monochrome marks
-    // in this file do, and no published stop was altered.
+    // One colour, the published one: the emblem is white, so the mark
+    // reads as a monochrome silhouette like every other mark in the deck.
     expect(svg?.querySelector('[fill="currentColor"]')).toBeNull();
-    expect(new Set(rects.map((rect) => rect[4]))).toEqual(
-      new Set(["#FFAF01", "#FF8204", "#FA500F", "#E61300", "#C4001D"]),
-    );
+    expect(new Set(rects.map((rect) => rect[4]))).toEqual(new Set(["white"]));
+
+    // The rejected gradient variant is gone: none of its five published
+    // stops survives anywhere in the mark.
+    for (const stop of REJECTED_GRADIENT_STOPS) {
+      expect(rects.map((rect) => rect[4])).not.toContain(stop);
+    }
+    const source = view.container.innerHTML;
+    for (const stop of REJECTED_GRADIENT_STOPS) {
+      expect(source).not.toContain(stop);
+    }
+  });
+
+  it("keeps the published white fill out of a currentColor recolour", () => {
+    const view = render(<ProviderMark id="mistral" />);
+    const { svg, rects } = readEmblem(view, "svg");
+
+    // The white file is reproduced as published: the rects carry Mistral's
+    // own "white", not the slot's inherited colour, and the gradient
+    // variant's stops are not reintroduced through another mechanism.
+    expect(rects.every((rect) => rect[4] === "white")).toBe(true);
+    expect(svg?.querySelector('[fill^="#"]')).toBeNull();
+    expect(svg?.querySelector('linearGradient')).toBeNull();
+    expect(svg?.querySelector('[fill^="url("]')).toBeNull();
   });
 
   it("shares one mark between the collapsed segment and the expanded card", () => {
@@ -206,6 +237,13 @@ describe("Mistral provider mark", () => {
     ]);
     expect(item.windowLabel).toBe("Vibe Budget");
     expect(item.primaryReset?.label).toBe("Vibe Budget");
+
+    // Independent monthly data: the primary (Vibe) and the secondary
+    // (API) budget keep their own allowance and their own consumption, so
+    // the shared mark never merges them.
+    expect(item.windows.map((row) => row.usedPercent)).toEqual([0.27, 14.12]);
+    expect(item.usedPercent).toBe(0.27);
+    expect(item.percent).toBe(0);
 
     const view = render(card(item));
     const rows = view.container.querySelectorAll("[data-mistral-row]");
