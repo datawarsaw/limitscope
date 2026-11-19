@@ -3,7 +3,7 @@ import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ProviderUsage } from "../types";
 import { floatingQuotaItems } from "../lib/floatingQuota";
-import { FloatingProviderItem } from "./FloatingProviderItem";
+import { FloatingProviderItem, ProviderMark } from "./FloatingProviderItem";
 import { FloatingProviderPopover } from "./FloatingProviderPopover";
 
 const invoke = vi.hoisted(() => vi.fn());
@@ -60,15 +60,15 @@ const card = (item: ReturnType<typeof floatingQuotaItems>[number]) => (
 
 /**
  * The published Claude mark: Anthropic's claude-logo.svg geometry, at the
- * published viewBox and in the published brand colour. The monogram that
- * stood in for it is gone.
+ * published viewBox, filled with the inherited currentColor instead of the
+ * published brand colour. The monogram that stood in for it is gone.
  */
 const claudeMark = (view: { container: HTMLElement }) => {
   const svg = view.container.querySelector(".fq-mark svg");
   expect(svg).not.toBeNull();
   expect(svg?.getAttribute("viewBox")).toBe("0 0 24 24");
   const path = svg?.querySelector("path");
-  expect(path?.getAttribute("fill")).toBe("#D97757");
+  expect(path?.getAttribute("fill")).toBe("currentColor");
   const d = path?.getAttribute("d") ?? "";
   expect(d.startsWith("M11.376 24")).toBe(true);
   expect(d.endsWith("L11.376 24Z")).toBe(true);
@@ -107,10 +107,31 @@ describe("Claude Code provider mark", () => {
     const cardSvg = cardView.container.querySelector(".fq-popover-mark svg");
     expect(cardSvg?.getAttribute("viewBox")).toBe("0 0 24 24");
     const cardPath = cardSvg?.querySelector("path");
-    expect(cardPath?.getAttribute("fill")).toBe("#D97757");
+    expect(cardPath?.getAttribute("fill")).toBe("currentColor");
 
     // One identity, two places: the expanded card wears the mark of the
     // segment it expands, character for character.
     expect(cardPath?.getAttribute("d")).toBe(segmentPath);
+  });
+
+  it("leaves every other provider mark on the inherited fill", () => {
+    const svgProviders = [
+      "openai-codex",
+      "zai",
+      "opencode-go",
+      "antigravity",
+      "grok",
+    ];
+
+    for (const id of svgProviders) {
+      const view = render(<ProviderMark id={id} />);
+      const path = view.container.querySelector("path");
+      expect(path, id).not.toBeNull();
+      expect(path?.getAttribute("fill"), id).toBe("currentColor");
+    }
+
+    // The retired brand fill is gone from the whole mark surface.
+    const claudeView = render(<ProviderMark id="claude-code" />);
+    expect(claudeView.container.querySelector('path[fill="#D97757"]')).toBeNull();
   });
 });
