@@ -193,8 +193,12 @@ export function FloatingProviderPopover({
           {item.accountAlias ? (
             <span className="fq-account-alias">{item.accountAlias}</span>
           ) : null}
-          {/* The healthy "Live" chip is clutter; degraded statuses still badge. */}
-          {item.statusClass !== "ok" || item.providerId === "claude-code" ? (
+          {/* The healthy chip is clutter for every provider, Claude included:
+              only a degraded reading earns a label. A healthy Claude card
+              therefore shows no "Recent" chip, exactly like a healthy card
+              of any other provider; a degraded one still names its state
+              ("Last known", "Unknown", "Unavailable"). */}
+          {item.statusClass !== "ok" ? (
             <span className={"fq-status status-" + item.statusClass}>
               {item.statusLabel}
             </span>

@@ -98,7 +98,7 @@ function renderSurfaces(usage: ProviderUsage) {
 afterEach(cleanup);
 
 describe("Claude 5h-only header/rail/floating status without per-row badges", () => {
-  it("shows single green Recent header, rail dot, and healthy floating pill when equal 5h is freshly confirmed and 7d is hours old, with zero row badges", () => {
+  it("shows single green Recent header, rail dot, and healthy floating pill without a floating status chip when equal 5h is freshly confirmed and 7d is hours old, with zero row badges", () => {
     const claude = makeClaudeUsage();
     expect(providerStatusPresentation(claude, NOW)).toEqual({
       label: "Recent",
@@ -126,15 +126,17 @@ describe("Claude 5h-only header/rail/floating status without per-row badges", ()
     // Rail dot: green status-ok
     expect(rail.container.querySelector(".rail-item .status-dot")?.className).toContain("status-ok");
 
-    // Floating pill & popover: Recent, status-ok, no stale dot
+    // Floating pill & popover: the reading is Recent and status-ok, the pill
+    // wears no stale dot, and the detail card stays quiet: a healthy card
+    // shows no status chip for any provider, Claude included. "Recent" stays
+    // on the main header above, where the state is stated once.
     expect(item.statusLabel).toBe("Recent");
     expect(item.statusClass).toBe("ok");
     expect(item.stale).toBe(false);
     expect(pill.container.querySelector(".fq-stale-dot")).toBeNull();
     const floatingStatus = floating.container.querySelectorAll(".fq-status");
-    expect(floatingStatus).toHaveLength(1);
-    expect(floatingStatus[0].textContent).toBe("Recent");
-    expect(floatingStatus[0].className).toContain("status-ok");
+    expect(floatingStatus).toHaveLength(0);
+    expect(floating.container.textContent).not.toContain("Recent");
   });
 
   it("shows Last known when only generic hook or weekly-only event is recent, or when 5h is stale and 7d is recent", () => {
