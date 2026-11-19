@@ -268,11 +268,30 @@ describe("floating quota bar semantic color guards", () => {
     expect(css).not.toContain('[data-provider="antigravity"]');
   });
 
+  it("hands the collapsed and expanded marks the same inherited tone", () => {
+    // Both mark slots must resolve their currentColor fill from the SAME
+    // token, so the 16px collapsed mark and the 14px expanded mark cannot
+    // drift into two different tones of the same muted grey. A literal
+    // colour or an opacity overlay here would break that, and would break
+    // the theme switch with it.
+    const markBlock = css.match(/\.fq-mark \{[^}]*\}/)?.[0] ?? "";
+    const popoverBlock = css.match(/\.fq-popover-mark \{[^}]*\}/)?.[0] ?? "";
+    expect(markBlock).toContain("color: var(--text-dim)");
+    expect(popoverBlock).toContain("color: var(--text-dim)");
+
+    // The mark slots stay colour sources, not colour painters: no fill is
+    // forced on the marks, so the inherited tone is the only tone in play.
+    expect(css).not.toMatch(/\.fq-mark svg \{[^}]*fill:/);
+    expect(css).not.toMatch(/\.fq-popover-mark svg \{[^}]*fill:/);
+    expect(css).not.toMatch(/\.fq-mark[^{]*\{[^}]*opacity:/);
+  });
+
   it("gives the provider mark its published collapsed and expanded sizes", () => {
     // The marks are monochrome silhouettes, so their size is the whole
     // legibility budget: 16px on the collapsed segment, 14px on the
-    // expanded card. The Mistral mark's ten white pixels have to survive
-    // both, so the sizes are pinned here rather than left to drift.
+    // expanded card. The Mistral mark's ten pixels have to survive both,
+    // and they carry the inherited tone at both sizes, so the sizes are
+    // pinned here rather than left to drift.
     const markBlock = css.match(/\.fq-mark svg \{[^}]*\}/)?.[0] ?? "";
     expect(markBlock).toContain("width: 16px");
     expect(markBlock).toContain("height: 16px");

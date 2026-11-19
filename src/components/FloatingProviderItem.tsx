@@ -13,11 +13,11 @@ import {
  * filled geometry that makes them recognizable. Claude Code carries
  * Anthropic's published Claude mark geometry, filled with the inherited
  * currentColor instead of the published brand colour. Mistral carries
- * Mistral's published pixel-cat emblem in Mistral's published WHITE
- * monochrome variant, so every mark in this file is a single-colour
- * silhouette. Unknown providers keep the letter fallback. Shared with the
- * detail card header so hover previews and pinned cards carry the same
- * identity as the segment they expand.
+ * Mistral's published pixel-cat emblem geometry, filled with the same
+ * inherited currentColor, so every mark in this file is a single-colour
+ * silhouette in the muted tone of its slot. Unknown providers keep the
+ * letter fallback. Shared with the detail card header so hover previews and
+ * pinned cards carry the same identity as the segment they expand.
  */
 export function ProviderMark({ id }: { id: string }) {
   // An account-scoped id (a second OpenAI/Codex account) names the same
@@ -87,38 +87,52 @@ export function ProviderMark({ id }: { id: string }) {
     // multicolor "M" logo from mistralai/mistral-common is a retired mark
     // and is deliberately not reproduced.
     //
-    // COLOUR: the brand page says "Prefer the gradient version" and
-    // "Use monochrome on busy background". The Floating Deck is a row of
-    // small marks on a dark surface (graphite #1f1f24, glass
-    // rgba(33,33,42,0.55), oled #060607), and every other mark in this
-    // file is a monochrome silhouette, so the published WHITE variant is
-    // the treatment used here: one colour, no gradient stops, the same
-    // pixel-cat shape. The fill is Mistral's published "white", used
-    // verbatim, and NOT currentColor: the asset is reproduced as
-    // published rather than re-tinted like the currentColor marks.
+    // GEOMETRY AND COLOUR ARE DIFFERENT CLAIMS, so they are kept apart
+    // here on purpose:
+    //   - GEOMETRY is Mistral's official published mark. The viewBox and
+    //     the ten rects are the official WHITE file's, verbatim.
+    //   - COLOUR is a LimitScope UI adaptation, not a published variant.
+    //     The official reference for this geometry is Mistral's own flat
+    //     white (the kit's flat Black sibling is #151524), but the
+    //     Floating Deck is a row of small marks on a dark surface
+    //     (graphite #1f1f24, glass rgba(33,33,42,0.55), oled #060607)
+    //     and every neighbouring mark in this file is an inherited
+    //     monochrome silhouette. So the rects carry currentColor, which
+    //     resolves to the slot's own muted tone (var(--text-dim), the very
+    //     colour .fq-mark hands to every other provider mark), and the
+    //     Mistral mark reads as one set with its neighbours instead of as a
+    //     bright cut-out. One colour, no gradient stops, no hard-coded
+    //     grey, no opacity trick, and the tone follows the theme because
+    //     the token does.
+    //   The tint shipped here is therefore NOT an official Mistral colour
+    //   variant: Mistral's kit publishes flat Black and flat White
+    //   monochrome files, and this is neither of them.
     //
     // TRADEMARK: https://mistral.ai/brand/ states that Mistral's names,
     // trademarks, logos and icons are Mistral's property, that partners
     // and collaborators are welcome to use the brand, and that the brand
     // must not be stretched, deformed, rotated, relaid out, recoloured or
-    // taken from an old or unofficial version. The monochrome variant is
-    // the brand's own published file, so nothing here is recoloured or
-    // redrawn, but permission for a third-party desktop app to ship this
-    // icon is NOT established by that page: treat the usage question as a
-    // release gate for Human Acceptance, not as a settled licence.
+    // taken from an old or unofficial version. Filling the published
+    // geometry with currentColor is a recolouring of the mark on the face
+    // of that rule, and the published white reference is the only colour
+    // Mistral shipped for this geometry. Permission for a third-party
+    // desktop app to ship this icon is NOT established by that page, and
+    // the recolouring question is a separate question from it: treat both
+    // the usage question and the recolouring question as a release gate
+    // for Human Acceptance, not as a settled licence.
     // LimitScope is not affiliated with or endorsed by Mistral AI.
     return (
       <svg viewBox="0 0 162 162" aria-hidden="true">
-        <rect x="31" y="31" width="20" height="20" fill="white" />
-        <rect x="111" y="31" width="20" height="20" fill="white" />
-        <rect x="71" y="91" width="20" height="20" fill="white" />
-        <rect x="31" y="91" width="20" height="20" fill="white" />
-        <rect x="111" y="91" width="20" height="20" fill="white" />
-        <rect x="31" y="51" width="40" height="20" fill="white" />
-        <rect x="11" y="111" width="60" height="20" fill="white" />
-        <rect x="91" y="111" width="60" height="20" fill="white" />
-        <rect x="31" y="71" width="100" height="20" fill="white" />
-        <rect x="91" y="51" width="40" height="20" fill="white" />
+        <rect x="31" y="31" width="20" height="20" fill="currentColor" />
+        <rect x="111" y="31" width="20" height="20" fill="currentColor" />
+        <rect x="71" y="91" width="20" height="20" fill="currentColor" />
+        <rect x="31" y="91" width="20" height="20" fill="currentColor" />
+        <rect x="111" y="91" width="20" height="20" fill="currentColor" />
+        <rect x="31" y="51" width="40" height="20" fill="currentColor" />
+        <rect x="11" y="111" width="60" height="20" fill="currentColor" />
+        <rect x="91" y="111" width="60" height="20" fill="currentColor" />
+        <rect x="31" y="71" width="100" height="20" fill="currentColor" />
+        <rect x="91" y="51" width="40" height="20" fill="currentColor" />
       </svg>
     );
   }
