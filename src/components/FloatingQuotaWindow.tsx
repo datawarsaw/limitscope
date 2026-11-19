@@ -111,7 +111,7 @@ export function FloatingQuotaWindow() {
     registryIds,
     settings.providerPreferences,
   );
-  const items = floatingQuotaItems(visibleUsages);
+  const items = floatingQuotaItems(visibleUsages, now);
   const [detail, setDetail] = useState<ProviderDetail | null>(
     devOverlay === "hover"
       ? { id: "openai-codex", pinned: false }

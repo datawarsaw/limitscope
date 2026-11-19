@@ -355,6 +355,8 @@ pub struct ClaudeStatuslineTimes {
     pub five_hour_changed_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seven_day_changed_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub five_hour_confirmed_at: Option<String>,
 }
 
 /// One provider's entry in the snapshot — the exact `ProviderUsage` wire
@@ -1710,14 +1712,53 @@ fn normalize_claude_statusline(
     dto
 }
 
-fn claude_with_receipt(mut dto: ProviderUsageDto, receipt: Option<i64>) -> ProviderUsageDto {
+#[cfg(test)]
+fn claude_with_receipt(dto: ProviderUsageDto, receipt: Option<i64>) -> ProviderUsageDto {
+    claude_with_receipt_info(dto, receipt, None, i64::MAX)
+}
+
+fn claude_with_receipt_info(
+    mut dto: ProviderUsageDto,
+    receipt: Option<i64>,
+    five_hour_confirmation: Option<crate::claude_statusline::FiveHourConfirmation>,
+    now_s: i64,
+) -> ProviderUsageDto {
     let changed = |label: &str| dto.limits.iter().find(|limit| limit.label == label)
         .and_then(|limit| limit.observed_at.clone());
+    let five_hour_confirmed_at = dto
+        .limits
+        .iter()
+        .find(|limit| limit.label == "5-hour")
+        .and_then(|limit| {
+            let conf = five_hour_confirmation?;
+            if conf.confirmed_at <= 0 || conf.confirmed_at > now_s || conf.resets_at <= now_s {
+                return None;
+            }
+            let limit_resets_at = limit
+                .reset_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.timestamp())?;
+            if limit_resets_at <= now_s {
+                return None;
+            }
+            if (conf.resets_at - limit_resets_at).abs()
+                > crate::claude_statusline::SAME_WINDOW_TOLERANCE_S
+            {
+                return None;
+            }
+            if (conf.used_percent - limit.used_percent).abs() > 1e-9 {
+                return None;
+            }
+            DateTime::from_timestamp(conf.confirmed_at, 0)
+                .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+        });
     dto.claude_statusline_times = Some(ClaudeStatuslineTimes {
         receipt_at: receipt.and_then(|s| DateTime::from_timestamp(s, 0))
             .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true)),
         five_hour_changed_at: changed("5-hour"),
         seven_day_changed_at: changed("7-day"),
+        five_hour_confirmed_at,
     });
     dto
 }
@@ -1866,9 +1907,15 @@ fn other_production_specs() -> Vec<ProviderSpec> {
                         crate::claude_statusline::read_default_store(now),
                         now,
                     );
-                    let receipt = crate::claude_statusline::data_dir()
-                        .and_then(|dir| crate::claude_statusline::read_receipt(&dir, now.timestamp()));
-                    Ok(claude_with_receipt(dto, receipt))
+                    let (receipt, five_hour_confirmation) = crate::claude_statusline::data_dir()
+                        .map(|dir| crate::claude_statusline::read_receipt_info(&dir, now.timestamp()))
+                        .unwrap_or((None, None));
+                    Ok(claude_with_receipt_info(
+                        dto,
+                        receipt,
+                        five_hour_confirmation,
+                        now.timestamp(),
+                    ))
                 })
             }),
         },
@@ -5882,6 +5929,58 @@ mod tests {
         let missing = claude_with_receipt(normalize_claude_statusline(crate::claude_statusline::StoreRead::Missing, now), Some(s));
         assert!(missing.limits.is_empty());
         assert_eq!(missing.health, ProviderHealth::Unavailable);
+    }
+
+    #[test]
+    fn claude_five_hour_confirmation_stays_bound_and_leaves_backend_health_unchanged() {
+        use crate::claude_statusline::FiveHourConfirmation;
+        let now = fixed_now();
+        let s = now.timestamp();
+        // 5h observed_at 2h ago, 7d observed_at 3h ago -> backend health remains Stale.
+        let base = normalize_claude_statusline(
+            claude_store(Some((20.0, s + 3600, s - 7200)), Some((40.0, s + 86_400, s - 10_800))),
+            now,
+        );
+        assert_eq!(base.health, ProviderHealth::Stale);
+        assert_eq!(base.data_freshness, Some("stale"));
+
+        let valid_conf = FiveHourConfirmation {
+            confirmed_at: s - 30,
+            resets_at: s + 3600,
+            used_percent: 20.0,
+        };
+        let confirmed = claude_with_receipt_info(base.clone(), Some(s - 30), Some(valid_conf), s);
+        assert_eq!(confirmed.health, ProviderHealth::Stale, "backend health stays unchanged");
+        assert_eq!(confirmed.data_freshness, Some("stale"));
+        assert_eq!(confirmed.source_updated_at, base.source_updated_at);
+        let times = confirmed.claude_statusline_times.as_ref().unwrap();
+        assert!(times.five_hour_confirmed_at.is_some());
+        assert_ne!(times.five_hour_confirmed_at, times.five_hour_changed_at);
+
+        // Reset mismatch or percent mismatch suppresses five_hour_confirmed_at.
+        let reset_mismatch = FiveHourConfirmation { resets_at: s + 7200, ..valid_conf };
+        assert_eq!(
+            claude_with_receipt_info(base.clone(), Some(s - 30), Some(reset_mismatch), s)
+                .claude_statusline_times.unwrap().five_hour_confirmed_at,
+            None
+        );
+        let pct_mismatch = FiveHourConfirmation { used_percent: 19.0, ..valid_conf };
+        assert_eq!(
+            claude_with_receipt_info(base.clone(), Some(s - 30), Some(pct_mismatch), s)
+                .claude_statusline_times.unwrap().five_hour_confirmed_at,
+            None
+        );
+
+        // Weekly-only snapshot never surfaces a 5h confirmation.
+        let weekly_only = normalize_claude_statusline(
+            claude_store(None, Some((40.0, s + 86_400, s - 30))),
+            now,
+        );
+        assert_eq!(
+            claude_with_receipt_info(weekly_only, Some(s - 30), Some(valid_conf), s)
+                .claude_statusline_times.unwrap().five_hour_confirmed_at,
+            None
+        );
     }
 
     #[test]

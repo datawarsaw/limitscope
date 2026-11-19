@@ -1019,6 +1019,7 @@ mod tests {
             receipt_at: Some("2026-09-29T12:01:00Z".into()),
             five_hour_changed_at: None,
             seven_day_changed_at: None,
+            five_hour_confirmed_at: None,
         });
         assert!(harness.cycle(&[replay]).is_empty());
         assert!(harness.reopen().cycle(&[reading(81.0)]).is_empty());

@@ -61,7 +61,7 @@ const FIVE_HOUR_HORIZON_S: i64 = 6 * 3600;
 const SEVEN_DAY_HORIZON_S: i64 = 8 * 86_400;
 /// Two reset stamps this close describe the same window (server-side
 /// rounding between responses).
-const SAME_WINDOW_TOLERANCE_S: i64 = 300;
+pub(crate) const SAME_WINDOW_TOLERANCE_S: i64 = 300;
 /// Tolerated clock skew for stored observation times.
 const CLOCK_SKEW_S: i64 = 300;
 
@@ -324,28 +324,135 @@ fn replace_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Err(last.unwrap_or_else(|| std::io::Error::other("replace failed")))
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Receipt { timestamp: i64 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FiveHourConfirmation {
+    pub confirmed_at: i64,
+    pub resets_at: i64,
+    pub used_percent: f64,
+}
 
-fn receipt_raw(dir: &Path) -> Option<i64> {
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Receipt {
+    timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    five_hour_confirmed_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    five_hour_resets_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    five_hour_used_percent: Option<f64>,
+}
+
+impl Receipt {
+    fn validated_five_hour(&self, now_s: i64) -> Option<FiveHourConfirmation> {
+        let confirmed_at = self.five_hour_confirmed_at?;
+        let resets_at = self.five_hour_resets_at?;
+        let used_percent = self.five_hour_used_percent?;
+        if confirmed_at <= 0
+            || confirmed_at > now_s
+            || resets_at <= now_s
+            || resets_at > confirmed_at.saturating_add(FIVE_HOUR_HORIZON_S)
+            || !used_percent.is_finite()
+            || !(0.0..=100.0).contains(&used_percent)
+        {
+            return None;
+        }
+        Some(FiveHourConfirmation {
+            confirmed_at,
+            resets_at,
+            used_percent,
+        })
+    }
+}
+
+fn receipt_raw(dir: &Path) -> Option<Receipt> {
     let file = fs::File::open(dir.join(RECEIPT_FILE_NAME)).ok()?;
     let mut bytes = Vec::new();
-    file.take(129).read_to_end(&mut bytes).ok()?;
-    if bytes.len() > 128 { return None; }
+    file.take(257).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 256 { return None; }
     let receipt: Receipt = serde_json::from_slice(&bytes).ok()?;
-    (receipt.timestamp > 0).then_some(receipt.timestamp)
+    (receipt.timestamp > 0).then_some(receipt)
 }
 
+#[cfg(test)]
 pub(crate) fn read_receipt(dir: &Path, now_s: i64) -> Option<i64> {
-    receipt_raw(dir).filter(|stamp| *stamp <= now_s)
+    read_receipt_info(dir, now_s).0
 }
 
-fn record_receipt(dir: &Path, now_s: i64) -> std::io::Result<()> {
-    if now_s <= 0 || receipt_raw(dir).is_some_and(|old| now_s.saturating_sub(old) < 60) {
+pub(crate) fn read_receipt_info(dir: &Path, now_s: i64) -> (Option<i64>, Option<FiveHourConfirmation>) {
+    let Some(receipt) = receipt_raw(dir) else {
+        return (None, None);
+    };
+    let timestamp = (receipt.timestamp <= now_s).then_some(receipt.timestamp);
+    let five_hour = receipt.validated_five_hour(now_s);
+    (timestamp, five_hour)
+}
+
+/// Qualifies an incoming 5-hour payload against the active stored 5-hour window.
+/// Returns `(used_percent, canonical_resets_at)` only when the incoming reading
+/// is valid, matches the active window's reset identity (or opens a new window
+/// when none is active), and is non-regressing (`percent >= old.used_percent`).
+fn qualified_five_hour_confirmation(
+    old: Option<WindowReading>,
+    new: Option<(f64, i64)>,
+    now_s: i64,
+) -> Option<(f64, i64)> {
+    let (percent, resets_at) = new?;
+    let old = old.filter(|window| window.resets_at > now_s);
+    let Some(old) = old else {
+        return Some((percent, resets_at));
+    };
+    if (old.resets_at - resets_at).abs() <= SAME_WINDOW_TOLERANCE_S && percent >= old.used_percent {
+        Some((percent, old.resets_at))
+    } else {
+        None
+    }
+}
+
+fn record_receipt(
+    dir: &Path,
+    now_s: i64,
+    confirmed_five_hour: Option<(f64, i64)>,
+) -> std::io::Result<()> {
+    if now_s <= 0 {
         return Ok(());
     }
-    let bytes = serde_json::to_vec(&Receipt { timestamp: now_s })?;
+    let old = receipt_raw(dir);
+    if let Some(old_receipt) = old {
+        if now_s < old_receipt.timestamp {
+            return Ok(());
+        }
+        let timestamp_recent = now_s.saturating_sub(old_receipt.timestamp) < 60;
+        let five_hour_already_recent = match confirmed_five_hour {
+            None => true,
+            Some((pct, resets_at)) => old_receipt.validated_five_hour(now_s).is_some_and(|c| {
+                (c.resets_at - resets_at).abs() <= SAME_WINDOW_TOLERANCE_S
+                    && (c.used_percent - pct).abs() <= 1e-9
+                    && now_s.saturating_sub(c.confirmed_at) < 60
+            }),
+        };
+        if timestamp_recent && five_hour_already_recent {
+            return Ok(());
+        }
+    }
+    let (five_hour_confirmed_at, five_hour_resets_at, five_hour_used_percent) =
+        if let Some((pct, resets_at)) = confirmed_five_hour {
+            (Some(now_s), Some(resets_at), Some(pct))
+        } else if let Some(existing) = old.and_then(|r| r.validated_five_hour(now_s)) {
+            (
+                Some(existing.confirmed_at),
+                Some(existing.resets_at),
+                Some(existing.used_percent),
+            )
+        } else {
+            (None, None, None)
+        };
+    let bytes = serde_json::to_vec(&Receipt {
+        timestamp: now_s,
+        five_hour_confirmed_at,
+        five_hour_resets_at,
+        five_hour_used_percent,
+    })?;
     replace_file(&dir.join(RECEIPT_FILE_NAME), &bytes)
 }
 
@@ -372,10 +479,8 @@ pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
     if lock.lock().is_err() {
         return IngestOutcome::WriteFailed;
     }
-    // A sidecar failure must not suppress an otherwise valid quota update.
-    let _ = record_receipt(dir, now_s);
-    if no_limits { return IngestOutcome::NoRateLimits; }
     let path = store_path(dir);
+    let mut future_store = false;
     let stored = match read_store(dir, now_s) {
         StoreRead::Valid(snapshot) => snapshot,
         StoreRead::Missing => Snapshot::empty(),
@@ -389,11 +494,20 @@ pub(crate) fn ingest(dir: &Path, input: &[u8], now_s: i64) -> IngestOutcome {
                 .and_then(|value| value.get("version").and_then(Value::as_u64))
                 .is_some_and(|version| version > SCHEMA_VERSION);
             if future {
-                return IngestOutcome::StoreNotWritable;
+                future_store = true;
             }
             Snapshot::empty()
         }
     };
+    let confirmed_five_hour = if no_limits || future_store {
+        None
+    } else {
+        qualified_five_hour_confirmation(stored.five_hour, observed.five_hour, now_s)
+    };
+    // A sidecar failure must not suppress an otherwise valid quota update.
+    let _ = record_receipt(dir, now_s, confirmed_five_hour);
+    if no_limits { return IngestOutcome::NoRateLimits; }
+    if future_store { return IngestOutcome::StoreNotWritable; }
     let next = Snapshot {
         version: SCHEMA_VERSION,
         source: SOURCE.to_string(),
@@ -1007,5 +1121,84 @@ mod tests {
             assert_eq!((setup.command, setup.powershell_command, setup.settings_snippet), (None, None, None), "{hostile}");
         }
         assert_eq!(setup_for_executable(None).command, None);
+    }
+
+    #[test]
+    fn equal_valid_five_hour_confirms_receipt_without_advancing_observed_at() {
+        let dir = temp_dir("qualified-5h-equal");
+        let doc = payload(Some((20.0, NOW + 4000)), Some((40.0, NOW + 90_000)));
+        assert_eq!(ingest(&dir, &doc, NOW), IngestOutcome::Written);
+
+        // 20 minutes later (> 15m): identical 5h payload keeps snapshot unchanged
+        // (observed_at stays NOW) while advancing qualified 5h confirmation.
+        let later = NOW + 1200;
+        assert_eq!(ingest(&dir, &doc, later), IngestOutcome::Unchanged);
+        let StoreRead::Valid(snapshot) = read_store(&dir, later) else { panic!() };
+        assert_eq!(snapshot.five_hour.unwrap().observed_at, NOW);
+        let (receipt, conf) = read_receipt_info(&dir, later);
+        assert_eq!(receipt, Some(later));
+        assert_eq!(
+            conf,
+            Some(FiveHourConfirmation {
+                confirmed_at: later,
+                resets_at: NOW + 4000,
+                used_percent: 20.0,
+            })
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn generic_hook_weekly_only_lagging_and_mismatched_reset_never_confirm_five_hour() {
+        let dir = temp_dir("qualified-5h-guards");
+        // Seed active 5h = 30%, resets_at = NOW + 4000 at NOW.
+        assert_eq!(
+            ingest(&dir, &payload(Some((30.0, NOW + 4000)), None), NOW),
+            IngestOutcome::Written
+        );
+        let initial_conf = FiveHourConfirmation {
+            confirmed_at: NOW,
+            resets_at: NOW + 4000,
+            used_percent: 30.0,
+        };
+        assert_eq!(read_receipt_info(&dir, NOW).1, Some(initial_conf));
+
+        // 1. Generic hook (no rate_limits) after 100s advances receiptAt but NOT 5h confirmation.
+        let cli = br#"{"session_id":"synthetic","model":{"id":"synthetic"}}"#;
+        assert_eq!(ingest(&dir, cli, NOW + 100), IngestOutcome::NoRateLimits);
+        assert_eq!(read_receipt_info(&dir, NOW + 100), (Some(NOW + 100), Some(initial_conf)));
+
+        // 2. Weekly-only payload advances receiptAt and stores 7d, does NOT advance 5h confirmation.
+        assert_eq!(
+            ingest(&dir, &payload(None, Some((10.0, NOW + 80_000))), NOW + 200),
+            IngestOutcome::Written
+        );
+        assert_eq!(read_receipt_info(&dir, NOW + 200), (Some(NOW + 200), Some(initial_conf)));
+
+        // 3. Lagging lower-percent 5h sample does NOT advance 5h confirmation.
+        assert_eq!(
+            ingest(&dir, &payload(Some((25.0, NOW + 4001)), None), NOW + 300),
+            IngestOutcome::Unchanged
+        );
+        assert_eq!(read_receipt_info(&dir, NOW + 300), (Some(NOW + 300), Some(initial_conf)));
+
+        // 4. Ambiguous / mismatched reset while old window is open does NOT advance 5h confirmation.
+        assert_eq!(
+            ingest(&dir, &payload(Some((50.0, NOW + 8000)), None), NOW + 400),
+            IngestOutcome::Unchanged
+        );
+        assert_eq!(read_receipt_info(&dir, NOW + 400), (Some(NOW + 400), Some(initial_conf)));
+
+        // 5. After window expires, expired confirmation is rejected on read.
+        assert_eq!(read_receipt_info(&dir, NOW + 4000).1, None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn old_receipt_format_degrades_conservatively_without_five_hour_confirmation() {
+        let dir = temp_dir("old-receipt");
+        fs::write(dir.join(RECEIPT_FILE_NAME), format!("{{\"timestamp\":{NOW}}}")).unwrap();
+        assert_eq!(read_receipt_info(&dir, NOW + 30), (Some(NOW), None));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

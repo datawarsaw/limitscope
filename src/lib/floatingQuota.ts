@@ -624,6 +624,7 @@ function stateFor(
  */
 export function floatingQuotaItems(
   usages: readonly ProviderUsage[],
+  now: Date = new Date(),
 ): FloatingQuotaItem[] {
   const items: FloatingQuotaItem[] = [];
   const seen = new Set<string>();
@@ -632,7 +633,8 @@ export function floatingQuotaItems(
     if (seen.has(usage.id)) continue;
     seen.add(usage.id);
 
-    const status = providerStatusPresentation(usage);
+    const status = providerStatusPresentation(usage, now);
+    const isClaude = baseProviderId(usage.id) === CLAUDE_CODE_PROVIDER_ID;
     const primary = floatingPrimaryWindow(usage);
     const hasWindow = primary !== undefined;
     // The runtime's own Grok Bot observation, so the floating card shows the
@@ -663,7 +665,9 @@ export function floatingQuotaItems(
       ...(grokBot ? { grokBot } : {}),
       ...(usage.mistralBudgets ? { mistralBudgets: usage.mistralBudgets } : {}),
       ...(usage.resetCredits ? { resetCredits: usage.resetCredits } : {}),
-      stale: isStaleSnapshot(usage) || status.className === "stale",
+      stale: isClaude
+        ? status.className === "stale"
+        : isStaleSnapshot(usage) || status.className === "stale",
       statusLabel: status.label,
       ...(usage.id === "claude-code" ? { claudeStatuslineTimes: usage.claudeStatuslineTimes } : {}),
       statusClass: status.className,

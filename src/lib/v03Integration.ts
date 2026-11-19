@@ -21,11 +21,6 @@ export type ProviderStatusPresentation = {
   className: "ok" | "stale" | "error" | "unknown" | "mock" | "paused";
 };
 
-export type ClaudeWindowFreshness = {
-  label: string;
-  className: "ok" | "stale" | "unknown";
-};
-
 const CLAUDE_WINDOW_FRESH_MS = 15 * 60 * 1000;
 
 function validTime(value: string | undefined): string | undefined {
@@ -33,57 +28,38 @@ function validTime(value: string | undefined): string | undefined {
   return value;
 }
 
-function formatCompactFreshnessAge(ageMs: number): string {
-  const totalMinutes = Math.floor(ageMs / 60_000);
-  if (totalMinutes < 60) return `${totalMinutes}m`;
-  const totalHours = Math.floor(totalMinutes / 60);
-  if (totalHours < 24) return `${totalHours}h`;
-  return `${Math.floor(totalHours / 24)}d`;
-}
-
-/**
- * Derives presentation-only per-window freshness for Claude Code's 5-hour
- * and 7-day quota rows from `claudeStatuslineTimes` using the same 15-minute
- * threshold as the Rust runtime. Missing, invalid, or future timestamps fail
- * closed as "Unknown", never fresh; returns null for non-Claude providers or
- * other window labels.
- */
-export function claudeWindowFreshness(
-  providerId: string,
-  windowLabel: string,
-  times: ProviderUsage["claudeStatuslineTimes"] | undefined,
-  now: Date,
-): ClaudeWindowFreshness | null {
-  if (baseProviderId(providerId) !== CLAUDE_CODE_PROVIDER_ID) return null;
-  const normalizedLabel = windowLabel.trim().toLowerCase();
-  let changedAt: string | undefined;
-  if (normalizedLabel === "5-hour") {
-    changedAt = times?.fiveHourChangedAt;
-  } else if (normalizedLabel === "7-day") {
-    changedAt = times?.sevenDayChangedAt;
-  } else {
-    return null;
-  }
-
-  if (!changedAt) {
-    return { label: "Unknown", className: "unknown" };
-  }
-  const changedMs = Date.parse(changedAt);
+function isClaudeFiveHourRecent(usage: ProviderUsage, now: Date): boolean {
   const nowMs = now.getTime();
-  if (!Number.isFinite(changedMs) || !Number.isFinite(nowMs)) {
-    return { label: "Unknown", className: "unknown" };
+  if (!Number.isFinite(nowMs)) return false;
+
+  const fiveHour = usage.limits.find(
+    (limit) => limit.label.trim().toLowerCase() === "5-hour",
+  );
+  if (!fiveHour) return false;
+  if (
+    !Number.isFinite(fiveHour.usedPercent) ||
+    fiveHour.usedPercent < 0 ||
+    fiveHour.usedPercent > 100
+  ) {
+    return false;
   }
-  const ageMs = nowMs - changedMs;
-  if (ageMs < 0) {
-    return { label: "Unknown", className: "unknown" };
-  }
-  if (ageMs <= CLAUDE_WINDOW_FRESH_MS) {
-    return { label: "Recent", className: "ok" };
-  }
-  return {
-    label: `Last known \u00b7 ${formatCompactFreshnessAge(ageMs)}`,
-    className: "stale",
-  };
+  const resetAt = validTime(fiveHour.resetAt);
+  if (!resetAt || Date.parse(resetAt) <= nowMs) return false;
+
+  // Prefer the qualified 5h confirmation timestamp; old receipts without
+  // fiveHourConfirmedAt degrade conservatively to 5h observedAt
+  // (fiveHourChangedAt). Generic receiptAt is never used because statusLine
+  // hooks can fire without rate_limits.
+  const confirmedAt = validTime(usage.claudeStatuslineTimes?.fiveHourConfirmedAt);
+  const changedAt = validTime(usage.claudeStatuslineTimes?.fiveHourChangedAt);
+  const candidates = [confirmedAt, changedAt]
+    .filter((value): value is string => value !== undefined)
+    .map((value) => Date.parse(value))
+    .filter((ms) => Number.isFinite(ms) && ms <= nowMs);
+
+  if (candidates.length === 0) return false;
+  const latestFiveHourMs = Math.max(...candidates);
+  return nowMs - latestFiveHourMs <= CLAUDE_WINDOW_FRESH_MS;
 }
 
 export function claudeTimesNote(times: ProviderUsage["claudeStatuslineTimes"], now: Date): string {
@@ -165,9 +141,14 @@ export function visiblePrediction(
  * visual class — it never reconstructs health from other fields. The
  * freshness branch (`Cached`) stays because a live fetch from a cached
  * source snapshot is exactly a live health with a fresh verdict.
+ *
+ * Exception (presentation-only): for Claude Code's passive statusLine source,
+ * the top status badge and provider icon reflect the 5-hour window's own
+ * confirmation recency (15-minute cutoff), independent of 7-day window age.
  */
 export function providerStatusPresentation(
   usage: ProviderUsage,
+  now: Date = new Date(),
 ): ProviderStatusPresentation {
   if (usage.simulated) return { label: "Mock", className: "mock" };
   // A paused account is not a failure and not a live reading: the runtime
@@ -179,9 +160,9 @@ export function providerStatusPresentation(
   if (usage.health === "error") return { label: "Refresh failed", className: "error" };
   if (usage.health === "cooldown") return { label: "Cooldown", className: "error" };
   if (usage.health === "unavailable") return { label: "Unavailable", className: "error" };
-  if (usage.id === "claude-code") {
+  if (baseProviderId(usage.id) === CLAUDE_CODE_PROVIDER_ID) {
     if (usage.health === "unknown") return { label: "Unknown", className: "unknown" };
-    return usage.health === "live" && usage.dataFreshness === "fresh" && validTime(usage.sourceUpdatedAt)
+    return isClaudeFiveHourRecent(usage, now)
       ? { label: "Recent", className: "ok" }
       : { label: "Last known", className: "stale" };
   }

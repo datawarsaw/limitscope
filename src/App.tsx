@@ -390,6 +390,7 @@ export default function App() {
               orientation={layout === "narrow" ? "horizontal" : "vertical"}
               controlsId={view === "insights" ? "usage-panel" : "provider-panel"}
               perspective={settings.quotaPerspective}
+              now={now}
             />
             {view === "insights" ? (
               <main
