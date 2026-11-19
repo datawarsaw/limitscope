@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { CSSProperties, FocusEvent } from "react";
 import { formatCountdown } from "../lib/format";
-import { claudeTimesNote } from "../lib/v03Integration";
+import { claudeTimesNote, claudeWindowFreshness } from "../lib/v03Integration";
 import type { FloatingQuotaItem } from "../lib/floatingQuota";
 import {
   FLOATING_QUOTA_PERSPECTIVE,
@@ -52,6 +52,7 @@ function primaryResetLine(
 function WindowRow({
   item,
   label,
+  rawLabel,
   usedPercent,
   resetAt,
   resetText,
@@ -59,6 +60,7 @@ function WindowRow({
 }: {
   item: FloatingQuotaItem;
   label: string;
+  rawLabel: string;
   usedPercent: number;
   resetAt: string | null;
   resetText?: string;
@@ -69,6 +71,12 @@ function WindowRow({
     FLOATING_QUOTA_PERSPECTIVE,
   );
   const countdown = resetAt ? formatCountdown(resetAt, now) : null;
+  const freshness = claudeWindowFreshness(
+    item.providerId,
+    rawLabel,
+    item.claudeStatuslineTimes,
+    now,
+  );
   return (
     <div className="fq-window-row" key={label}>
       <span className="fq-window-label">{label}</span>
@@ -87,6 +95,14 @@ function WindowRow({
             </span>
           ) : null}
           {resetText ? <span className="fq-observed-reset">{` · At observation: ${resetText}`}</span> : null}
+          {freshness ? (
+            <span
+              className={`window-freshness-badge window-freshness-${freshness.className}`}
+              aria-label={`${label} freshness: ${freshness.label}`}
+            >
+              {freshness.label}
+            </span>
+          ) : null}
         </p>
         <span
           className="fq-meter fq-meter-row"
@@ -244,6 +260,7 @@ export function FloatingProviderPopover({
                 key={window.label}
                 item={item}
                 label={floatingDetailRowLabel(item.providerId, window.label)}
+                rawLabel={window.label}
                 usedPercent={window.usedPercent}
                 resetAt={window.resetAt}
                 resetText={window.resetText}

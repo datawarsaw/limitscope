@@ -4,6 +4,7 @@ import type { QuotaObservation } from "./quotaHistory";
 import type { ProviderUsage } from "../types";
 import { formatTime } from "./format";
 import {
+  claudeWindowFreshness,
   historyForCurrentAccounts,
   predictionBasisLabel,
   providerSourceNote,
@@ -383,5 +384,103 @@ describe("global refresh outcome", () => {
       usage({ id: "a", status: "error", health: "error" }),
       usage({ id: "b" }),
     ])).toBe(true);
+  });
+});
+
+describe("claudeWindowFreshness", () => {
+  const fixedNow = new Date("2026-11-17T12:00:00.000Z");
+
+  it("handles 5h recent / 7d stale (screenshot case) and reverse", () => {
+    const times = {
+      receiptAt: "2026-11-17T11:59:30.000Z",
+      fiveHourChangedAt: "2026-11-17T11:59:30.000Z",
+      sevenDayChangedAt: "2026-11-17T10:00:00.000Z",
+    };
+    expect(claudeWindowFreshness("claude-code", "5-hour", times, fixedNow)).toEqual({
+      label: "Recent",
+      className: "ok",
+    });
+    expect(claudeWindowFreshness("claude-code", "7-day", times, fixedNow)).toEqual({
+      label: "Last known · 2h",
+      className: "stale",
+    });
+
+    const reversed = {
+      fiveHourChangedAt: "2026-11-17T11:40:00.000Z",
+      sevenDayChangedAt: "2026-11-17T11:58:00.000Z",
+    };
+    expect(claudeWindowFreshness("claude-code", "5-hour", reversed, fixedNow)).toEqual({
+      label: "Last known · 20m",
+      className: "stale",
+    });
+    expect(claudeWindowFreshness("claude-code", "7-day", reversed, fixedNow)).toEqual({
+      label: "Recent",
+      className: "ok",
+    });
+  });
+
+  it("enforces the 15-minute threshold consistent with Rust", () => {
+    const times = {
+      fiveHourChangedAt: "2026-11-17T11:45:00.000Z", // exactly 15m -> Recent
+      sevenDayChangedAt: "2026-11-17T11:44:59.000Z", // 15m 1s -> stale
+    };
+    expect(claudeWindowFreshness("claude-code", "5-hour", times, fixedNow)).toEqual({
+      label: "Recent",
+      className: "ok",
+    });
+    expect(claudeWindowFreshness("claude-code", "7-day", times, fixedNow)).toEqual({
+      label: "Last known · 15m",
+      className: "stale",
+    });
+  });
+
+  it("handles both recent and both stale", () => {
+    expect(
+      claudeWindowFreshness(
+        "claude-code",
+        "5-hour",
+        { fiveHourChangedAt: "2026-11-17T11:50:00.000Z" },
+        fixedNow,
+      ),
+    ).toEqual({ label: "Recent", className: "ok" });
+    expect(
+      claudeWindowFreshness(
+        "claude-code",
+        "7-day",
+        { sevenDayChangedAt: "2026-11-15T10:00:00.000Z" },
+        fixedNow,
+      ),
+    ).toEqual({ label: "Last known · 2d", className: "stale" });
+  });
+
+  it("treats missing, invalid, and future timestamps as Unknown, never fresh", () => {
+    expect(claudeWindowFreshness("claude-code", "5-hour", undefined, fixedNow)).toEqual({
+      label: "Unknown",
+      className: "unknown",
+    });
+    expect(
+      claudeWindowFreshness("claude-code", "7-day", { sevenDayChangedAt: "" }, fixedNow),
+    ).toEqual({ label: "Unknown", className: "unknown" });
+    expect(
+      claudeWindowFreshness("claude-code", "5-hour", { fiveHourChangedAt: "not-a-date" }, fixedNow),
+    ).toEqual({ label: "Unknown", className: "unknown" });
+    expect(
+      claudeWindowFreshness(
+        "claude-code",
+        "7-day",
+        { sevenDayChangedAt: "2026-11-17T12:00:01.000Z" },
+        fixedNow,
+      ),
+    ).toEqual({ label: "Unknown", className: "unknown" });
+  });
+
+  it("returns null for non-Claude providers and non-5h/7d windows", () => {
+    const times = {
+      fiveHourChangedAt: "2026-11-17T11:59:00.000Z",
+      sevenDayChangedAt: "2026-11-17T11:59:00.000Z",
+    };
+    expect(claudeWindowFreshness("codex", "5-hour", times, fixedNow)).toBeNull();
+    expect(claudeWindowFreshness("opendesign", "7-day", times, fixedNow)).toBeNull();
+    expect(claudeWindowFreshness("claude-code", "Monthly", times, fixedNow)).toBeNull();
   });
 });

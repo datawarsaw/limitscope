@@ -1,6 +1,7 @@
 import type { QuotaObservation } from "./quotaHistory";
 import type { QuotaPrediction } from "./prediction/types";
 import { formatAge, formatTime } from "./format";
+import { baseProviderId, CLAUDE_CODE_PROVIDER_ID } from "./providerIds";
 import type { ProviderUsage } from "../types";
 
 export type ProviderStatusPresentation = {
@@ -20,9 +21,69 @@ export type ProviderStatusPresentation = {
   className: "ok" | "stale" | "error" | "unknown" | "mock" | "paused";
 };
 
+export type ClaudeWindowFreshness = {
+  label: string;
+  className: "ok" | "stale" | "unknown";
+};
+
+const CLAUDE_WINDOW_FRESH_MS = 15 * 60 * 1000;
+
 function validTime(value: string | undefined): string | undefined {
   if (!value || Number.isNaN(Date.parse(value))) return undefined;
   return value;
+}
+
+function formatCompactFreshnessAge(ageMs: number): string {
+  const totalMinutes = Math.floor(ageMs / 60_000);
+  if (totalMinutes < 60) return `${totalMinutes}m`;
+  const totalHours = Math.floor(totalMinutes / 60);
+  if (totalHours < 24) return `${totalHours}h`;
+  return `${Math.floor(totalHours / 24)}d`;
+}
+
+/**
+ * Derives presentation-only per-window freshness for Claude Code's 5-hour
+ * and 7-day quota rows from `claudeStatuslineTimes` using the same 15-minute
+ * threshold as the Rust runtime. Missing, invalid, or future timestamps fail
+ * closed as "Unknown", never fresh; returns null for non-Claude providers or
+ * other window labels.
+ */
+export function claudeWindowFreshness(
+  providerId: string,
+  windowLabel: string,
+  times: ProviderUsage["claudeStatuslineTimes"] | undefined,
+  now: Date,
+): ClaudeWindowFreshness | null {
+  if (baseProviderId(providerId) !== CLAUDE_CODE_PROVIDER_ID) return null;
+  const normalizedLabel = windowLabel.trim().toLowerCase();
+  let changedAt: string | undefined;
+  if (normalizedLabel === "5-hour") {
+    changedAt = times?.fiveHourChangedAt;
+  } else if (normalizedLabel === "7-day") {
+    changedAt = times?.sevenDayChangedAt;
+  } else {
+    return null;
+  }
+
+  if (!changedAt) {
+    return { label: "Unknown", className: "unknown" };
+  }
+  const changedMs = Date.parse(changedAt);
+  const nowMs = now.getTime();
+  if (!Number.isFinite(changedMs) || !Number.isFinite(nowMs)) {
+    return { label: "Unknown", className: "unknown" };
+  }
+  const ageMs = nowMs - changedMs;
+  if (ageMs < 0) {
+    return { label: "Unknown", className: "unknown" };
+  }
+  if (ageMs <= CLAUDE_WINDOW_FRESH_MS) {
+    return { label: "Recent", className: "ok" };
+  }
+  return {
+    label: `Last known \u00b7 ${formatCompactFreshnessAge(ageMs)}`,
+    className: "stale",
+  };
 }
 
 export function claudeTimesNote(times: ProviderUsage["claudeStatuslineTimes"], now: Date): string {
