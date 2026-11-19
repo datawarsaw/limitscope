@@ -631,49 +631,8 @@ body {
   gap: 8px;
 }
 
-.limit-label-group {
-  display: inline-flex;
-  align-items: baseline;
-  flex-wrap: wrap;
-  gap: 6px;
-  min-width: 0;
-}
-
 .limit-label {
   font-size: 11.5px;
-  color: var(--text-dim);
-}
-
-.window-freshness-badge {
-  display: inline-flex;
-  align-items: center;
-  padding: 1px 6px;
-  border-radius: 999px;
-  border: 1px solid var(--card-border);
-  background: transparent;
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 1.35;
-  white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
-
-.fq-window-line .window-freshness-badge {
-  margin-left: 6px;
-  vertical-align: baseline;
-}
-
-.window-freshness-ok {
-  color: var(--green);
-  border-color: rgba(52, 211, 153, 0.3);
-}
-
-.window-freshness-stale {
-  color: var(--amber);
-  border-color: rgba(251, 191, 36, 0.3);
-}
-
-.window-freshness-unknown {
   color: var(--text-dim);
 }
 

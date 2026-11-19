@@ -262,6 +262,7 @@ export type ProviderUsage = {
     receiptAt?: string;
     fiveHourChangedAt?: string;
     sevenDayChangedAt?: string;
+    fiveHourConfirmedAt?: string;
   };
   /**
    * Provider-specific banked reset-credit observation (v0.7, Codex only).

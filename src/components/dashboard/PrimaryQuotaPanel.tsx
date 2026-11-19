@@ -43,7 +43,7 @@ export function PrimaryQuotaPanel({
   ) => QuotaPrediction | undefined;
   perspective: QuotaPerspective;
 }) {
-  const status = providerStatusPresentation(usage);
+  const status = providerStatusPresentation(usage, now);
   const primary = primaryQuotaWindow(usage);
   const presentation = mainQuotaPresentation(primary?.usedPercent, usage.id === "opendesign" ? "remaining" : perspective);
   const tone = primary === undefined ? "calm" : toneFor(primary.usedPercent);

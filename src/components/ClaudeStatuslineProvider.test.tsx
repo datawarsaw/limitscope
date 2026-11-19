@@ -111,44 +111,75 @@ describe("Claude Code provider presentation", () => {
     expect(note).toContain("5h usage changed: 2m ago");
     expect(note).toContain("7d usage changed: 4h ago");
     expect(note).toContain("does not confirm a quota refresh");
-    expect(providerStatusPresentation(live).label).toBe("Recent");
+    expect(providerStatusPresentation(live, now).label).toBe("Recent");
     expect(providerSourceNote(noData, now)).toContain("Last statusLine event: Unknown");
     expect(providerStatusPresentation(noData).label).toBe("Unavailable");
   });
 
   it("shows idle data as stale, not live", () => {
-    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
-    expect(providerStatusPresentation(stale).label).toBe("Last known");
+    const stale: ProviderUsage = {
+      ...live,
+      health: "stale",
+      status: "stale",
+      dataFreshness: "stale",
+      claudeStatuslineTimes: {
+        receiptAt: "2026-11-17T11:59:00Z",
+        fiveHourChangedAt: "2026-11-17T11:40:00Z",
+        sevenDayChangedAt: "2026-11-17T08:00:00Z",
+      },
+    };
+    expect(providerStatusPresentation(stale, now).label).toBe("Last known");
     expect(providerSourceNote({ ...stale, sourceUpdatedAt: "2026-11-17T11:42:00Z" }, now)).toContain("7d usage changed: 4h ago");
-    expect(floatingQuotaItems([stale])[0].statusLabel).toBe("Last known");
+    expect(floatingQuotaItems([stale], now)[0].statusLabel).toBe("Last known");
   });
 
   it("preserves unknown health and does not claim a check time for missing source data", () => {
     expect(providerStatusPresentation({ ...live, health: "unknown" })).toEqual({ label: "Unknown", className: "unknown" });
-    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale" };
+    const stale: ProviderUsage = {
+      ...live,
+      health: "stale",
+      status: "stale",
+      dataFreshness: "stale",
+      claudeStatuslineTimes: {
+        receiptAt: "2026-11-17T11:59:00Z",
+        fiveHourChangedAt: "2026-11-17T11:40:00Z",
+        sevenDayChangedAt: "2026-11-17T08:00:00Z",
+      },
+    };
     for (const usage of [
       { ...stale, sourceUpdatedAt: undefined },
       { ...stale, sourceUpdatedAt: "invalid" },
       { ...stale, limits: [] },
     ]) {
-      expect(providerStatusPresentation(usage).label).toBe("Last known");
+      expect(providerStatusPresentation(usage, now).label).toBe("Last known");
       expect(providerSourceNote(usage, now)).toContain("Last statusLine event: 1m ago");
     }
   });
 
   it("shows last known age and retained values on both surfaces", async () => {
     invoke.mockResolvedValue(setupInfo);
-    const stale: ProviderUsage = { ...live, health: "stale", status: "stale", dataFreshness: "stale", sourceUpdatedAt: "2026-11-17T11:42:00Z" };
+    const stale: ProviderUsage = {
+      ...live,
+      health: "stale",
+      status: "stale",
+      dataFreshness: "stale",
+      sourceUpdatedAt: "2026-11-17T11:42:00Z",
+      claudeStatuslineTimes: {
+        receiptAt: "2026-11-17T11:59:00Z",
+        fiveHourChangedAt: "2026-11-17T11:40:00Z",
+        sevenDayChangedAt: "2026-11-17T08:00:00Z",
+      },
+    };
     await render(<PrimaryQuotaPanel usage={stale} now={now} predictionFor={() => undefined} perspective="used" />);
     expect(container.textContent).toContain("Last known");
     expect(container.textContent).toContain("7d usage changed: 4h ago");
     expect(container.textContent).toContain("41% used");
-    await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
+    await render(<FloatingProviderPopover item={floatingQuotaItems([stale], now)[0]} pinned={false} now={now} note={null} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.textContent).toContain("Last known");
     expect(container.textContent).toContain("7d usage changed: 4h ago");
     expect(container.textContent).toContain("does not confirm a quota refresh");
     const note = providerSourceNote(stale, now, { includeAccount: false });
-    await render(<FloatingProviderPopover item={floatingQuotaItems([stale])[0]} pinned={false} now={now} note={note} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
+    await render(<FloatingProviderPopover item={floatingQuotaItems([stale], now)[0]} pinned={false} now={now} note={note} align={0} exiting={false} onMouseEnter={() => {}} onMouseLeave={() => {}} onFocus={() => {}} onBlur={() => {}} />);
     expect(container.textContent).toContain("Last known");
     expect(container.textContent?.match(/Last statusLine event/g)).toHaveLength(1);
     expect(container.textContent).toContain("does not confirm a quota refresh");

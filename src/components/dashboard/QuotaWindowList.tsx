@@ -3,7 +3,7 @@ import { ZCodePlanGroups } from "./ZCodePlanGroups";
 import { GrokBotPanel } from "./GrokBotPanel";
 import { toneFor, usableQuotaWindows } from "../../lib/dashboard";
 import { formatResetLine } from "../../lib/format";
-import { claudeWindowFreshness, visiblePrediction } from "../../lib/v03Integration";
+import { visiblePrediction } from "../../lib/v03Integration";
 import type { QuotaPrediction } from "../../lib/prediction/types";
 import type { LimitWindow, ProviderUsage } from "../../types";
 import {
@@ -78,7 +78,6 @@ function WindowRow({
   const presentation = mainQuotaPresentation(limit.usedPercent, usage.id === "opendesign" ? "remaining" : perspective);
   const tone = toneFor(limit.usedPercent);
   const resetLine = limit.resetText ? `At observation: ${limit.resetText}` : limit.resetAt ? formatResetLine(limit.resetAt, now) : null;
-  const freshness = claudeWindowFreshness(usage.id, limit.label, usage.claudeStatuslineTimes, now);
   const prediction = visiblePrediction(
     usage,
     limit.usedPercent,
@@ -87,17 +86,7 @@ function WindowRow({
   return (
     <div className="limit">
       <div className="limit-row">
-        <span className="limit-label-group">
-          <span className="limit-label">{limit.label}</span>
-          {freshness ? (
-            <span
-              className={`window-freshness-badge window-freshness-${freshness.className}`}
-              aria-label={`${limit.label} freshness: ${freshness.label}`}
-            >
-              {freshness.label}
-            </span>
-          ) : null}
-        </span>
+        <span className="limit-label">{limit.label}</span>
         <span className={`limit-percent tone-${tone}`}>{presentation.label}</span>
       </div>
       <div

@@ -30,6 +30,7 @@ export function ProviderRail({
   orientation = "vertical",
   controlsId = "provider-panel",
   perspective,
+  now = new Date(),
 }: {
   usages: readonly ProviderUsage[];
   selectedId: string | null;
@@ -39,6 +40,7 @@ export function ProviderRail({
   /** id of the region the rail entries control (varies by view). */
   controlsId?: string;
   perspective: QuotaPerspective;
+  now?: Date;
 }) {
   const entries = providerRailEntries(usages);
   const listRef = useRef<HTMLDivElement>(null);
@@ -118,6 +120,7 @@ export function ProviderRail({
             onKeyDown={onKeyDown}
             controlsId={controlsId}
             perspective={perspective}
+            now={now}
           />
         ))}
       </div>
@@ -133,6 +136,7 @@ function RailItem({
   onKeyDown,
   controlsId,
   perspective,
+  now,
 }: {
   entry: ProviderRailEntry;
   selected: boolean;
@@ -141,9 +145,10 @@ function RailItem({
   onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => void;
   controlsId: string;
   perspective: QuotaPerspective;
+  now: Date;
 }) {
   const { usage, shortName, mark, primary, percent } = entry;
-  const status = providerStatusPresentation(usage);
+  const status = providerStatusPresentation(usage, now);
   const presentation = mainQuotaPresentation(primary?.usedPercent, entry.usage.id === "opendesign" ? "remaining" : perspective);
   const tone = percent === undefined ? undefined : toneFor(percent);
   const meterWidth = Math.min(100, Math.max(0, presentation.meterPercent ?? 0));
