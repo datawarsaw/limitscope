@@ -90,29 +90,44 @@ const card = (item: ReturnType<typeof floatingQuotaItems>[number]) => (
 );
 
 /**
- * The published Mistral pixel-cat emblem in Mistral's published WHITE
- * monochrome variant, as it stands in Mistral's own 2026 brand kit:
+ * The published Mistral pixel-cat emblem GEOMETRY, as it stands in
+ * Mistral's own 2026 brand kit:
  * Icon/Monochrome/RGB/SVG/Icon-Mistral-White.svg
  * (sha256 65b6edef03c108849cea04b82017882624be60e641f0fa9dff72800b4a6c83b5),
  * fetched from https://mistral.ai/cms-media/api/media/file/Mistral_Logos_2026.zip
  * and linked from https://mistral.ai/brand/ . The viewBox is the published
- * one, so the emblem keeps the brand's own clearspace, and the ten rects
- * are the gradient variant's ten rects with the published white fill.
+ * one, so the emblem keeps the brand's own clearspace, and the ten rects are
+ * the gradient variant's ten rects with the published white fill.
+ *
+ * GEOMETRY AND FILL ARE SEPARATE CLAIMS. The geometry below is Mistral's
+ * published one and is what the mark still ships, unchanged and unpinned
+ * from the brand's own placement. The FILL is a LimitScope UI adaptation:
+ * the mark inherits the same muted tone as every neighbouring provider mark
+ * instead of carrying a literal white cut-out.
  */
 const PUBLISHED_VIEWBOX = "0 0 162 162";
 
-const PUBLISHED_PIXELS: [number, number, number, number, string][] = [
-  [31, 31, 20, 20, "white"],
-  [111, 31, 20, 20, "white"],
-  [71, 91, 20, 20, "white"],
-  [31, 91, 20, 20, "white"],
-  [111, 91, 20, 20, "white"],
-  [31, 51, 40, 20, "white"],
-  [11, 111, 60, 20, "white"],
-  [91, 111, 60, 20, "white"],
-  [31, 71, 100, 20, "white"],
-  [91, 51, 40, 20, "white"],
+/** The ten published pixels: x, y, width, height, in the published order. */
+const PUBLISHED_GEOMETRY: [number, number, number, number][] = [
+  [31, 31, 20, 20],
+  [111, 31, 20, 20],
+  [71, 91, 20, 20],
+  [31, 91, 20, 20],
+  [111, 91, 20, 20],
+  [31, 51, 40, 20],
+  [11, 111, 60, 20],
+  [91, 111, 60, 20],
+  [31, 71, 100, 20],
+  [91, 51, 40, 20],
 ];
+
+/**
+ * The fill the mark ships: the slot's own inherited colour. The neighbouring
+ * provider marks use the same keyword, so the browser resolves every mark in
+ * the deck from the same `color` property and no mark can drift into its own
+ * private tone.
+ */
+const INHERITED_FILL = "currentColor";
 
 /** The gradient variant's published stops, which must not reach the mark. */
 const REJECTED_GRADIENT_STOPS = [
@@ -124,6 +139,8 @@ const REJECTED_GRADIENT_STOPS = [
 ];
 
 /** Reads the emblem back out of the DOM, pixel by pixel. */
+type EmblemRect = [number, number, number, number, string | null];
+
 const readEmblem = (
   view: { container: HTMLElement },
   selector = ".fq-mark svg",
@@ -131,7 +148,9 @@ const readEmblem = (
   const svg = view.container.querySelector(selector);
   expect(svg).not.toBeNull();
   expect(svg?.getAttribute("viewBox")).toBe(PUBLISHED_VIEWBOX);
-  const rects = Array.from(svg?.querySelectorAll("rect") ?? []).map((rect) => [
+  const rects: EmblemRect[] = Array.from(
+    svg?.querySelectorAll("rect") ?? [],
+  ).map((rect) => [
     Number(rect.getAttribute("x")),
     Number(rect.getAttribute("y")),
     Number(rect.getAttribute("width")),
@@ -141,18 +160,22 @@ const readEmblem = (
   return { svg, rects };
 };
 
+/** The ten rects' geometry, without the fill, for a geometry-only compare. */
+const geometryOf = (rects: EmblemRect[]): [number, number, number, number][] =>
+  rects.map(([x, y, width, height]) => [x, y, width, height]);
+
 afterEach(cleanup);
 
 describe("Mistral provider mark", () => {
-  it("draws the published pixel-cat emblem on the collapsed segment", () => {
+  it("draws the published pixel-cat geometry on the collapsed segment", () => {
     const [item] = floatingQuotaItems([mistral], now);
     const view = render(segment(item));
 
     const { rects } = readEmblem(view);
 
-    // The ten published pixels, in the published places and in the
-    // published colours: the emblem is the asset, not a redraw of it.
-    expect(rects).toEqual(PUBLISHED_PIXELS);
+    // The ten published pixels, in the published places: the emblem is the
+    // official geometry, not a redraw of it.
+    expect(geometryOf(rects)).toEqual(PUBLISHED_GEOMETRY);
 
     // The "MI" monogram is gone: no letter fallback stands in for the mark.
     expect(view.container.querySelector(".fq-mark-fallback")).toBeNull();
@@ -164,41 +187,60 @@ describe("Mistral provider mark", () => {
     const view = render(segment(item));
 
     const { rects } = readEmblem(view);
-    expect(rects).toEqual(PUBLISHED_PIXELS);
+    expect(geometryOf(rects)).toEqual(PUBLISHED_GEOMETRY);
+    expect(rects.every((rect) => rect[4] === INHERITED_FILL)).toBe(true);
     expect(view.container.querySelector(".fq-mark-fallback")).toBeNull();
   });
 
-  it("draws the mark in one published white fill, with no gradient and no multicolour", () => {
+  it("inherits the slot's muted tone instead of a published white fill", () => {
     const view = render(<ProviderMark id="mistral" />);
     const { svg, rects } = readEmblem(view, "svg");
 
-    // One colour, the published one: the emblem is white, so the mark
-    // reads as a monochrome silhouette like every other mark in the deck.
-    expect(svg?.querySelector('[fill="currentColor"]')).toBeNull();
-    expect(new Set(rects.map((rect) => rect[4]))).toEqual(new Set(["white"]));
+    // One colour, and it is the inherited one: every pixel resolves from the
+    // slot's `color` property, exactly like every neighbouring mark, so the
+    // deck reads as one muted set instead of a white cut-out in the row.
+    expect(new Set(rects.map((rect) => rect[4]))).toEqual(new Set([INHERITED_FILL]));
+    expect(svg?.querySelectorAll(`[fill="${INHERITED_FILL}"]`).length).toBe(
+      PUBLISHED_GEOMETRY.length,
+    );
+
+    // No literal white survives: the published white reference is not the
+    // shipped treatment, and no other hard-coded colour sneaks in either.
+    const source = view.container.innerHTML;
+    expect(source).not.toContain('fill="white"');
+    expect(svg?.querySelector('[fill="white"]')).toBeNull();
+    expect(svg?.querySelector('[fill^="#"]')).toBeNull();
+    expect(svg?.querySelector('[fill^="rgb"]')).toBeNull();
+    expect(svg?.querySelector('[fill^="url("]')).toBeNull();
+
+    // No opacity trick and no inline colour: the tone is inherited, so it
+    // follows the theme token instead of being faked on the mark itself.
+    expect(svg?.querySelector("[opacity]")).toBeNull();
+    expect(svg?.querySelector("[fill-opacity]")).toBeNull();
+    expect(svg?.getAttribute("style")).toBeNull();
+    expect(svg?.getAttribute("color")).toBeNull();
 
     // The rejected gradient variant is gone: none of its five published
     // stops survives anywhere in the mark.
     for (const stop of REJECTED_GRADIENT_STOPS) {
       expect(rects.map((rect) => rect[4])).not.toContain(stop);
     }
-    const source = view.container.innerHTML;
     for (const stop of REJECTED_GRADIENT_STOPS) {
       expect(source).not.toContain(stop);
     }
+    expect(svg?.querySelector("linearGradient")).toBeNull();
+    expect(svg?.querySelector("radialGradient")).toBeNull();
   });
 
-  it("keeps the published white fill out of a currentColor recolour", () => {
+  it("carries the official geometry with the inherited fill in every slot", () => {
     const view = render(<ProviderMark id="mistral" />);
     const { svg, rects } = readEmblem(view, "svg");
 
-    // The white file is reproduced as published: the rects carry Mistral's
-    // own "white", not the slot's inherited colour, and the gradient
-    // variant's stops are not reintroduced through another mechanism.
-    expect(rects.every((rect) => rect[4] === "white")).toBe(true);
-    expect(svg?.querySelector('[fill^="#"]')).toBeNull();
-    expect(svg?.querySelector('linearGradient')).toBeNull();
-    expect(svg?.querySelector('[fill^="url("]')).toBeNull();
+    // The official viewBox and the ten published pixels are untouched by the
+    // recolour: only the fill changed.
+    expect(svg?.getAttribute("viewBox")).toBe(PUBLISHED_VIEWBOX);
+    expect(geometryOf(rects)).toEqual(PUBLISHED_GEOMETRY);
+    expect(rects).toHaveLength(PUBLISHED_GEOMETRY.length);
   });
 
   it("shares one mark between the collapsed segment and the expanded card", () => {
@@ -210,19 +252,20 @@ describe("Mistral provider mark", () => {
     const cardView = render(card(item));
     const cardSvg = cardView.container.querySelector(".fq-popover-mark svg");
     expect(cardSvg?.getAttribute("viewBox")).toBe(PUBLISHED_VIEWBOX);
-    const cardRects = Array.from(cardSvg?.querySelectorAll("rect") ?? []).map(
-      (rect) => [
+    const cardRects: EmblemRect[] = Array.from(
+      cardSvg?.querySelectorAll("rect") ?? [],
+    ).map((rect) => [
         Number(rect.getAttribute("x")),
         Number(rect.getAttribute("y")),
         Number(rect.getAttribute("width")),
         Number(rect.getAttribute("height")),
         rect.getAttribute("fill"),
-      ],
-    );
+      ]);
 
     // One identity, two places: the expanded card wears the mark of the
-    // segment it expands, pixel for pixel.
+    // segment it expands, pixel for pixel and in the same inherited tone.
     expect(cardRects).toEqual(rects);
+    expect(cardRects.every((rect) => rect[4] === INHERITED_FILL)).toBe(true);
   });
 
   it("leaves the Vibe and API budgets independent under the shared mark", () => {
@@ -268,6 +311,31 @@ describe("Mistral provider mark", () => {
       const path = view.container.querySelector("path");
       expect(path, id).not.toBeNull();
       expect(path?.getAttribute("fill"), id).toBe("currentColor");
+
+      // The neighbours are untouched by the Mistral change: one path, the
+      // same inherited keyword, and no literal colour of their own.
+      expect(view.container.querySelectorAll("path"), id).toHaveLength(1);
+      expect(view.container.querySelector("rect"), id).toBeNull();
+      expect(view.container.innerHTML, id).not.toContain('fill="white"');
+      expect(path?.getAttribute("fill"), id).toBe(INHERITED_FILL);
     }
+  });
+
+  it("gives the Mistral mark the same inherited tone as its neighbours", () => {
+    // The harmonisation is only real if the browser resolves the Mistral
+    // mark and the neighbouring marks from the SAME `color` property. A
+    // shared keyword is the guarantee; a shared hard-coded hex would be a
+    // new hard-coded grey, and an opacity overlay would not match themes.
+    const mistralView = render(<ProviderMark id="mistral" />);
+    const mistralFills = Array.from(
+      mistralView.container.querySelectorAll("rect"),
+    ).map((rect) => rect.getAttribute("fill"));
+    expect(mistralFills.every((fill) => fill === INHERITED_FILL)).toBe(true);
+
+    const claudeView = render(<ProviderMark id="claude-code" />);
+    const claudeFill = claudeView.container
+      .querySelector("path")
+      ?.getAttribute("fill");
+    expect(claudeFill).toBe(mistralFills[0]);
   });
 });
