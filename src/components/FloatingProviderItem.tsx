@@ -13,11 +13,11 @@ import {
  * filled geometry that makes them recognizable. Claude Code carries
  * Anthropic's published Claude mark geometry, filled with the inherited
  * currentColor instead of the published brand colour. Mistral carries
- * Mistral's published pixel-cat emblem in its published gradient, the one
- * mark here that keeps its official colour treatment. Unknown providers
- * keep the letter fallback. Shared with the detail card header so hover
- * previews and pinned cards carry the same identity as the segment they
- * expand.
+ * Mistral's published pixel-cat emblem in Mistral's published WHITE
+ * monochrome variant, so every mark in this file is a single-colour
+ * silhouette. Unknown providers keep the letter fallback. Shared with the
+ * detail card header so hover previews and pinned cards carry the same
+ * identity as the segment they expand.
  */
 export function ProviderMark({ id }: { id: string }) {
   // An account-scoped id (a second OpenAI/Codex account) names the same
@@ -68,55 +68,57 @@ export function ProviderMark({ id }: { id: string }) {
   if (provider === "mistral") {
     // Mistral's CURRENT emblem: the abstract pixel cat, taken from
     // Mistral's own 2026 brand material at https://mistral.ai/brand/ (the
-    // "Icon / Gradient" entry). The geometry below is the published
-    // vector, copied verbatim:
+    // "Icon / Monochrome" entry). The geometry below is the published
+    // WHITE vector, copied verbatim:
     //   https://mistral.ai/cms-media/api/media/file/Mistral_Logos_2026.zip
-    //     -> Icon/Gradient/RGB/SVG/Mistral-Icon-Gradient-RGB.svg
-    //   sha256 5aa0534fb52009c3ef9321544cd14d4b84ba34d4ee041abb3bdde9c3f2e765ca
-    // The same artwork as the published raster
-    //   https://mistral.ai/cms-media/api/media/file/Mistral-Icon-Gradient-RGB.png
-    //   sha256 e3426d84d7b2665ea6842aa39c62d25c11c046ce0a1ebd5faabf4683df5199ba
-    // (648x648, the rasterization of the same artwork).
+    //     -> Icon/Monochrome/RGB/SVG/Icon-Mistral-White.svg
+    //   sha256 65b6edef03c108849cea04b82017882624be60e641f0fa9dff72800b4a6c83b5
+    // (the same kit also ships Icon/Gradient/RGB/SVG/Mistral-Icon-Gradient-RGB.svg,
+    // sha256 5aa0534fb52009c3ef9321544cd14d4b84ba34d4ee041abb3bdde9c3f2e765ca,
+    // whose geometry is identical to the WHITE file's).
     //
     // The published viewBox "0 0 162 162" is kept as published, so the
     // emblem keeps the brand's own clearspace and the ten 20-unit pixels
-    // sit exactly where Mistral put them. Nothing is cropped, stretched,
-    // rotated or redrawn, and the markup is bundled here, so the app
-    // never fetches the asset at runtime. The old multicolor "M" logo
-    // from mistralai/mistral-common is a retired mark and is deliberately
-    // not reproduced.
+    // sit exactly where Mistral put them. The white file's ten rects are
+    // the gradient file's ten rects with the published white fill, so the
+    // shape is the published mark and not a redraw of it. Nothing is
+    // cropped, stretched, rotated or redrawn, and the markup is bundled
+    // here, so the app never fetches the asset at runtime. The old
+    // multicolor "M" logo from mistralai/mistral-common is a retired mark
+    // and is deliberately not reproduced.
     //
     // COLOUR: the brand page says "Prefer the gradient version" and
-    // "Use monochrome on busy background", and the Floating Deck's mark
-    // slot is a plain, neutral dark surface (graphite #1f1f24, glass
-    // rgba(33,33,42,0.55), oled #060607) rather than a coloured
-    // background, so the official gradient is the treatment used here.
-    // Its five published stops (#FFAF01, #FF8204, #FA500F, #E61300,
-    // #C4001D) are used exactly as published: the mark is NOT recoloured
-    // and deliberately does not inherit currentColor the way the
-    // monochrome marks in this file do.
+    // "Use monochrome on busy background". The Floating Deck is a row of
+    // small marks on a dark surface (graphite #1f1f24, glass
+    // rgba(33,33,42,0.55), oled #060607), and every other mark in this
+    // file is a monochrome silhouette, so the published WHITE variant is
+    // the treatment used here: one colour, no gradient stops, the same
+    // pixel-cat shape. The fill is Mistral's published "white", used
+    // verbatim, and NOT currentColor: the asset is reproduced as
+    // published rather than re-tinted like the currentColor marks.
     //
     // TRADEMARK: https://mistral.ai/brand/ states that Mistral's names,
     // trademarks, logos and icons are Mistral's property, that partners
     // and collaborators are welcome to use the brand, and that the brand
     // must not be stretched, deformed, rotated, relaid out, recoloured or
-    // taken from an old or unofficial version. Permission for a
-    // third-party desktop app to ship this icon is NOT established by that
-    // page: treat the usage question as a release gate for Human
-    // Acceptance, not as a settled licence. LimitScope is not affiliated
-    // with or endorsed by Mistral AI.
+    // taken from an old or unofficial version. The monochrome variant is
+    // the brand's own published file, so nothing here is recoloured or
+    // redrawn, but permission for a third-party desktop app to ship this
+    // icon is NOT established by that page: treat the usage question as a
+    // release gate for Human Acceptance, not as a settled licence.
+    // LimitScope is not affiliated with or endorsed by Mistral AI.
     return (
       <svg viewBox="0 0 162 162" aria-hidden="true">
-        <rect x="31" y="31" width="20" height="20" fill="#FFAF01" />
-        <rect x="111" y="31" width="20" height="20" fill="#FFAF01" />
-        <rect x="71" y="91" width="20" height="20" fill="#E61300" />
-        <rect x="31" y="91" width="20" height="20" fill="#E61300" />
-        <rect x="111" y="91" width="20" height="20" fill="#E61300" />
-        <rect x="31" y="51" width="40" height="20" fill="#FF8204" />
-        <rect x="11" y="111" width="60" height="20" fill="#C4001D" />
-        <rect x="91" y="111" width="60" height="20" fill="#C4001D" />
-        <rect x="31" y="71" width="100" height="20" fill="#FA500F" />
-        <rect x="91" y="51" width="40" height="20" fill="#FF8204" />
+        <rect x="31" y="31" width="20" height="20" fill="white" />
+        <rect x="111" y="31" width="20" height="20" fill="white" />
+        <rect x="71" y="91" width="20" height="20" fill="white" />
+        <rect x="31" y="91" width="20" height="20" fill="white" />
+        <rect x="111" y="91" width="20" height="20" fill="white" />
+        <rect x="31" y="51" width="40" height="20" fill="white" />
+        <rect x="11" y="111" width="60" height="20" fill="white" />
+        <rect x="91" y="111" width="60" height="20" fill="white" />
+        <rect x="31" y="71" width="100" height="20" fill="white" />
+        <rect x="91" y="51" width="40" height="20" fill="white" />
       </svg>
     );
   }
