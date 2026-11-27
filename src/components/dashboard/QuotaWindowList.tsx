@@ -54,7 +54,7 @@ export function QuotaWindowList({
         </div>
       )}
       <ZCodePlanGroups usage={usage} now={now} />
-      <GrokBotPanel usage={usage} now={now} />
+      <GrokBotPanel usage={usage} now={now} perspective={perspective} />
     </section>
   );
 }

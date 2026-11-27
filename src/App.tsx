@@ -236,7 +236,7 @@ export default function App() {
   const attention = attentionItems(
     visibleUsages,
     predictionFor,
-    settings.quotaPerspective,
+    "remaining",
   );
 
   const updatedLabel = refreshOverdue
@@ -389,7 +389,7 @@ export default function App() {
               onSelect={view === "insights" ? selectUsageScope : selectProvider}
               orientation={layout === "narrow" ? "horizontal" : "vertical"}
               controlsId={view === "insights" ? "usage-panel" : "provider-panel"}
-              perspective={settings.quotaPerspective}
+              perspective="remaining"
               now={now}
             />
             {view === "insights" ? (
@@ -431,12 +431,12 @@ export default function App() {
                         usage={selectedUsage}
                         now={now}
                         predictionFor={predictionFor}
-                        perspective={settings.quotaPerspective}
+                        perspective="remaining"
                       />
                       <StatusHistoryChart
                         usage={selectedUsage}
                         historyRevision={historyRevision}
-                        perspective={settings.quotaPerspective}
+                        perspective="remaining"
                         loader={devFixture?.loader}
                         codexIdentityStates={codexIdentityStates}
                       />
@@ -444,7 +444,7 @@ export default function App() {
                         usage={selectedUsage}
                         now={now}
                         predictionFor={predictionFor}
-                        perspective={settings.quotaPerspective}
+                        perspective="remaining"
                       />
                     </>
                   ) : (

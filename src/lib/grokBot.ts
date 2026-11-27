@@ -1,3 +1,4 @@
+import { quotaPresentation, type QuotaPerspective } from "./quotaPresentation";
 import type { GrokBotUsage, ProviderUsage } from "../types";
 
 /**
@@ -56,7 +57,9 @@ export function grokBotLabel(grokBot: GrokBotUsage): string {
  * The usage readout, one decimal place without inventing precision
  * ("17.7% used"); integral values stay integral ("0% used", "100% used").
  */
-export function formatGrokBotPercent(usedPercent: number): string {
-  const rounded = Math.round(usedPercent * 10) / 10;
-  return `${rounded}% used`;
+export function formatGrokBotPercent(usedPercent: number, perspective: QuotaPerspective = "used"): string {
+  const presentation = quotaPresentation(usedPercent, perspective);
+  if (presentation.meterPercent === null) return presentation.label;
+  const rounded = Math.round(presentation.meterPercent * 10) / 10;
+  return `${rounded}% ${perspective}`;
 }

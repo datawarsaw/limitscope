@@ -113,7 +113,13 @@ describe("Status history chart", () => {
     expect(chart).toBeTruthy();
     // The large chart carries the labeled y-axis.
     const svg = document.querySelector("svg.usage-chart")!;
-    expect(svg.getAttribute("aria-label")).toContain("peak 78% used");
+    expect(svg.getAttribute("aria-label")).toContain("percent remaining 0 to 100");
+    expect(svg.getAttribute("aria-label")).toContain("lowest remaining 22%");
+    expect(svg.querySelector(".usage-chart-line")?.getAttribute("d")).toBe(
+      "M302.00 66.88 L503.33 137.28",
+    );
+    expect(Number(svg.querySelector(".usage-chart-guide")?.getAttribute("y1"))).toBeCloseTo(140.8);
+    expect(within(region).getByText(/20% remaining near-limit threshold/)).toBeTruthy();
     const axisLabels = Array.from(
       svg.querySelectorAll(".usage-chart-axis-label"),
     ).map((label) => label.textContent);

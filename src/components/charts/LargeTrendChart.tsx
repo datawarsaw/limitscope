@@ -17,9 +17,7 @@ import type { QuotaPerspective } from "../../lib/quotaPresentation";
  * disagree about the data. The only differences are size, a labeled y-axis,
  * and a thicker line.
  *
- * The quota-perspective preference never touches the plot: the line and the
- * 0–100 scale stay canonical on the used percentage, and only the summary
- * line follows the perspective.
+ * Status plots remaining capacity. Insights retains the consumption plot.
  */
 const CHART_WIDTH = 640;
 const CHART_HEIGHT = 176;
@@ -35,10 +33,12 @@ export function LargeTrendChart({
   series,
   analytics,
   perspective = "used",
+  plotPerspective = "used",
 }: {
   series: UsageTrendSeries;
   analytics: UsageAnalytics;
   perspective?: QuotaPerspective;
+  plotPerspective?: QuotaPerspective;
 }) {
   const title = seriesTitle(series, shortProviderId);
   const summary = trendSummaryText(series, perspective);
@@ -49,6 +49,7 @@ export function LargeTrendChart({
     Date.parse(analytics.rangeEnd),
     plotWidth,
     CHART_HEIGHT,
+    plotPerspective,
   );
 
   const points = series.points;
@@ -68,15 +69,8 @@ export function LargeTrendChart({
         viewBox={`0 0 ${CHART_WIDTH} ${CHART_HEIGHT + CHART_AXIS}`}
         className="usage-chart large-chart"
         role="img"
-        aria-label={
-          perspective === "used"
-            ? `${title} usage, percent used 0 to 100 over the ${analytics.range} range. ${summary}.`
-            : `${title} usage, plotted as percent used 0 to 100 (remaining is the complement) over the ${analytics.range} range. ${summary}.`
-        }
+        aria-label={`${title} quota, percent ${plotPerspective} 0 to 100 over the ${analytics.range} range. ${summary}.`}
       >
-        {/* Labeled y-axis: the fixed 0–100 scale is spelled out, so a
-            half-full chart always reads as 50% used without counting
-            gridlines. */}
         {[100, 50, 0].map((percent) => (
           <text
             key={percent}

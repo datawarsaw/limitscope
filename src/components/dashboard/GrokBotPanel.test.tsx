@@ -155,7 +155,7 @@ describe("missing optional fields", () => {
       grokBot: observation(),
     };
     render(
-      <GrokBotPanel usage={zai} now={NOW} />,
+      <GrokBotPanel usage={zai} now={NOW} perspective="remaining" />,
     );
     expect(screen.queryByRole("group", { name: /^Grok Bot/ })).toBeNull();
   });
@@ -185,6 +185,7 @@ describe("display contract helpers", () => {
     expect(formatGrokBotPercent(0)).toBe("0% used");
     expect(formatGrokBotPercent(100)).toBe("100% used");
     expect(formatGrokBotPercent(54)).toBe("54% used");
+    expect(formatGrokBotPercent(17.66, "remaining")).toBe("82.3% remaining");
   });
 
   it("labels the block from the server-reported plan name", () => {

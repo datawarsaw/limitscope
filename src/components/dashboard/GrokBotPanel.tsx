@@ -1,6 +1,7 @@
 import type { ProviderUsage } from "../../types";
 import { formatResetTime } from "../../lib/format";
 import { formatGrokBotPercent, grokBotFor, grokBotLabel } from "../../lib/grokBot";
+import type { QuotaPerspective } from "../../lib/quotaPresentation";
 import { toneFor } from "../../lib/dashboard";
 
 /**
@@ -17,7 +18,11 @@ import { toneFor } from "../../lib/dashboard";
  * stale-trimmed, or for any other provider) this renders nothing, and the
  * existing Grok card is unchanged.
  */
-export function GrokBotPanel({ usage, now }: { usage: ProviderUsage; now: Date }) {
+export function GrokBotPanel({ usage, now, perspective }: {
+  usage: ProviderUsage;
+  now: Date;
+  perspective: QuotaPerspective;
+}) {
   const grokBot = grokBotFor(usage);
   if (!grokBot) return null;
   const label = grokBotLabel(grokBot);
@@ -27,7 +32,7 @@ export function GrokBotPanel({ usage, now }: { usage: ProviderUsage; now: Date }
       <div className="limit-row">
         <span className="limit-label">{label}</span>
         <span className={`limit-percent tone-${tone}`}>
-          {formatGrokBotPercent(grokBot.usedPercent)}
+          {formatGrokBotPercent(grokBot.usedPercent, perspective)}
         </span>
       </div>
       {grokBot.resetAt ? (
