@@ -9,7 +9,7 @@ import type {
   UsageTrendSeries,
 } from "./usageAnalytics";
 import { toneFor, type UsageTone } from "./dashboard";
-import type { QuotaPerspective } from "./quotaPresentation";
+import { quotaHistoryPresentation, type QuotaPerspective } from "./quotaPresentation";
 import {
   CRITICAL_PERCENT,
   NEAR_LIMIT_PERCENT,
@@ -398,8 +398,7 @@ export function trendSummaryText(
     undefined,
   );
   if (peak !== undefined) {
-    // The plotted line stays canonical (percent used); the headline follows
-    // the perspective — peak usage is the lowest remaining point.
+    // Peak usage is the lowest remaining point.
     parts.push(
       perspective === "used"
         ? `peak ${Math.round(peak)}% used`
@@ -453,7 +452,7 @@ const PERCENT_MAX = 100;
 /**
  * Maps a series into a fixed 0–100 percent viewBox. The x-domain is the
  * query's full range so every small multiple shares one time axis; the
- * y-domain is always 0–100 so a half-full chart always means 50% used.
+ * y-domain is always 0–100 for either display perspective.
  */
 export function trendGeometry(
   series: UsageTrendSeries,
@@ -461,11 +460,14 @@ export function trendGeometry(
   rangeEndMs: number,
   width: number,
   height: number,
+  perspective: QuotaPerspective = "used",
 ): TrendGeometry {
   const span = Math.max(1, rangeEndMs - rangeStartMs);
   const x = (ms: number) => ((ms - rangeStartMs) / span) * width;
-  const y = (percent: number) =>
-    height - (Math.min(PERCENT_MAX, Math.max(0, percent)) / PERCENT_MAX) * height;
+  const y = (usedPercent: number) => {
+    const percent = quotaHistoryPresentation(usedPercent, perspective).meterPercent;
+    return height - ((percent ?? NaN) / PERCENT_MAX) * height;
+  };
   const shape = trendShape(series);
 
   const paths = shape.segments

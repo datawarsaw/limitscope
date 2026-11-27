@@ -9,9 +9,10 @@ import {
 import { useUsageAnalytics } from "../../hooks/useUsageAnalytics";
 import { hasAnyObservation } from "../../lib/usagePresentation";
 import { shortProviderName } from "../../lib/dashboard";
-import type { QuotaPerspective } from "../../lib/quotaPresentation";
+import { quotaHistoryPresentation, type QuotaPerspective } from "../../lib/quotaPresentation";
 import type { ProviderUsage } from "../../types";
 import { isCodexProviderId } from "../../lib/providerIds";
+import { NEAR_LIMIT_PERCENT } from "../../lib/thresholds";
 import { LargeTrendChart } from "../charts/LargeTrendChart";
 
 /**
@@ -44,7 +45,7 @@ export function StatusHistoryChart(props: StatusHistoryChartProps) {
 function ProviderHistoryChart({
   usage,
   historyRevision,
-  perspective = "used",
+  perspective = "remaining",
   loader = loadUsageAnalytics,
   codexIdentityStates,
 }: StatusHistoryChartProps) {
@@ -148,6 +149,7 @@ function ProviderHistoryChart({
                 series={series}
                 analytics={data}
                 perspective={perspective}
+                plotPerspective={perspective}
               />
             ))}
           </div>
@@ -159,7 +161,7 @@ function ProviderHistoryChart({
             </p>
           ) : null}
           <p className="usage-chart-legend">
-            dashed guide = 80% near-limit threshold · ◇ reset boundary ·
+            dashed guide = {quotaHistoryPresentation(NEAR_LIMIT_PERCENT, perspective).label} near-limit threshold · ◇ reset boundary ·
             hatched floor = not observed · line breaks at resets and gaps
           </p>
         </>

@@ -58,12 +58,11 @@ pub(crate) const MISTRAL_BUDGET_URL: &str = "https://api.mistral.ai/v1/billing/b
 /// The subscription read: the plan name (e.g. `EDU`).
 pub(crate) const MISTRAL_SUBSCRIPTION_URL: &str = "https://api.mistral.ai/v1/billing/subscription";
 
-/// The Windows Credential Manager entry that holds the account's Mistral
-/// API key. LimitScope reads this entry; it never writes it.
+/// The base Windows Credential Manager target used by Mistral Vibe.
 pub(crate) const CREDENTIAL_TARGET: &str = "ai.mistral.vibe";
+const COMPOUND_CREDENTIAL_TARGET: &str = "MISTRAL_API_KEY@ai.mistral.vibe";
 /// The account name the entry is stored under. The key itself is the
-/// credential blob; this name is the identity the entry is expected to
-/// carry, and a mismatch fails closed.
+/// credential blob; this exact label is required before decoding it.
 pub(crate) const CREDENTIAL_USER: &str = "MISTRAL_API_KEY";
 
 /// The credential is absent from the store: nothing was there to read.
@@ -71,8 +70,7 @@ pub(crate) const CREDENTIAL_MISSING: &str = "credential_missing";
 /// The credential is there but cannot be used: the store could not be read,
 /// the entry could not be decoded, or the secret is not a usable key.
 pub(crate) const CREDENTIAL_UNREADABLE: &str = "credential_unreadable";
-/// The entry under the authorized target belongs to a different account
-/// than the one this adapter is authorized to read.
+/// At least one entry exists, but neither target has matching metadata.
 pub(crate) const CREDENTIAL_AMBIGUOUS: &str = "credential_ambiguous";
 
 /// Every credential-source code this adapter can produce.
@@ -267,30 +265,39 @@ impl Drop for MistralSecret {
 
 /// Reads the account's Mistral API key from the Windows Credential Manager.
 ///
-/// The entry is validated before it is used: the target must be the
-/// authorized one and the stored account name must be the expected one. A
-/// missing entry, an unreadable store, an entry under a different account
-/// name and an empty secret all fail closed — the provider is unavailable,
-/// never a fabricated zero.
+/// Both supported targets require the exact API key user name. A lookup
+/// without a usable matching entry fails closed.
 pub(crate) fn resolve_credential() -> Result<MistralCredential, ProviderError> {
-    let stored = read_stored_credential()?;
-    let Some(stored) = stored else {
-        return Err(ProviderError::new(
-            CREDENTIAL_MISSING,
-            "No Mistral API key is stored in Windows Credential Manager under \"ai.mistral.vibe\".",
-        ));
+    resolve_with_reader(read_stored_credential)
+}
+
+fn resolve_with_reader(
+    mut read: impl FnMut(&str) -> Result<StoredCredential, ProviderError>,
+) -> Result<MistralCredential, ProviderError> {
+    // Match keyring precedence: a matching base entry wins, even if its
+    // payload is unusable. Only absence or a metadata mismatch allows fallback.
+    let base = read(CREDENTIAL_TARGET)?;
+    let stored = match base {
+        StoredCredential::Matching(secret) => secret,
+        StoredCredential::Missing | StoredCredential::Mismatched => {
+            match read(COMPOUND_CREDENTIAL_TARGET)? {
+                StoredCredential::Matching(secret) => secret,
+                StoredCredential::Missing if matches!(base, StoredCredential::Missing) => {
+                    return Err(ProviderError::new(
+                        CREDENTIAL_MISSING,
+                        "No Mistral API key entry was found in Windows Credential Manager.",
+                    ));
+                }
+                StoredCredential::Missing | StoredCredential::Mismatched => {
+                    return Err(ProviderError::new(
+                        CREDENTIAL_AMBIGUOUS,
+                        "No matching MISTRAL_API_KEY entry was found at the supported Mistral Vibe targets in Windows Credential Manager.",
+                    ));
+                }
+            }
+        }
     };
-    if stored.user != CREDENTIAL_USER {
-        // The entry under the authorized target belongs to a different
-        // account than the one this adapter is authorized to read. Failing
-        // closed is the only safe answer: using it would spend a credential
-        // nobody authorized for this read.
-        return Err(ProviderError::new(
-            CREDENTIAL_AMBIGUOUS,
-            "The stored Mistral credential belongs to a different account than the authorized one.",
-        ));
-    }
-    let secret_text = stored.secret.trim();
+    let secret_text = stored.trim();
     if secret_text.is_empty() || !secret_text.chars().all(|ch| ch.is_ascii_graphic()) {
         return Err(ProviderError::new(
             CREDENTIAL_UNREADABLE,
@@ -344,14 +351,28 @@ fn key_hint(secret: &str) -> Option<String> {
     Some(tail.into_iter().rev().collect())
 }
 
-/// The raw stored entry: the account name and the secret text.
-struct StoredCredential {
-    user: String,
-    secret: String,
+enum StoredCredential {
+    Missing,
+    Mismatched,
+    Matching(String),
+}
+
+#[cfg(any(windows, test))]
+fn match_stored_credential(
+    target: &str,
+    stored_target: &str,
+    user: &str,
+    decode: impl FnOnce() -> String,
+) -> StoredCredential {
+    if stored_target == target && user == CREDENTIAL_USER {
+        StoredCredential::Matching(decode())
+    } else {
+        StoredCredential::Mismatched
+    }
 }
 
 #[cfg(windows)]
-fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
+fn read_stored_credential(target_name: &str) -> Result<StoredCredential, ProviderError> {
     use std::ffi::c_void;
     use windows_sys::Win32::Security::Credentials::{
         CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
@@ -360,7 +381,7 @@ fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
     /// `ERROR_NOT_FOUND`: the credential manager has no such entry.
     const ERROR_NOT_FOUND: i32 = 1168;
 
-    let mut target: Vec<u16> = CREDENTIAL_TARGET.encode_utf16().collect();
+    let mut target: Vec<u16> = target_name.encode_utf16().collect();
     target.push(0);
     let mut raw: *mut CREDENTIALW = std::ptr::null_mut();
     // SAFETY: `target` is a NUL-terminated UTF-16 string that outlives the
@@ -371,7 +392,7 @@ fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
     if ok == 0 {
         let code = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
         if code == ERROR_NOT_FOUND {
-            return Ok(None);
+            return Ok(StoredCredential::Missing);
         }
         return Err(ProviderError::new(
             CREDENTIAL_UNREADABLE,
@@ -379,31 +400,31 @@ fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
         ));
     }
     // SAFETY: `raw` is the credential CredReadW just allocated and owns.
-    let (user, blob) = unsafe {
+    let stored = unsafe {
         let credential = &*raw;
-        let user = read_wide(credential.UserName);
-        let blob = if credential.CredentialBlob.is_null() || credential.CredentialBlobSize == 0 {
-            Vec::new()
-        } else {
-            std::slice::from_raw_parts(
-                credential.CredentialBlob,
-                credential.CredentialBlobSize as usize,
-            )
-            .to_vec()
-        };
-        (user, blob)
+        match_stored_credential(
+            target_name,
+            &read_wide(credential.TargetName),
+            &read_wide(credential.UserName),
+            || {
+                if credential.CredentialBlob.is_null() || credential.CredentialBlobSize == 0 {
+                    return String::new();
+                }
+                decode_secret_blob(std::slice::from_raw_parts(
+                    credential.CredentialBlob,
+                    credential.CredentialBlobSize as usize,
+                ))
+            },
+        )
     };
     // SAFETY: `raw` was allocated by CredReadW and is released exactly once.
     unsafe { CredFree(raw as *const c_void) };
 
-    Ok(Some(StoredCredential {
-        user,
-        secret: decode_secret_blob(&blob),
-    }))
+    Ok(stored)
 }
 
 #[cfg(not(windows))]
-fn read_stored_credential() -> Result<Option<StoredCredential>, ProviderError> {
+fn read_stored_credential(_target_name: &str) -> Result<StoredCredential, ProviderError> {
     Err(ProviderError::new(
         CREDENTIAL_UNREADABLE,
         "Mistral budget reading requires the Windows Credential Manager.",
@@ -790,6 +811,140 @@ fn finite_number(value: &Value) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_keyring_lookup_uses_only_matching_entries_in_order() {
+        const BASE: &str = "ai.mistral.vibe";
+        const QUALIFIED: &str = "MISTRAL_API_KEY@ai.mistral.vibe";
+        const USER: &str = "MISTRAL_API_KEY";
+        const OAUTH: &str = "mcp-oauth:synthetic:tokens";
+        const BASE_KEY: &str = "synthetic-base-key";
+        const QUALIFIED_KEY: &str = "synthetic-compound-key";
+
+        enum Entry {
+            Missing,
+            Unreadable,
+            Record(&'static str, &'static str, Option<&'static str>),
+        }
+        use Entry::*;
+        for (name, base, qualified, expected) in [
+            (
+                "base only",
+                Record(BASE, USER, Some(BASE_KEY)),
+                None,
+                Ok(BASE_KEY),
+            ),
+            (
+                "both match",
+                Record(BASE, USER, Some(BASE_KEY)),
+                Some((Record(QUALIFIED, USER, Some(QUALIFIED_KEY)), false)),
+                Ok(BASE_KEY),
+            ),
+            (
+                "base missing",
+                Missing,
+                Some((Record(QUALIFIED, USER, Some(QUALIFIED_KEY)), true)),
+                Ok(QUALIFIED_KEY),
+            ),
+            (
+                "base OAuth",
+                Record(BASE, OAUTH, None),
+                Some((Record(QUALIFIED, USER, Some(QUALIFIED_KEY)), true)),
+                Ok(QUALIFIED_KEY),
+            ),
+            (
+                "qualified user mismatch",
+                Missing,
+                Some((Record(QUALIFIED, "mistral_api_key", None), true)),
+                Err(CREDENTIAL_AMBIGUOUS),
+            ),
+            (
+                "qualified target mismatch",
+                Missing,
+                Some((Record("other", USER, None), true)),
+                Err(CREDENTIAL_AMBIGUOUS),
+            ),
+            (
+                "qualified missing after mismatch",
+                Record(BASE, OAUTH, None),
+                Some((Missing, true)),
+                Err(CREDENTIAL_AMBIGUOUS),
+            ),
+            (
+                "both missing",
+                Missing,
+                Some((Missing, true)),
+                Err(CREDENTIAL_MISSING),
+            ),
+            (
+                "base unreadable",
+                Unreadable,
+                None,
+                Err(CREDENTIAL_UNREADABLE),
+            ),
+            (
+                "qualified unreadable",
+                Record(BASE, OAUTH, None),
+                Some((Unreadable, true)),
+                Err(CREDENTIAL_UNREADABLE),
+            ),
+            (
+                "malformed base",
+                Record(BASE, USER, Some("bad key")),
+                Some((Record(QUALIFIED, USER, Some(QUALIFIED_KEY)), false)),
+                Err(CREDENTIAL_UNREADABLE),
+            ),
+            (
+                "malformed qualified",
+                Missing,
+                Some((Record(QUALIFIED, USER, Some("")), true)),
+                Err(CREDENTIAL_UNREADABLE),
+            ),
+        ] {
+            let mut base = Some(base);
+            let mut qualified = qualified;
+            let result = resolve_with_reader(|target| {
+                match target {
+                    BASE => base.take().expect("repeated base lookup"),
+                    QUALIFIED => {
+                        assert!(base.is_none(), "{name}: qualified was read first");
+                        let (entry, expected_read) =
+                            qualified.take().expect("unexpected qualified lookup");
+                        assert!(expected_read, "{name}: matching base must win");
+                        entry
+                    }
+                    _ => panic!("{name}: unexpected target"),
+                }
+                .read(target)
+            });
+            assert!(base.is_none(), "{name}: base was skipped");
+            assert!(
+                !matches!(qualified, Some((_, true))),
+                "{name}: qualified was skipped"
+            );
+            match expected {
+                Ok(key) => assert_eq!(result.unwrap().secret.expose(), key, "{name}"),
+                Err(code) => assert_eq!(result.unwrap_err().code, code, "{name}"),
+            }
+        }
+
+        impl Entry {
+            fn read(self, target: &str) -> Result<StoredCredential, ProviderError> {
+                match self {
+                    Self::Missing => Ok(StoredCredential::Missing),
+                    Self::Unreadable => Err(ProviderError::new(CREDENTIAL_UNREADABLE, "fixture")),
+                    Self::Record(stored_target, user, payload) => {
+                        Ok(match_stored_credential(target, stored_target, user, || {
+                            decode_secret_blob(
+                                payload.expect("rejected payload was read").as_bytes(),
+                            )
+                        }))
+                    }
+                }
+            }
+        }
+    }
+
     use serde_json::json;
 
     /// The historical fixture the baseline screenshot shows. It is a fixed

@@ -5,6 +5,8 @@ import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { QuotaPrediction } from "./lib/prediction/types";
 import type { ProviderUsage } from "./types";
+import { FloatingProviderItem } from "./components/FloatingProviderItem";
+import { floatingQuotaItems } from "./lib/floatingQuota";
 import type { CodexScope, UsageAnalytics } from "./lib/usageAnalytics";
 import type { UsageIntelligence } from "./lib/usageIntelligence";
 
@@ -283,6 +285,70 @@ describe("Status | Insights | Settings primary navigation", () => {
 
   afterEach(cleanup);
 
+  it("matches the Floating Deck for separate Codex accounts and unavailable Mistral", async () => {
+    mocks.usages = [
+      usage({
+        id: "openai-codex", name: "Codex primary",
+        limits: [{ label: "Weekly", usedPercent: 57 }, { label: "5-hour", usedPercent: 10 }],
+      }),
+      usage({
+        id: "openai-codex:secondary", name: "Codex secondary",
+        status: "stale", health: "stale",
+        limits: [{ label: "Weekly", usedPercent: 28 }],
+      }),
+      usage({
+        id: "mistral", name: "Mistral", status: "error", health: "unknown",
+        errorCategory: "credential_ambiguous", error: "Multiple Mistral credentials found",
+      }),
+    ];
+    render(<App />);
+    const noop = () => {};
+    render(<div aria-label="Floating Deck">{floatingQuotaItems(mocks.usages).map((item) => (
+      <FloatingProviderItem key={item.providerId} item={item} expanded={false}
+        onHover={noop} onHoverEnd={noop} onOpen={noop} onContextMenu={noop} />
+    ))}</div>);
+
+    const primary = screen.getByRole("tab", { name: /Codex primary: 43% remaining/ });
+    fireEvent.click(primary);
+    const panel = screen.getByRole("tabpanel");
+    expect(panel.querySelector(".primary-percent")?.textContent).toBe("43% remaining");
+    const meter = within(panel).getAllByRole("progressbar", { name: /Weekly quota.*43% remaining/ });
+    expect(meter).toHaveLength(2);
+    for (const bar of meter) {
+      expect(bar.getAttribute("aria-valuenow")).toBe("43");
+      expect(bar.querySelector<HTMLElement>(".bar-fill")?.style.width).toBe("43%");
+    }
+    expect(within(panel).getByRole("progressbar", { name: /5-hour.*90% remaining/ })).toBeTruthy();
+    expect(within(screen.getByLabelText("Floating Deck")).getByRole("button", { name: /Codex.*43% remaining/i })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: /Codex secondary: 72% remaining/ }));
+    expect(within(panel).getByText("72% remaining", { selector: ".primary-percent" })).toBeTruthy();
+    expect(within(panel).getAllByRole("progressbar", { name: /72% remaining/ })[0].querySelector(".tone-calm")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("tab", { name: /^Mistral:/ }));
+    expect(within(panel).getByRole("alert").textContent).toBe("Multiple Mistral credentials found");
+    expect(within(panel).queryByRole("progressbar")).toBeNull();
+    expect(within(screen.getByLabelText("Floating Deck")).getByRole("button", { name: /Mistral/i }).textContent).toContain("—");
+
+    fireEvent.click(screen.getByRole("button", { name: "Insights" }));
+    await screen.findByLabelText("Usage analytics");
+    expect(screen.getByRole("tab", { name: /Codex primary: 43% remaining/ })).toBeTruthy();
+  });
+
+  it("renders Mistral budgets independently at the bounds and with their original risk colors", () => {
+    mocks.usages = [usage({
+      id: "mistral", name: "Mistral",
+      limits: [{ label: "Vibe Budget", usedPercent: 0 }, { label: "API Budget", usedPercent: 100 }],
+    })];
+    render(<App />);
+    const windows = screen.getByRole("region", { name: "Mistral quota windows" });
+    const vibe = within(windows).getByRole("progressbar", { name: /Vibe Budget.*100% remaining/ });
+    const api = within(windows).getByRole("progressbar", { name: /API Budget.*0% remaining/ });
+    expect(vibe.querySelector<HTMLElement>(".tone-calm")?.style.width).toBe("100%");
+    expect(api.querySelector<HTMLElement>(".tone-critical")?.style.width).toBe("0%");
+    expect(within(windows).getByText("Limit reached")).toBeTruthy();
+  });
+
   it("switches to the Insights view and back, keeping Status intact", async () => {
     mocks.usages = standardUsages();
     render(<App />);
@@ -383,7 +449,7 @@ describe("Status | Insights | Settings primary navigation", () => {
     const panel = screen.getByRole("tabpanel");
     expect(within(panel).getByText("Grok (xAI)")).toBeTruthy();
     expect(panel.querySelector(".primary-percent")?.textContent).toBe(
-      "96% used",
+      "4% remaining",
     );
   });
 

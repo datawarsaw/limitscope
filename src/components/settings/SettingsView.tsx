@@ -291,8 +291,8 @@ export function SettingsView({
           />
         </label>
         <fieldset className="setting-row setting-fieldset">
-          <legend className="setting-label">Quota display</legend>
-          <div className="quota-perspective-control" role="radiogroup" aria-label="Quota display">
+          <legend className="setting-label">Insights quota summaries</legend>
+          <div className="quota-perspective-control" role="radiogroup" aria-label="Insights quota summaries" aria-describedby="insights-quota-display-note">
             {QUOTA_PERSPECTIVES.map((perspective) => (
               <label key={perspective} className="quota-perspective-option">
                 <input
@@ -306,6 +306,9 @@ export function SettingsView({
               </label>
             ))}
           </div>
+          <span id="insights-quota-display-note" className="setting-copy">
+            Status, provider sidebar, and Floating Deck always show remaining quota.
+          </span>
         </fieldset>
         {/* The retry control is a sibling of the select, not a descendant of a
             label that wraps it: a button inside that label would take the

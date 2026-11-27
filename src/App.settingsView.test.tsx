@@ -164,7 +164,7 @@ describe("settings destination", () => {
     ).toBeTruthy();
     expect(screen.getByLabelText("Auto-refresh")).toBeTruthy();
     expect(screen.getByLabelText("Theme")).toBeTruthy();
-    expect(screen.getByRole("radiogroup", { name: "Quota display" })).toBeTruthy();
+    expect(screen.getByRole("radiogroup", { name: "Insights quota summaries" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Check for updates" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Data & Privacy" }));
     expect(
