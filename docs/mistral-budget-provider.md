@@ -21,20 +21,23 @@ JSON.
 
 ## The credential
 
-The key is read from the Windows Credential Manager entry the account already
-uses:
+LimitScope checks two Windows Credential Manager generic targets in order:
 
-- target `ai.mistral.vibe`
-- account name `MISTRAL_API_KEY`
+1. `ai.mistral.vibe`
+2. `MISTRAL_API_KEY@ai.mistral.vibe`
 
-LimitScope never writes, copies, rotates or migrates that entry. The secret
-is resolved into a value whose `Debug` renders a fixed placeholder and whose
-`Drop` overwrites the buffer; it is used exactly once, as a bearer token.
-Only two things leave the adapter: the SHA-256 fingerprint of the key (the
-account identity the runtime isolates last-good by) and a masked four
-character tail. A missing entry, an unreadable store, an entry under a
-different account name and an empty secret all fail closed — the provider is
-*unavailable*, never a zero.
+Both require the exact stored `UserName` `MISTRAL_API_KEY`. The second
+lookup runs only when the base entry is absent or its metadata does not
+match, for example when the base holds an MCP OAuth entry. When both
+entries match, the base wins, following Windows Python keyring lookup
+precedence. A store read error or an unusable payload on a matching entry
+ends the lookup. LimitScope checks the target and user name before decoding
+the payload, and performs no writes or migrations.
+
+The key's `Debug` representation is a fixed placeholder and its secret
+buffer is overwritten on drop. The adapter exposes a SHA-256 fingerprint
+for account-bound last-good data and a masked four-character tail for
+display.
 
 ## The two rows
 
@@ -78,7 +81,9 @@ for stays usable, exactly as in the live reading.
 
 | Condition | Verdict | Health |
 |---|---|---|
-| no / unreadable / foreign credential | `credential_missing`, `credential_unreadable`, `credential_ambiguous` | unavailable |
+| both targets absent | `credential_missing` | unavailable |
+| entry found, but neither target has matching metadata | `credential_ambiguous` | unavailable |
+| store read error or unusable matching payload | `credential_unreadable` | unavailable |
 | 401 | `auth_invalid` | unavailable |
 | 403 | `not_entitled` | error |
 | 402 | `billing_restricted` — a billing refusal of the *reading*, never an invalid-key verdict | error |
